@@ -3,6 +3,7 @@ use crate::memory::event::MemoryEvent;
 use crate::memory::trigger::MemoryTrigger;
 use async_trait::async_trait;
 use std::sync::Arc;
+use tracing;
 
 pub struct NightlyConsolidationTrigger;
 
@@ -23,13 +24,19 @@ impl MemoryTrigger for NightlyConsolidationTrigger {
         if let MemoryEvent::NightlyConsolidation { scope, agent_dirs } = event {
             let mut all_memories = String::new();
             for (name, dir) in &agent_dirs {
-                let mem = store.load_agent_memory(dir, &scope).await.unwrap_or_default();
+                let mem = store.load_agent_memory(dir, &scope).await.unwrap_or_else(|e| {
+                    tracing::warn!("nightly: failed to load agent memory for {name}: {e}");
+                    String::new()
+                });
                 if !mem.is_empty() {
                     all_memories.push_str(&format!("### {name}\n{mem}\n\n"));
                 }
             }
             if all_memories.is_empty() { return Ok(()); }
-            let current_shared = store.load_shared_memory(&scope).await.unwrap_or_default();
+            let current_shared = store.load_shared_memory(&scope).await.unwrap_or_else(|e| {
+                tracing::warn!("nightly: failed to load shared memory: {e}");
+                String::new()
+            });
             let new_shared = distiller.distill(&all_memories, &current_shared).await?;
             store.overwrite_shared(&scope, &new_shared).await?;
         }

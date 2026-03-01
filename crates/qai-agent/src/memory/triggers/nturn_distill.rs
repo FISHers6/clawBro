@@ -7,7 +7,10 @@ use std::sync::Arc;
 pub struct NTurnDistillTrigger { n: u64 }
 
 impl NTurnDistillTrigger {
-    pub fn new(n: u64) -> Self { Self { n } }
+    pub fn new(n: u64) -> Self {
+        assert!(n > 0, "distill_every_n must be > 0");
+        Self { n }
+    }
     pub fn should_fire_for(&self, turn_count: u64) -> bool {
         turn_count > 0 && turn_count % self.n == 0
     }

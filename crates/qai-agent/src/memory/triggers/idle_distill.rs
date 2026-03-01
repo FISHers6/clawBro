@@ -6,6 +6,34 @@ use std::sync::Arc;
 
 pub struct IdleDistillTrigger;
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::{distiller::NoopDistiller, store::FileMemoryStore, trigger::MemoryTrigger};
+    use qai_protocol::SessionKey;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn test_idle_distills_and_overwrites_agent_memory() {
+        let shared = tempdir().unwrap();
+        let persona = tempdir().unwrap();
+        let store: Arc<dyn MemoryStore> = Arc::new(FileMemoryStore::new(shared.path().to_path_buf()));
+        let distiller: Arc<dyn MemoryDistiller> = Arc::new(NoopDistiller);
+        store.append_daily_log(persona.path(), &SessionKey::new("lark", "g2"), "user: test\nbot: ok").await.unwrap();
+        let trigger = IdleDistillTrigger;
+        let event = MemoryEvent::SessionIdle {
+            scope: SessionKey::new("lark", "g2"),
+            agent: "bot".to_string(),
+            persona_dir: persona.path().to_path_buf(),
+        };
+        assert!(trigger.matches(&event));
+        trigger.fire(event, store.clone(), distiller).await.unwrap();
+        let mem = store.load_agent_memory(persona.path(), &SessionKey::new("lark", "g2")).await.unwrap();
+        assert!(!mem.is_empty(), "memory should be written after idle distillation");
+    }
+}
+
 #[async_trait]
 impl MemoryTrigger for IdleDistillTrigger {
     fn name(&self) -> &str { "idle_distill" }
