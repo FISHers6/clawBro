@@ -264,6 +264,13 @@ impl SessionRegistry {
                 }
             }
             SlashCommand::Help => {}
+            // Memory commands: handled by MemorySystem integration (Task 11).
+            // For now return confirmation text only — wiring happens in registry once
+            // MemorySystem is injected.
+            SlashCommand::Remember(_) => {}
+            SlashCommand::Memory => {}
+            SlashCommand::Forget(_) => {}
+            SlashCommand::MemoryReset => {}
         }
         Ok(Some(cmd.confirmation_text()))
     }
