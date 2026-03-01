@@ -162,17 +162,19 @@ async fn main() -> Result<()> {
                         let thread_ts = inbound.thread_ts.clone();
                         let reply_to = Some(inbound.id.clone());
 
-                        // Send thinking placeholder before invoking the agent.
+                        // Send thinking placeholder only for non-duplicate messages.
                         // DingTalk has no edit API, so this is a separate message.
-                        // If sending fails, log a warning but continue processing.
-                        let thinking_msg = qai_protocol::OutboundMsg {
-                            session_key: session_key.clone(),
-                            content: qai_protocol::MsgContent::text("⏳ 思考中..."),
-                            reply_to: reply_to.clone(),
-                            thread_ts: thread_ts.clone(),
-                        };
-                        if let Err(e) = channel_clone.send(&thinking_msg).await {
-                            tracing::warn!("DingTalk send_thinking failed: {e}");
+                        // The definitive dedup check happens inside handle(); this is a best-effort pre-check.
+                        if !registry_clone.is_duplicate(&inbound.id) {
+                            let thinking_msg = qai_protocol::OutboundMsg {
+                                session_key: session_key.clone(),
+                                content: qai_protocol::MsgContent::text("⏳ 思考中..."),
+                                reply_to: reply_to.clone(),
+                                thread_ts: thread_ts.clone(),
+                            };
+                            if let Err(e) = channel_clone.send(&thinking_msg).await {
+                                tracing::warn!("DingTalk send_thinking failed: {e}");
+                            }
                         }
 
                         match registry_clone.handle(inbound).await {

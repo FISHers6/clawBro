@@ -6,8 +6,8 @@
 //! - No platform-specific text parsing here
 
 use crate::dedup::DedupStore;
-use crate::memory::{MemoryEvent, MemorySystem, MemoryTarget};
 use crate::memory::cap_to_words;
+use crate::memory::{MemoryEvent, MemorySystem, MemoryTarget};
 use crate::persona::AgentPersona;
 use crate::roster::AgentRoster;
 use crate::selector::{EngineConfig, EngineSelector};
@@ -79,22 +79,31 @@ impl SessionRegistry {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
                 loop {
                     interval.tick().await;
-                    let Some(reg) = registry_weak.upgrade() else { break };
+                    let Some(reg) = registry_weak.upgrade() else {
+                        break;
+                    };
                     let now = std::time::Instant::now();
-                    for entry in reg.last_activity.iter() {
-                        if now.duration_since(*entry.value()).as_secs() >= 1800 {
-                            if let Some(roster) = &reg.roster {
-                                for agent in roster.all_agents() {
-                                    if let Some(ref pd) = agent.persona_dir {
-                                        ms.emit(MemoryEvent::SessionIdle {
-                                            scope: entry.key().clone(),
-                                            agent: agent.name.clone(),
-                                            persona_dir: pd.clone(),
-                                        });
-                                    }
+                    // Collect idle scopes first to avoid mutation during iteration
+                    let idle_scopes: Vec<SessionKey> = reg
+                        .last_activity
+                        .iter()
+                        .filter(|e| now.duration_since(*e.value()).as_secs() >= 1800)
+                        .map(|e| e.key().clone())
+                        .collect();
+                    for scope in &idle_scopes {
+                        if let Some(roster) = &reg.roster {
+                            for agent in roster.all_agents() {
+                                if let Some(ref pd) = agent.persona_dir {
+                                    ms.emit(MemoryEvent::SessionIdle {
+                                        scope: scope.clone(),
+                                        agent: agent.name.clone(),
+                                        persona_dir: pd.clone(),
+                                    });
                                 }
                             }
                         }
+                        // Reset timestamp so we don't re-fire until new activity arrives
+                        reg.last_activity.insert(scope.clone(), now);
                     }
                 }
             });
@@ -109,7 +118,10 @@ impl SessionRegistry {
             .entry(key.clone())
             .or_insert_with(|| {
                 let engine = EngineSelector::build(&self.default_engine_cfg);
-                Arc::new(Session { key: key.clone(), engine })
+                Arc::new(Session {
+                    key: key.clone(),
+                    engine,
+                })
             })
             .clone()
     }
@@ -117,8 +129,22 @@ impl SessionRegistry {
     /// Override engine for a session (/engine slash command)
     pub fn set_session_engine(&self, key: &SessionKey, config: EngineConfig) {
         let engine = EngineSelector::build(&config);
-        let session = Arc::new(Session { key: key.clone(), engine });
+        let session = Arc::new(Session {
+            key: key.clone(),
+            engine,
+        });
         self.sessions.insert(key.clone(), session);
+    }
+
+    /// All session scopes that have had activity (used by nightly consolidation scheduler).
+    pub fn all_active_scopes(&self) -> Vec<SessionKey> {
+        self.last_activity.iter().map(|e| e.key().clone()).collect()
+    }
+
+    /// Best-effort pre-check: returns true if this message id was already processed.
+    /// The definitive check is inside `handle()`; use this only to skip side-effects.
+    pub fn is_duplicate(&self, id: &str) -> bool {
+        self.dedup.is_duplicate(id)
     }
 
     /// Global broadcast sender (for WS monitor clients)
@@ -144,7 +170,9 @@ impl SessionRegistry {
 
         // Slash commands take priority (no engine involved)
         if let Some(cmd) = SlashCommand::parse(&user_text) {
-            return self.handle_slash(cmd, &session_key, inbound.target_agent.as_deref()).await;
+            return self
+                .handle_slash(cmd, &session_key, inbound.target_agent.as_deref())
+                .await;
         }
 
         // ── Generic routing via target_agent (set by Channel) ──
@@ -155,7 +183,11 @@ impl SessionRegistry {
                     .as_ref()
                     .and_then(|r| r.find_by_mention(mention))
                     .map(|entry| {
-                        (entry.engine.clone(), entry.name.clone(), entry.persona_dir.clone())
+                        (
+                            entry.engine.clone(),
+                            entry.name.clone(),
+                            entry.persona_dir.clone(),
+                        )
                     })
             });
 
@@ -163,7 +195,10 @@ impl SessionRegistry {
         let (engine, sender_name): (BoxEngine, Option<String>) =
             if let Some((engine_cfg, name, _)) = &roster_match {
                 // AcpEngine is stateless per-turn; no need to cache in session for roster entries
-                (EngineSelector::build(engine_cfg), Some(format!("@{}", name)))
+                (
+                    EngineSelector::build(engine_cfg),
+                    Some(format!("@{}", name)),
+                )
             } else {
                 // No @mention or no roster: use the session's persistent engine (supports /engine)
                 let session = self.get_or_create_session(&session_key);
@@ -175,7 +210,10 @@ impl SessionRegistry {
             if let Some(dir) = persona_dir.as_deref() {
                 let persona = AgentPersona::load_from_dir_scoped(dir, &session_key);
                 let shared_mem = if let Some(ms) = &self.memory_system {
-                    ms.store().load_shared_memory(&session_key).await.unwrap_or_default()
+                    ms.store()
+                        .load_shared_memory(&session_key)
+                        .await
+                        .unwrap_or_default()
                 } else {
                     String::new()
                 };
@@ -202,7 +240,10 @@ impl SessionRegistry {
                     Some(s) if !s.is_empty() => format!("[{}]: {}", s, m.content),
                     _ => m.content.clone(),
                 };
-                HistoryMsg { role: m.role.clone(), content }
+                HistoryMsg {
+                    role: m.role.clone(),
+                    content,
+                }
             })
             .collect();
 
@@ -238,13 +279,15 @@ impl SessionRegistry {
                 while let Ok(event) = fwd_rx.recv().await {
                     // Inject sender into TurnComplete so WS clients know which agent replied
                     let event = match event {
-                        AgentEvent::TurnComplete { session_id, full_text, .. } => {
-                            AgentEvent::TurnComplete {
-                                session_id,
-                                full_text,
-                                sender: sender_for_fwd.clone(),
-                            }
-                        }
+                        AgentEvent::TurnComplete {
+                            session_id,
+                            full_text,
+                            ..
+                        } => AgentEvent::TurnComplete {
+                            session_id,
+                            full_text,
+                            sender: sender_for_fwd.clone(),
+                        },
                         other => other,
                     };
                     let _ = global_tx.send(event.clone());
@@ -279,8 +322,7 @@ impl SessionRegistry {
                 let sk = session_key.clone();
                 let log_entry = format!(
                     "**[{}]**: {}\n\n**[@{}]**: {}",
-                    inbound.sender, user_text_for_log,
-                    agent_name, full_text
+                    inbound.sender, user_text_for_log, agent_name, full_text
                 );
                 let store = ms.store();
                 tokio::spawn(async move {
@@ -300,7 +342,8 @@ impl SessionRegistry {
                     turn_count: new_count,
                 });
             }
-            self.last_activity.insert(session_key.clone(), std::time::Instant::now());
+            self.last_activity
+                .insert(session_key.clone(), std::time::Instant::now());
         }
 
         Ok(Some(full_text))
@@ -348,7 +391,11 @@ impl SessionRegistry {
             SlashCommand::Remember(content) => {
                 let memory_target = target_agent
                     .and_then(|mention| {
-                        self.roster.as_ref()?.find_by_mention(mention)?.persona_dir.clone()
+                        self.roster
+                            .as_ref()?
+                            .find_by_mention(mention)?
+                            .persona_dir
+                            .clone()
                     })
                     .map(|dir| MemoryTarget::Agent { persona_dir: dir })
                     .unwrap_or(MemoryTarget::Shared);
@@ -363,9 +410,13 @@ impl SessionRegistry {
             SlashCommand::Memory => {
                 if let Some(ms) = &self.memory_system {
                     let store = ms.store();
-                    let shared = store.load_shared_memory(session_key).await.unwrap_or_default();
+                    let shared = store
+                        .load_shared_memory(session_key)
+                        .await
+                        .unwrap_or_default();
                     let response = if shared.is_empty() {
-                        "📭 当前还没有关于这个范围的共享记忆。\n可用 /remember <内容> 添加。".to_string()
+                        "📭 当前还没有关于这个范围的共享记忆。\n可用 /remember <内容> 添加。"
+                            .to_string()
                     } else {
                         format!("📚 共享记忆：\n\n{}", cap_to_words(&shared, 500))
                     };
@@ -375,7 +426,10 @@ impl SessionRegistry {
             SlashCommand::Forget(keyword) => {
                 if let Some(ms) = &self.memory_system {
                     let store = ms.store();
-                    let shared = store.load_shared_memory(session_key).await.unwrap_or_default();
+                    let shared = store
+                        .load_shared_memory(session_key)
+                        .await
+                        .unwrap_or_default();
                     let filtered: String = shared
                         .lines()
                         .filter(|line| !line.to_lowercase().contains(&keyword.to_lowercase()))
@@ -405,7 +459,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("test-registry-{}", uuid::Uuid::new_v4()));
         let storage = SessionStorage::new(dir);
         let session_manager = Arc::new(SessionManager::new(storage));
-        SessionRegistry::new(EngineConfig::default(), session_manager, String::new(), None, None)
+        SessionRegistry::new(
+            EngineConfig::default(),
+            session_manager,
+            String::new(),
+            None,
+            None,
+        )
     }
 
     fn make_registry_with_roster() -> (Arc<SessionRegistry>, broadcast::Receiver<AgentEvent>) {
@@ -415,10 +475,18 @@ mod tests {
         let roster = AgentRoster::new(vec![AgentEntry {
             name: "mybot".to_string(),
             mentions: vec!["@mybot".to_string()],
-            engine: EngineConfig::RustAgent { binary: Some("my-custom-agent".to_string()) },
+            engine: EngineConfig::RustAgent {
+                binary: Some("my-custom-agent".to_string()),
+            },
             persona_dir: None,
         }]);
-        SessionRegistry::new(EngineConfig::default(), session_manager, String::new(), Some(roster), None)
+        SessionRegistry::new(
+            EngineConfig::default(),
+            session_manager,
+            String::new(),
+            Some(roster),
+            None,
+        )
     }
 
     #[test]
@@ -433,12 +501,22 @@ mod tests {
     fn test_registry_per_session_engine_override() {
         let (registry, _rx) = make_registry();
         let key = SessionKey::new("ws", "user2");
-        let default_name = registry.get_or_create_session(&key).engine.name().to_string();
+        let default_name = registry
+            .get_or_create_session(&key)
+            .engine
+            .name()
+            .to_string();
         registry.set_session_engine(
             &key,
-            EngineConfig::RustAgent { binary: Some("my-agent".to_string()) },
+            EngineConfig::RustAgent {
+                binary: Some("my-agent".to_string()),
+            },
         );
-        let new_name = registry.get_or_create_session(&key).engine.name().to_string();
+        let new_name = registry
+            .get_or_create_session(&key)
+            .engine
+            .name()
+            .to_string();
         assert_ne!(default_name, new_name);
         assert_eq!(new_name, "my-agent");
     }
