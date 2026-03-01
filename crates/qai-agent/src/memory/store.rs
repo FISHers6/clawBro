@@ -42,7 +42,7 @@ impl FileMemoryStore {
         persona_dir.join("logs").join(format!("{}_{}.md", scope_key(scope), date))
     }
 
-    async fn lock_for(&self, path: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    fn lock_for(&self, path: &Path) -> Arc<tokio::sync::Mutex<()>> {
         self.write_locks
             .entry(path.to_path_buf())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
@@ -65,24 +65,32 @@ impl FileMemoryStore {
 impl MemoryStore for FileMemoryStore {
     async fn load_shared_memory(&self, scope: &SessionKey) -> Result<String> {
         let path = self.shared_path(scope);
-        Ok(tokio::fs::read_to_string(&path).await.unwrap_or_default())
+        match tokio::fs::read_to_string(&path).await {
+            Ok(s) => Ok(s),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+            Err(e) => Err(e.into()),
+        }
     }
 
     async fn load_agent_memory(&self, persona_dir: &Path, scope: &SessionKey) -> Result<String> {
         let path = self.agent_path(persona_dir, scope);
-        Ok(tokio::fs::read_to_string(&path).await.unwrap_or_default())
+        match tokio::fs::read_to_string(&path).await {
+            Ok(s) => Ok(s),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+            Err(e) => Err(e.into()),
+        }
     }
 
     async fn append_shared(&self, scope: &SessionKey, content: &str) -> Result<()> {
         let path = self.shared_path(scope);
-        let lock = self.lock_for(&path).await;
+        let lock = self.lock_for(&path);
         let _guard = lock.lock().await;
         Self::atomic_append(&path, &format!("{content}\n")).await
     }
 
     async fn overwrite_agent_memory(&self, persona_dir: &Path, scope: &SessionKey, content: &str) -> Result<()> {
         let path = self.agent_path(persona_dir, scope);
-        let lock = self.lock_for(&path).await;
+        let lock = self.lock_for(&path);
         let _guard = lock.lock().await;
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -93,7 +101,7 @@ impl MemoryStore for FileMemoryStore {
 
     async fn append_daily_log(&self, persona_dir: &Path, scope: &SessionKey, entry: &str) -> Result<()> {
         let path = self.daily_log_path(persona_dir, scope);
-        let lock = self.lock_for(&path).await;
+        let lock = self.lock_for(&path);
         let _guard = lock.lock().await;
         let now = chrono::Local::now().format("%H:%M").to_string();
         Self::atomic_append(&path, &format!("## {now}\n\n{entry}\n\n---\n")).await
@@ -102,7 +110,7 @@ impl MemoryStore for FileMemoryStore {
     async fn load_recent_logs(&self, persona_dir: &Path, scope: &SessionKey, days: u64) -> Result<String> {
         let logs_dir = persona_dir.join("logs");
         let sk = scope_key(scope);
-        let cutoff = chrono::Local::now() - chrono::Duration::days(days as i64);
+        let cutoff_date = (chrono::Local::now() - chrono::Duration::days(days as i64)).date_naive();
         let mut out = String::new();
 
         let mut read_dir = match tokio::fs::read_dir(&logs_dir).await {
@@ -110,27 +118,34 @@ impl MemoryStore for FileMemoryStore {
             Err(_) => return Ok(out),
         };
         let mut entries = Vec::new();
-        while let Ok(Some(e)) = read_dir.next_entry().await {
-            let name = e.file_name().to_string_lossy().to_string();
-            if name.starts_with(&sk) && name.ends_with(".md") {
-                // filename: {scope_key}_{YYYY-MM-DD}.md
-                if let Some(date_str) = name.strip_prefix(&format!("{sk}_")).and_then(|s| s.strip_suffix(".md")) {
-                    if let Ok(date) = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
-                        let file_dt = chrono::DateTime::<chrono::Local>::from_naive_utc_and_offset(
-                            date.and_hms_opt(0, 0, 0).unwrap().and_utc().naive_utc(),
-                            *chrono::Local::now().offset(),
-                        );
-                        if file_dt >= cutoff {
-                            entries.push((date, e.path()));
+        loop {
+            match read_dir.next_entry().await {
+                Ok(Some(e)) => {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    if name.starts_with(&sk) && name.ends_with(".md") {
+                        // filename: {scope_key}_{YYYY-MM-DD}.md
+                        if let Some(date_str) = name.strip_prefix(&format!("{sk}_")).and_then(|s| s.strip_suffix(".md")) {
+                            if let Ok(date) = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
+                                if date >= cutoff_date {
+                                    entries.push((date, e.path()));
+                                }
+                            }
                         }
                     }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    tracing::warn!("Failed to read log dir entry: {e}");
+                    break;
                 }
             }
         }
         entries.sort_by_key(|(d, _)| *d);
         for (_, path) in entries {
-            if let Ok(content) = tokio::fs::read_to_string(&path).await {
-                out.push_str(&content);
+            match tokio::fs::read_to_string(&path).await {
+                Ok(content) => out.push_str(&content),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => tracing::warn!("Failed to read log file {:?}: {e}", path),
             }
         }
         Ok(out)
