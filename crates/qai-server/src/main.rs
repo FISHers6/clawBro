@@ -102,6 +102,8 @@ async fn main() -> Result<()> {
         let triggers = default_triggers(cfg.memory.distill_every_n);
         Some(MemorySystem::new(triggers, store, distiller))
     };
+    // Keep a reference for cron and nightly scheduler (registry takes ownership of its copy)
+    let memory_system_ref = memory_system.clone();
 
     // 初始化 SessionRegistry（替换 AgentRunner）
     let (registry, _event_rx) = SessionRegistry::new(
@@ -159,6 +161,19 @@ async fn main() -> Result<()> {
                         let session_key = inbound.session_key.clone();
                         let thread_ts = inbound.thread_ts.clone();
                         let reply_to = Some(inbound.id.clone());
+
+                        // Send thinking placeholder before invoking the agent.
+                        // DingTalk has no edit API, so this is a separate message.
+                        // If sending fails, log a warning but continue processing.
+                        let thinking_msg = qai_protocol::OutboundMsg {
+                            session_key: session_key.clone(),
+                            content: qai_protocol::MsgContent::text("⏳ 思考中..."),
+                            reply_to: reply_to.clone(),
+                            thread_ts: thread_ts.clone(),
+                        };
+                        if let Err(e) = channel_clone.send(&thinking_msg).await {
+                            tracing::warn!("DingTalk send_thinking failed: {e}");
+                        }
 
                         match registry_clone.handle(inbound).await {
                             Ok(Some(full_text)) => {
@@ -306,9 +321,11 @@ async fn main() -> Result<()> {
     // 启动 CronScheduler
     {
         let cron_registry = registry.clone();
+        let cron_memory = memory_system_ref.clone();
         let cron_trigger: qai_cron::TriggerFn =
             Arc::new(move |session_key_str: String, prompt: String| {
                 let registry = cron_registry.clone();
+                let memory = cron_memory.clone();
                 tokio::spawn(async move {
                     // Parse "channel:scope" into SessionKey.
                     // Fall back to channel="cron", scope=full string if no colon.
@@ -322,7 +339,7 @@ async fn main() -> Result<()> {
                     };
                     let msg = qai_protocol::InboundMsg {
                         id: uuid::Uuid::new_v4().to_string(),
-                        session_key,
+                        session_key: session_key.clone(),
                         content: qai_protocol::MsgContent::text(prompt),
                         sender: "cron".to_string(),
                         channel: "cron".to_string(),
@@ -330,14 +347,69 @@ async fn main() -> Result<()> {
                         thread_ts: None,
                         target_agent: None,
                     };
-                    if let Err(e) = registry.handle(msg).await {
-                        tracing::error!("Cron trigger failed: {e}");
+                    match registry.handle(msg).await {
+                        Ok(Some(result)) => {
+                            // Emit CronJobCompleted so CronResultTrigger can write to shared memory
+                            if let Some(ms) = &memory {
+                                let summary: String = result.chars().take(300).collect();
+                                ms.emit(qai_agent::MemoryEvent::CronJobCompleted {
+                                    scope: session_key,
+                                    agent: "cron".to_string(),
+                                    persona_dir: std::path::PathBuf::new(),
+                                    result_summary: summary,
+                                });
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => tracing::error!("Cron trigger failed: {e}"),
                     }
                 })
             });
         let scheduler = qai_cron::CronScheduler::new(cron_store, cron_trigger);
         tokio::spawn(async move { scheduler.run().await });
         tracing::info!("CronScheduler started (polling every 1s, db={:?})", cron_db);
+    }
+
+    // 启动 NightlyConsolidation 调度器（每天本地零点合并 agent 私有记忆 → 共享记忆）
+    if let Some(ms) = &memory_system_ref {
+        let ms_clone = ms.clone();
+        let registry_clone = registry.clone();
+        let agent_roster = cfg.agent_roster.clone();
+        tokio::spawn(async move {
+            use chrono::Timelike;
+            loop {
+                // Sleep until next local midnight
+                let now = chrono::Local::now();
+                let secs_since_midnight = now.num_seconds_from_midnight() as u64;
+                let secs_until_midnight = 86400u64.saturating_sub(secs_since_midnight).max(1);
+                tokio::time::sleep(Duration::from_secs(secs_until_midnight)).await;
+
+                // Collect agent dirs from roster entries that have a persona_dir
+                let agent_dirs: Vec<(String, std::path::PathBuf)> = agent_roster
+                    .iter()
+                    .filter_map(|entry| {
+                        entry
+                            .persona_dir
+                            .as_ref()
+                            .map(|pd| (entry.name.clone(), pd.clone()))
+                    })
+                    .collect();
+
+                if !agent_dirs.is_empty() {
+                    for scope in registry_clone.all_active_scopes() {
+                        ms_clone.emit(qai_agent::MemoryEvent::NightlyConsolidation {
+                            scope,
+                            agent_dirs: agent_dirs.clone(),
+                        });
+                    }
+                    tracing::info!(
+                        "NightlyConsolidation emitted for {} agent(s)",
+                        agent_dirs.len()
+                    );
+                }
+            }
+        });
+        tracing::info!("NightlyConsolidation scheduler started");
     }
 
     // 启动 Gateway HTTP/WS 服务器
