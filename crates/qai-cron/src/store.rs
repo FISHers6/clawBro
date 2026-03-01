@@ -47,7 +47,7 @@ impl CronStore {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS cron_jobs (
                 id          TEXT    PRIMARY KEY,
-                name        TEXT    NOT NULL,
+                name        TEXT    NOT NULL UNIQUE,
                 expr        TEXT    NOT NULL,
                 prompt      TEXT    NOT NULL,
                 session_key TEXT    NOT NULL,
@@ -128,7 +128,7 @@ impl CronStore {
     }
 
     /// Upsert a cron job by name. Updates if name exists, inserts if not.
-    /// Does NOT reset `last_run` on update (preserves scheduler continuity).
+    /// Does NOT reset `last_run` or `id` on update (preserves scheduler continuity).
     pub fn upsert_by_name(
         &self,
         name: &str,
@@ -138,24 +138,17 @@ impl CronStore {
         enabled: bool,
     ) -> anyhow::Result<()> {
         let conn = self.0.lock().unwrap();
-        let exists: bool = conn.query_row(
-            "SELECT COUNT(*) FROM cron_jobs WHERE name = ?1",
-            params![name],
-            |row| row.get::<_, i64>(0),
-        )? > 0;
-        if exists {
-            conn.execute(
-                "UPDATE cron_jobs SET expr = ?1, prompt = ?2, session_key = ?3, enabled = ?4 WHERE name = ?5",
-                params![expr, prompt, session_key, enabled as i64, name],
-            )?;
-        } else {
-            let id = uuid::Uuid::new_v4().to_string();
-            conn.execute(
-                "INSERT INTO cron_jobs (id, name, expr, prompt, session_key, enabled, last_run)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
-                params![id, name, expr, prompt, session_key, enabled as i64],
-            )?;
-        }
+        let id = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO cron_jobs (id, name, expr, prompt, session_key, enabled, last_run)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)
+             ON CONFLICT(name) DO UPDATE SET
+                 expr        = excluded.expr,
+                 prompt      = excluded.prompt,
+                 session_key = excluded.session_key,
+                 enabled     = excluded.enabled",
+            params![id, name, expr, prompt, session_key, enabled as i64],
+        )?;
         Ok(())
     }
 }
