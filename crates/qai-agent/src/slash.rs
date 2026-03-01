@@ -64,6 +64,7 @@ impl SlashCommand {
             // Unreachable in practice: registry's handle_slash returns early with real content.
             Self::Memory => "正在读取记忆…".to_string(),
             Self::Forget(keyword) => format!("✅ 已删除包含「{keyword}」的记忆条目"),
+            // Unreachable in practice: registry's handle_slash handles MemoryReset with two-step confirmation.
             Self::MemoryReset => "✅ 记忆已清空".to_string(),
         }
     }

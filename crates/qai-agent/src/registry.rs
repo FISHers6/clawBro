@@ -46,6 +46,8 @@ pub struct SessionRegistry {
     turn_counts: DashMap<(SessionKey, String), u64>,
     /// Last activity timestamp per session (for idle detection)
     last_activity: DashMap<SessionKey, std::time::Instant>,
+    /// Pending /memory reset confirmations: session_key → timestamp of first reset request
+    pending_resets: DashMap<SessionKey, std::time::Instant>,
 }
 
 impl SessionRegistry {
@@ -69,6 +71,7 @@ impl SessionRegistry {
             memory_system,
             turn_counts: DashMap::new(),
             last_activity: DashMap::new(),
+            pending_resets: DashMap::new(),
         });
 
         // Idle timer: check every 60s for sessions idle > 30 min
@@ -451,8 +454,23 @@ impl SessionRegistry {
                 }
             }
             SlashCommand::MemoryReset => {
-                if let Some(ms) = &self.memory_system {
-                    ms.store().overwrite_shared(session_key, "").await.ok();
+                let now = std::time::Instant::now();
+                let confirmed = self
+                    .pending_resets
+                    .get(session_key)
+                    .map(|t| now.duration_since(*t).as_secs() < 60)
+                    .unwrap_or(false);
+                if confirmed {
+                    self.pending_resets.remove(session_key);
+                    if let Some(ms) = &self.memory_system {
+                        ms.store().overwrite_shared(session_key, "").await.ok();
+                    }
+                    return Ok(Some("✅ 记忆已清空。".to_string()));
+                } else {
+                    self.pending_resets.insert(session_key.clone(), now);
+                    return Ok(Some(
+                        "⚠️ 你确定要清空当前记忆吗？此操作不可撤销。\n再次发送 /memory reset 以确认（60 秒内有效）。".to_string()
+                    ));
                 }
             }
         }
@@ -624,5 +642,58 @@ mod tests {
         assert!(text.contains("编码规范"), "empty memory should contain guiding question about 编码规范");
         assert!(text.contains("项目"), "empty memory should contain guiding question about 项目");
         assert!(text.contains("group_test"), "empty memory should include the scope name");
+    }
+
+    #[tokio::test]
+    async fn test_memory_reset_first_call_warns() {
+        let (registry, _rx) = make_registry_with_memory();
+        let key = SessionKey::new("dt", "group1");
+        let inbound = InboundMsg {
+            id: "mr-1".to_string(),
+            session_key: key.clone(),
+            content: MsgContent::text("/memory reset"),
+            sender: "user".to_string(),
+            channel: "dt".to_string(),
+            timestamp: chrono::Utc::now(),
+            thread_ts: None,
+            target_agent: None,
+        };
+        let result = registry.handle(inbound).await.unwrap().unwrap();
+        assert!(result.contains("⚠️"));
+        assert!(result.contains("60 秒"));
+    }
+
+    #[tokio::test]
+    async fn test_memory_reset_second_call_confirms() {
+        let (registry, _rx) = make_registry_with_memory();
+        let key = SessionKey::new("dt", "group2");
+
+        // First call: warn
+        let inbound1 = InboundMsg {
+            id: "mr-2a".to_string(),
+            session_key: key.clone(),
+            content: MsgContent::text("/memory reset"),
+            sender: "user".to_string(),
+            channel: "dt".to_string(),
+            timestamp: chrono::Utc::now(),
+            thread_ts: None,
+            target_agent: None,
+        };
+        registry.handle(inbound1).await.unwrap();
+
+        // Second call: execute
+        let inbound2 = InboundMsg {
+            id: "mr-2b".to_string(),
+            session_key: key.clone(),
+            content: MsgContent::text("/memory reset"),
+            sender: "user".to_string(),
+            channel: "dt".to_string(),
+            timestamp: chrono::Utc::now(),
+            thread_ts: None,
+            target_agent: None,
+        };
+        let result = registry.handle(inbound2).await.unwrap().unwrap();
+        assert!(result.contains("✅"));
+        assert!(result.contains("清空"));
     }
 }
