@@ -61,6 +61,7 @@ impl SlashCommand {
             Self::Reset => "✅ 对话历史已清除".to_string(),
             Self::Help => "可用命令：\n/engine <rust|claude|codex> — 切换引擎\n/reset — 清除历史\n/help — 显示帮助\n/remember <内容> — 写入记忆\n/memory — 查看记忆\n/memory reset — 清空记忆\n/forget <关键词> — 删除记忆条目".to_string(),
             Self::Remember(content) => format!("✅ 已记录：{content}"),
+            // Unreachable in practice: registry's handle_slash returns early with real content.
             Self::Memory => "正在读取记忆…".to_string(),
             Self::Forget(keyword) => format!("✅ 已删除包含「{keyword}」的记忆条目"),
             Self::MemoryReset => "✅ 记忆已清空".to_string(),

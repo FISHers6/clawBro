@@ -171,7 +171,7 @@ impl MemoryStore for FileMemoryStore {
                 Ok(None) => break,
                 Err(e) => {
                     tracing::warn!("Failed to read log dir entry: {e}");
-                    break;
+                    continue;
                 }
             }
         }
