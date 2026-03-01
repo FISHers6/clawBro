@@ -320,6 +320,22 @@ async fn main() -> Result<()> {
     }
     let cron_store = Arc::new(qai_cron::CronStore::open(&cron_db)?);
 
+    // Sync cron jobs declared in config.toml into the SQLite store
+    for job in &cfg.cron_jobs {
+        if let Err(e) = cron_store.upsert_by_name(
+            &job.name,
+            &job.expr,
+            &job.prompt,
+            &job.session_key,
+            job.enabled,
+        ) {
+            tracing::warn!("Failed to sync cron job {:?} from config: {e}", job.name);
+        }
+    }
+    if !cfg.cron_jobs.is_empty() {
+        tracing::info!("Synced {} cron job(s) from config.toml", cfg.cron_jobs.len());
+    }
+
     // 启动 CronScheduler
     {
         let cron_registry = registry.clone();

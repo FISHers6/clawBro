@@ -55,6 +55,20 @@ impl Default for MemorySection {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CronJobConfig {
+    pub name: String,
+    pub expr: String,
+    pub prompt: String,
+    pub session_key: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GatewayConfig {
     #[serde(default)]
@@ -73,6 +87,8 @@ pub struct GatewayConfig {
     pub agent_roster: Vec<AgentEntry>,
     #[serde(default)]
     pub memory: MemorySection,
+    #[serde(default)]
+    pub cron_jobs: Vec<CronJobConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -214,5 +230,38 @@ type = "codex_acp"
         let toml_str = "[memory]\ndistill_every_n = 10";
         let cfg: GatewayConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.memory.distill_every_n, 10);
+    }
+
+    #[test]
+    fn test_cron_jobs_config_deserializes() {
+        let toml_str = r#"
+[[cron_jobs]]
+name = "daily-standup"
+expr = "0 9 * * 1-5"
+prompt = "站会摘要"
+session_key = "dingtalk:group_xxx"
+enabled = true
+
+[[cron_jobs]]
+name = "weekly-report"
+expr = "0 18 * * 5"
+prompt = "工作报告"
+session_key = "lark:ou_xxx"
+"#;
+        let cfg: GatewayConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.cron_jobs.len(), 2);
+        assert_eq!(cfg.cron_jobs[0].name, "daily-standup");
+        assert_eq!(cfg.cron_jobs[0].expr, "0 9 * * 1-5");
+        assert!(cfg.cron_jobs[0].enabled);
+        assert_eq!(cfg.cron_jobs[1].name, "weekly-report");
+        // enabled defaults to true when omitted
+        assert!(cfg.cron_jobs[1].enabled);
+    }
+
+    #[test]
+    fn test_cron_jobs_empty_by_default() {
+        let toml_str = "[gateway]\nhost = \"127.0.0.1\"\nport = 0";
+        let cfg: GatewayConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.cron_jobs.is_empty());
     }
 }
