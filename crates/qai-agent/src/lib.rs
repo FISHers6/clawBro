@@ -1,0 +1,21 @@
+pub mod traits;
+pub mod acp_engine;
+pub mod runner;
+pub mod selector;
+pub mod dedup;
+pub mod slash;
+pub mod registry;
+pub mod output_sink;
+pub mod roster;
+pub mod persona;
+pub mod memory;
+
+pub use acp_engine::{AcpEngine, AcpEngineConfig};
+pub use dedup::DedupStore;
+pub use output_sink::{throttled_stream, OutputSink};
+pub use registry::{Session, SessionRegistry};
+pub use roster::{AgentEntry, AgentRoster};
+pub use selector::{EngineConfig, EngineSelector};
+pub use slash::SlashCommand;
+pub use traits::{AgentCtx, AgentEngine, BoxEngine, HistoryMsg};
+pub use persona::AgentPersona;

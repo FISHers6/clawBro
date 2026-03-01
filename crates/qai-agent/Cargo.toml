@@ -1,0 +1,23 @@
+[package]
+name = "qai-agent"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+qai-protocol  = { path = "../qai-protocol" }
+qai-session   = { path = "../qai-session" }
+tokio.workspace      = true
+futures.workspace    = true
+async-trait.workspace = true
+serde.workspace      = true
+serde_json.workspace = true
+anyhow.workspace     = true
+tracing.workspace    = true
+uuid.workspace       = true
+dashmap.workspace    = true
+agent-client-protocol = "0.9"
+tokio-util = { version = "0.7", features = ["compat"] }
+chrono.workspace     = true
+
+[dev-dependencies]
+tempfile = "3"
