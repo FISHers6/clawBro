@@ -6,6 +6,8 @@
 //! - No platform-specific text parsing here
 
 use crate::dedup::DedupStore;
+use crate::memory::{MemoryEvent, MemorySystem, MemoryTarget};
+use crate::memory::cap_to_words;
 use crate::persona::AgentPersona;
 use crate::roster::AgentRoster;
 use crate::selector::{EngineConfig, EngineSelector};
@@ -38,6 +40,12 @@ pub struct SessionRegistry {
     system_injection: String,
     /// User-configured agent roster (None = single-engine mode, no @mention routing)
     pub roster: Option<AgentRoster>,
+    /// Optional memory system for event-driven memory management
+    memory_system: Option<Arc<MemorySystem>>,
+    /// Per-(session, agent) turn counter for distillation triggers
+    turn_counts: DashMap<(SessionKey, String), u64>,
+    /// Last activity timestamp per session (for idle detection)
+    last_activity: DashMap<SessionKey, std::time::Instant>,
 }
 
 impl SessionRegistry {
@@ -46,6 +54,7 @@ impl SessionRegistry {
         session_manager: Arc<SessionManager>,
         system_injection: String,
         roster: Option<AgentRoster>,
+        memory_system: Option<Arc<MemorySystem>>,
     ) -> (Arc<Self>, broadcast::Receiver<AgentEvent>) {
         let (global_tx, global_rx) = broadcast::channel(256);
         let registry = Arc::new(Self {
@@ -57,7 +66,40 @@ impl SessionRegistry {
             global_tx,
             system_injection,
             roster,
+            memory_system,
+            turn_counts: DashMap::new(),
+            last_activity: DashMap::new(),
         });
+
+        // Idle timer: check every 60s for sessions idle > 30 min
+        if let Some(ms) = &registry.memory_system {
+            let registry_weak = Arc::downgrade(&registry);
+            let ms = Arc::clone(ms);
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+                loop {
+                    interval.tick().await;
+                    let Some(reg) = registry_weak.upgrade() else { break };
+                    let now = std::time::Instant::now();
+                    for entry in reg.last_activity.iter() {
+                        if now.duration_since(*entry.value()).as_secs() >= 1800 {
+                            if let Some(roster) = &reg.roster {
+                                for agent in roster.all_agents() {
+                                    if let Some(ref pd) = agent.persona_dir {
+                                        ms.emit(MemoryEvent::SessionIdle {
+                                            scope: entry.key().clone(),
+                                            agent: agent.name.clone(),
+                                            persona_dir: pd.clone(),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
         (registry, global_rx)
     }
 
@@ -98,10 +140,11 @@ impl SessionRegistry {
 
         let session_key = inbound.session_key.clone();
         let user_text = inbound.content.as_text().unwrap_or("").to_string();
+        let user_text_for_log = user_text.clone();
 
         // Slash commands take priority (no engine involved)
         if let Some(cmd) = SlashCommand::parse(&user_text) {
-            return self.handle_slash(cmd, &session_key).await;
+            return self.handle_slash(cmd, &session_key, inbound.target_agent.as_deref()).await;
         }
 
         // ── Generic routing via target_agent (set by Channel) ──
@@ -129,13 +172,17 @@ impl SessionRegistry {
 
         // Load persona: compose per-agent system_injection (SOUL + IDENTITY + MEMORY + skills)
         let system_injection = if let Some((_, _, persona_dir)) = &roster_match {
-            persona_dir
-                .as_deref()
-                .map(|dir| {
-                    AgentPersona::load_from_dir_scoped(dir, &session_key)
-                        .build_system_injection(&self.system_injection)
-                })
-                .unwrap_or_else(|| self.system_injection.clone())
+            if let Some(dir) = persona_dir.as_deref() {
+                let persona = AgentPersona::load_from_dir_scoped(dir, &session_key);
+                let shared_mem = if let Some(ms) = &self.memory_system {
+                    ms.store().load_shared_memory(&session_key).await.unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                persona.build_system_injection_v2(&self.system_injection, &shared_mem, 300, 500)
+            } else {
+                self.system_injection.clone()
+            }
         } else {
             self.system_injection.clone()
         };
@@ -223,6 +270,39 @@ impl SessionRegistry {
         };
         storage.append_message(session_id, &assistant_msg).await?;
 
+        // ── Memory events (non-blocking) ──
+        if let Some(ms) = &self.memory_system {
+            if let Some((_, agent_name_raw, Some(persona_dir))) = &roster_match {
+                let agent_name = agent_name_raw.trim_start_matches('@').to_string();
+                let pd = persona_dir.clone();
+                let pd_for_event = persona_dir.clone();
+                let sk = session_key.clone();
+                let log_entry = format!(
+                    "**[{}]**: {}\n\n**[@{}]**: {}",
+                    inbound.sender, user_text_for_log,
+                    agent_name, full_text
+                );
+                let store = ms.store();
+                tokio::spawn(async move {
+                    store.append_daily_log(&pd, &sk, &log_entry).await.ok();
+                });
+
+                let count_key = (session_key.clone(), agent_name.clone());
+                let new_count = {
+                    let mut c = self.turn_counts.entry(count_key).or_insert(0);
+                    *c += 1;
+                    *c
+                };
+                ms.emit(MemoryEvent::TurnCompleted {
+                    scope: session_key.clone(),
+                    agent: agent_name,
+                    persona_dir: pd_for_event,
+                    turn_count: new_count,
+                });
+            }
+            self.last_activity.insert(session_key.clone(), std::time::Instant::now());
+        }
+
         Ok(Some(full_text))
     }
 
@@ -231,6 +311,7 @@ impl SessionRegistry {
         &self,
         cmd: SlashCommand,
         session_key: &SessionKey,
+        target_agent: Option<&str>,
     ) -> Result<Option<String>> {
         match &cmd {
             SlashCommand::SetEngine(name) => {
@@ -264,13 +345,50 @@ impl SessionRegistry {
                 }
             }
             SlashCommand::Help => {}
-            // Memory commands: handled by MemorySystem integration (Task 11).
-            // For now return confirmation text only — wiring happens in registry once
-            // MemorySystem is injected.
-            SlashCommand::Remember(_) => {}
-            SlashCommand::Memory => {}
-            SlashCommand::Forget(_) => {}
-            SlashCommand::MemoryReset => {}
+            SlashCommand::Remember(content) => {
+                let memory_target = target_agent
+                    .and_then(|mention| {
+                        self.roster.as_ref()?.find_by_mention(mention)?.persona_dir.clone()
+                    })
+                    .map(|dir| MemoryTarget::Agent { persona_dir: dir })
+                    .unwrap_or(MemoryTarget::Shared);
+                if let Some(ms) = &self.memory_system {
+                    ms.emit(MemoryEvent::UserRemember {
+                        scope: session_key.clone(),
+                        target: memory_target,
+                        content: content.clone(),
+                    });
+                }
+            }
+            SlashCommand::Memory => {
+                if let Some(ms) = &self.memory_system {
+                    let store = ms.store();
+                    let shared = store.load_shared_memory(session_key).await.unwrap_or_default();
+                    let response = if shared.is_empty() {
+                        "📭 当前还没有关于这个范围的共享记忆。\n可用 /remember <内容> 添加。".to_string()
+                    } else {
+                        format!("📚 共享记忆：\n\n{}", cap_to_words(&shared, 500))
+                    };
+                    return Ok(Some(response));
+                }
+            }
+            SlashCommand::Forget(keyword) => {
+                if let Some(ms) = &self.memory_system {
+                    let store = ms.store();
+                    let shared = store.load_shared_memory(session_key).await.unwrap_or_default();
+                    let filtered: String = shared
+                        .lines()
+                        .filter(|line| !line.to_lowercase().contains(&keyword.to_lowercase()))
+                        .map(|l| format!("{l}\n"))
+                        .collect();
+                    store.overwrite_shared(session_key, &filtered).await.ok();
+                }
+            }
+            SlashCommand::MemoryReset => {
+                if let Some(ms) = &self.memory_system {
+                    ms.store().overwrite_shared(session_key, "").await.ok();
+                }
+            }
         }
         Ok(Some(cmd.confirmation_text()))
     }
@@ -287,7 +405,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("test-registry-{}", uuid::Uuid::new_v4()));
         let storage = SessionStorage::new(dir);
         let session_manager = Arc::new(SessionManager::new(storage));
-        SessionRegistry::new(EngineConfig::default(), session_manager, String::new(), None)
+        SessionRegistry::new(EngineConfig::default(), session_manager, String::new(), None, None)
     }
 
     fn make_registry_with_roster() -> (Arc<SessionRegistry>, broadcast::Receiver<AgentEvent>) {
@@ -300,7 +418,7 @@ mod tests {
             engine: EngineConfig::RustAgent { binary: Some("my-custom-agent".to_string()) },
             persona_dir: None,
         }]);
-        SessionRegistry::new(EngineConfig::default(), session_manager, String::new(), Some(roster))
+        SessionRegistry::new(EngineConfig::default(), session_manager, String::new(), Some(roster), None)
     }
 
     #[test]
