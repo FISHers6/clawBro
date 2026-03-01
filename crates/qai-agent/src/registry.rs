@@ -414,11 +414,23 @@ impl SessionRegistry {
                         .load_shared_memory(session_key)
                         .await
                         .unwrap_or_default();
+                    let scope_display = &session_key.scope;
                     let response = if shared.is_empty() {
-                        "📭 当前还没有关于这个范围的共享记忆。\n可用 /remember <内容> 添加。"
-                            .to_string()
+                        format!(
+                            "📭 当前还没有关于「{scope_display}」的记忆。\n\n可以告诉我一些背景，比如：\n- 团队用什么技术栈？\n- 有哪些编码规范？\n- 当前在做什么项目？\n\n或者直接 /remember <内容> 手动添加。"
+                        )
                     } else {
-                        format!("📚 共享记忆：\n\n{}", cap_to_words(&shared, 500))
+                        let ts = store
+                            .shared_last_modified(session_key)
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                            .unwrap_or_else(|| "未知".to_string());
+                        format!(
+                            "📚 当前记忆（{scope_display}）\n最后更新：{ts}\n\n{}\n\n输入 /remember <内容> 添加新记忆，/forget <关键词> 删除。",
+                            cap_to_words(&shared, 500)
+                        )
                     };
                     return Ok(Some(response));
                 }
@@ -451,9 +463,11 @@ impl SessionRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::{distiller::NoopDistiller, store::FileMemoryStore, MemorySystem};
     use crate::roster::{AgentEntry, AgentRoster};
     use qai_protocol::{InboundMsg, MsgContent};
     use qai_session::SessionStorage;
+    use tempfile::tempdir;
 
     fn make_registry() -> (Arc<SessionRegistry>, broadcast::Receiver<AgentEvent>) {
         let dir = std::env::temp_dir().join(format!("test-registry-{}", uuid::Uuid::new_v4()));
@@ -465,6 +479,24 @@ mod tests {
             String::new(),
             None,
             None,
+        )
+    }
+
+    fn make_registry_with_memory() -> (Arc<SessionRegistry>, broadcast::Receiver<AgentEvent>) {
+        let db_dir = std::env::temp_dir().join(format!("test-registry-mem-{}", uuid::Uuid::new_v4()));
+        let storage = SessionStorage::new(db_dir);
+        let session_manager = Arc::new(SessionManager::new(storage));
+        let mem_dir = tempdir().unwrap();
+        let store: Arc<dyn crate::memory::MemoryStore> =
+            Arc::new(FileMemoryStore::new(mem_dir.into_path()));
+        let distiller: Arc<dyn crate::memory::MemoryDistiller> = Arc::new(NoopDistiller);
+        let memory_system = MemorySystem::new(vec![], store, distiller);
+        SessionRegistry::new(
+            EngineConfig::default(),
+            session_manager,
+            String::new(),
+            None,
+            Some(memory_system),
         )
     }
 
@@ -571,5 +603,26 @@ mod tests {
     fn test_registry_no_roster_is_none() {
         let (registry, _rx) = make_registry();
         assert!(registry.roster.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_memory_empty_state_guidance() {
+        let (registry, _rx) = make_registry_with_memory();
+        let inbound = InboundMsg {
+            id: "mem-empty-1".to_string(),
+            session_key: SessionKey::new("dingtalk", "group_test"),
+            content: MsgContent::text("/memory"),
+            sender: "user".to_string(),
+            channel: "dingtalk".to_string(),
+            timestamp: chrono::Utc::now(),
+            thread_ts: None,
+            target_agent: None,
+        };
+        let result = registry.handle(inbound).await.unwrap();
+        let text = result.unwrap();
+        assert!(text.contains("技术栈"), "empty memory should contain guiding question about 技术栈");
+        assert!(text.contains("编码规范"), "empty memory should contain guiding question about 编码规范");
+        assert!(text.contains("项目"), "empty memory should contain guiding question about 项目");
+        assert!(text.contains("group_test"), "empty memory should include the scope name");
     }
 }

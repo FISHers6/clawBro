@@ -19,6 +19,8 @@ pub trait MemoryStore: Send + Sync {
     async fn load_recent_logs(&self, persona_dir: &Path, scope: &SessionKey, days: u64) -> Result<String>;
     async fn append_to_agent_memory(&self, persona_dir: &Path, scope: &SessionKey, content: &str) -> Result<()>;
     async fn overwrite_shared(&self, scope: &SessionKey, content: &str) -> Result<()>;
+    /// Returns the last-modified timestamp of the shared memory file, or None if not yet created.
+    async fn shared_last_modified(&self, scope: &SessionKey) -> Result<Option<chrono::DateTime<chrono::Local>>>;
 }
 
 pub struct FileMemoryStore {
@@ -125,6 +127,19 @@ impl MemoryStore for FileMemoryStore {
         }
         tokio::fs::write(&path, content).await?;
         Ok(())
+    }
+
+    async fn shared_last_modified(&self, scope: &SessionKey) -> Result<Option<chrono::DateTime<chrono::Local>>> {
+        let path = self.shared_path(scope);
+        match tokio::fs::metadata(&path).await {
+            Ok(meta) => {
+                let modified = meta.modified()?;
+                let dt: chrono::DateTime<chrono::Local> = modified.into();
+                Ok(Some(dt))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     async fn load_recent_logs(&self, persona_dir: &Path, scope: &SessionKey, days: u64) -> Result<String> {
@@ -235,5 +250,22 @@ mod tests {
         std::fs::write(&old_file, "old content").unwrap();
         let logs = store.load_recent_logs(persona.path(), &scope, 7).await.unwrap();
         assert!(!logs.contains("old content"));
+    }
+
+    #[tokio::test]
+    async fn test_shared_last_modified_none_when_missing() {
+        let dir = tempdir().unwrap();
+        let store = FileMemoryStore::new(dir.path().to_path_buf());
+        let result = store.shared_last_modified(&scope()).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_shared_last_modified_some_after_write() {
+        let dir = tempdir().unwrap();
+        let store = FileMemoryStore::new(dir.path().to_path_buf());
+        store.append_shared(&scope(), "something").await.unwrap();
+        let result = store.shared_last_modified(&scope()).await.unwrap();
+        assert!(result.is_some());
     }
 }
