@@ -476,6 +476,12 @@ impl SessionRegistry {
         }
         Ok(Some(cmd.confirmation_text()))
     }
+
+    /// Test helper: inject an instant into pending_resets directly (bypasses 60s window).
+    #[cfg(test)]
+    pub fn inject_pending_reset_at(&self, key: SessionKey, instant: std::time::Instant) {
+        self.pending_resets.insert(key, instant);
+    }
 }
 
 #[cfg(test)]
@@ -695,5 +701,32 @@ mod tests {
         let result = registry.handle(inbound2).await.unwrap().unwrap();
         assert!(result.contains("✅"));
         assert!(result.contains("清空"));
+    }
+
+    #[tokio::test]
+    async fn test_memory_reset_expired_pending_rewarns() {
+        let (registry, _rx) = make_registry_with_memory();
+        let key = SessionKey::new("dt", "group3");
+
+        // Inject an already-expired pending reset (61s ago)
+        let expired = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(61))
+            .expect("system clock supports this subtraction");
+        registry.inject_pending_reset_at(key.clone(), expired);
+
+        // Call /memory reset — should re-warn, not clear
+        let inbound = InboundMsg {
+            id: "mr-expired".to_string(),
+            session_key: key.clone(),
+            content: MsgContent::text("/memory reset"),
+            sender: "user".to_string(),
+            channel: "dt".to_string(),
+            timestamp: chrono::Utc::now(),
+            thread_ts: None,
+            target_agent: None,
+        };
+        let result = registry.handle(inbound).await.unwrap().unwrap();
+        assert!(result.contains("⚠️"), "expired pending should re-warn, got: {result}");
+        assert!(!result.contains("✅"), "expired pending must NOT confirm clear, got: {result}");
     }
 }
