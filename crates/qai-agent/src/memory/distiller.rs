@@ -19,8 +19,9 @@ pub struct NoopDistiller;
 #[async_trait]
 impl MemoryDistiller for NoopDistiller {
     async fn distill(&self, logs: &str, current_memory: &str) -> Result<String> {
-        let mem_preview = &current_memory[..current_memory.len().min(200)];
-        let logs_preview = &logs[..logs.len().min(200)];
+        // Use char-safe truncation to avoid panicking on multi-byte UTF-8 (e.g. Chinese text)
+        let mem_preview: String = current_memory.chars().take(200).collect();
+        let logs_preview: String = logs.chars().take(200).collect();
         Ok(format!("[distilled]\n{}\n---\n{}", mem_preview, logs_preview))
     }
 }
@@ -61,6 +62,8 @@ impl MemoryDistiller for AcpDistiller {
             system_injection: DISTILL_PROMPT.to_string(),
         };
 
+        // Broadcast receiver is intentionally discarded: distillation runs in the background
+        // and streaming progress events are not surfaced to callers.
         let (tx, _) = broadcast::channel(16);
         engine.run(ctx, tx).await
     }
