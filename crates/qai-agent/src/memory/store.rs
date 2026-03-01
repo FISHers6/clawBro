@@ -17,6 +17,8 @@ pub trait MemoryStore: Send + Sync {
     async fn overwrite_agent_memory(&self, persona_dir: &Path, scope: &SessionKey, content: &str) -> Result<()>;
     async fn append_daily_log(&self, persona_dir: &Path, scope: &SessionKey, entry: &str) -> Result<()>;
     async fn load_recent_logs(&self, persona_dir: &Path, scope: &SessionKey, days: u64) -> Result<String>;
+    async fn append_to_agent_memory(&self, persona_dir: &Path, scope: &SessionKey, content: &str) -> Result<()>;
+    async fn overwrite_shared(&self, scope: &SessionKey, content: &str) -> Result<()>;
 }
 
 pub struct FileMemoryStore {
@@ -105,6 +107,24 @@ impl MemoryStore for FileMemoryStore {
         let _guard = lock.lock().await;
         let now = chrono::Local::now().format("%H:%M").to_string();
         Self::atomic_append(&path, &format!("## {now}\n\n{entry}\n\n---\n")).await
+    }
+
+    async fn append_to_agent_memory(&self, persona_dir: &Path, scope: &SessionKey, content: &str) -> Result<()> {
+        let path = self.agent_path(persona_dir, scope);
+        let lock = self.lock_for(&path);
+        let _guard = lock.lock().await;
+        Self::atomic_append(&path, &format!("{content}\n")).await
+    }
+
+    async fn overwrite_shared(&self, scope: &SessionKey, content: &str) -> Result<()> {
+        let path = self.shared_path(scope);
+        let lock = self.lock_for(&path);
+        let _guard = lock.lock().await;
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::write(&path, content).await?;
+        Ok(())
     }
 
     async fn load_recent_logs(&self, persona_dir: &Path, scope: &SessionKey, days: u64) -> Result<String> {
