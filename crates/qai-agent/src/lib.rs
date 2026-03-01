@@ -19,3 +19,4 @@ pub use selector::{EngineConfig, EngineSelector};
 pub use slash::SlashCommand;
 pub use traits::{AgentCtx, AgentEngine, BoxEngine, HistoryMsg};
 pub use persona::AgentPersona;
+pub use memory::{MemoryEvent, MemorySystem, MemoryTarget};
