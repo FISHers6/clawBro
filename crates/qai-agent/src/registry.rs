@@ -622,11 +622,20 @@ impl SessionRegistry {
             SlashCommand::Workspace(path_opt) => {
                 match path_opt {
                     None => {
-                        // Show current workspace
-                        let current = self
+                        // Show current workspace using the full three-tier resolution:
+                        //   per-session override > roster entry workspace_dir > global default
+                        let roster_workspace: Option<std::path::PathBuf> =
+                            target_agent.and_then(|mention| {
+                                self.roster
+                                    .as_ref()
+                                    .and_then(|r| r.find_by_mention(mention))
+                                    .and_then(|entry| entry.workspace_dir.clone())
+                            });
+                        let resolved = self
                             .session_workspace(session_key)
+                            .or(roster_workspace)
                             .or_else(|| self.default_workspace.clone());
-                        let display = current
+                        let display = resolved
                             .map(|p| p.display().to_string())
                             .unwrap_or_else(|| "(none — running in gateway process directory)".to_string());
                         return Ok(Some(format!("Current workspace: `{display}`")));
@@ -636,6 +645,11 @@ impl SessionRegistry {
                         if !new_path.exists() {
                             return Ok(Some(format!(
                                 "Directory does not exist: `{path_str}`"
+                            )));
+                        }
+                        if !new_path.is_dir() {
+                            return Ok(Some(format!(
+                                "Path is not a directory: `{path_str}`"
                             )));
                         }
                         self.set_session_workspace(session_key, new_path);
@@ -1123,5 +1137,46 @@ mod tests {
         let names: Vec<&str> = skills.iter().map(|s| s.manifest.name.as_str()).collect();
         assert!(names.contains(&"ws-skill"));
         assert!(names.contains(&"gw-skill"));
+    }
+
+    // ── /workspace slash command tests ──────────────────────────────────────
+
+    #[test]
+    fn test_workspace_cmd_rejects_file_path() {
+        // Verify parse correctly extracts the path from /workspace /etc/hosts
+        let cmd = SlashCommand::parse("/workspace /etc/hosts");
+        assert_eq!(
+            cmd,
+            Some(SlashCommand::Workspace(Some("/etc/hosts".to_string())))
+        );
+        // The is_dir check happens at runtime in handle_slash; the parse result
+        // is a path, not a command failure — that is the correct contract.
+    }
+
+    #[tokio::test]
+    async fn test_workspace_set_rejects_file_not_directory() {
+        // /workspace /etc/hosts should fail with "Path is not a directory" because
+        // /etc/hosts is a regular file (exists but is_dir() == false).
+        let (registry, _rx) = make_registry();
+        let hosts = std::path::Path::new("/etc/hosts");
+        // Only run if /etc/hosts exists on this platform; skip otherwise.
+        if !hosts.exists() {
+            return;
+        }
+        let inbound = InboundMsg {
+            id: "ws-file-check-1".to_string(),
+            session_key: SessionKey::new("ws", "user_ws_file"),
+            content: MsgContent::text("/workspace /etc/hosts"),
+            sender: "user".to_string(),
+            channel: "ws".to_string(),
+            timestamp: chrono::Utc::now(),
+            thread_ts: None,
+            target_agent: None,
+        };
+        let result = registry.handle(inbound).await.unwrap().unwrap();
+        assert!(
+            result.contains("not a directory"),
+            "expected 'not a directory' error, got: {result}"
+        );
     }
 }
