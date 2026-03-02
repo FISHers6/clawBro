@@ -63,6 +63,10 @@ pub struct CronJobConfig {
     pub session_key: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub condition: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -95,6 +99,13 @@ pub struct GatewayConfig {
 pub struct GatewaySection {
     pub host: String,
     pub port: u16,
+    /// When true, bot only responds in group chats if @-mentioned.
+    /// In private chats this flag has no effect.
+    #[serde(default)]
+    pub require_mention_in_groups: bool,
+    /// Default workspace directory for all agent sessions.
+    #[serde(default)]
+    pub default_workspace: Option<PathBuf>,
 }
 
 impl Default for GatewaySection {
@@ -102,6 +113,8 @@ impl Default for GatewaySection {
         Self {
             host: "127.0.0.1".to_string(),
             port: 0,
+            require_mention_in_groups: false,
+            default_workspace: None,
         }
     }
 }
@@ -263,5 +276,97 @@ session_key = "lark:ou_xxx"
         let toml_str = "[gateway]\nhost = \"127.0.0.1\"\nport = 0";
         let cfg: GatewayConfig = toml::from_str(toml_str).unwrap();
         assert!(cfg.cron_jobs.is_empty());
+    }
+
+    #[test]
+    fn test_cron_job_config_with_agent() {
+        let toml = r#"
+[[cron_jobs]]
+name = "digest"
+expr = "0 0 8 * * *"
+prompt = "Summarize today"
+session_key = "lark:ou_xxx"
+agent = "reviewer"
+"#;
+        let cfg: GatewayConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.cron_jobs[0].agent, Some("reviewer".to_string()));
+    }
+
+    #[test]
+    fn test_cron_job_config_agent_defaults_to_none() {
+        let toml = r#"
+[[cron_jobs]]
+name = "digest"
+expr = "0 0 8 * * *"
+prompt = "Summarize today"
+session_key = "lark:ou_xxx"
+"#;
+        let cfg: GatewayConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.cron_jobs[0].agent, None);
+    }
+
+    #[test]
+    fn test_cron_job_config_condition_deserializes() {
+        let toml = r#"
+[[cron_jobs]]
+name = "heartbeat"
+expr = "0 */30 * * * *"
+prompt = "Check in with the user"
+session_key = "lark:ou_xxx"
+condition = "idle_gt_seconds = 3600"
+"#;
+        let cfg: GatewayConfig = toml::from_str(toml).unwrap();
+        assert_eq!(
+            cfg.cron_jobs[0].condition,
+            Some("idle_gt_seconds = 3600".to_string())
+        );
+    }
+
+    #[test]
+    fn test_cron_job_config_condition_defaults_to_none() {
+        let toml = r#"
+[[cron_jobs]]
+name = "ping"
+expr = "0 * * * * *"
+prompt = "Hello"
+session_key = "lark:ou_xxx"
+"#;
+        let cfg: GatewayConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.cron_jobs[0].condition, None);
+    }
+
+    #[test]
+    fn test_gateway_require_mention_in_groups_defaults_to_false() {
+        let toml_str = "[gateway]\nhost = \"127.0.0.1\"\nport = 8080";
+        let cfg: GatewayConfig = toml::from_str(toml_str).unwrap();
+        assert!(!cfg.gateway.require_mention_in_groups);
+    }
+
+    #[test]
+    fn test_gateway_require_mention_in_groups_can_be_set_true() {
+        let toml_str = "[gateway]\nhost = \"127.0.0.1\"\nport = 8080\nrequire_mention_in_groups = true";
+        let cfg: GatewayConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.gateway.require_mention_in_groups);
+    }
+
+    #[test]
+    fn test_gateway_default_workspace_deserialises() {
+        let toml = r#"
+[gateway]
+host = "127.0.0.1"
+port = 8080
+default_workspace = "/home/user/workspace"
+    "#;
+        let cfg: GatewayConfig = toml::from_str(toml).unwrap();
+        assert_eq!(
+            cfg.gateway.default_workspace,
+            Some(std::path::PathBuf::from("/home/user/workspace"))
+        );
+    }
+
+    #[test]
+    fn test_gateway_default_workspace_defaults_to_none() {
+        let cfg = GatewayConfig::default();
+        assert!(cfg.gateway.default_workspace.is_none());
     }
 }

@@ -48,6 +48,9 @@ pub struct SessionRegistry {
     last_activity: DashMap<SessionKey, std::time::Instant>,
     /// Pending /memory reset confirmations: session_key → timestamp of first reset request
     pending_resets: DashMap<SessionKey, std::time::Instant>,
+    /// Fallback persona_dir for single-engine mode (no roster match).
+    /// When set, TurnCompleted events fire even without a roster agent.
+    default_persona_dir: Option<std::path::PathBuf>,
 }
 
 impl SessionRegistry {
@@ -57,6 +60,7 @@ impl SessionRegistry {
         system_injection: String,
         roster: Option<AgentRoster>,
         memory_system: Option<Arc<MemorySystem>>,
+        default_persona_dir: Option<std::path::PathBuf>,
     ) -> (Arc<Self>, broadcast::Receiver<AgentEvent>) {
         let (global_tx, global_rx) = broadcast::channel(256);
         let registry = Arc::new(Self {
@@ -72,6 +76,7 @@ impl SessionRegistry {
             turn_counts: DashMap::new(),
             last_activity: DashMap::new(),
             pending_resets: DashMap::new(),
+            default_persona_dir,
         });
 
         // Idle timer: check every 60s for sessions idle > 30 min
@@ -144,10 +149,21 @@ impl SessionRegistry {
         self.last_activity.iter().map(|e| e.key().clone()).collect()
     }
 
-    /// Best-effort pre-check: returns true if this message id was already processed.
-    /// The definitive check is inside `handle()`; use this only to skip side-effects.
-    pub fn is_duplicate(&self, id: &str) -> bool {
-        self.dedup.is_duplicate(id)
+    /// Return how many seconds the given session has been idle (no `handle()` activity).
+    ///
+    /// Returns `None` if the session has never been active (no recorded activity).
+    pub fn session_idle_seconds(&self, session_key: &str) -> Option<u64> {
+        // session_key may be in "channel:scope" format or just a plain scope string.
+        // Parse into a SessionKey with a single lookup: "channel:scope" splits on the first ':',
+        // bare strings are treated as scope under a synthetic "cron" channel.
+        let key_parsed = if let Some(pos) = session_key.find(':') {
+            SessionKey::new(&session_key[..pos], &session_key[pos + 1..])
+        } else {
+            SessionKey::new("cron", session_key)
+        };
+        self.last_activity
+            .get(&key_parsed)
+            .map(|t| t.elapsed().as_secs())
     }
 
     /// Global broadcast sender (for WS monitor clients)
@@ -316,12 +332,26 @@ impl SessionRegistry {
         };
         storage.append_message(session_id, &assistant_msg).await?;
 
+        // After engine completes, update idle tracking unconditionally
+        self.last_activity
+            .insert(session_key.clone(), std::time::Instant::now());
+
         // ── Memory events (non-blocking) ──
         if let Some(ms) = &self.memory_system {
-            if let Some((_, agent_name_raw, Some(persona_dir))) = &roster_match {
+            // persona_dir: roster agent dir takes priority; fall back to default (single-engine mode)
+            let persona_dir_opt: Option<std::path::PathBuf> = roster_match
+                .as_ref()
+                .and_then(|(_, _, pd)| pd.clone())
+                .or_else(|| self.default_persona_dir.clone());
+
+            let agent_name_raw: String = roster_match
+                .as_ref()
+                .map(|(_, name, _)| name.clone())
+                .unwrap_or_else(|| "default".to_string());
+
+            if let Some(persona_dir) = persona_dir_opt {
                 let agent_name = agent_name_raw.trim_start_matches('@').to_string();
                 let pd = persona_dir.clone();
-                let pd_for_event = persona_dir.clone();
                 let sk = session_key.clone();
                 let log_entry = format!(
                     "**[{}]**: {}\n\n**[@{}]**: {}",
@@ -341,12 +371,10 @@ impl SessionRegistry {
                 ms.emit(MemoryEvent::TurnCompleted {
                     scope: session_key.clone(),
                     agent: agent_name,
-                    persona_dir: pd_for_event,
+                    persona_dir,
                     turn_count: new_count,
                 });
             }
-            self.last_activity
-                .insert(session_key.clone(), std::time::Instant::now());
         }
 
         Ok(Some(full_text))
@@ -410,32 +438,44 @@ impl SessionRegistry {
                     });
                 }
             }
-            SlashCommand::Memory => {
-                if let Some(ms) = &self.memory_system {
-                    let store = ms.store();
-                    let shared = store
-                        .load_shared_memory(session_key)
-                        .await
-                        .unwrap_or_default();
-                    let scope_display = &session_key.scope;
-                    let response = if shared.is_empty() {
-                        format!(
-                            "📭 当前还没有关于「{scope_display}」的记忆。\n\n可以告诉我一些背景，比如：\n- 团队用什么技术栈？\n- 有哪些编码规范？\n- 当前在做什么项目？\n\n或者直接 /remember <内容> 手动添加。"
-                        )
-                    } else {
-                        let ts = store
-                            .shared_last_modified(session_key)
-                            .await
-                            .ok()
-                            .flatten()
-                            .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
-                            .unwrap_or_else(|| "未知".to_string());
-                        format!(
-                            "📚 当前记忆（{scope_display}）\n最后更新：{ts}\n\n{}\n\n输入 /remember <内容> 添加新记忆，/forget <关键词> 删除。",
-                            cap_to_words(&shared, 500)
-                        )
-                    };
-                    return Ok(Some(response));
+            SlashCommand::Memory(agent_opt) => {
+                match agent_opt {
+                    Some(agent_name) => {
+                        // Per-agent memory lookup: <persona_dir>/<agent_name>/memory.md
+                        let content = self
+                            .read_agent_memory(agent_name)
+                            .unwrap_or_else(|| format!("No memory found for agent @{agent_name}"));
+                        return Ok(Some(content));
+                    }
+                    None => {
+                        // Shared memory (original behaviour)
+                        if let Some(ms) = &self.memory_system {
+                            let store = ms.store();
+                            let shared = store
+                                .load_shared_memory(session_key)
+                                .await
+                                .unwrap_or_default();
+                            let scope_display = &session_key.scope;
+                            let response = if shared.is_empty() {
+                                format!(
+                                    "📭 当前还没有关于「{scope_display}」的记忆。\n\n可以告诉我一些背景，比如：\n- 团队用什么技术栈？\n- 有哪些编码规范？\n- 当前在做什么项目？\n\n或者直接 /remember <内容> 手动添加。"
+                                )
+                            } else {
+                                let ts = store
+                                    .shared_last_modified(session_key)
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                    .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                                    .unwrap_or_else(|| "未知".to_string());
+                                format!(
+                                    "📚 当前记忆（{scope_display}）\n最后更新：{ts}\n\n{}\n\n输入 /remember <内容> 添加新记忆，/forget <关键词> 删除。",
+                                    cap_to_words(&shared, 500)
+                                )
+                            };
+                            return Ok(Some(response));
+                        }
+                    }
                 }
             }
             SlashCommand::Forget(keyword) => {
@@ -477,6 +517,22 @@ impl SessionRegistry {
         Ok(Some(cmd.confirmation_text()))
     }
 
+    /// Read the memory file for a named agent persona.
+    /// Prefers the per-entry `persona_dir` from the roster if available.
+    /// Convention: `<persona_dir>/<agent_name>/memory.md` — matches AgentPersona path structure.
+    /// Falls back to `default_persona_dir` (single-engine mode).
+    /// Returns None if no persona_dir is configured, or if the file doesn't exist / can't be read.
+    pub fn read_agent_memory(&self, agent_name: &str) -> Option<String> {
+        let persona_dir: std::path::PathBuf = self
+            .roster
+            .as_ref()
+            .and_then(|r| r.find_by_name(agent_name))
+            .and_then(|entry| entry.persona_dir.clone())
+            .or_else(|| self.default_persona_dir.clone())?;
+        let mem_path = persona_dir.join(agent_name).join("memory.md");
+        std::fs::read_to_string(&mem_path).ok()
+    }
+
     /// Test helper: inject an instant into pending_resets directly (bypasses 60s window).
     #[cfg(test)]
     pub fn inject_pending_reset_at(&self, key: SessionKey, instant: std::time::Instant) {
@@ -503,6 +559,7 @@ mod tests {
             String::new(),
             None,
             None,
+            None,
         )
     }
 
@@ -512,7 +569,7 @@ mod tests {
         let session_manager = Arc::new(SessionManager::new(storage));
         let mem_dir = tempdir().unwrap();
         let store: Arc<dyn crate::memory::MemoryStore> =
-            Arc::new(FileMemoryStore::new(mem_dir.into_path()));
+            Arc::new(FileMemoryStore::new(mem_dir.keep()));
         let distiller: Arc<dyn crate::memory::MemoryDistiller> = Arc::new(NoopDistiller);
         let memory_system = MemorySystem::new(vec![], store, distiller);
         SessionRegistry::new(
@@ -521,6 +578,7 @@ mod tests {
             String::new(),
             None,
             Some(memory_system),
+            None,
         )
     }
 
@@ -535,12 +593,14 @@ mod tests {
                 binary: Some("my-custom-agent".to_string()),
             },
             persona_dir: None,
+            workspace_dir: None,
         }]);
         SessionRegistry::new(
             EngineConfig::default(),
             session_manager,
             String::new(),
             Some(roster),
+            None,
             None,
         )
     }
@@ -629,6 +689,79 @@ mod tests {
         assert!(registry.roster.is_none());
     }
 
+    #[test]
+    fn test_read_agent_memory_no_persona_dir() {
+        // make_registry() passes None for default_persona_dir
+        let (reg, _rx) = make_registry();
+        assert!(reg.read_agent_memory("reviewer").is_none());
+    }
+
+    #[test]
+    fn test_read_agent_memory_file_exists() {
+        let tmp = tempdir().unwrap();
+        let agent_dir = tmp.path().join("reviewer");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(agent_dir.join("memory.md"), "reviewer memory content").unwrap();
+
+        let storage = SessionStorage::new(
+            std::env::temp_dir()
+                .join(format!("test-agent-mem-{}", uuid::Uuid::new_v4())),
+        );
+        let session_manager = Arc::new(SessionManager::new(storage));
+        let (reg, _rx) = SessionRegistry::new(
+            EngineConfig::default(),
+            session_manager,
+            String::new(),
+            None,
+            None,
+            Some(tmp.path().to_path_buf()),
+        );
+        let content = reg.read_agent_memory("reviewer").unwrap();
+        assert_eq!(content, "reviewer memory content");
+    }
+
+    #[test]
+    fn test_read_agent_memory_file_missing() {
+        let tmp = tempdir().unwrap();
+        // persona_dir exists but no subdirectory for "reviewer"
+        let storage = SessionStorage::new(
+            std::env::temp_dir()
+                .join(format!("test-agent-missing-{}", uuid::Uuid::new_v4())),
+        );
+        let session_manager = Arc::new(SessionManager::new(storage));
+        let (reg, _rx) = SessionRegistry::new(
+            EngineConfig::default(),
+            session_manager,
+            String::new(),
+            None,
+            None,
+            Some(tmp.path().to_path_buf()),
+        );
+        assert!(reg.read_agent_memory("reviewer").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_slash_memory_at_agent_no_persona_dir_returns_not_found() {
+        // make_registry has no persona_dir; /memory @reviewer should return "No memory found"
+        let (registry, _rx) = make_registry();
+        let inbound = InboundMsg {
+            id: "mem-agent-1".to_string(),
+            session_key: SessionKey::new("ws", "user_agent_mem"),
+            content: MsgContent::text("/memory @reviewer"),
+            sender: "user".to_string(),
+            channel: "ws".to_string(),
+            timestamp: chrono::Utc::now(),
+            thread_ts: None,
+            target_agent: None,
+        };
+        let result = registry.handle(inbound).await.unwrap();
+        let text = result.unwrap();
+        assert!(
+            text.contains("No memory found for agent @reviewer"),
+            "expected 'No memory found' message, got: {text}"
+        );
+    }
+
     #[tokio::test]
     async fn test_memory_empty_state_guidance() {
         let (registry, _rx) = make_registry_with_memory();
@@ -701,6 +834,21 @@ mod tests {
         let result = registry.handle(inbound2).await.unwrap().unwrap();
         assert!(result.contains("✅"));
         assert!(result.contains("清空"));
+    }
+
+    #[test]
+    fn test_session_idle_seconds_unknown_session_returns_none() {
+        let (reg, _rx) = make_registry();
+        assert!(
+            reg.session_idle_seconds("lark:nonexistent").is_none(),
+            "session with no recorded activity should return None"
+        );
+    }
+
+    #[test]
+    fn test_session_idle_seconds_unknown_scope_only_returns_none() {
+        let (reg, _rx) = make_registry();
+        assert!(reg.session_idle_seconds("nonexistent").is_none());
     }
 
     #[tokio::test]
