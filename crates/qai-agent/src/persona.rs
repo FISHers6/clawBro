@@ -65,6 +65,45 @@ impl AgentPersona {
         parts.join("\n\n")
     }
 
+    /// Returns the conventional default persona directory for a named agent:
+    /// `~/.quickai/agents/{sanitised_name}/`.
+    ///
+    /// The name is sanitised to prevent path traversal: only alphanumeric chars,
+    /// hyphens, and underscores are kept; everything else is replaced with `-`.
+    pub fn default_dir_for(name: &str) -> std::path::PathBuf {
+        let safe_name: String = name
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+            .collect();
+        dirs::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+            .join(".quickai")
+            .join("agents")
+            .join(safe_name)
+    }
+
+    /// Ensures the persona directory exists and contains a skeleton SOUL.md.
+    /// Idempotent: safe to call if directory already exists.
+    pub fn ensure_default_dir(dir: &std::path::Path, agent_name: &str) -> std::io::Result<()> {
+        std::fs::create_dir_all(dir)?;
+        let soul_path = dir.join("SOUL.md");
+        if !soul_path.exists() {
+            std::fs::write(
+                &soul_path,
+                format!(
+                    "# {name}\n\n\
+                     <!-- Describe this agent's personality, values, and behavior principles. -->\n\n\
+                     ## 角色定位\n\n\
+                     你是一个 AI 助手。\n\n\
+                     ## 核心原则\n\n\
+                     - 诚实、主动、简洁\n",
+                    name = agent_name
+                ),
+            )?;
+        }
+        Ok(())
+    }
+
     /// V2: inject both shared group memory and agent private memory with word caps
     pub fn build_system_injection_v2(
         &self,
@@ -221,5 +260,22 @@ mod tests {
         assert!(result.contains("agent_mem"));
         assert!(result.contains("群组共享记忆"));
         assert!(result.contains("长期记忆"));
+    }
+
+    #[test]
+    fn test_default_persona_dir_for_agent_name() {
+        let dir = AgentPersona::default_dir_for("claude");
+        let expected = dirs::home_dir()
+            .unwrap()
+            .join(".quickai/agents/claude");
+        assert_eq!(dir, expected);
+    }
+
+    #[test]
+    fn test_default_persona_dir_sanitises_name() {
+        // Path traversal characters should be replaced with '-'
+        let dir = AgentPersona::default_dir_for("my agent/../../etc");
+        let path_str = dir.to_str().unwrap();
+        assert!(!path_str.contains(".."));
     }
 }

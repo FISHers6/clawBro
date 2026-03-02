@@ -18,6 +18,7 @@ dashmap.workspace    = true
 agent-client-protocol = "0.9"
 tokio-util = { version = "0.7", features = ["compat"] }
 chrono.workspace     = true
+dirs = "5"
 
 [dev-dependencies]
 tempfile = "3"

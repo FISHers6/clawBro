@@ -231,9 +231,19 @@ impl SessionRegistry {
             };
 
         // Load persona: compose per-agent system_injection (SOUL + IDENTITY + MEMORY + skills)
-        let system_injection = if let Some((_, _, persona_dir, _)) = &roster_match {
-            if let Some(dir) = persona_dir.as_deref() {
-                let persona = AgentPersona::load_from_dir_scoped(dir, &session_key);
+        let system_injection = if let Some((_, name, persona_dir, _)) = &roster_match {
+            // Resolve persona dir: explicit config > auto-derived ~/.quickai/agents/{name}/
+            let resolved_dir: Option<std::path::PathBuf> = persona_dir
+                .clone()
+                .or_else(|| {
+                    let dir = AgentPersona::default_dir_for(name);
+                    if let Err(e) = AgentPersona::ensure_default_dir(&dir, name) {
+                        tracing::warn!(agent = %name, error = %e, "Failed to create default persona dir");
+                    }
+                    Some(dir)
+                });
+            if let Some(dir) = resolved_dir {
+                let persona = AgentPersona::load_from_dir_scoped(&dir, &session_key);
                 let shared_mem = if let Some(ms) = &self.memory_system {
                     ms.store()
                         .load_shared_memory(&session_key)
@@ -352,10 +362,20 @@ impl SessionRegistry {
         // ── Memory events (non-blocking) ──
         if let Some(ms) = &self.memory_system {
             // persona_dir: roster agent dir takes priority; fall back to default (single-engine mode)
+            // If neither is set but we have a roster match, auto-derive ~/.quickai/agents/{name}/
             let persona_dir_opt: Option<std::path::PathBuf> = roster_match
                 .as_ref()
                 .and_then(|(_, _, pd, _)| pd.clone())
-                .or_else(|| self.default_persona_dir.clone());
+                .or_else(|| self.default_persona_dir.clone())
+                .or_else(|| {
+                    roster_match.as_ref().map(|(_, name, _, _)| {
+                        let dir = AgentPersona::default_dir_for(name);
+                        if let Err(e) = AgentPersona::ensure_default_dir(&dir, name) {
+                            tracing::warn!(agent = %name, error = %e, "Failed to create default persona dir");
+                        }
+                        dir
+                    })
+                });
 
             let agent_name_raw: String = roster_match
                 .as_ref()
