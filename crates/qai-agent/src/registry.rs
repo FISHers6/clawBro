@@ -22,14 +22,13 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 /// Cloned data extracted from a roster match to avoid holding a borrow across await points.
-/// Fields: (engine_config, agent_name, persona_dir, workspace_dir, extra_skills_dirs)
-type RosterMatchData = (
-    EngineConfig,
-    String,
-    Option<std::path::PathBuf>,
-    Option<std::path::PathBuf>,
-    Vec<std::path::PathBuf>,
-);
+struct RosterMatchData {
+    engine_cfg: EngineConfig,
+    agent_name: String,
+    persona_dir: Option<std::path::PathBuf>,
+    workspace_dir: Option<std::path::PathBuf>,
+    extra_skills_dirs: Vec<std::path::PathBuf>,
+}
 
 /// Single session state: holds a per-session engine (supports /engine override)
 pub struct Session {
@@ -180,10 +179,11 @@ impl SessionRegistry {
     ) -> Option<std::path::PathBuf> {
         roster_match
             .as_ref()
-            .and_then(|(_, _, pd, _, _)| pd.clone())
+            .and_then(|rm| rm.persona_dir.clone())
             .or_else(|| self.default_persona_dir.clone())
             .or_else(|| {
-                roster_match.as_ref().map(|(_, name, _, _, _)| {
+                roster_match.as_ref().map(|rm| {
+                    let name = &rm.agent_name;
                     let dir = AgentPersona::default_dir_for(name);
                     if !self.initialized_persona_dirs.contains(&dir) {
                         if let Err(e) = AgentPersona::ensure_default_dir(&dir, name) {
@@ -244,30 +244,27 @@ impl SessionRegistry {
 
         // ── Generic routing via target_agent (set by Channel) ──
         // Clone needed data from roster match to avoid holding borrow across await
-        // Tuple: (EngineConfig, name, persona_dir, workspace_dir, extra_skills_dirs)
         let roster_match: Option<RosterMatchData> =
             inbound.target_agent.as_deref().and_then(|mention| {
                 self.roster
                     .as_ref()
                     .and_then(|r| r.find_by_mention(mention))
-                    .map(|entry| {
-                        (
-                            entry.engine.clone(),
-                            entry.name.clone(),
-                            entry.persona_dir.clone(),
-                            entry.workspace_dir.clone(),
-                            entry.extra_skills_dirs.clone(),
-                        )
+                    .map(|entry| RosterMatchData {
+                        engine_cfg: entry.engine.clone(),
+                        agent_name: entry.name.clone(),
+                        persona_dir: entry.persona_dir.clone(),
+                        workspace_dir: entry.workspace_dir.clone(),
+                        extra_skills_dirs: entry.extra_skills_dirs.clone(),
                     })
             });
 
         // Select engine: roster match → fresh engine per turn; no match → session-cached engine
         let (engine, sender_name): (BoxEngine, Option<String>) =
-            if let Some((engine_cfg, name, _, _, _)) = &roster_match {
+            if let Some(rm) = &roster_match {
                 // AcpEngine is stateless per-turn; no need to cache in session for roster entries
                 (
-                    EngineSelector::build(engine_cfg),
-                    Some(format!("@{}", name)),
+                    EngineSelector::build(&rm.engine_cfg),
+                    Some(format!("@{}", rm.agent_name)),
                 )
             } else {
                 // No @mention or no roster: use the session's persistent engine (supports /engine)
@@ -333,7 +330,7 @@ impl SessionRegistry {
         // Resolve workspace: per-roster-agent entry > global default
         let workspace_dir_resolved: Option<std::path::PathBuf> = roster_match
             .as_ref()
-            .and_then(|(_, _, _, workspace_dir, _)| workspace_dir.clone())
+            .and_then(|rm| rm.workspace_dir.clone())
             .or_else(|| self.default_workspace.clone());
 
         // Build workspace-aware skill injection:
@@ -350,8 +347,8 @@ impl SessionRegistry {
                 }
             }
             // 2. Agent's explicit extra dirs
-            if let Some((_, _, _, _, extra_dirs)) = &roster_match {
-                agent_skill_dirs.extend(extra_dirs.iter().cloned());
+            if let Some(rm) = &roster_match {
+                agent_skill_dirs.extend(rm.extra_skills_dirs.iter().cloned());
             }
             if agent_skill_dirs.is_empty() && self.skill_loader_dirs.is_empty() {
                 // No workspace-specific dirs — use pre-built gateway-level injection
@@ -442,7 +439,7 @@ impl SessionRegistry {
 
             let agent_name_raw: String = roster_match
                 .as_ref()
-                .map(|(_, name, _, _, _)| name.clone())
+                .map(|rm| rm.agent_name.clone())
                 .unwrap_or_else(|| "default".to_string());
 
             if let Some(persona_dir) = persona_dir_opt {
