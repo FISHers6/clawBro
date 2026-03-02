@@ -11,12 +11,15 @@ pub enum SlashCommand {
     Help,
     /// /remember <content> — 将内容追加写入 agent 记忆文件
     Remember(String),
-    /// /memory — 查看当前 agent 记忆内容
-    Memory,
+    /// /memory [<@agent>] — 查看记忆内容（无参数=共享记忆，@agent=指定 agent 记忆）
+    Memory(Option<String>),
     /// /forget <keyword> — 从记忆中删除包含关键词的条目
     Forget(String),
     /// /memory reset — 清空当前 agent 记忆文件
     MemoryReset,
+    /// /workspace — 查看当前 session 工作区目录
+    /// /workspace <path> — 设置当前 session 工作区目录
+    Workspace(Option<String>),
 }
 
 impl SlashCommand {
@@ -43,12 +46,21 @@ impl SlashCommand {
             "/memory" => {
                 match arg.map(|s| s.trim()) {
                     Some("reset") => Some(Self::MemoryReset),
-                    _ => Some(Self::Memory),
+                    Some(rest) if !rest.is_empty() => {
+                        // /memory @agent or /memory agent — strip leading '@'
+                        let agent = rest.strip_prefix('@').unwrap_or(rest).to_string();
+                        Some(Self::Memory(Some(agent)))
+                    }
+                    _ => Some(Self::Memory(None)),
                 }
             }
             "/forget" => {
                 let keyword = arg.map(|s| s.trim()).filter(|s| !s.is_empty())?;
                 Some(Self::Forget(keyword.to_string()))
+            }
+            "/workspace" => {
+                let path = arg.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+                Some(Self::Workspace(path))
             }
             _ => None,
         }
@@ -59,13 +71,18 @@ impl SlashCommand {
         match self {
             Self::SetEngine(name) => format!("✅ 引擎已切换到 {name}\n下次消息将使用新引擎处理"),
             Self::Reset => "✅ 对话历史已清除".to_string(),
-            Self::Help => "可用命令：\n/engine <rust|claude|codex> — 切换引擎\n/reset — 清除历史\n/help — 显示帮助\n/remember <内容> — 写入记忆\n/memory — 查看记忆\n/memory reset — 清空记忆\n/forget <关键词> — 删除记忆条目".to_string(),
+            Self::Help => "可用命令：\n/engine <rust|claude|codex> — 切换引擎\n/reset — 清除历史\n/help — 显示帮助\n/remember <内容> — 写入记忆\n/memory — 查看共享记忆\n/memory @agent — 查看指定 agent 记忆\n/memory reset — 清空记忆\n/forget <关键词> — 删除记忆条目\n/workspace — 查看当前 session 工作区目录\n/workspace /path — 设置 session 工作区目录".to_string(),
             Self::Remember(content) => format!("✅ 已记录：{content}"),
             // Unreachable in practice: registry's handle_slash returns early with real content.
-            Self::Memory => "正在读取记忆…".to_string(),
+            Self::Memory(_) => unreachable!(
+                "Memory must be handled by handle_slash (returns early with real content), not confirmation_text"
+            ),
             Self::Forget(keyword) => format!("✅ 已删除包含「{keyword}」的记忆条目"),
             Self::MemoryReset => unreachable!(
                 "MemoryReset must be handled by handle_slash (two-step confirmation), not confirmation_text"
+            ),
+            Self::Workspace(_) => unreachable!(
+                "Workspace must be handled by handle_slash (returns early with real content), not confirmation_text"
             ),
         }
     }
@@ -136,9 +153,25 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_memory() {
-        let cmd = SlashCommand::parse("/memory").unwrap();
-        assert!(matches!(cmd, SlashCommand::Memory));
+    fn test_parse_memory_no_agent() {
+        assert_eq!(SlashCommand::parse("/memory"), Some(SlashCommand::Memory(None)));
+    }
+
+    #[test]
+    fn test_parse_memory_with_at_agent() {
+        assert_eq!(
+            SlashCommand::parse("/memory @reviewer"),
+            Some(SlashCommand::Memory(Some("reviewer".to_string())))
+        );
+    }
+
+    #[test]
+    fn test_parse_memory_with_agent_no_at() {
+        // Agent name without '@' prefix is also accepted
+        assert_eq!(
+            SlashCommand::parse("/memory reviewer"),
+            Some(SlashCommand::Memory(Some("reviewer".to_string())))
+        );
     }
 
     #[test]
@@ -151,5 +184,21 @@ mod tests {
     fn test_parse_memory_reset() {
         let cmd = SlashCommand::parse("/memory reset").unwrap();
         assert!(matches!(cmd, SlashCommand::MemoryReset));
+    }
+
+    #[test]
+    fn test_parse_workspace_no_arg() {
+        assert_eq!(
+            SlashCommand::parse("/workspace"),
+            Some(SlashCommand::Workspace(None))
+        );
+    }
+
+    #[test]
+    fn test_parse_workspace_with_path() {
+        assert_eq!(
+            SlashCommand::parse("/workspace /projects/my-app"),
+            Some(SlashCommand::Workspace(Some("/projects/my-app".to_string())))
+        );
     }
 }

@@ -62,6 +62,8 @@ pub struct SessionRegistry {
     default_persona_dir: Option<std::path::PathBuf>,
     /// Global default workspace directory. Used when no per-agent workspace_dir is set.
     default_workspace: Option<std::path::PathBuf>,
+    /// Per-session workspace overrides set via /workspace command.
+    session_workspaces: DashMap<SessionKey, std::path::PathBuf>,
     /// Gateway-level skill search directories (fallback after workspace/.agents/skills/ and agent extra dirs).
     skill_loader_dirs: Vec<std::path::PathBuf>,
     /// Tracks which persona directories have already been initialized (SOUL.md created).
@@ -97,6 +99,7 @@ impl SessionRegistry {
             pending_resets: DashMap::new(),
             default_persona_dir,
             default_workspace,
+            session_workspaces: DashMap::new(),
             skill_loader_dirs,
             initialized_persona_dirs: dashmap::DashSet::new(),
         });
@@ -164,6 +167,16 @@ impl SessionRegistry {
             engine,
         });
         self.sessions.insert(key.clone(), session);
+    }
+
+    /// Get per-session workspace override (set via /workspace command).
+    pub fn session_workspace(&self, key: &SessionKey) -> Option<std::path::PathBuf> {
+        self.session_workspaces.get(key).map(|v| v.clone())
+    }
+
+    /// Set per-session workspace override (called from /workspace slash command handler).
+    fn set_session_workspace(&self, key: &SessionKey, path: std::path::PathBuf) {
+        self.session_workspaces.insert(key.clone(), path);
     }
 
     /// All session scopes that have had activity (used by nightly consolidation scheduler).
@@ -327,11 +340,11 @@ impl SessionRegistry {
         };
         storage.append_message(session_id, &user_msg).await?;
 
-        // Resolve workspace: per-roster-agent entry > global default
-        let workspace_dir_resolved: Option<std::path::PathBuf> = roster_match
-            .as_ref()
-            .and_then(|rm| rm.workspace_dir.clone())
-            .or_else(|| self.default_workspace.clone());
+        // Resolve workspace: per-session override (/workspace cmd) > per-roster-agent entry > global default
+        let workspace_dir_resolved: Option<std::path::PathBuf> =
+            self.session_workspace(&session_key) // per-session override from /workspace command
+                .or_else(|| roster_match.as_ref().and_then(|rm| rm.workspace_dir.clone()))
+                .or_else(|| self.default_workspace.clone());
 
         // Build workspace-aware skill injection:
         //   1. {workspace}/.agents/skills/ (canonical npx-skills install dir) ← primary
@@ -604,6 +617,32 @@ impl SessionRegistry {
                     return Ok(Some(
                         "⚠️ 你确定要清空当前记忆吗？此操作不可撤销。\n再次发送 /memory reset 以确认（60 秒内有效）。".to_string()
                     ));
+                }
+            }
+            SlashCommand::Workspace(path_opt) => {
+                match path_opt {
+                    None => {
+                        // Show current workspace
+                        let current = self
+                            .session_workspace(session_key)
+                            .or_else(|| self.default_workspace.clone());
+                        let display = current
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "(none — running in gateway process directory)".to_string());
+                        return Ok(Some(format!("Current workspace: `{display}`")));
+                    }
+                    Some(path_str) => {
+                        let new_path = std::path::PathBuf::from(path_str);
+                        if !new_path.exists() {
+                            return Ok(Some(format!(
+                                "Directory does not exist: `{path_str}`"
+                            )));
+                        }
+                        self.set_session_workspace(session_key, new_path);
+                        return Ok(Some(format!(
+                            "Workspace set to: `{path_str}`\nNew agent turns will run in this directory."
+                        )));
+                    }
                 }
             }
         }
