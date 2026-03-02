@@ -8,6 +8,7 @@ pub mod output_sink;
 pub mod roster;
 pub mod persona;
 pub mod memory;
+pub mod prompt_builder;
 
 pub use acp_engine::{AcpEngine, AcpEngineConfig};
 pub use dedup::DedupStore;
@@ -19,3 +20,4 @@ pub use slash::SlashCommand;
 pub use traits::{AgentCtx, AgentEngine, BoxEngine, HistoryMsg};
 pub use persona::AgentPersona;
 pub use memory::{MemoryEvent, MemorySystem, MemoryTarget};
+pub use prompt_builder::SystemPromptBuilder;
