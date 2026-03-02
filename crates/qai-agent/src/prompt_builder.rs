@@ -15,7 +15,9 @@ use qai_skills::PersonaSkillData;
 ///   5. Shared memory + agent memory (word-capped)
 ///   6. Skills injection (capability text)
 ///
-/// Without persona: SOUL.md + raw IDENTITY.md (backward compat) + memory + skills.
+/// Without persona (backward compat):
+///   SOUL.md → `identity_raw` (raw IDENTITY.md text) → memory → skills.
+#[derive(Debug)]
 pub struct SystemPromptBuilder<'a> {
     /// Loaded persona skill (type: persona), if any.
     pub persona: Option<&'a PersonaSkillData>,
@@ -63,35 +65,35 @@ impl<'a> SystemPromptBuilder<'a> {
             }
 
             // ── Layer 3: soul-injection.md ──
-            if !persona.soul_injection.is_empty() {
+            if !persona.soul_injection.trim().is_empty() {
                 parts.push(persona.soul_injection.clone());
             }
         }
 
         // ── Layer 4: SOUL.md (operator customization) ──
-        if !self.soul_md.is_empty() {
+        if !self.soul_md.trim().is_empty() {
             parts.push(self.soul_md.to_string());
         }
 
         // ── Layer 4b: raw IDENTITY.md (only when no persona — backward compat) ──
-        if self.persona.is_none() && !self.identity_raw.is_empty() {
+        if self.persona.is_none() && !self.identity_raw.trim().is_empty() {
             parts.push(self.identity_raw.to_string());
         }
 
         // ── Layer 5a: Shared memory ──
-        if !self.shared_memory.is_empty() {
+        if !self.shared_memory.trim().is_empty() {
             let capped = cap_to_words(self.shared_memory, self.shared_max_words);
             parts.push(format!("## 群组共享记忆\n\n{capped}"));
         }
 
         // ── Layer 5b: Agent memory ──
-        if !self.agent_memory.is_empty() {
+        if !self.agent_memory.trim().is_empty() {
             let capped = cap_to_words(self.agent_memory, self.agent_max_words);
             parts.push(format!("## 长期记忆\n\n{capped}"));
         }
 
         // ── Layer 6: Skills injection ──
-        if !self.skills_injection.is_empty() {
+        if !self.skills_injection.trim().is_empty() {
             parts.push(self.skills_injection.to_string());
         }
 
@@ -271,5 +273,43 @@ mod tests {
         }.build();
 
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_whitespace_only_sections_not_included() {
+        // Whitespace-only strings (e.g. trailing newlines from file reads) should be treated as empty.
+        let result = SystemPromptBuilder {
+            persona: None,
+            soul_md: "   \n  ",
+            identity_raw: "\n",
+            skills_injection: "\t",
+            shared_memory: "  ",
+            agent_memory: "\n\n",
+            shared_max_words: 300,
+            agent_max_words: 500,
+        }.build();
+
+        assert!(result.is_empty(), "whitespace-only inputs should produce an empty prompt");
+    }
+
+    #[test]
+    fn test_memory_before_skills_ordering() {
+        let result = SystemPromptBuilder {
+            persona: None,
+            soul_md: "",
+            identity_raw: "",
+            skills_injection: "SKILLS",
+            shared_memory: "SHARED_MEM",
+            agent_memory: "AGENT_MEM",
+            shared_max_words: 300,
+            agent_max_words: 500,
+        }.build();
+
+        let shared_pos  = result.find("SHARED_MEM").unwrap();
+        let agent_pos   = result.find("AGENT_MEM").unwrap();
+        let skills_pos  = result.find("SKILLS").unwrap();
+
+        assert!(shared_pos < skills_pos, "shared memory must appear before skills");
+        assert!(agent_pos  < skills_pos, "agent memory must appear before skills");
     }
 }
