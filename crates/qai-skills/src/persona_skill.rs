@@ -4,7 +4,7 @@ use crate::identity::IdentityData;
 use crate::mbti::MbtiType;
 
 /// Loaded persona skill data from a `type: persona` SKILL.md package.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PersonaSkillData {
     /// Identity metadata from IDENTITY.md (with priority chain applied).
     pub identity: IdentityData,
