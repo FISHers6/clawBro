@@ -23,6 +23,9 @@ pub struct AgentEntry {
     /// Directory to use as working directory when spawning the agent subprocess.
     #[serde(default)]
     pub workspace_dir: Option<PathBuf>,
+    /// Explicit extra skill directories for this agent (in addition to workspace-derived .agents/skills/).
+    #[serde(default)]
+    pub extra_skills_dirs: Vec<PathBuf>,
 }
 
 /// User-configured roster of agents for a gateway instance.
@@ -86,6 +89,7 @@ mod tests {
                 engine: EngineConfig::ClaudeAgent { binary: None },
                 persona_dir: None,
                 workspace_dir: None,
+                extra_skills_dirs: vec![],
             },
             AgentEntry {
                 name: "reviewer".to_string(),
@@ -93,6 +97,7 @@ mod tests {
                 engine: EngineConfig::CodexAcp { binary: None },
                 persona_dir: None,
                 workspace_dir: None,
+                extra_skills_dirs: vec![],
             },
         ])
     }
@@ -197,5 +202,31 @@ type = "claude_agent"
     "#;
         let entry: AgentEntry = toml::from_str(toml).unwrap();
         assert!(entry.workspace_dir.is_none());
+    }
+
+    #[test]
+    fn test_agent_entry_extra_skills_dirs_deserialises() {
+        let toml = r#"
+name = "claude"
+mentions = ["@claude"]
+extra_skills_dirs = ["/custom/skills"]
+[engine]
+type = "claude_agent"
+        "#;
+        let entry: AgentEntry = toml::from_str(toml).unwrap();
+        assert_eq!(entry.extra_skills_dirs.len(), 1);
+        assert_eq!(entry.extra_skills_dirs[0], std::path::PathBuf::from("/custom/skills"));
+    }
+
+    #[test]
+    fn test_agent_entry_extra_skills_dirs_defaults_empty() {
+        let toml = r#"
+name = "claude"
+mentions = ["@claude"]
+[engine]
+type = "claude_agent"
+        "#;
+        let entry: AgentEntry = toml::from_str(toml).unwrap();
+        assert!(entry.extra_skills_dirs.is_empty());
     }
 }

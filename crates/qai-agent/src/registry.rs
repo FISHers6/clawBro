@@ -21,6 +21,16 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
+/// Cloned data extracted from a roster match to avoid holding a borrow across await points.
+/// Fields: (engine_config, agent_name, persona_dir, workspace_dir, extra_skills_dirs)
+type RosterMatchData = (
+    EngineConfig,
+    String,
+    Option<std::path::PathBuf>,
+    Option<std::path::PathBuf>,
+    Vec<std::path::PathBuf>,
+);
+
 /// Single session state: holds a per-session engine (supports /engine override)
 pub struct Session {
     pub key: SessionKey,
@@ -53,12 +63,15 @@ pub struct SessionRegistry {
     default_persona_dir: Option<std::path::PathBuf>,
     /// Global default workspace directory. Used when no per-agent workspace_dir is set.
     default_workspace: Option<std::path::PathBuf>,
+    /// Gateway-level skill search directories (fallback after workspace/.agents/skills/ and agent extra dirs).
+    skill_loader_dirs: Vec<std::path::PathBuf>,
     /// Tracks which persona directories have already been initialized (SOUL.md created).
     /// Avoids repeated blocking filesystem calls per message.
     initialized_persona_dirs: dashmap::DashSet<std::path::PathBuf>,
 }
 
 impl SessionRegistry {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         default_engine_cfg: EngineConfig,
         session_manager: Arc<SessionManager>,
@@ -67,6 +80,7 @@ impl SessionRegistry {
         memory_system: Option<Arc<MemorySystem>>,
         default_persona_dir: Option<std::path::PathBuf>,
         default_workspace: Option<std::path::PathBuf>,
+        skill_loader_dirs: Vec<std::path::PathBuf>,
     ) -> (Arc<Self>, broadcast::Receiver<AgentEvent>) {
         let (global_tx, global_rx) = broadcast::channel(256);
         let registry = Arc::new(Self {
@@ -84,6 +98,7 @@ impl SessionRegistry {
             pending_resets: DashMap::new(),
             default_persona_dir,
             default_workspace,
+            skill_loader_dirs,
             initialized_persona_dirs: dashmap::DashSet::new(),
         });
 
@@ -161,14 +176,14 @@ impl SessionRegistry {
     /// Priority: roster agent's explicit dir > session-level default > auto-derived ~/.quickai/agents/{name}/
     fn resolve_persona_dir(
         &self,
-        roster_match: &Option<(EngineConfig, String, Option<std::path::PathBuf>, Option<std::path::PathBuf>)>,
+        roster_match: &Option<RosterMatchData>,
     ) -> Option<std::path::PathBuf> {
         roster_match
             .as_ref()
-            .and_then(|(_, _, pd, _)| pd.clone())
+            .and_then(|(_, _, pd, _, _)| pd.clone())
             .or_else(|| self.default_persona_dir.clone())
             .or_else(|| {
-                roster_match.as_ref().map(|(_, name, _, _)| {
+                roster_match.as_ref().map(|(_, name, _, _, _)| {
                     let dir = AgentPersona::default_dir_for(name);
                     if !self.initialized_persona_dirs.contains(&dir) {
                         if let Err(e) = AgentPersona::ensure_default_dir(&dir, name) {
@@ -229,8 +244,8 @@ impl SessionRegistry {
 
         // ── Generic routing via target_agent (set by Channel) ──
         // Clone needed data from roster match to avoid holding borrow across await
-        // Tuple: (EngineConfig, name, persona_dir, workspace_dir)
-        let roster_match: Option<(EngineConfig, String, Option<std::path::PathBuf>, Option<std::path::PathBuf>)> =
+        // Tuple: (EngineConfig, name, persona_dir, workspace_dir, extra_skills_dirs)
+        let roster_match: Option<RosterMatchData> =
             inbound.target_agent.as_deref().and_then(|mention| {
                 self.roster
                     .as_ref()
@@ -241,13 +256,14 @@ impl SessionRegistry {
                             entry.name.clone(),
                             entry.persona_dir.clone(),
                             entry.workspace_dir.clone(),
+                            entry.extra_skills_dirs.clone(),
                         )
                     })
             });
 
         // Select engine: roster match → fresh engine per turn; no match → session-cached engine
         let (engine, sender_name): (BoxEngine, Option<String>) =
-            if let Some((engine_cfg, name, _, _)) = &roster_match {
+            if let Some((engine_cfg, name, _, _, _)) = &roster_match {
                 // AcpEngine is stateless per-turn; no need to cache in session for roster entries
                 (
                     EngineSelector::build(engine_cfg),
@@ -317,8 +333,47 @@ impl SessionRegistry {
         // Resolve workspace: per-roster-agent entry > global default
         let workspace_dir_resolved: Option<std::path::PathBuf> = roster_match
             .as_ref()
-            .and_then(|(_, _, _, workspace_dir)| workspace_dir.clone())
+            .and_then(|(_, _, _, workspace_dir, _)| workspace_dir.clone())
             .or_else(|| self.default_workspace.clone());
+
+        // Build workspace-aware skill injection:
+        //   1. {workspace}/.agents/skills/ (canonical npx-skills install dir) ← primary
+        //   2. Agent's explicit extra_skills_dirs
+        //   3. Gateway-level skill_loader_dirs (fallback)
+        let skill_injection = {
+            let mut agent_skill_dirs: Vec<std::path::PathBuf> = Vec::new();
+            // 1. Canonical workspace dir
+            if let Some(ref ws) = workspace_dir_resolved {
+                let canonical = ws.join(".agents").join("skills");
+                if canonical.exists() {
+                    agent_skill_dirs.push(canonical);
+                }
+            }
+            // 2. Agent's explicit extra dirs
+            if let Some((_, _, _, _, extra_dirs)) = &roster_match {
+                agent_skill_dirs.extend(extra_dirs.iter().cloned());
+            }
+            if agent_skill_dirs.is_empty() && self.skill_loader_dirs.is_empty() {
+                // No workspace-specific dirs — use pre-built gateway-level injection
+                String::new()
+            } else {
+                // Merge: workspace dirs first, then gateway fallback dirs
+                let mut all_dirs = agent_skill_dirs;
+                all_dirs.extend(self.skill_loader_dirs.iter().cloned());
+                let loader = qai_skills::SkillLoader::with_dirs(all_dirs);
+                let skills = loader.load_all();
+                loader.build_system_injection(&skills)
+            }
+        };
+
+        // Combine persona system_injection with skill_injection
+        let system_injection = if skill_injection.is_empty() {
+            system_injection
+        } else if system_injection.is_empty() {
+            skill_injection
+        } else {
+            format!("{}\n\n{}", system_injection, skill_injection)
+        };
 
         // Build AgentCtx for the engine
         let ctx = AgentCtx {
@@ -387,7 +442,7 @@ impl SessionRegistry {
 
             let agent_name_raw: String = roster_match
                 .as_ref()
-                .map(|(_, name, _, _)| name.clone())
+                .map(|(_, name, _, _, _)| name.clone())
                 .unwrap_or_else(|| "default".to_string());
 
             if let Some(persona_dir) = persona_dir_opt {
@@ -602,6 +657,7 @@ mod tests {
             None,
             None,
             None,
+            vec![],
         )
     }
 
@@ -622,6 +678,7 @@ mod tests {
             Some(memory_system),
             None,
             None,
+            vec![],
         )
     }
 
@@ -637,6 +694,7 @@ mod tests {
             },
             persona_dir: None,
             workspace_dir: None,
+            extra_skills_dirs: vec![],
         }]);
         SessionRegistry::new(
             EngineConfig::default(),
@@ -646,6 +704,7 @@ mod tests {
             None,
             None,
             None,
+            vec![],
         )
     }
 
@@ -772,6 +831,7 @@ mod tests {
             None,
             Some(tmp.path().to_path_buf()),
             None,
+            vec![],
         );
         let content = reg.read_agent_memory("reviewer").unwrap();
         assert_eq!(content, "reviewer memory content");
@@ -794,6 +854,7 @@ mod tests {
             None,
             Some(tmp.path().to_path_buf()),
             None,
+            vec![],
         );
         assert!(reg.read_agent_memory("reviewer").is_none());
     }
@@ -934,5 +995,97 @@ mod tests {
         let result = registry.handle(inbound).await.unwrap().unwrap();
         assert!(result.contains("⚠️"), "expired pending should re-warn, got: {result}");
         assert!(!result.contains("✅"), "expired pending must NOT confirm clear, got: {result}");
+    }
+
+    #[test]
+    fn test_registry_stores_skill_loader_dirs() {
+        // Verify that skill_loader_dirs passed to new() are stored correctly.
+        let dir = std::env::temp_dir().join(format!("test-skills-dir-{}", uuid::Uuid::new_v4()));
+        let storage = SessionStorage::new(
+            std::env::temp_dir().join(format!("test-reg-skills-{}", uuid::Uuid::new_v4())),
+        );
+        let session_manager = Arc::new(SessionManager::new(storage));
+        let (registry, _rx) = SessionRegistry::new(
+            EngineConfig::default(),
+            session_manager,
+            String::new(),
+            None,
+            None,
+            None,
+            None,
+            vec![dir.clone()],
+        );
+        assert_eq!(registry.skill_loader_dirs, vec![dir]);
+    }
+
+    #[test]
+    fn test_registry_skill_loader_dirs_empty_by_default() {
+        // make_registry() passes vec![] for skill_loader_dirs
+        let (registry, _rx) = make_registry();
+        assert!(registry.skill_loader_dirs.is_empty());
+    }
+
+    #[test]
+    fn test_workspace_agents_skills_dir_included_in_loader() {
+        // Verify the logic: if workspace_dir contains .agents/skills/, the loader merges it.
+        // This exercises the dir-building logic directly without spawning an engine.
+        let tmp = tempdir().unwrap();
+        let workspace = tmp.path().to_path_buf();
+        let agents_skills = workspace.join(".agents").join("skills");
+        std::fs::create_dir_all(agents_skills.join("my-skill")).unwrap();
+        std::fs::write(
+            agents_skills.join("my-skill/SKILL.md"),
+            "---\nname: my-skill\nmetadata:\n  version: '1.0.0'\n---\nDo cool things.",
+        ).unwrap();
+
+        // Build the dirs as handle() would:
+        let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+        let canonical = workspace.join(".agents").join("skills");
+        if canonical.exists() {
+            dirs.push(canonical.clone());
+        }
+        // No extra_dirs, no gateway dirs in this test
+        let loader = qai_skills::SkillLoader::with_dirs(dirs);
+        let skills = loader.load_all();
+        let injection = loader.build_system_injection(&skills);
+
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].manifest.name, "my-skill");
+        assert!(injection.contains("my-skill"));
+        assert!(injection.contains("Do cool things"));
+    }
+
+    #[test]
+    fn test_workspace_skill_dirs_merged_with_gateway_dirs() {
+        // Verify that workspace dirs come first and gateway fallback dirs follow.
+        let tmp = tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let gateway_skills = tmp.path().join("gateway-skills");
+
+        let agents_skills = workspace.join(".agents").join("skills");
+        std::fs::create_dir_all(agents_skills.join("ws-skill")).unwrap();
+        std::fs::write(
+            agents_skills.join("ws-skill/SKILL.md"),
+            "---\nname: ws-skill\nmetadata:\n  version: '1.0.0'\n---\nWorkspace skill.",
+        ).unwrap();
+
+        std::fs::create_dir_all(gateway_skills.join("gw-skill")).unwrap();
+        std::fs::write(
+            gateway_skills.join("gw-skill/SKILL.md"),
+            "---\nname: gw-skill\nmetadata:\n  version: '2.0.0'\n---\nGateway skill.",
+        ).unwrap();
+
+        let mut all_dirs = vec![agents_skills.clone()];
+        all_dirs.push(gateway_skills.clone());
+        let loader = qai_skills::SkillLoader::with_dirs(all_dirs);
+        let skills = loader.load_all();
+
+        assert_eq!(skills.len(), 2);
+        // Workspace dir is first, so ws-skill should appear before gw-skill
+        assert_eq!(loader.search_dirs()[0], agents_skills);
+        assert_eq!(loader.search_dirs()[1], gateway_skills);
+        let names: Vec<&str> = skills.iter().map(|s| s.manifest.name.as_str()).collect();
+        assert!(names.contains(&"ws-skill"));
+        assert!(names.contains(&"gw-skill"));
     }
 }

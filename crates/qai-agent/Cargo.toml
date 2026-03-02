@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 qai-protocol  = { path = "../qai-protocol" }
 qai-session   = { path = "../qai-session" }
+qai-skills    = { path = "../qai-skills" }
 tokio.workspace      = true
 futures.workspace    = true
 async-trait.workspace = true

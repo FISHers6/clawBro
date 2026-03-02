@@ -50,6 +50,11 @@ impl SkillLoader {
         Self { dirs }
     }
 
+    /// Returns the directories this loader searches.
+    pub fn search_dirs(&self) -> &[PathBuf] {
+        &self.dirs
+    }
+
     /// 扫描所有目录，加载所有合法 skill
     pub fn load_all(&self) -> Vec<LoadedSkill> {
         let mut skills = Vec::new();
@@ -460,6 +465,33 @@ mod tests {
         let skills = loader.load_all();
         let injection = loader.build_system_injection(&skills);
         assert!(injection.contains("[UNTRUSTED]"));
+    }
+
+    #[test]
+    fn test_load_all_from_agents_skills_canonical_dir() {
+        // Simulate what npx skills add xxx creates
+        let workspace = TempDir::new().unwrap();
+        let agents_skills = workspace.path().join(".agents/skills");
+        std::fs::create_dir_all(agents_skills.join("my-skill")).unwrap();
+        std::fs::write(
+            agents_skills.join("my-skill/SKILL.md"),
+            "---\nname: my-skill\nmetadata:\n  version: '1.0.0'\n---\nDo cool things.",
+        ).unwrap();
+
+        let loader = SkillLoader::with_dirs(vec![agents_skills]);
+        let skills = loader.load_all();
+
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].manifest.name, "my-skill");
+        assert_eq!(skills[0].manifest.version, "1.0.0");
+    }
+
+    #[test]
+    fn test_search_dirs_returns_configured_dirs() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let loader = SkillLoader::with_dirs(vec![dir.clone()]);
+        assert_eq!(loader.search_dirs(), &[dir]);
     }
 
     #[test]

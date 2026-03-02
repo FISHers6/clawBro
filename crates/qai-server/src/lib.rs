@@ -46,6 +46,7 @@ pub async fn start_test_gateway_with_engine(engine_config: EngineConfig) -> Resu
         None, // no memory system in test helpers
         None, // no default_persona_dir in test helpers
         None, // no default_workspace in test helpers
+        vec![cfg.skills.dir.clone()], // gateway-level skill dirs
     );
     let event_tx = registry.global_sender();
 

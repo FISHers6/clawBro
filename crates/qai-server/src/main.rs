@@ -114,6 +114,7 @@ async fn main() -> Result<()> {
         memory_system,
         Some(cfg.memory.shared_dir.clone()),
         cfg.gateway.default_workspace.clone(),
+        vec![cfg.skills.dir.clone()],
     );
     // 使用 registry 内部的 global_tx，确保事件正确广播
     let event_tx = registry.global_sender();
