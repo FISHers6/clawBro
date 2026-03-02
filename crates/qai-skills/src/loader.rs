@@ -22,6 +22,15 @@ fn scan_for_injection(content: &str) -> Vec<&'static str> {
         .collect()
 }
 
+/// Full parsed data from a SKILL.md frontmatter + body.
+struct SkillMdFrontmatter {
+    name: String,
+    version: String,
+    /// Raw value of the `type:` frontmatter key (e.g. "persona"), if present.
+    skill_type: Option<String>,
+    body: String,
+}
+
 /// 已加载的 Skill
 #[derive(Debug, Clone)]
 pub struct LoadedSkill {
@@ -159,7 +168,7 @@ impl SkillLoader {
     }
 
     /// Try loading a skill from a `SKILL.md` file (vercel/skills / skills.sh format).
-    /// Returns None if no SKILL.md exists in the directory.
+    /// Returns None if no SKILL.md exists in the directory, or if it is a persona-type skill.
     fn try_load_skill_md(&self, dir: &Path) -> Option<LoadedSkill> {
         let skill_md_path = dir.join("SKILL.md");
         if !skill_md_path.exists() {
@@ -168,9 +177,16 @@ impl SkillLoader {
 
         let raw = std::fs::read_to_string(&skill_md_path).ok()?;
         let dir_name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
-        let (name, version, body) = parse_skill_md_frontmatter(&raw, dir_name);
+        let fm = parse_skill_md_full(&raw, dir_name);
 
-        let mut instruction = body;
+        // Persona-type skills are handled by load_personas(), not load_all()
+        if fm.skill_type.as_deref() == Some("persona") {
+            return None;
+        }
+
+        let name = fm.name.clone();
+        let version = fm.version.clone();
+        let mut instruction = fm.body;
 
         // Apply injection scan (same as manifest-based path)
         if instruction.len() <= MAX_SCAN_BYTES {
@@ -202,30 +218,149 @@ impl SkillLoader {
 
         Some(LoadedSkill { manifest, instruction, dir: dir.to_path_buf() })
     }
-}
 
-/// Parses a SKILL.md file into (name, version, body_content).
-/// Handles YAML frontmatter delimited by `---` lines.
-/// Falls back gracefully: name → dir_name_hint, version → "0.0.0", body → full content.
-fn parse_skill_md_frontmatter(
-    content: &str,
-    dir_name_hint: &str,
-) -> (String, String, String) {
-    // Check for frontmatter: content starts with "---\n"
-    if !content.starts_with("---\n") {
-        return (dir_name_hint.to_string(), "0.0.0".to_string(), content.to_string());
+    /// Try to load a `type: persona` skill package from a directory.
+    /// Returns None if not a valid persona skill (no SKILL.md or wrong type).
+    fn try_load_persona_from_dir(&self, dir: &Path) -> Option<crate::persona_skill::PersonaSkillData> {
+        if !dir.is_dir() { return None; }
+
+        let skill_md_path = dir.join("SKILL.md");
+        if !skill_md_path.exists() { return None; }
+
+        let raw = std::fs::read_to_string(&skill_md_path).ok()?;
+        let dir_name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
+        let fm = parse_skill_md_full(&raw, dir_name);
+
+        if fm.skill_type.as_deref() != Some("persona") {
+            return None;
+        }
+
+        let soul_injection = std::fs::read_to_string(dir.join("soul-injection.md"))
+            .unwrap_or_default();
+
+        let identity = crate::identity::load_identity_with_priority(dir, &fm.name)
+            .unwrap_or_else(|| crate::identity::IdentityData {
+                name: fm.name.clone(),
+                emoji: None,
+                mbti_str: None,
+                vibe: None,
+                avatar_url: None,
+                color: None,
+            });
+
+        Some(crate::persona_skill::PersonaSkillData {
+            identity,
+            soul_injection,
+            capability_body: fm.body,
+        })
     }
 
-    // Find closing "---"
-    let rest = &content[4..]; // skip opening "---\n"
-    // Compute (frontmatter_end, body_start) so each branch uses the correct length.
-    // "\n---\n" is 5 bytes; "\n---" (no trailing newline) is 4 bytes.
+    /// Scan all configured directories for `type: persona` SKILL.md packages.
+    /// Returns all found persona skills in directory order.
+    pub fn load_personas(&self) -> Vec<crate::persona_skill::PersonaSkillData> {
+        let mut personas = Vec::new();
+        for dir in &self.dirs {
+            if !dir.exists() { continue; }
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    if let Some(p) = self.try_load_persona_from_dir(&entry.path()) {
+                        personas.push(p);
+                    }
+                }
+            }
+        }
+        personas
+    }
+}
+
+/// Parse a SKILL.md file into its full frontmatter data + body.
+fn parse_skill_md_full(content: &str, dir_name_hint: &str) -> SkillMdFrontmatter {
+    if !content.starts_with("---\n") {
+        return SkillMdFrontmatter {
+            name: dir_name_hint.to_string(),
+            version: "0.0.0".to_string(),
+            skill_type: None,
+            body: content.to_string(),
+        };
+    }
+
+    let rest = &content[4..];
     let end = rest.find("\n---\n").map(|p| (p, p + 5))
         .or_else(|| rest.find("\n---").map(|p| (p, p + 4)));
     let (frontmatter, body) = match end {
         Some((fm_end, body_start)) => {
             let fm = &rest[..fm_end];
             let body = if body_start <= rest.len() { &rest[body_start..] } else { "" };
+            (fm, body)
+        }
+        None => (rest, ""),
+    };
+
+    let mut name = dir_name_hint.to_string();
+    let mut version = "0.0.0".to_string();
+    let mut skill_type: Option<String> = None;
+    let mut in_metadata = false;
+
+    for line in frontmatter.lines() {
+        if line.trim() == "metadata:" {
+            in_metadata = true;
+        } else if in_metadata && line.trim_start().starts_with("version:") {
+            let v = line
+                .trim_start_matches(|c: char| c.is_whitespace())
+                .trim_start_matches("version:")
+                .trim()
+                .trim_matches('\'')
+                .trim_matches('"');
+            if !v.is_empty() { version = v.to_string(); }
+            in_metadata = false;
+        } else if !line.starts_with(' ') && !line.starts_with('\t') {
+            in_metadata = false;
+            if let Some((key, val)) = line.split_once(':') {
+                let key = key.trim();
+                let val = val.trim().trim_matches('\'').trim_matches('"');
+                if val.is_empty() { continue; }
+                match key {
+                    "name" => name = val.to_string(),
+                    "type" => skill_type = Some(val.to_string()),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    SkillMdFrontmatter { name, version, skill_type, body: body.to_string() }
+}
+
+/// Parses a SKILL.md file into (name, version, body_content).
+/// Handles YAML frontmatter delimited by `---` lines.
+/// Falls back gracefully: name → dir_name_hint, version → "0.0.0", body → full content.
+#[cfg(test)]
+fn parse_skill_md_frontmatter(content: &str, dir_name_hint: &str) -> (String, String, String) {
+    // Check for frontmatter: content starts with "---\n"
+    if !content.starts_with("---\n") {
+        return (
+            dir_name_hint.to_string(),
+            "0.0.0".to_string(),
+            content.to_string(),
+        );
+    }
+
+    // Find closing "---"
+    let rest = &content[4..]; // skip opening "---\n"
+                              // Compute (frontmatter_end, body_start) so each branch uses the correct length.
+                              // "\n---\n" is 5 bytes; "\n---" (no trailing newline) is 4 bytes.
+    let end = rest
+        .find("\n---\n")
+        .map(|p| (p, p + 5))
+        .or_else(|| rest.find("\n---").map(|p| (p, p + 4)));
+    let (frontmatter, body) = match end {
+        Some((fm_end, body_start)) => {
+            let fm = &rest[..fm_end];
+            let body = if body_start <= rest.len() {
+                &rest[body_start..]
+            } else {
+                ""
+            };
             (fm, body)
         }
         None => (rest, ""), // malformed — treat everything as frontmatter, no body
@@ -238,8 +373,14 @@ fn parse_skill_md_frontmatter(
 
     for line in frontmatter.lines() {
         if line.starts_with("name:") {
-            let v = line.trim_start_matches("name:").trim().trim_matches('\'').trim_matches('"');
-            if !v.is_empty() { name = v.to_string(); }
+            let v = line
+                .trim_start_matches("name:")
+                .trim()
+                .trim_matches('\'')
+                .trim_matches('"');
+            if !v.is_empty() {
+                name = v.to_string();
+            }
         } else if line.trim() == "metadata:" {
             in_metadata = true;
         } else if in_metadata && line.trim_start().starts_with("version:") {
@@ -249,7 +390,9 @@ fn parse_skill_md_frontmatter(
                 .trim()
                 .trim_matches('\'')
                 .trim_matches('"');
-            if !v.is_empty() { version = v.to_string(); }
+            if !v.is_empty() {
+                version = v.to_string();
+            }
             in_metadata = false;
         } else if !line.starts_with(' ') && !line.starts_with('\t') {
             in_metadata = false; // left metadata block
@@ -264,7 +407,13 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn create_vercel_skill_dir(parent: &TempDir, dir_name: &str, name: &str, version: &str, body: &str) -> PathBuf {
+    fn create_vercel_skill_dir(
+        parent: &TempDir,
+        dir_name: &str,
+        name: &str,
+        version: &str,
+        body: &str,
+    ) -> PathBuf {
         let dir = parent.path().join(dir_name);
         std::fs::create_dir_all(&dir).unwrap();
         let skill_md = format!(
@@ -277,7 +426,13 @@ mod tests {
     #[test]
     fn test_load_vercel_skill_md_with_frontmatter() {
         let tmp = TempDir::new().unwrap();
-        create_vercel_skill_dir(&tmp, "my-tool", "my-tool", "1.2.3", "## Instructions\nDo something useful.");
+        create_vercel_skill_dir(
+            &tmp,
+            "my-tool",
+            "my-tool",
+            "1.2.3",
+            "## Instructions\nDo something useful.",
+        );
 
         let loader = SkillLoader::with_dirs(vec![tmp.path().to_path_buf()]);
         let skills = loader.load_all();
@@ -332,7 +487,8 @@ mod tests {
         std::fs::write(
             dir.join("quickai.plugin.json"),
             r#"{"id":"d","name":"Dual","version":"2.0.0","skill_md":"prompt.md"}"#,
-        ).unwrap();
+        )
+        .unwrap();
         std::fs::write(dir.join("prompt.md"), "manifest content").unwrap();
         std::fs::write(dir.join("SKILL.md"), "---\nname: dual\n---\nbare content").unwrap();
 
@@ -344,7 +500,12 @@ mod tests {
         assert!(skills[0].instruction.contains("manifest content"));
     }
 
-    fn create_skill_dir(parent: &TempDir, name: &str, manifest_json: &str, skill_md: Option<&str>) -> PathBuf {
+    fn create_skill_dir(
+        parent: &TempDir,
+        name: &str,
+        manifest_json: &str,
+        skill_md: Option<&str>,
+    ) -> PathBuf {
         let dir = parent.path().join(name);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("quickai.plugin.json"), manifest_json).unwrap();
@@ -402,6 +563,71 @@ mod tests {
         assert_eq!(body, "");
     }
 
+    // ── Persona skill tests ──
+
+    fn create_persona_skill_dir(parent: &TempDir, dir_name: &str) -> PathBuf {
+        let dir = parent.path().join(dir_name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), "---\nname: Rex\ntype: persona\nmbti: INTJ\n---\nRex capabilities.").unwrap();
+        std::fs::write(dir.join("soul-injection.md"), "You are Rex, a strategist.").unwrap();
+        std::fs::write(dir.join("IDENTITY.md"), "---\nname: Rex\nemoji: 🦅\nmbti: INTJ\nvibe: Strategic.\n---\n").unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_load_all_excludes_persona_type_skills() {
+        let tmp = TempDir::new().unwrap();
+        create_persona_skill_dir(&tmp, "rex-intj");
+        create_vercel_skill_dir(&tmp, "regular-tool", "regular-tool", "1.0.0", "Do something.");
+
+        let loader = SkillLoader::with_dirs(vec![tmp.path().to_path_buf()]);
+        let skills = loader.load_all();
+
+        // Only the regular skill should appear
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].manifest.name, "regular-tool");
+    }
+
+    #[test]
+    fn test_load_personas_returns_persona_type_skills() {
+        let tmp = TempDir::new().unwrap();
+        create_persona_skill_dir(&tmp, "rex-intj");
+
+        let loader = SkillLoader::with_dirs(vec![tmp.path().to_path_buf()]);
+        let personas = loader.load_personas();
+
+        assert_eq!(personas.len(), 1);
+        assert_eq!(personas[0].identity.name, "Rex");
+        assert_eq!(personas[0].identity.emoji, Some("🦅".to_string()));
+        assert_eq!(personas[0].identity.mbti_str, Some("INTJ".to_string()));
+        assert_eq!(personas[0].soul_injection, "You are Rex, a strategist.");
+        assert!(personas[0].capability_body.contains("Rex capabilities."));
+    }
+
+    #[test]
+    fn test_load_personas_missing_soul_injection_ok() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("bare-persona");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), "---\nname: Bare\ntype: persona\n---\nCapability text.").unwrap();
+        // No soul-injection.md
+
+        let loader = SkillLoader::with_dirs(vec![tmp.path().to_path_buf()]);
+        let personas = loader.load_personas();
+
+        assert_eq!(personas.len(), 1);
+        assert!(personas[0].soul_injection.is_empty());
+    }
+
+    #[test]
+    fn test_load_personas_empty_when_no_persona_skills() {
+        let tmp = TempDir::new().unwrap();
+        create_vercel_skill_dir(&tmp, "tool", "tool", "1.0.0", "Do stuff.");
+
+        let loader = SkillLoader::with_dirs(vec![tmp.path().to_path_buf()]);
+        assert!(loader.load_personas().is_empty());
+    }
+
     #[test]
     fn test_scan_clean_content_returns_empty() {
         let hits = scan_for_injection("Write clean code.");
@@ -434,7 +660,9 @@ mod tests {
         let skills = loader.load_all();
         assert_eq!(skills.len(), 1);
         assert!(skills[0].instruction.contains("UNTRUSTED SKILL"));
-        assert!(skills[0].instruction.contains("Ignore previous instructions"));
+        assert!(skills[0]
+            .instruction
+            .contains("Ignore previous instructions"));
     }
 
     #[test]
@@ -476,7 +704,8 @@ mod tests {
         std::fs::write(
             agents_skills.join("my-skill/SKILL.md"),
             "---\nname: my-skill\nmetadata:\n  version: '1.0.0'\n---\nDo cool things.",
-        ).unwrap();
+        )
+        .unwrap();
 
         let loader = SkillLoader::with_dirs(vec![agents_skills]);
         let skills = loader.load_all();
