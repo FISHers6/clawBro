@@ -53,6 +53,9 @@ pub struct SessionRegistry {
     default_persona_dir: Option<std::path::PathBuf>,
     /// Global default workspace directory. Used when no per-agent workspace_dir is set.
     default_workspace: Option<std::path::PathBuf>,
+    /// Tracks which persona directories have already been initialized (SOUL.md created).
+    /// Avoids repeated blocking filesystem calls per message.
+    initialized_persona_dirs: dashmap::DashSet<std::path::PathBuf>,
 }
 
 impl SessionRegistry {
@@ -81,6 +84,7 @@ impl SessionRegistry {
             pending_resets: DashMap::new(),
             default_persona_dir,
             default_workspace,
+            initialized_persona_dirs: dashmap::DashSet::new(),
         });
 
         // Idle timer: check every 60s for sessions idle > 30 min
@@ -151,6 +155,31 @@ impl SessionRegistry {
     /// All session scopes that have had activity (used by nightly consolidation scheduler).
     pub fn all_active_scopes(&self) -> Vec<SessionKey> {
         self.last_activity.iter().map(|e| e.key().clone()).collect()
+    }
+
+    /// Resolve the persona directory for the current turn.
+    /// Priority: roster agent's explicit dir > session-level default > auto-derived ~/.quickai/agents/{name}/
+    fn resolve_persona_dir(
+        &self,
+        roster_match: &Option<(EngineConfig, String, Option<std::path::PathBuf>, Option<std::path::PathBuf>)>,
+    ) -> Option<std::path::PathBuf> {
+        roster_match
+            .as_ref()
+            .and_then(|(_, _, pd, _)| pd.clone())
+            .or_else(|| self.default_persona_dir.clone())
+            .or_else(|| {
+                roster_match.as_ref().map(|(_, name, _, _)| {
+                    let dir = AgentPersona::default_dir_for(name);
+                    if !self.initialized_persona_dirs.contains(&dir) {
+                        if let Err(e) = AgentPersona::ensure_default_dir(&dir, name) {
+                            tracing::warn!(agent = %name, error = %e, "Failed to create default persona dir");
+                        } else {
+                            self.initialized_persona_dirs.insert(dir.clone());
+                        }
+                    }
+                    dir
+                })
+            })
     }
 
     /// Return how many seconds the given session has been idle (no `handle()` activity).
@@ -231,17 +260,9 @@ impl SessionRegistry {
             };
 
         // Load persona: compose per-agent system_injection (SOUL + IDENTITY + MEMORY + skills)
-        let system_injection = if let Some((_, name, persona_dir, _)) = &roster_match {
-            // Resolve persona dir: explicit config > auto-derived ~/.quickai/agents/{name}/
-            let resolved_dir: Option<std::path::PathBuf> = persona_dir
-                .clone()
-                .or_else(|| {
-                    let dir = AgentPersona::default_dir_for(name);
-                    if let Err(e) = AgentPersona::ensure_default_dir(&dir, name) {
-                        tracing::warn!(agent = %name, error = %e, "Failed to create default persona dir");
-                    }
-                    Some(dir)
-                });
+        let system_injection = if roster_match.is_some() {
+            // Resolve persona dir using unified priority chain
+            let resolved_dir = self.resolve_persona_dir(&roster_match);
             if let Some(dir) = resolved_dir {
                 let persona = AgentPersona::load_from_dir_scoped(&dir, &session_key);
                 let shared_mem = if let Some(ms) = &self.memory_system {
@@ -361,21 +382,8 @@ impl SessionRegistry {
 
         // ── Memory events (non-blocking) ──
         if let Some(ms) = &self.memory_system {
-            // persona_dir: roster agent dir takes priority; fall back to default (single-engine mode)
-            // If neither is set but we have a roster match, auto-derive ~/.quickai/agents/{name}/
-            let persona_dir_opt: Option<std::path::PathBuf> = roster_match
-                .as_ref()
-                .and_then(|(_, _, pd, _)| pd.clone())
-                .or_else(|| self.default_persona_dir.clone())
-                .or_else(|| {
-                    roster_match.as_ref().map(|(_, name, _, _)| {
-                        let dir = AgentPersona::default_dir_for(name);
-                        if let Err(e) = AgentPersona::ensure_default_dir(&dir, name) {
-                            tracing::warn!(agent = %name, error = %e, "Failed to create default persona dir");
-                        }
-                        dir
-                    })
-                });
+            // persona_dir: unified resolution chain (roster explicit > session default > auto-derived)
+            let persona_dir_opt = self.resolve_persona_dir(&roster_match);
 
             let agent_name_raw: String = roster_match
                 .as_ref()

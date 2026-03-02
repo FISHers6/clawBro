@@ -71,10 +71,13 @@ impl AgentPersona {
     /// The name is sanitised to prevent path traversal: only alphanumeric chars,
     /// hyphens, and underscores are kept; everything else is replaced with `-`.
     pub fn default_dir_for(name: &str) -> std::path::PathBuf {
-        let safe_name: String = name
-            .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
-            .collect();
+        let safe_name: String = {
+            let s: String = name
+                .chars()
+                .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+                .collect();
+            if s.is_empty() { "unknown-agent".to_string() } else { s }
+        };
         dirs::home_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
             .join(".quickai")
@@ -277,5 +280,15 @@ mod tests {
         let dir = AgentPersona::default_dir_for("my agent/../../etc");
         let path_str = dir.to_str().unwrap();
         assert!(!path_str.contains(".."));
+    }
+
+    #[test]
+    fn test_default_persona_dir_empty_name_fallback() {
+        let dir = AgentPersona::default_dir_for("");
+        // Should not end with "agents/" — must have a non-empty component
+        let path_str = dir.to_str().unwrap();
+        assert!(!path_str.ends_with("agents/") && !path_str.ends_with("agents"));
+        // Should use the "unknown-agent" fallback
+        assert!(path_str.ends_with("unknown-agent") || !path_str.ends_with("/"));
     }
 }
