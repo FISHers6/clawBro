@@ -43,6 +43,18 @@ pub enum FunctionPosition {
     Inferior,
 }
 
+impl FunctionPosition {
+    /// Human-readable label for this position in the function stack.
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::Dominant => "Dominant",
+            Self::Auxiliary => "Auxiliary",
+            Self::Tertiary => "Tertiary",
+            Self::Inferior => "Inferior",
+        }
+    }
+}
+
 impl std::str::FromStr for MbtiType {
     type Err = ();
 
@@ -135,16 +147,15 @@ impl MbtiType {
         use FunctionPosition::*;
         let stack = self.function_stack();
         let positions = [Dominant, Auxiliary, Tertiary, Inferior];
-        let labels = ["Dominant", "Auxiliary", "Tertiary", "Inferior"];
 
         let mut parts = vec!["## Your Cognitive Architecture".to_string()];
-        for (i, (func, pos)) in stack.iter().zip(positions.iter()).enumerate() {
-            let full_name = func.full_name();
-            let abbr = func.abbr();
-            let text = func.directive_text(*pos);
+        for (func, pos) in stack.iter().zip(positions.iter()) {
             parts.push(format!(
                 "**{} — {} ({}):**\n{}",
-                labels[i], full_name, abbr, text
+                pos.as_label(),
+                func.full_name(),
+                func.abbr(),
+                func.directive_text(*pos)
             ));
         }
         parts.join("\n\n")
@@ -179,6 +190,9 @@ impl CognitiveFunction {
     }
 
     /// Behavioral directive text for this function at the given stack position.
+    // The match arms are the canonical lookup table for 8×4 position-aware directive texts.
+    // Splitting into sub-functions would obfuscate the structure without adding clarity.
+    #[allow(clippy::too_many_lines)]
     pub fn directive_text(&self, pos: FunctionPosition) -> &'static str {
         use FunctionPosition::*;
         match (self, pos) {
