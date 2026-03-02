@@ -213,12 +213,14 @@ fn parse_skill_md_frontmatter(
 
     // Find closing "---"
     let rest = &content[4..]; // skip opening "---\n"
-    let end = rest.find("\n---\n").or_else(|| rest.find("\n---"));
+    // Compute (frontmatter_end, body_start) so each branch uses the correct length.
+    // "\n---\n" is 5 bytes; "\n---" (no trailing newline) is 4 bytes.
+    let end = rest.find("\n---\n").map(|p| (p, p + 5))
+        .or_else(|| rest.find("\n---").map(|p| (p, p + 4)));
     let (frontmatter, body) = match end {
-        Some(pos) => {
-            let fm = &rest[..pos];
-            let body_start = pos + 5; // "\n---\n".len()
-            let body = if body_start < rest.len() { &rest[body_start..] } else { "" };
+        Some((fm_end, body_start)) => {
+            let fm = &rest[..fm_end];
+            let body = if body_start <= rest.len() { &rest[body_start..] } else { "" };
             (fm, body)
         }
         None => (rest, ""), // malformed — treat everything as frontmatter, no body
@@ -383,6 +385,16 @@ mod tests {
     fn test_empty_skills_no_injection() {
         let loader = SkillLoader::with_dirs(vec![]);
         assert_eq!(loader.build_system_injection(&[]), "");
+    }
+
+    #[test]
+    fn test_parse_skill_md_frontmatter_closing_delimiter_no_trailing_newline() {
+        // Closing --- with no trailing newline: body should be empty, no panic.
+        let content = "---\nname: my-skill\nmetadata:\n  version: '1.0.0'\n---";
+        let (name, version, body) = parse_skill_md_frontmatter(content, "fallback");
+        assert_eq!(name, "my-skill");
+        assert_eq!(version, "1.0.0");
+        assert_eq!(body, "");
     }
 
     #[test]
