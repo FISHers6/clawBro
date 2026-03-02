@@ -49,6 +49,7 @@ impl MemoryDistiller for AcpDistiller {
             command: self.binary.clone(),
             args: vec![],
             env: vec![],
+            workspace_dir: None,
         });
 
         let user_text = format!(
@@ -60,6 +61,7 @@ impl MemoryDistiller for AcpDistiller {
             user_text,
             history: vec![],
             system_injection: DISTILL_PROMPT.to_string(),
+            workspace_dir: None,
         };
 
         // Broadcast receiver is intentionally discarded: distillation runs in the background

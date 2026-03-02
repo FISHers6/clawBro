@@ -112,6 +112,8 @@ async fn main() -> Result<()> {
         system_injection,
         roster,
         memory_system,
+        Some(cfg.memory.shared_dir.clone()),
+        cfg.gateway.default_workspace.clone(),
     );
     // 使用 registry 内部的 global_tx，确保事件正确广播
     let event_tx = registry.global_sender();
@@ -122,11 +124,19 @@ async fn main() -> Result<()> {
         cfg: Arc::new(cfg.clone()),
     };
 
+    // Channel registry for cron output: maps channel name → channel Arc
+    let mut cron_channel_map: std::collections::HashMap<String, Arc<dyn qai_channels::Channel>> =
+        std::collections::HashMap::new();
+
     // 启动 Channel 监听（DingTalk）
     if let Some(dt_cfg) = &cfg.channels.dingtalk {
         if dt_cfg.enabled {
             if let Ok(dt_config) = qai_channels::dingtalk::DingTalkConfig::from_env() {
-                let channel = Arc::new(qai_channels::DingTalkChannel::new(dt_config));
+                let channel = Arc::new(qai_channels::DingTalkChannel::new(
+                    dt_config,
+                    cfg.gateway.require_mention_in_groups,
+                ));
+                cron_channel_map.insert("dingtalk".to_string(), channel.clone() as Arc<dyn qai_channels::Channel>);
                 let registry_clone = registry.clone();
                 let channel_clone = channel.clone();
                 let (tx, mut rx) = tokio::sync::mpsc::channel(64);
@@ -162,21 +172,6 @@ async fn main() -> Result<()> {
                         let thread_ts = inbound.thread_ts.clone();
                         let reply_to = Some(inbound.id.clone());
 
-                        // Send thinking placeholder only for non-duplicate messages.
-                        // DingTalk has no edit API, so this is a separate message.
-                        // The definitive dedup check happens inside handle(); this is a best-effort pre-check.
-                        if !registry_clone.is_duplicate(&inbound.id) {
-                            let thinking_msg = qai_protocol::OutboundMsg {
-                                session_key: session_key.clone(),
-                                content: qai_protocol::MsgContent::text("⏳ 思考中..."),
-                                reply_to: reply_to.clone(),
-                                thread_ts: thread_ts.clone(),
-                            };
-                            if let Err(e) = channel_clone.send(&thinking_msg).await {
-                                tracing::warn!("DingTalk send_thinking failed: {e}");
-                            }
-                        }
-
                         match registry_clone.handle(inbound).await {
                             Ok(Some(full_text)) => {
                                 let reply = qai_protocol::OutboundMsg {
@@ -209,9 +204,22 @@ async fn main() -> Result<()> {
     // 启动 Channel 监听（Lark/飞书）
     if let Some(lark_cfg) = &cfg.channels.lark {
         if lark_cfg.enabled {
-            match qai_channels::LarkChannel::from_env() {
+            let lark_channel_result = {
+                let app_id = std::env::var("LARK_APP_ID");
+                let app_secret = std::env::var("LARK_APP_SECRET");
+                match (app_id, app_secret) {
+                    (Ok(id), Ok(secret)) => Ok(qai_channels::LarkChannel::new(
+                        id,
+                        secret,
+                        cfg.gateway.require_mention_in_groups,
+                    )),
+                    _ => Err(anyhow::anyhow!("LARK_APP_ID or LARK_APP_SECRET not set")),
+                }
+            };
+            match lark_channel_result {
                 Ok(channel) => {
                     let channel = Arc::new(channel);
+                    cron_channel_map.insert("lark".to_string(), channel.clone() as Arc<dyn qai_channels::Channel>);
                     let registry_clone = registry.clone();
                     let channel_clone = channel.clone();
                     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
@@ -328,6 +336,8 @@ async fn main() -> Result<()> {
             &job.prompt,
             &job.session_key,
             job.enabled,
+            job.agent.as_deref(),
+            job.condition.as_deref(),
         ) {
             tracing::warn!("Failed to sync cron job {:?} from config: {e}", job.name);
         }
@@ -336,15 +346,44 @@ async fn main() -> Result<()> {
         tracing::info!("Synced {} cron job(s) from config.toml", cfg.cron_jobs.len());
     }
 
+    let cron_channel_map = Arc::new(cron_channel_map);
+
     // 启动 CronScheduler
     {
         let cron_registry = registry.clone();
         let cron_memory = memory_system_ref.clone();
-        let cron_trigger: qai_cron::TriggerFn =
-            Arc::new(move |session_key_str: String, prompt: String| {
+        let cron_channels = cron_channel_map.clone();
+        let cron_trigger: qai_cron::TriggerFn = Arc::new(
+            move |session_key_str: String,
+                  prompt: String,
+                  agent_opt: Option<String>,
+                  condition: Option<String>| {
                 let registry = cron_registry.clone();
                 let memory = cron_memory.clone();
+                let channels = cron_channels.clone();
                 tokio::spawn(async move {
+                    // Check condition before firing
+                    if let Some(ref cond_str) = condition {
+                        if let Some(cond) = qai_cron::CronCondition::parse(cond_str) {
+                            match cond {
+                                qai_cron::CronCondition::IdleGtSeconds(threshold) => {
+                                    let idle = registry
+                                        .session_idle_seconds(&session_key_str)
+                                        .unwrap_or(0);
+                                    if idle < threshold {
+                                        tracing::debug!(
+                                            session = %session_key_str,
+                                            idle_secs = idle,
+                                            threshold = threshold,
+                                            "Cron job skipped: session not idle long enough"
+                                        );
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // Parse "channel:scope" into SessionKey.
                     // Fall back to channel="cron", scope=full string if no colon.
                     let session_key = if let Some(pos) = session_key_str.find(':') {
@@ -363,10 +402,25 @@ async fn main() -> Result<()> {
                         channel: "cron".to_string(),
                         timestamp: chrono::Utc::now(),
                         thread_ts: None,
-                        target_agent: None,
+                        target_agent: agent_opt,
                     };
                     match registry.handle(msg).await {
                         Ok(Some(result)) => {
+                            // Send result to IM channel if one is registered for this session's channel
+                            if let Some(ch) = channels.get(&session_key.channel) {
+                                let outbound = qai_protocol::OutboundMsg {
+                                    session_key: session_key.clone(),
+                                    content: qai_protocol::MsgContent::text(&result),
+                                    reply_to: None,
+                                    thread_ts: None,
+                                };
+                                if let Err(e) = ch.send(&outbound).await {
+                                    tracing::error!(
+                                        "Cron output send to channel '{}' failed: {e}",
+                                        session_key.channel
+                                    );
+                                }
+                            }
                             // Emit CronJobCompleted so CronResultTrigger can write to shared memory
                             if let Some(ms) = &memory {
                                 let summary: String = result.chars().take(300).collect();

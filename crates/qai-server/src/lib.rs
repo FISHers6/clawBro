@@ -44,6 +44,8 @@ pub async fn start_test_gateway_with_engine(engine_config: EngineConfig) -> Resu
         system_injection,
         None, // no roster in test helpers
         None, // no memory system in test helpers
+        None, // no default_persona_dir in test helpers
+        None, // no default_workspace in test helpers
     );
     let event_tx = registry.global_sender();
 

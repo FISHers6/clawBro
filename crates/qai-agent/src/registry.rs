@@ -51,6 +51,8 @@ pub struct SessionRegistry {
     /// Fallback persona_dir for single-engine mode (no roster match).
     /// When set, TurnCompleted events fire even without a roster agent.
     default_persona_dir: Option<std::path::PathBuf>,
+    /// Global default workspace directory. Used when no per-agent workspace_dir is set.
+    default_workspace: Option<std::path::PathBuf>,
 }
 
 impl SessionRegistry {
@@ -61,6 +63,7 @@ impl SessionRegistry {
         roster: Option<AgentRoster>,
         memory_system: Option<Arc<MemorySystem>>,
         default_persona_dir: Option<std::path::PathBuf>,
+        default_workspace: Option<std::path::PathBuf>,
     ) -> (Arc<Self>, broadcast::Receiver<AgentEvent>) {
         let (global_tx, global_rx) = broadcast::channel(256);
         let registry = Arc::new(Self {
@@ -77,6 +80,7 @@ impl SessionRegistry {
             last_activity: DashMap::new(),
             pending_resets: DashMap::new(),
             default_persona_dir,
+            default_workspace,
         });
 
         // Idle timer: check every 60s for sessions idle > 30 min
@@ -196,7 +200,8 @@ impl SessionRegistry {
 
         // ── Generic routing via target_agent (set by Channel) ──
         // Clone needed data from roster match to avoid holding borrow across await
-        let roster_match: Option<(EngineConfig, String, Option<std::path::PathBuf>)> =
+        // Tuple: (EngineConfig, name, persona_dir, workspace_dir)
+        let roster_match: Option<(EngineConfig, String, Option<std::path::PathBuf>, Option<std::path::PathBuf>)> =
             inbound.target_agent.as_deref().and_then(|mention| {
                 self.roster
                     .as_ref()
@@ -206,13 +211,14 @@ impl SessionRegistry {
                             entry.engine.clone(),
                             entry.name.clone(),
                             entry.persona_dir.clone(),
+                            entry.workspace_dir.clone(),
                         )
                     })
             });
 
         // Select engine: roster match → fresh engine per turn; no match → session-cached engine
         let (engine, sender_name): (BoxEngine, Option<String>) =
-            if let Some((engine_cfg, name, _)) = &roster_match {
+            if let Some((engine_cfg, name, _, _)) = &roster_match {
                 // AcpEngine is stateless per-turn; no need to cache in session for roster entries
                 (
                     EngineSelector::build(engine_cfg),
@@ -225,7 +231,7 @@ impl SessionRegistry {
             };
 
         // Load persona: compose per-agent system_injection (SOUL + IDENTITY + MEMORY + skills)
-        let system_injection = if let Some((_, _, persona_dir)) = &roster_match {
+        let system_injection = if let Some((_, _, persona_dir, _)) = &roster_match {
             if let Some(dir) = persona_dir.as_deref() {
                 let persona = AgentPersona::load_from_dir_scoped(dir, &session_key);
                 let shared_mem = if let Some(ms) = &self.memory_system {
@@ -277,12 +283,19 @@ impl SessionRegistry {
         };
         storage.append_message(session_id, &user_msg).await?;
 
+        // Resolve workspace: per-roster-agent entry > global default
+        let workspace_dir_resolved: Option<std::path::PathBuf> = roster_match
+            .as_ref()
+            .and_then(|(_, _, _, workspace_dir)| workspace_dir.clone())
+            .or_else(|| self.default_workspace.clone());
+
         // Build AgentCtx for the engine
         let ctx = AgentCtx {
             session_id,
             user_text,
             history,
             system_injection,
+            workspace_dir: workspace_dir_resolved,
         };
 
         // Per-call event channel: forward to global_tx + ws_subs
@@ -341,12 +354,12 @@ impl SessionRegistry {
             // persona_dir: roster agent dir takes priority; fall back to default (single-engine mode)
             let persona_dir_opt: Option<std::path::PathBuf> = roster_match
                 .as_ref()
-                .and_then(|(_, _, pd)| pd.clone())
+                .and_then(|(_, _, pd, _)| pd.clone())
                 .or_else(|| self.default_persona_dir.clone());
 
             let agent_name_raw: String = roster_match
                 .as_ref()
-                .map(|(_, name, _)| name.clone())
+                .map(|(_, name, _, _)| name.clone())
                 .unwrap_or_else(|| "default".to_string());
 
             if let Some(persona_dir) = persona_dir_opt {
@@ -560,6 +573,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -578,6 +592,7 @@ mod tests {
             String::new(),
             None,
             Some(memory_system),
+            None,
             None,
         )
     }
@@ -602,7 +617,20 @@ mod tests {
             Some(roster),
             None,
             None,
+            None,
         )
+    }
+
+    #[test]
+    fn test_agent_ctx_carries_workspace_dir() {
+        let ctx = AgentCtx {
+            session_id: uuid::Uuid::new_v4(),
+            user_text: "hello".to_string(),
+            history: vec![],
+            system_injection: String::new(),
+            workspace_dir: Some(std::path::PathBuf::from("/projects/test")),
+        };
+        assert!(ctx.workspace_dir.is_some());
     }
 
     #[test]
@@ -715,6 +743,7 @@ mod tests {
             None,
             None,
             Some(tmp.path().to_path_buf()),
+            None,
         );
         let content = reg.read_agent_memory("reviewer").unwrap();
         assert_eq!(content, "reviewer memory content");
@@ -736,6 +765,7 @@ mod tests {
             None,
             None,
             Some(tmp.path().to_path_buf()),
+            None,
         );
         assert!(reg.read_agent_memory("reviewer").is_none());
     }
