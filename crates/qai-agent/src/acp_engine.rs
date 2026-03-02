@@ -113,7 +113,11 @@ async fn run_acp_session(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit());
     if let Some(ref ws) = config.workspace_dir {
-        cmd.current_dir(ws);
+        if ws.exists() {
+            cmd.current_dir(ws);
+        } else {
+            tracing::warn!(path = %ws.display(), "Workspace directory does not exist; running in default directory");
+        }
     }
     let mut child = cmd.spawn()?;
 
@@ -204,10 +208,11 @@ async fn run_acp_session(
     .await
     .map_err(|e| anyhow::anyhow!("ACP initialize failed: {e:?}"))?;
 
+    let session_root = config.workspace_dir
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
     let sess = conn
-        .new_session(acp::NewSessionRequest::new(
-            std::path::PathBuf::from("."),
-        ))
+        .new_session(acp::NewSessionRequest::new(session_root))
         .await
         .map_err(|e| anyhow::anyhow!("ACP new_session failed: {e:?}"))?;
 
