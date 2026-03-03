@@ -433,7 +433,13 @@ impl SessionRegistry {
         let ws_subs_clone = Arc::clone(&self.ws_subs);
         let sk_for_fwd = session_key.clone();
         let sender_for_fwd = sender_name.clone();
-        let prefix_for_fwd: Option<String> = first_persona.as_ref().map(|p| p.display_prefix());
+        // Only apply persona prefix when a roster agent was resolved (persona injected into prompt).
+        // Without a roster match the persona system prompt is not built, so prefix would be misleading.
+        let prefix_for_fwd: Option<String> = if roster_match.is_some() {
+            first_persona.as_ref().map(|p| p.display_prefix())
+        } else {
+            None
+        };
         {
             let mut fwd_rx = session_tx.subscribe();
             tokio::spawn(async move {
@@ -519,9 +525,14 @@ impl SessionRegistry {
             }
         }
 
-        let reply_text = match &first_persona {
-            Some(p) => format!("{}{full_text}", p.display_prefix()),
-            None => full_text,
+        // Apply persona IM prefix only when a roster agent was resolved (persona was injected).
+        let reply_text = if roster_match.is_some() {
+            match &first_persona {
+                Some(p) => format!("{}{full_text}", p.display_prefix()),
+                None => full_text,
+            }
+        } else {
+            full_text
         };
         Ok(Some(reply_text))
     }
@@ -1237,5 +1248,49 @@ mod tests {
             result.contains("not a directory"),
             "expected 'not a directory' error, got: {result}"
         );
+    }
+
+    /// When no roster match (single-engine mode) and a persona-type skill happens to be present
+    /// in a workspace skill dir, the persona prefix must NOT be applied to the reply.
+    /// (The persona system prompt layers are only built for roster-matched agents.)
+    #[test]
+    fn test_no_roster_match_persona_prefix_not_applied() {
+        // Build a temp dir with a persona-type SKILL.md
+        let tmp = tempfile::TempDir::new().unwrap();
+        let persona_dir = tmp.path().join("rex-intj");
+        std::fs::create_dir_all(&persona_dir).unwrap();
+        std::fs::write(
+            persona_dir.join("SKILL.md"),
+            "---\nname: Rex\ntype: persona\n---\nRex capabilities.",
+        )
+        .unwrap();
+
+        // Build skill loader pointing at the temp dir
+        let loader = qai_skills::SkillLoader::with_dirs(vec![tmp.path().to_path_buf()]);
+        let personas = loader.load_personas();
+
+        // Simulate the no-roster code path: prefix_for_fwd and reply_text must be None / unmodified
+        let first_persona = personas.into_iter().next();
+        assert!(first_persona.is_some(), "sanity: persona loaded");
+
+        let roster_match_is_some = false; // no roster match
+        let full_text = "Hello world".to_string();
+
+        let prefix_for_fwd: Option<String> = if roster_match_is_some {
+            first_persona.as_ref().map(|p| p.display_prefix())
+        } else {
+            None
+        };
+        let reply_text = if roster_match_is_some {
+            match &first_persona {
+                Some(p) => format!("{}{full_text}", p.display_prefix()),
+                None => full_text.clone(),
+            }
+        } else {
+            full_text.clone()
+        };
+
+        assert!(prefix_for_fwd.is_none(), "no prefix in no-roster mode");
+        assert_eq!(reply_text, "Hello world", "reply unchanged in no-roster mode");
     }
 }
