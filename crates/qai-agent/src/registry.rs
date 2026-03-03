@@ -9,6 +9,7 @@ use crate::dedup::DedupStore;
 use crate::memory::cap_to_words;
 use crate::memory::{MemoryEvent, MemorySystem, MemoryTarget};
 use crate::persona::AgentPersona;
+use crate::prompt_builder::SystemPromptBuilder;
 use crate::roster::AgentRoster;
 use crate::selector::{EngineConfig, EngineSelector};
 use crate::slash::SlashCommand;
@@ -285,28 +286,6 @@ impl SessionRegistry {
                 (Arc::clone(&session.engine), None)
             };
 
-        // Load persona: compose per-agent system_injection (SOUL + IDENTITY + MEMORY + skills)
-        let system_injection = if roster_match.is_some() {
-            // Resolve persona dir using unified priority chain
-            let resolved_dir = self.resolve_persona_dir(&roster_match);
-            if let Some(dir) = resolved_dir {
-                let persona = AgentPersona::load_from_dir_scoped(&dir, &session_key);
-                let shared_mem = if let Some(ms) = &self.memory_system {
-                    ms.store()
-                        .load_shared_memory(&session_key)
-                        .await
-                        .unwrap_or_default()
-                } else {
-                    String::new()
-                };
-                persona.build_system_injection_v2(&self.system_injection, &shared_mem, 300, 500)
-            } else {
-                self.system_injection.clone()
-            }
-        } else {
-            self.system_injection.clone()
-        };
-
         // Get-or-create persistent session record
         let session_id = self.session_manager.get_or_create(&session_key).await?;
         let storage = self.session_manager.storage();
@@ -350,7 +329,7 @@ impl SessionRegistry {
         //   1. {workspace}/.agents/skills/ (canonical npx-skills install dir) ← primary
         //   2. Agent's explicit extra_skills_dirs
         //   3. Gateway-level skill_loader_dirs (fallback)
-        let skill_injection = {
+        let (skill_injection, first_persona) = {
             let mut agent_skill_dirs: Vec<std::path::PathBuf> = Vec::new();
             // 1. Canonical workspace dir
             if let Some(ref ws) = workspace_dir_resolved {
@@ -365,24 +344,74 @@ impl SessionRegistry {
             }
             if agent_skill_dirs.is_empty() && self.skill_loader_dirs.is_empty() {
                 // No workspace-specific dirs — use pre-built gateway-level injection
-                String::new()
+                (String::new(), None)
             } else {
                 // Merge: workspace dirs first, then gateway fallback dirs
                 let mut all_dirs = agent_skill_dirs;
                 all_dirs.extend(self.skill_loader_dirs.iter().cloned());
                 let loader = qai_skills::SkillLoader::with_dirs(all_dirs);
                 let skills = loader.load_all();
-                loader.build_system_injection(&skills)
+                let personas = loader.load_personas();
+                let injection = loader.build_system_injection(&skills);
+                let persona = personas.into_iter().next();
+                (injection, persona)
             }
         };
 
-        // Combine persona system_injection with skill_injection
-        let system_injection = if skill_injection.is_empty() {
-            system_injection
-        } else if system_injection.is_empty() {
-            skill_injection
-        } else {
-            format!("{}\n\n{}", system_injection, skill_injection)
+        // Build the full system prompt via SystemPromptBuilder (6-layer persona-aware).
+        let system_injection = {
+            if roster_match.is_some() {
+                // Roster match: build fresh with all persona layers.
+                let resolved_dir = self.resolve_persona_dir(&roster_match);
+                let (soul_md, identity_raw, agent_memory) = if let Some(ref dir) = resolved_dir {
+                    let ap = AgentPersona::load_from_dir_scoped(dir, &session_key);
+                    (ap.soul, ap.identity, ap.memory)
+                } else {
+                    (String::new(), String::new(), String::new())
+                };
+
+                let shared_mem = if let Some(ms) = &self.memory_system {
+                    ms.store()
+                        .load_shared_memory(&session_key)
+                        .await
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+
+                // Persona capability body prepended to regular skill injection.
+                let combined_skills = match &first_persona {
+                    Some(p) if !p.capability_body.trim().is_empty() => {
+                        if skill_injection.is_empty() {
+                            p.capability_body.clone()
+                        } else {
+                            format!("{}\n\n{}", p.capability_body, skill_injection)
+                        }
+                    }
+                    _ => skill_injection,
+                };
+
+                SystemPromptBuilder {
+                    persona: first_persona.as_ref(),
+                    soul_md: &soul_md,
+                    identity_raw: &identity_raw,
+                    skills_injection: &combined_skills,
+                    shared_memory: &shared_mem,
+                    agent_memory: &agent_memory,
+                    shared_max_words: 300,
+                    agent_max_words: 500,
+                }
+                .build()
+            } else {
+                // No roster match: use cached gateway-level injection; fold in workspace skills if any.
+                if skill_injection.is_empty() {
+                    self.system_injection.clone()
+                } else if self.system_injection.is_empty() {
+                    skill_injection
+                } else {
+                    format!("{}\n\n{}", self.system_injection, skill_injection)
+                }
+            }
         };
 
         // Build AgentCtx for the engine
@@ -401,6 +430,7 @@ impl SessionRegistry {
         let ws_subs_clone = Arc::clone(&self.ws_subs);
         let sk_for_fwd = session_key.clone();
         let sender_for_fwd = sender_name.clone();
+        let prefix_for_fwd: Option<String> = first_persona.as_ref().map(|p| p.display_prefix());
         {
             let mut fwd_rx = session_tx.subscribe();
             tokio::spawn(async move {
@@ -413,7 +443,10 @@ impl SessionRegistry {
                             ..
                         } => AgentEvent::TurnComplete {
                             session_id,
-                            full_text,
+                            full_text: match &prefix_for_fwd {
+                                Some(p) => format!("{p}{full_text}"),
+                                None    => full_text,
+                            },
                             sender: sender_for_fwd.clone(),
                         },
                         other => other,
@@ -483,7 +516,11 @@ impl SessionRegistry {
             }
         }
 
-        Ok(Some(full_text))
+        let reply_text = match &first_persona {
+            Some(p) => format!("{}{full_text}", p.display_prefix()),
+            None    => full_text,
+        };
+        Ok(Some(reply_text))
     }
 
     /// Handle slash commands
