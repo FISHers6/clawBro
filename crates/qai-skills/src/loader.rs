@@ -377,6 +377,7 @@ fn parse_skill_md_full(content: &str, dir_name_hint: &str) -> SkillMdFrontmatter
                 match key {
                     "name" => name = val.to_string(),
                     "type" => skill_type = Some(val.to_string()),
+                    "version" => version = val.to_string(),
                     _ => {}
                 }
             }
@@ -804,12 +805,16 @@ mod tests {
         assert_eq!(rex.identity.emoji, Some("🦅".to_string()));
         assert_eq!(rex.identity.mbti_str, Some("INTJ".to_string()));
         assert!(
-            !rex.soul_injection.is_empty(),
-            "soul_injection should not be empty"
+            rex.soul_injection.contains("Rex"),
+            "soul_injection should identify Rex by name"
         );
         assert!(
-            rex.capability_body.contains("Rex"),
-            "capability_body should mention Rex"
+            rex.soul_injection.contains("chess grandmaster") || rex.soul_injection.contains("systems"),
+            "soul_injection should contain persona-specific content"
+        );
+        assert!(
+            rex.capability_body.contains("战略分解") || rex.capability_body.contains("架构评审"),
+            "capability_body should mention Rex's capability areas"
         );
     }
 }
