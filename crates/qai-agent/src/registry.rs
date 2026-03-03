@@ -407,6 +407,16 @@ impl SessionRegistry {
                 .build()
             } else {
                 // No roster match: use cached gateway-level injection; fold in workspace skills if any.
+                // If a persona skill was found in a workspace skill dir, its capability_body and identity
+                // layers are intentionally NOT injected here — persona layers require a roster-matched agent
+                // so that the correct persona_dir (SOUL.md + IDENTITY.md) is resolved.
+                if let Some(ref p) = first_persona {
+                    tracing::debug!(
+                        persona = %p.identity.name,
+                        "persona found in skill dirs but no roster match — \
+                         persona layers not injected in single-engine mode"
+                    );
+                }
                 if skill_injection.is_empty() {
                     self.system_injection.clone()
                 } else if self.system_injection.is_empty() {
@@ -435,6 +445,11 @@ impl SessionRegistry {
         let sender_for_fwd = sender_name.clone();
         // Only apply persona prefix when a roster agent was resolved (persona injected into prompt).
         // Without a roster match the persona system prompt is not built, so prefix would be misleading.
+        //
+        // Design note: The prefix is applied in TWO independent places intentionally:
+        //   1. Here (prefix_for_fwd): for WebSocket subscribers that receive TurnComplete events.
+        //   2. reply_text below: for IM channel callers (DingTalk/Lark) that use handle()'s return.
+        // These are different consumers of the same turn output, not the same consumer seeing it twice.
         let prefix_for_fwd: Option<String> = if roster_match.is_some() {
             first_persona.as_ref().map(|p| p.display_prefix())
         } else {
