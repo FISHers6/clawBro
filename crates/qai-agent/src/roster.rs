@@ -189,7 +189,10 @@ workspace_dir = "/projects/my-app"
 type = "claude_agent"
     "#;
         let entry: AgentEntry = toml::from_str(toml).unwrap();
-        assert_eq!(entry.workspace_dir, Some(std::path::PathBuf::from("/projects/my-app")));
+        assert_eq!(
+            entry.workspace_dir,
+            Some(std::path::PathBuf::from("/projects/my-app"))
+        );
     }
 
     #[test]
@@ -215,7 +218,10 @@ type = "claude_agent"
         "#;
         let entry: AgentEntry = toml::from_str(toml).unwrap();
         assert_eq!(entry.extra_skills_dirs.len(), 1);
-        assert_eq!(entry.extra_skills_dirs[0], std::path::PathBuf::from("/custom/skills"));
+        assert_eq!(
+            entry.extra_skills_dirs[0],
+            std::path::PathBuf::from("/custom/skills")
+        );
     }
 
     #[test]

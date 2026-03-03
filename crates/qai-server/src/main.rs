@@ -137,7 +137,10 @@ async fn main() -> Result<()> {
                     dt_config,
                     cfg.gateway.require_mention_in_groups,
                 ));
-                cron_channel_map.insert("dingtalk".to_string(), channel.clone() as Arc<dyn qai_channels::Channel>);
+                cron_channel_map.insert(
+                    "dingtalk".to_string(),
+                    channel.clone() as Arc<dyn qai_channels::Channel>,
+                );
                 let registry_clone = registry.clone();
                 let channel_clone = channel.clone();
                 let (tx, mut rx) = tokio::sync::mpsc::channel(64);
@@ -220,7 +223,10 @@ async fn main() -> Result<()> {
             match lark_channel_result {
                 Ok(channel) => {
                     let channel = Arc::new(channel);
-                    cron_channel_map.insert("lark".to_string(), channel.clone() as Arc<dyn qai_channels::Channel>);
+                    cron_channel_map.insert(
+                        "lark".to_string(),
+                        channel.clone() as Arc<dyn qai_channels::Channel>,
+                    );
                     let registry_clone = registry.clone();
                     let channel_clone = channel.clone();
                     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
@@ -344,7 +350,10 @@ async fn main() -> Result<()> {
         }
     }
     if !cfg.cron_jobs.is_empty() {
-        tracing::info!("Synced {} cron job(s) from config.toml", cfg.cron_jobs.len());
+        tracing::info!(
+            "Synced {} cron job(s) from config.toml",
+            cfg.cron_jobs.len()
+        );
     }
 
     let cron_channel_map = Arc::new(cron_channel_map);
@@ -437,7 +446,8 @@ async fn main() -> Result<()> {
                         Err(e) => tracing::error!("Cron trigger failed: {e}"),
                     }
                 })
-            });
+            },
+        );
         let scheduler = qai_cron::CronScheduler::new(cron_store, cron_trigger);
         tokio::spawn(async move { scheduler.run().await });
         tracing::info!("CronScheduler started (polling every 1s, db={:?})", cron_db);

@@ -1,0 +1,12 @@
+{
+  "dingtalk": {
+    "enabled": true,
+    "mode": "allowlist",
+    "users": ["user_staff_id_1", "user_staff_id_2"]
+  },
+  "lark": {
+    "enabled": true,
+    "mode": "allowlist",
+    "open_ids": ["ou_abc123", "ou_xyz456"]
+  }
+}

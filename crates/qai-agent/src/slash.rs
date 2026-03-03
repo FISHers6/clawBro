@@ -154,7 +154,10 @@ mod tests {
 
     #[test]
     fn test_parse_memory_no_agent() {
-        assert_eq!(SlashCommand::parse("/memory"), Some(SlashCommand::Memory(None)));
+        assert_eq!(
+            SlashCommand::parse("/memory"),
+            Some(SlashCommand::Memory(None))
+        );
     }
 
     #[test]
@@ -198,7 +201,9 @@ mod tests {
     fn test_parse_workspace_with_path() {
         assert_eq!(
             SlashCommand::parse("/workspace /projects/my-app"),
-            Some(SlashCommand::Workspace(Some("/projects/my-app".to_string())))
+            Some(SlashCommand::Workspace(Some(
+                "/projects/my-app".to_string()
+            )))
         );
     }
 }

@@ -1,0 +1,46 @@
+[package]
+name = "qai-server"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "qai_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "quickai-gateway"
+path = "src/main.rs"
+
+[dependencies]
+qai-protocol  = { path = "../qai-protocol" }
+qai-session   = { path = "../qai-session" }
+qai-agent     = { path = "../qai-agent" }
+qai-channels  = { path = "../qai-channels" }
+qai-skills    = { path = "../qai-skills" }
+qai-cron      = { path = "../qai-cron" }
+tokio.workspace    = true
+chrono.workspace   = true
+futures.workspace  = true
+axum.workspace     = true
+serde.workspace    = true
+serde_json.workspace = true
+anyhow.workspace   = true
+tracing.workspace  = true
+tracing-subscriber.workspace = true
+uuid.workspace     = true
+toml.workspace     = true
+dirs.workspace     = true
+async-trait.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
+futures-util = "0.3"
+reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }
+qai-channels = { path = "../qai-channels" }
+qai-protocol = { path = "../qai-protocol" }
+chrono = { version = "0.4", features = ["serde"] }
+serde_json = "1"
+uuid = { version = "1.6", features = ["v4"] }
+# Needed to install a default CryptoProvider for rustls 0.23 used by tokio-tungstenite 0.26
+rustls = { version = "0.23", features = ["ring"] }

@@ -56,9 +56,7 @@ impl EngineSelector {
                 workspace_dir: None,
             },
             EngineConfig::CodexAcp { binary } => AcpEngineConfig {
-                command: binary
-                    .clone()
-                    .unwrap_or_else(|| "codex-acp".to_string()),
+                command: binary.clone().unwrap_or_else(|| "codex-acp".to_string()),
                 args: vec![],
                 env: vec![],
                 workspace_dir: None,

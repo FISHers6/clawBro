@@ -28,11 +28,7 @@ pub trait AgentEngine: Send + Sync {
     fn name(&self) -> &str;
 
     /// 执行一次 Agent 对话，通过 broadcast channel 流式发出事件
-    async fn run(
-        &self,
-        ctx: AgentCtx,
-        event_tx: broadcast::Sender<AgentEvent>,
-    ) -> Result<String>; // 返回完整回复文本
+    async fn run(&self, ctx: AgentCtx, event_tx: broadcast::Sender<AgentEvent>) -> Result<String>; // 返回完整回复文本
 }
 
 pub type BoxEngine = Arc<dyn AgentEngine>;

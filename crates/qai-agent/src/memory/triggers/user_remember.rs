@@ -1,6 +1,6 @@
-use crate::memory::{MemoryDistiller, MemoryStore};
 use crate::memory::event::{MemoryEvent, MemoryTarget};
 use crate::memory::trigger::MemoryTrigger;
+use crate::memory::{MemoryDistiller, MemoryStore};
 use async_trait::async_trait;
 use std::sync::Arc;
 
@@ -8,7 +8,9 @@ pub struct UserRememberTrigger;
 
 #[async_trait]
 impl MemoryTrigger for UserRememberTrigger {
-    fn name(&self) -> &str { "user_remember" }
+    fn name(&self) -> &str {
+        "user_remember"
+    }
 
     fn matches(&self, event: &MemoryEvent) -> bool {
         matches!(event, MemoryEvent::UserRemember { .. })
@@ -20,12 +22,20 @@ impl MemoryTrigger for UserRememberTrigger {
         store: Arc<dyn MemoryStore>,
         _distiller: Arc<dyn MemoryDistiller>,
     ) -> anyhow::Result<()> {
-        if let MemoryEvent::UserRemember { scope, target, content } = event {
+        if let MemoryEvent::UserRemember {
+            scope,
+            target,
+            content,
+        } = event
+        {
             let entry = format!("- {content}\n");
             match target {
                 MemoryTarget::Shared => store.append_shared(&scope, &entry).await?,
-                MemoryTarget::Agent { persona_dir } =>
-                    store.append_to_agent_memory(&persona_dir, &scope, &entry).await?,
+                MemoryTarget::Agent { persona_dir } => {
+                    store
+                        .append_to_agent_memory(&persona_dir, &scope, &entry)
+                        .await?
+                }
             }
         }
         Ok(())
@@ -35,8 +45,8 @@ impl MemoryTrigger for UserRememberTrigger {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::{distiller::NoopDistiller, store::FileMemoryStore, trigger::MemoryTrigger};
     use crate::memory::event::{MemoryEvent, MemoryTarget};
+    use crate::memory::{distiller::NoopDistiller, store::FileMemoryStore, trigger::MemoryTrigger};
     use qai_protocol::SessionKey;
     use std::sync::Arc;
     use tempfile::tempdir;
@@ -53,8 +63,14 @@ mod tests {
             content: "我们用 Redis".to_string(),
         };
         assert!(trigger.matches(&event));
-        trigger.fire(event, Arc::clone(&store), distiller).await.unwrap();
-        let mem = store.load_shared_memory(&SessionKey::new("dingtalk", "g1")).await.unwrap();
+        trigger
+            .fire(event, Arc::clone(&store), distiller)
+            .await
+            .unwrap();
+        let mem = store
+            .load_shared_memory(&SessionKey::new("dingtalk", "g1"))
+            .await
+            .unwrap();
         assert!(mem.contains("我们用 Redis"));
     }
 
@@ -62,16 +78,25 @@ mod tests {
     async fn test_user_remember_agent_appends_to_agent() {
         let shared_dir = tempdir().unwrap();
         let persona_dir = tempdir().unwrap();
-        let store: Arc<dyn MemoryStore> = Arc::new(FileMemoryStore::new(shared_dir.path().to_path_buf()));
+        let store: Arc<dyn MemoryStore> =
+            Arc::new(FileMemoryStore::new(shared_dir.path().to_path_buf()));
         let distiller: Arc<dyn MemoryDistiller> = Arc::new(NoopDistiller);
         let trigger = UserRememberTrigger;
         let event = MemoryEvent::UserRemember {
             scope: SessionKey::new("dingtalk", "g1"),
-            target: MemoryTarget::Agent { persona_dir: persona_dir.path().to_path_buf() },
+            target: MemoryTarget::Agent {
+                persona_dir: persona_dir.path().to_path_buf(),
+            },
             content: "Alice 喜欢 Python".to_string(),
         };
-        trigger.fire(event, Arc::clone(&store), distiller).await.unwrap();
-        let mem = store.load_agent_memory(persona_dir.path(), &SessionKey::new("dingtalk", "g1")).await.unwrap();
+        trigger
+            .fire(event, Arc::clone(&store), distiller)
+            .await
+            .unwrap();
+        let mem = store
+            .load_agent_memory(persona_dir.path(), &SessionKey::new("dingtalk", "g1"))
+            .await
+            .unwrap();
         assert!(mem.contains("Alice 喜欢 Python"));
     }
 

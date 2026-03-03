@@ -10,8 +10,8 @@
 //!     memory/
 //!       {channel}_{scope}.md  — scoped per-session memory (V2)
 
-use std::path::Path;
 use qai_protocol::SessionKey;
+use std::path::Path;
 
 /// Per-agent persona loaded from a user-configured directory.
 /// Missing files result in empty strings (graceful degradation).
@@ -74,9 +74,19 @@ impl AgentPersona {
         let safe_name: String = {
             let s: String = name
                 .chars()
-                .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+                .map(|c| {
+                    if c.is_alphanumeric() || c == '-' || c == '_' {
+                        c
+                    } else {
+                        '-'
+                    }
+                })
                 .collect();
-            if s.is_empty() { "unknown-agent".to_string() } else { s }
+            if s.is_empty() {
+                "unknown-agent".to_string()
+            } else {
+                s
+            }
         };
         dirs::home_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
@@ -117,8 +127,12 @@ impl AgentPersona {
     ) -> String {
         use crate::memory::cap_to_words;
         let mut parts: Vec<String> = Vec::new();
-        if !self.soul.is_empty() { parts.push(self.soul.clone()); }
-        if !self.identity.is_empty() { parts.push(self.identity.clone()); }
+        if !self.soul.is_empty() {
+            parts.push(self.soul.clone());
+        }
+        if !self.identity.is_empty() {
+            parts.push(self.identity.clone());
+        }
         if !shared_memory.is_empty() {
             let capped = cap_to_words(shared_memory, shared_max_words);
             parts.push(format!("## 群组共享记忆\n\n{capped}"));
@@ -127,7 +141,9 @@ impl AgentPersona {
             let capped = cap_to_words(&self.memory, agent_max_words);
             parts.push(format!("## 长期记忆\n\n{capped}"));
         }
-        if !skills_injection.is_empty() { parts.push(skills_injection.to_string()); }
+        if !skills_injection.is_empty() {
+            parts.push(skills_injection.to_string());
+        }
         parts.join("\n\n")
     }
 }
@@ -233,8 +249,9 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("memory")).unwrap();
         std::fs::write(
             dir.path().join("memory").join("dingtalk_group_C123.md"),
-            "scoped memory content"
-        ).unwrap();
+            "scoped memory content",
+        )
+        .unwrap();
         std::fs::write(dir.path().join("MEMORY.md"), "global WRONG content").unwrap();
 
         let persona = AgentPersona::load_from_dir_scoped(dir.path(), &scope);
@@ -268,9 +285,7 @@ mod tests {
     #[test]
     fn test_default_persona_dir_for_agent_name() {
         let dir = AgentPersona::default_dir_for("claude");
-        let expected = dirs::home_dir()
-            .unwrap()
-            .join(".quickai/agents/claude");
+        let expected = dirs::home_dir().unwrap().join(".quickai/agents/claude");
         assert_eq!(dir, expected);
     }
 

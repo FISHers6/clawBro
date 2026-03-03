@@ -34,7 +34,10 @@ mod tests {
 
     #[test]
     fn test_cap_adds_ellipsis_when_truncated() {
-        let text = (0..100).map(|i| format!("word{i}")).collect::<Vec<_>>().join(" ");
+        let text = (0..100)
+            .map(|i| format!("word{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         let result = cap_to_words(&text, 10);
         assert!(result.ends_with("..."));
     }

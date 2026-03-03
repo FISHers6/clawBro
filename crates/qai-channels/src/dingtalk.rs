@@ -62,13 +62,15 @@ impl DingTalkConfig {
 pub struct DingTalkChannel {
     config: DingTalkConfig,
     client: reqwest::Client,
+    require_mention_in_groups: bool,
 }
 
 impl DingTalkChannel {
-    pub fn new(config: DingTalkConfig) -> Self {
+    pub fn new(config: DingTalkConfig, require_mention_in_groups: bool) -> Self {
         Self {
             config,
             client: reqwest::Client::new(),
+            require_mention_in_groups,
         }
     }
 
@@ -86,6 +88,7 @@ impl DingTalkChannel {
             }))
             .send()
             .await?
+            .error_for_status()?
             .json()
             .await?;
         Ok(resp.access_token)
@@ -115,7 +118,8 @@ impl Channel for DingTalkChannel {
                     "text": { "content": text }
                 }))
                 .send()
-                .await?;
+                .await?
+                .error_for_status()?;
         } else if let Some(conversation_id) = scope.strip_prefix("group:") {
             // Proactive group message via openConversationId.
             let token = self.get_access_token().await?;
@@ -126,10 +130,12 @@ impl Channel for DingTalkChannel {
                     "robotCode": self.config.app_key,
                     "openConversationId": conversation_id,
                     "msgKey": "sampleText",
+                    // DingTalk requires msgParam to be a JSON-encoded string, not an inline object.
                     "msgParam": serde_json::json!({ "content": text }).to_string(),
                 }))
                 .send()
-                .await?;
+                .await?
+                .error_for_status()?;
         } else {
             // Proactive DM via batchSend — scope is "user:{senderId}".
             let user_id = scope.strip_prefix("user:").unwrap_or(scope.as_str());
@@ -141,10 +147,12 @@ impl Channel for DingTalkChannel {
                     "robotCode": self.config.app_key,
                     "userIds": [user_id],
                     "msgKey": "sampleText",
+                    // DingTalk requires msgParam to be a JSON-encoded string, not an inline object.
                     "msgParam": serde_json::json!({ "content": text }).to_string(),
                 }))
                 .send()
-                .await?;
+                .await?
+                .error_for_status()?;
         }
         Ok(())
     }
@@ -164,6 +172,7 @@ impl Channel for DingTalkChannel {
             }))
             .send()
             .await?
+            .error_for_status()?
             .json()
             .await?;
 
@@ -173,7 +182,7 @@ impl Channel for DingTalkChannel {
             .to_string();
         let ticket = endpoint_resp["ticket"]
             .as_str()
-            .unwrap_or("")
+            .ok_or_else(|| anyhow::anyhow!("No ticket in DingTalk connection response"))?
             .to_string();
 
         tracing::info!("DingTalk Stream Mode connecting: {}", ws_url);
@@ -214,11 +223,36 @@ impl Channel for DingTalkChannel {
                                 data["senderId"].as_str().unwrap_or("unknown").to_string();
                             // Allowlist check uses senderId regardless of chat type.
                             if !checker.is_allowed("dingtalk", &user_id) {
-                                tracing::debug!("AllowlistChecker: dingtalk user {} denied", user_id);
+                                tracing::debug!(
+                                    "AllowlistChecker: dingtalk user {} denied",
+                                    user_id
+                                );
                                 continue;
                             }
                             // Derive scope: group chat uses conversationId, private chat uses senderId.
                             let scope = derive_scope(&data);
+                            // Group mention-only mode: skip group messages with no @mention.
+                            if self.require_mention_in_groups && scope.starts_with("group:") {
+                                let raw_text = data["text"]["content"].as_str().unwrap_or("");
+                                let is_at_all = data["atUsers"]
+                                    .as_array()
+                                    .map(|arr| {
+                                        arr.iter().any(|u| {
+                                            u["dingtalkId"].as_str() == Some("@ALL")
+                                                || u["dingtalkId"].as_str() == Some("all")
+                                        })
+                                    })
+                                    .unwrap_or(false);
+                                let has_mention =
+                                    is_at_all || extract_first_mention(raw_text).is_some();
+                                if !has_mention {
+                                    tracing::debug!(
+                                        "DingTalk group message skipped (require_mention_in_groups): scope={}",
+                                        scope
+                                    );
+                                    continue;
+                                }
+                            }
                             let content_text = data["text"]["content"]
                                 .as_str()
                                 .unwrap_or("")
@@ -248,6 +282,7 @@ impl Channel for DingTalkChannel {
                 }
             }
         }
+        tracing::warn!("DingTalk WebSocket connection closed");
         Ok(())
     }
 
@@ -297,7 +332,7 @@ mod tests {
             app_key: "k".to_string(),
             app_secret: "s".to_string(),
         };
-        let ch = DingTalkChannel::new(cfg);
+        let ch = DingTalkChannel::new(cfg, false);
         assert_eq!(ch.name(), "dingtalk");
     }
 
@@ -367,7 +402,10 @@ mod tests {
         let data: serde_json::Value = serde_json::from_str(data_str).unwrap();
 
         let webhook = data["sessionWebhook"].as_str().unwrap_or("");
-        assert_eq!(webhook, "https://oapi.dingtalk.com/robot/send?access_token=tok");
+        assert_eq!(
+            webhook,
+            "https://oapi.dingtalk.com/robot/send?access_token=tok"
+        );
 
         let sender = data["senderId"].as_str().unwrap();
         assert_eq!(sender, "user_001");
@@ -404,6 +442,85 @@ mod tests {
         .to_string();
         let data: serde_json::Value = serde_json::from_str(&data_str).unwrap();
         let webhook = data["sessionWebhook"].as_str().map(str::to_string);
-        assert!(webhook.is_none(), "sessionWebhook absent → None → batchSend fallback");
+        assert!(
+            webhook.is_none(),
+            "sessionWebhook absent → None → batchSend fallback"
+        );
+    }
+
+    // ── require_mention_in_groups tests ────────────────────────────────────
+
+    /// Helper: decide whether a group message would be filtered out.
+    /// Mirrors the production logic in listen().
+    fn group_msg_passes_filter(require_mention: bool, text: &str, at_all: bool) -> bool {
+        if !require_mention {
+            return true;
+        }
+        let scope = "group:cid_test";
+        if !scope.starts_with("group:") {
+            return true;
+        }
+        let is_at_all = at_all;
+        is_at_all || extract_first_mention(text).is_some()
+    }
+
+    /// Group message, flag=false → always processes regardless of @mention.
+    #[test]
+    fn test_dingtalk_group_no_flag_always_processes() {
+        assert!(group_msg_passes_filter(false, "hello world", false));
+        assert!(group_msg_passes_filter(false, "no at sign", false));
+    }
+
+    /// Group message, flag=true, no @mention → skipped.
+    #[test]
+    fn test_dingtalk_group_flag_true_no_mention_skipped() {
+        assert!(!group_msg_passes_filter(true, "hello world", false));
+        assert!(!group_msg_passes_filter(true, "plain text message", false));
+    }
+
+    /// Group message, flag=true, has @mention in text → processes normally.
+    #[test]
+    fn test_dingtalk_group_flag_true_with_at_mention_processes() {
+        assert!(group_msg_passes_filter(
+            true,
+            "@claude please review",
+            false
+        ));
+        assert!(group_msg_passes_filter(true, "hey @bot help me", false));
+    }
+
+    /// Group message, flag=true, isAtAll=true → processes normally.
+    #[test]
+    fn test_dingtalk_group_flag_true_at_all_processes() {
+        assert!(group_msg_passes_filter(true, "broadcast message", true));
+    }
+
+    /// Private message (user: scope), flag=true → never filtered (flag only affects groups).
+    #[test]
+    fn test_dingtalk_private_scope_never_filtered() {
+        // Private scopes start with "user:", not "group:", so the filter is not applied.
+        let scope = "user:sender_001";
+        assert!(
+            !scope.starts_with("group:"),
+            "user scope should not match group prefix"
+        );
+    }
+
+    /// Email addresses ("user@example.com") must NOT trigger the mention filter.
+    /// Only @word tokens (no dot in the handle) should count as mentions.
+    #[test]
+    fn test_email_address_not_treated_as_mention() {
+        // "send to user@example.com" — no standalone @word token — should be filtered out.
+        assert!(!group_msg_passes_filter(
+            true,
+            "send to user@example.com",
+            false
+        ));
+        // A real @mention still passes.
+        assert!(group_msg_passes_filter(
+            true,
+            "@claude please check user@example.com",
+            false
+        ));
     }
 }

@@ -1,6 +1,6 @@
-use crate::memory::{MemoryDistiller, MemoryStore};
 use crate::memory::event::MemoryEvent;
 use crate::memory::trigger::MemoryTrigger;
+use crate::memory::{MemoryDistiller, MemoryStore};
 use async_trait::async_trait;
 use std::sync::Arc;
 
@@ -8,7 +8,9 @@ pub struct CronResultTrigger;
 
 #[async_trait]
 impl MemoryTrigger for CronResultTrigger {
-    fn name(&self) -> &str { "cron_result" }
+    fn name(&self) -> &str {
+        "cron_result"
+    }
 
     fn matches(&self, event: &MemoryEvent) -> bool {
         matches!(event, MemoryEvent::CronJobCompleted { .. })
@@ -20,9 +22,16 @@ impl MemoryTrigger for CronResultTrigger {
         store: Arc<dyn MemoryStore>,
         _: Arc<dyn MemoryDistiller>,
     ) -> anyhow::Result<()> {
-        if let MemoryEvent::CronJobCompleted { scope, result_summary, .. } = event {
+        if let MemoryEvent::CronJobCompleted {
+            scope,
+            result_summary,
+            ..
+        } = event
+        {
             let now = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
-            store.append_shared(&scope, &format!("- [{now}] {result_summary}\n")).await?;
+            store
+                .append_shared(&scope, &format!("- [{now}] {result_summary}\n"))
+                .await?;
         }
         Ok(())
     }
@@ -40,7 +49,8 @@ mod tests {
     async fn test_cron_result_writes_to_shared() {
         let shared = tempdir().unwrap();
         let persona = tempdir().unwrap();
-        let store: Arc<dyn MemoryStore> = Arc::new(FileMemoryStore::new(shared.path().to_path_buf()));
+        let store: Arc<dyn MemoryStore> =
+            Arc::new(FileMemoryStore::new(shared.path().to_path_buf()));
         let distiller: Arc<dyn MemoryDistiller> = Arc::new(NoopDistiller);
         let trigger = CronResultTrigger;
         let event = MemoryEvent::CronJobCompleted {
@@ -51,7 +61,10 @@ mod tests {
         };
         assert!(trigger.matches(&event));
         trigger.fire(event, store.clone(), distiller).await.unwrap();
-        let shared_mem = store.load_shared_memory(&SessionKey::new("dingtalk", "g1")).await.unwrap();
+        let shared_mem = store
+            .load_shared_memory(&SessionKey::new("dingtalk", "g1"))
+            .await
+            .unwrap();
         assert!(shared_mem.contains("支付模块进行中"));
     }
 }

@@ -64,11 +64,7 @@ impl AgentEngine for AcpEngine {
         &self.config.command
     }
 
-    async fn run(
-        &self,
-        ctx: AgentCtx,
-        event_tx: broadcast::Sender<AgentEvent>,
-    ) -> Result<String> {
+    async fn run(&self, ctx: AgentCtx, event_tx: broadcast::Sender<AgentEvent>) -> Result<String> {
         let mut config = self.config.clone();
         if ctx.workspace_dir.is_some() {
             config.workspace_dir = ctx.workspace_dir.clone();
@@ -83,9 +79,9 @@ impl AgentEngine for AcpEngine {
                 .expect("Failed to build current_thread runtime");
 
             let local = tokio::task::LocalSet::new();
-            let result = rt.block_on(local.run_until(async move {
-                run_acp_session(config, ctx, event_tx).await
-            }));
+            let result = rt.block_on(
+                local.run_until(async move { run_acp_session(config, ctx, event_tx).await }),
+            );
             let _ = result_tx.send(result);
         });
 
@@ -101,8 +97,8 @@ async fn run_acp_session(
     ctx: AgentCtx,
     event_tx: broadcast::Sender<AgentEvent>,
 ) -> Result<String> {
-    use agent_client_protocol as acp;
     use acp::Agent as _;
+    use agent_client_protocol as acp;
     use tokio::process::Command;
     use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
@@ -187,28 +183,22 @@ async fn run_acp_session(
         event_tx: event_tx_clone,
     };
 
-    let (conn, handle_io) = acp::ClientSideConnection::new(
-        client,
-        outgoing,
-        incoming,
-        |fut| {
-            tokio::task::spawn_local(fut);
-        },
-    );
+    let (conn, handle_io) = acp::ClientSideConnection::new(client, outgoing, incoming, |fut| {
+        tokio::task::spawn_local(fut);
+    });
     tokio::task::spawn_local(handle_io);
 
     // ACP 握手
     conn.initialize(
-        acp::InitializeRequest::new(acp::ProtocolVersion::V1)
-            .client_info(acp::Implementation::new(
-                "quickai-gateway",
-                env!("CARGO_PKG_VERSION"),
-            )),
+        acp::InitializeRequest::new(acp::ProtocolVersion::V1).client_info(
+            acp::Implementation::new("quickai-gateway", env!("CARGO_PKG_VERSION")),
+        ),
     )
     .await
     .map_err(|e| anyhow::anyhow!("ACP initialize failed: {e:?}"))?;
 
-    let session_root = config.workspace_dir
+    let session_root = config
+        .workspace_dir
         .clone()
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let sess = conn
@@ -234,7 +224,7 @@ async fn run_acp_session(
     let _ = event_tx.send(AgentEvent::TurnComplete {
         session_id,
         full_text: full_text.clone(),
-        sender: None,   // engine doesn't know about roster; registry fills this in
+        sender: None, // engine doesn't know about roster; registry fills this in
     });
 
     child.kill().await.ok();

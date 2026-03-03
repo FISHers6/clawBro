@@ -273,18 +273,17 @@ impl SessionRegistry {
             });
 
         // Select engine: roster match → fresh engine per turn; no match → session-cached engine
-        let (engine, sender_name): (BoxEngine, Option<String>) =
-            if let Some(rm) = &roster_match {
-                // AcpEngine is stateless per-turn; no need to cache in session for roster entries
-                (
-                    EngineSelector::build(&rm.engine_cfg),
-                    Some(format!("@{}", rm.agent_name)),
-                )
-            } else {
-                // No @mention or no roster: use the session's persistent engine (supports /engine)
-                let session = self.get_or_create_session(&session_key);
-                (Arc::clone(&session.engine), None)
-            };
+        let (engine, sender_name): (BoxEngine, Option<String>) = if let Some(rm) = &roster_match {
+            // AcpEngine is stateless per-turn; no need to cache in session for roster entries
+            (
+                EngineSelector::build(&rm.engine_cfg),
+                Some(format!("@{}", rm.agent_name)),
+            )
+        } else {
+            // No @mention or no roster: use the session's persistent engine (supports /engine)
+            let session = self.get_or_create_session(&session_key);
+            (Arc::clone(&session.engine), None)
+        };
 
         // Get-or-create persistent session record
         let session_id = self.session_manager.get_or_create(&session_key).await?;
@@ -320,10 +319,14 @@ impl SessionRegistry {
         storage.append_message(session_id, &user_msg).await?;
 
         // Resolve workspace: per-session override (/workspace cmd) > per-roster-agent entry > global default
-        let workspace_dir_resolved: Option<std::path::PathBuf> =
-            self.session_workspace(&session_key) // per-session override from /workspace command
-                .or_else(|| roster_match.as_ref().and_then(|rm| rm.workspace_dir.clone()))
-                .or_else(|| self.default_workspace.clone());
+        let workspace_dir_resolved: Option<std::path::PathBuf> = self
+            .session_workspace(&session_key) // per-session override from /workspace command
+            .or_else(|| {
+                roster_match
+                    .as_ref()
+                    .and_then(|rm| rm.workspace_dir.clone())
+            })
+            .or_else(|| self.default_workspace.clone());
 
         // Build workspace-aware skill injection:
         //   1. {workspace}/.agents/skills/ (canonical npx-skills install dir) ← primary
@@ -445,7 +448,7 @@ impl SessionRegistry {
                             session_id,
                             full_text: match &prefix_for_fwd {
                                 Some(p) => format!("{p}{full_text}"),
-                                None    => full_text,
+                                None => full_text,
                             },
                             sender: sender_for_fwd.clone(),
                         },
@@ -518,7 +521,7 @@ impl SessionRegistry {
 
         let reply_text = match &first_persona {
             Some(p) => format!("{}{full_text}", p.display_prefix()),
-            None    => full_text,
+            None => full_text,
         };
         Ok(Some(reply_text))
     }
@@ -672,22 +675,21 @@ impl SessionRegistry {
                             .session_workspace(session_key)
                             .or(roster_workspace)
                             .or_else(|| self.default_workspace.clone());
-                        let display = resolved
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_else(|| "(none — running in gateway process directory)".to_string());
+                        let display =
+                            resolved
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|| {
+                                    "(none — running in gateway process directory)".to_string()
+                                });
                         return Ok(Some(format!("Current workspace: `{display}`")));
                     }
                     Some(path_str) => {
                         let new_path = std::path::PathBuf::from(path_str);
                         if !new_path.exists() {
-                            return Ok(Some(format!(
-                                "Directory does not exist: `{path_str}`"
-                            )));
+                            return Ok(Some(format!("Directory does not exist: `{path_str}`")));
                         }
                         if !new_path.is_dir() {
-                            return Ok(Some(format!(
-                                "Path is not a directory: `{path_str}`"
-                            )));
+                            return Ok(Some(format!("Path is not a directory: `{path_str}`")));
                         }
                         self.set_session_workspace(session_key, new_path);
                         return Ok(Some(format!(
@@ -749,7 +751,8 @@ mod tests {
     }
 
     fn make_registry_with_memory() -> (Arc<SessionRegistry>, broadcast::Receiver<AgentEvent>) {
-        let db_dir = std::env::temp_dir().join(format!("test-registry-mem-{}", uuid::Uuid::new_v4()));
+        let db_dir =
+            std::env::temp_dir().join(format!("test-registry-mem-{}", uuid::Uuid::new_v4()));
         let storage = SessionStorage::new(db_dir);
         let session_manager = Arc::new(SessionManager::new(storage));
         let mem_dir = tempdir().unwrap();
@@ -906,8 +909,7 @@ mod tests {
         std::fs::write(agent_dir.join("memory.md"), "reviewer memory content").unwrap();
 
         let storage = SessionStorage::new(
-            std::env::temp_dir()
-                .join(format!("test-agent-mem-{}", uuid::Uuid::new_v4())),
+            std::env::temp_dir().join(format!("test-agent-mem-{}", uuid::Uuid::new_v4())),
         );
         let session_manager = Arc::new(SessionManager::new(storage));
         let (reg, _rx) = SessionRegistry::new(
@@ -929,8 +931,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         // persona_dir exists but no subdirectory for "reviewer"
         let storage = SessionStorage::new(
-            std::env::temp_dir()
-                .join(format!("test-agent-missing-{}", uuid::Uuid::new_v4())),
+            std::env::temp_dir().join(format!("test-agent-missing-{}", uuid::Uuid::new_v4())),
         );
         let session_manager = Arc::new(SessionManager::new(storage));
         let (reg, _rx) = SessionRegistry::new(
@@ -983,10 +984,22 @@ mod tests {
         };
         let result = registry.handle(inbound).await.unwrap();
         let text = result.unwrap();
-        assert!(text.contains("技术栈"), "empty memory should contain guiding question about 技术栈");
-        assert!(text.contains("编码规范"), "empty memory should contain guiding question about 编码规范");
-        assert!(text.contains("项目"), "empty memory should contain guiding question about 项目");
-        assert!(text.contains("group_test"), "empty memory should include the scope name");
+        assert!(
+            text.contains("技术栈"),
+            "empty memory should contain guiding question about 技术栈"
+        );
+        assert!(
+            text.contains("编码规范"),
+            "empty memory should contain guiding question about 编码规范"
+        );
+        assert!(
+            text.contains("项目"),
+            "empty memory should contain guiding question about 项目"
+        );
+        assert!(
+            text.contains("group_test"),
+            "empty memory should include the scope name"
+        );
     }
 
     #[tokio::test]
@@ -1080,8 +1093,14 @@ mod tests {
             target_agent: None,
         };
         let result = registry.handle(inbound).await.unwrap().unwrap();
-        assert!(result.contains("⚠️"), "expired pending should re-warn, got: {result}");
-        assert!(!result.contains("✅"), "expired pending must NOT confirm clear, got: {result}");
+        assert!(
+            result.contains("⚠️"),
+            "expired pending should re-warn, got: {result}"
+        );
+        assert!(
+            !result.contains("✅"),
+            "expired pending must NOT confirm clear, got: {result}"
+        );
     }
 
     #[test]
@@ -1123,7 +1142,8 @@ mod tests {
         std::fs::write(
             agents_skills.join("my-skill/SKILL.md"),
             "---\nname: my-skill\nmetadata:\n  version: '1.0.0'\n---\nDo cool things.",
-        ).unwrap();
+        )
+        .unwrap();
 
         // Build the dirs as handle() would:
         let mut dirs: Vec<std::path::PathBuf> = Vec::new();
@@ -1154,13 +1174,15 @@ mod tests {
         std::fs::write(
             agents_skills.join("ws-skill/SKILL.md"),
             "---\nname: ws-skill\nmetadata:\n  version: '1.0.0'\n---\nWorkspace skill.",
-        ).unwrap();
+        )
+        .unwrap();
 
         std::fs::create_dir_all(gateway_skills.join("gw-skill")).unwrap();
         std::fs::write(
             gateway_skills.join("gw-skill/SKILL.md"),
             "---\nname: gw-skill\nmetadata:\n  version: '2.0.0'\n---\nGateway skill.",
-        ).unwrap();
+        )
+        .unwrap();
 
         let mut all_dirs = vec![agents_skills.clone()];
         all_dirs.push(gateway_skills.clone());

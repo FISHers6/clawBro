@@ -19,13 +19,16 @@ impl PersonaSkillData {
     pub fn display_prefix(&self) -> String {
         match &self.identity.emoji {
             Some(e) => format!("[{} {}]: ", self.identity.name, e),
-            None    => format!("[@{}]: ", self.identity.name),
+            None => format!("[@{}]: ", self.identity.name),
         }
     }
 
     /// Parse the MBTI type from the identity's mbti_str field. Returns None if unset or unrecognised.
     pub fn mbti_type(&self) -> Option<MbtiType> {
-        self.identity.mbti_str.as_deref().and_then(MbtiType::from_str)
+        self.identity
+            .mbti_str
+            .as_deref()
+            .and_then(MbtiType::from_str)
     }
 }
 
@@ -39,7 +42,9 @@ mod tests {
             name: name.to_string(),
             emoji: emoji.map(String::from),
             mbti_str: mbti.map(String::from),
-            vibe: None, avatar_url: None, color: None,
+            vibe: None,
+            avatar_url: None,
+            color: None,
         }
     }
 

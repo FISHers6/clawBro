@@ -344,7 +344,8 @@ session_key = "lark:ou_xxx"
 
     #[test]
     fn test_gateway_require_mention_in_groups_can_be_set_true() {
-        let toml_str = "[gateway]\nhost = \"127.0.0.1\"\nport = 8080\nrequire_mention_in_groups = true";
+        let toml_str =
+            "[gateway]\nhost = \"127.0.0.1\"\nport = 8080\nrequire_mention_in_groups = true";
         let cfg: GatewayConfig = toml::from_str(toml_str).unwrap();
         assert!(cfg.gateway.require_mention_in_groups);
     }

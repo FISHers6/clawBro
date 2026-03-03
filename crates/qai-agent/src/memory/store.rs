@@ -14,13 +14,36 @@ pub trait MemoryStore: Send + Sync {
     async fn load_shared_memory(&self, scope: &SessionKey) -> Result<String>;
     async fn load_agent_memory(&self, persona_dir: &Path, scope: &SessionKey) -> Result<String>;
     async fn append_shared(&self, scope: &SessionKey, content: &str) -> Result<()>;
-    async fn overwrite_agent_memory(&self, persona_dir: &Path, scope: &SessionKey, content: &str) -> Result<()>;
-    async fn append_daily_log(&self, persona_dir: &Path, scope: &SessionKey, entry: &str) -> Result<()>;
-    async fn load_recent_logs(&self, persona_dir: &Path, scope: &SessionKey, days: u64) -> Result<String>;
-    async fn append_to_agent_memory(&self, persona_dir: &Path, scope: &SessionKey, content: &str) -> Result<()>;
+    async fn overwrite_agent_memory(
+        &self,
+        persona_dir: &Path,
+        scope: &SessionKey,
+        content: &str,
+    ) -> Result<()>;
+    async fn append_daily_log(
+        &self,
+        persona_dir: &Path,
+        scope: &SessionKey,
+        entry: &str,
+    ) -> Result<()>;
+    async fn load_recent_logs(
+        &self,
+        persona_dir: &Path,
+        scope: &SessionKey,
+        days: u64,
+    ) -> Result<String>;
+    async fn append_to_agent_memory(
+        &self,
+        persona_dir: &Path,
+        scope: &SessionKey,
+        content: &str,
+    ) -> Result<()>;
     async fn overwrite_shared(&self, scope: &SessionKey, content: &str) -> Result<()>;
     /// Returns the last-modified timestamp of the shared memory file, or None if not yet created.
-    async fn shared_last_modified(&self, scope: &SessionKey) -> Result<Option<chrono::DateTime<chrono::Local>>>;
+    async fn shared_last_modified(
+        &self,
+        scope: &SessionKey,
+    ) -> Result<Option<chrono::DateTime<chrono::Local>>>;
 }
 
 pub struct FileMemoryStore {
@@ -30,20 +53,29 @@ pub struct FileMemoryStore {
 
 impl FileMemoryStore {
     pub fn new(shared_dir: PathBuf) -> Self {
-        Self { shared_dir, write_locks: DashMap::new() }
+        Self {
+            shared_dir,
+            write_locks: DashMap::new(),
+        }
     }
 
     fn shared_path(&self, scope: &SessionKey) -> PathBuf {
-        self.shared_dir.join("memory").join(format!("{}.md", scope_key(scope)))
+        self.shared_dir
+            .join("memory")
+            .join(format!("{}.md", scope_key(scope)))
     }
 
     fn agent_path(&self, persona_dir: &Path, scope: &SessionKey) -> PathBuf {
-        persona_dir.join("memory").join(format!("{}.md", scope_key(scope)))
+        persona_dir
+            .join("memory")
+            .join(format!("{}.md", scope_key(scope)))
     }
 
     fn daily_log_path(&self, persona_dir: &Path, scope: &SessionKey) -> PathBuf {
         let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-        persona_dir.join("logs").join(format!("{}_{}.md", scope_key(scope), date))
+        persona_dir
+            .join("logs")
+            .join(format!("{}_{}.md", scope_key(scope), date))
     }
 
     fn lock_for(&self, path: &Path) -> Arc<tokio::sync::Mutex<()>> {
@@ -59,7 +91,10 @@ impl FileMemoryStore {
         }
         use tokio::io::AsyncWriteExt;
         let mut file = tokio::fs::OpenOptions::new()
-            .create(true).append(true).open(path).await?;
+            .create(true)
+            .append(true)
+            .open(path)
+            .await?;
         file.write_all(content.as_bytes()).await?;
         Ok(())
     }
@@ -92,7 +127,12 @@ impl MemoryStore for FileMemoryStore {
         Self::atomic_append(&path, &format!("{content}\n")).await
     }
 
-    async fn overwrite_agent_memory(&self, persona_dir: &Path, scope: &SessionKey, content: &str) -> Result<()> {
+    async fn overwrite_agent_memory(
+        &self,
+        persona_dir: &Path,
+        scope: &SessionKey,
+        content: &str,
+    ) -> Result<()> {
         let path = self.agent_path(persona_dir, scope);
         let lock = self.lock_for(&path);
         let _guard = lock.lock().await;
@@ -103,7 +143,12 @@ impl MemoryStore for FileMemoryStore {
         Ok(())
     }
 
-    async fn append_daily_log(&self, persona_dir: &Path, scope: &SessionKey, entry: &str) -> Result<()> {
+    async fn append_daily_log(
+        &self,
+        persona_dir: &Path,
+        scope: &SessionKey,
+        entry: &str,
+    ) -> Result<()> {
         let path = self.daily_log_path(persona_dir, scope);
         let lock = self.lock_for(&path);
         let _guard = lock.lock().await;
@@ -111,7 +156,12 @@ impl MemoryStore for FileMemoryStore {
         Self::atomic_append(&path, &format!("## {now}\n\n{entry}\n\n---\n")).await
     }
 
-    async fn append_to_agent_memory(&self, persona_dir: &Path, scope: &SessionKey, content: &str) -> Result<()> {
+    async fn append_to_agent_memory(
+        &self,
+        persona_dir: &Path,
+        scope: &SessionKey,
+        content: &str,
+    ) -> Result<()> {
         let path = self.agent_path(persona_dir, scope);
         let lock = self.lock_for(&path);
         let _guard = lock.lock().await;
@@ -129,7 +179,10 @@ impl MemoryStore for FileMemoryStore {
         Ok(())
     }
 
-    async fn shared_last_modified(&self, scope: &SessionKey) -> Result<Option<chrono::DateTime<chrono::Local>>> {
+    async fn shared_last_modified(
+        &self,
+        scope: &SessionKey,
+    ) -> Result<Option<chrono::DateTime<chrono::Local>>> {
         let path = self.shared_path(scope);
         match tokio::fs::metadata(&path).await {
             Ok(meta) => {
@@ -142,7 +195,12 @@ impl MemoryStore for FileMemoryStore {
         }
     }
 
-    async fn load_recent_logs(&self, persona_dir: &Path, scope: &SessionKey, days: u64) -> Result<String> {
+    async fn load_recent_logs(
+        &self,
+        persona_dir: &Path,
+        scope: &SessionKey,
+        days: u64,
+    ) -> Result<String> {
         let logs_dir = persona_dir.join("logs");
         let sk = scope_key(scope);
         let cutoff_date = (chrono::Local::now() - chrono::Duration::days(days as i64)).date_naive();
@@ -159,8 +217,13 @@ impl MemoryStore for FileMemoryStore {
                     let name = e.file_name().to_string_lossy().to_string();
                     if name.starts_with(&sk) && name.ends_with(".md") {
                         // filename: {scope_key}_{YYYY-MM-DD}.md
-                        if let Some(date_str) = name.strip_prefix(&format!("{sk}_")).and_then(|s| s.strip_suffix(".md")) {
-                            if let Ok(date) = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
+                        if let Some(date_str) = name
+                            .strip_prefix(&format!("{sk}_"))
+                            .and_then(|s| s.strip_suffix(".md"))
+                        {
+                            if let Ok(date) =
+                                chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
+                            {
                                 if date >= cutoff_date {
                                     entries.push((date, e.path()));
                                 }
@@ -190,10 +253,12 @@ impl MemoryStore for FileMemoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
     use qai_protocol::SessionKey;
+    use tempfile::tempdir;
 
-    fn scope() -> SessionKey { SessionKey::new("dingtalk", "group_C123") }
+    fn scope() -> SessionKey {
+        SessionKey::new("dingtalk", "group_C123")
+    }
 
     #[tokio::test]
     async fn test_load_shared_empty_when_missing() {
@@ -220,10 +285,22 @@ mod tests {
         let persona_b = tempdir().unwrap();
         let scope_a = SessionKey::new("dingtalk", "group_A");
         let scope_b = SessionKey::new("dingtalk", "group_B");
-        store.overwrite_agent_memory(persona_a.path(), &scope_a, "content-A").await.unwrap();
-        store.overwrite_agent_memory(persona_b.path(), &scope_b, "content-B").await.unwrap();
-        let a = store.load_agent_memory(persona_a.path(), &scope_a).await.unwrap();
-        let b = store.load_agent_memory(persona_b.path(), &scope_b).await.unwrap();
+        store
+            .overwrite_agent_memory(persona_a.path(), &scope_a, "content-A")
+            .await
+            .unwrap();
+        store
+            .overwrite_agent_memory(persona_b.path(), &scope_b, "content-B")
+            .await
+            .unwrap();
+        let a = store
+            .load_agent_memory(persona_a.path(), &scope_a)
+            .await
+            .unwrap();
+        let b = store
+            .load_agent_memory(persona_b.path(), &scope_b)
+            .await
+            .unwrap();
         assert!(a.contains("content-A") && !a.contains("content-B"));
         assert!(b.contains("content-B") && !b.contains("content-A"));
     }
@@ -233,8 +310,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = FileMemoryStore::new(dir.path().to_path_buf());
         let persona = tempdir().unwrap();
-        store.append_daily_log(persona.path(), &scope(), "[user]: hello\n[bot]: hi").await.unwrap();
-        let logs = store.load_recent_logs(persona.path(), &scope(), 7).await.unwrap();
+        store
+            .append_daily_log(persona.path(), &scope(), "[user]: hello\n[bot]: hi")
+            .await
+            .unwrap();
+        let logs = store
+            .load_recent_logs(persona.path(), &scope(), 7)
+            .await
+            .unwrap();
         assert!(logs.contains("hello"));
     }
 
@@ -245,10 +328,16 @@ mod tests {
         let persona = tempdir().unwrap();
         let scope = scope();
         let scope_key = format!("{}_{}", scope.channel, scope.scope);
-        let old_file = persona.path().join("logs").join(format!("{scope_key}_2020-01-01.md"));
+        let old_file = persona
+            .path()
+            .join("logs")
+            .join(format!("{scope_key}_2020-01-01.md"));
         std::fs::create_dir_all(old_file.parent().unwrap()).unwrap();
         std::fs::write(&old_file, "old content").unwrap();
-        let logs = store.load_recent_logs(persona.path(), &scope, 7).await.unwrap();
+        let logs = store
+            .load_recent_logs(persona.path(), &scope, 7)
+            .await
+            .unwrap();
         assert!(!logs.contains("old content"));
     }
 

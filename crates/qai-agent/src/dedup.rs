@@ -27,15 +27,6 @@ impl DedupStore {
         self.seen.insert(id.to_string(), now);
         true
     }
-
-    /// Returns true if this id has already been seen (and not expired).
-    /// Does NOT insert. Use as a best-effort pre-check before `check_and_insert`.
-    pub fn is_duplicate(&self, id: &str) -> bool {
-        let now = Instant::now();
-        self.seen
-            .get(id)
-            .is_some_and(|t| now.duration_since(*t) < self.ttl)
-    }
 }
 
 impl Default for DedupStore {
@@ -51,9 +42,9 @@ mod tests {
     #[test]
     fn test_dedup() {
         let store = DedupStore::new();
-        assert!(store.check_and_insert("msg1"));  // 新消息
+        assert!(store.check_and_insert("msg1")); // 新消息
         assert!(!store.check_and_insert("msg1")); // 重复
-        assert!(store.check_and_insert("msg2"));  // 新消息
+        assert!(store.check_and_insert("msg2")); // 新消息
     }
 
     #[test]
@@ -64,15 +55,5 @@ mod tests {
         assert!(store.check_and_insert("c"));
         assert!(!store.check_and_insert("a"));
         assert!(!store.check_and_insert("b"));
-    }
-
-    #[test]
-    fn test_is_duplicate_without_inserting() {
-        let store = DedupStore::new();
-        assert!(!store.is_duplicate("x")); // not seen yet
-        store.check_and_insert("x");       // insert
-        assert!(store.is_duplicate("x"));  // now duplicate
-        assert!(store.is_duplicate("x"));  // still duplicate, not consumed
-        assert!(!store.check_and_insert("x")); // check_and_insert also sees it as dup
     }
 }

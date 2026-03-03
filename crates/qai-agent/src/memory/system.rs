@@ -1,6 +1,6 @@
-use crate::memory::{MemoryDistiller, MemoryStore};
 use crate::memory::event::MemoryEvent;
 use crate::memory::trigger::MemoryTrigger;
+use crate::memory::{MemoryDistiller, MemoryStore};
 use std::sync::Arc;
 
 pub struct MemorySystem {
@@ -15,7 +15,11 @@ impl MemorySystem {
         store: Arc<dyn MemoryStore>,
         distiller: Arc<dyn MemoryDistiller>,
     ) -> Arc<Self> {
-        Arc::new(Self { triggers, store, distiller })
+        Arc::new(Self {
+            triggers,
+            store,
+            distiller,
+        })
     }
 
     /// 发射事件到所有匹配触发器，全部在后台 spawn（不阻塞调用方）
@@ -35,24 +39,42 @@ impl MemorySystem {
         }
     }
 
-    pub fn store(&self) -> Arc<dyn MemoryStore> { Arc::clone(&self.store) }
+    pub fn store(&self) -> Arc<dyn MemoryStore> {
+        Arc::clone(&self.store)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::{distiller::NoopDistiller, event::{MemoryEvent, MemoryTarget}, store::FileMemoryStore};
     use crate::memory::trigger::MemoryTrigger;
+    use crate::memory::{
+        distiller::NoopDistiller,
+        event::{MemoryEvent, MemoryTarget},
+        store::FileMemoryStore,
+    };
     use qai_protocol::SessionKey;
-    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
     use tempfile::tempdir;
 
     struct CountingTrigger(Arc<AtomicUsize>);
     #[async_trait::async_trait]
     impl MemoryTrigger for CountingTrigger {
-        fn name(&self) -> &str { "counter" }
-        fn matches(&self, _: &MemoryEvent) -> bool { true }
-        async fn fire(&self, _: MemoryEvent, _: Arc<dyn MemoryStore>, _: Arc<dyn MemoryDistiller>) -> anyhow::Result<()> {
+        fn name(&self) -> &str {
+            "counter"
+        }
+        fn matches(&self, _: &MemoryEvent) -> bool {
+            true
+        }
+        async fn fire(
+            &self,
+            _: MemoryEvent,
+            _: Arc<dyn MemoryStore>,
+            _: Arc<dyn MemoryDistiller>,
+        ) -> anyhow::Result<()> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -61,9 +83,18 @@ mod tests {
     struct NeverMatch;
     #[async_trait::async_trait]
     impl MemoryTrigger for NeverMatch {
-        fn name(&self) -> &str { "never" }
-        fn matches(&self, _: &MemoryEvent) -> bool { false }
-        async fn fire(&self, _: MemoryEvent, _: Arc<dyn MemoryStore>, _: Arc<dyn MemoryDistiller>) -> anyhow::Result<()> {
+        fn name(&self) -> &str {
+            "never"
+        }
+        fn matches(&self, _: &MemoryEvent) -> bool {
+            false
+        }
+        async fn fire(
+            &self,
+            _: MemoryEvent,
+            _: Arc<dyn MemoryStore>,
+            _: Arc<dyn MemoryDistiller>,
+        ) -> anyhow::Result<()> {
             panic!("should never be called");
         }
     }
@@ -82,7 +113,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let store: Arc<dyn MemoryStore> = Arc::new(FileMemoryStore::new(dir.path().to_path_buf()));
         let distiller: Arc<dyn MemoryDistiller> = Arc::new(NoopDistiller);
-        let triggers: Vec<Arc<dyn MemoryTrigger>> = vec![Arc::new(CountingTrigger(counter.clone()))];
+        let triggers: Vec<Arc<dyn MemoryTrigger>> =
+            vec![Arc::new(CountingTrigger(counter.clone()))];
         let system = MemorySystem::new(triggers, store, distiller);
         system.emit(make_event());
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;

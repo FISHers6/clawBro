@@ -22,7 +22,10 @@ impl MemoryDistiller for NoopDistiller {
         // Use char-safe truncation to avoid panicking on multi-byte UTF-8 (e.g. Chinese text)
         let mem_preview: String = current_memory.chars().take(200).collect();
         let logs_preview: String = logs.chars().take(200).collect();
-        Ok(format!("[distilled]\n{}\n---\n{}", mem_preview, logs_preview))
+        Ok(format!(
+            "[distilled]\n{}\n---\n{}",
+            mem_preview, logs_preview
+        ))
     }
 }
 
@@ -33,7 +36,9 @@ pub struct AcpDistiller {
 
 impl AcpDistiller {
     pub fn new(binary: impl Into<String>) -> Self {
-        Self { binary: binary.into() }
+        Self {
+            binary: binary.into(),
+        }
     }
 }
 
@@ -52,9 +57,8 @@ impl MemoryDistiller for AcpDistiller {
             workspace_dir: None,
         });
 
-        let user_text = format!(
-            "## Conversation Logs\n\n{logs}\n\n## Current Memory\n\n{current_memory}"
-        );
+        let user_text =
+            format!("## Conversation Logs\n\n{logs}\n\n## Current Memory\n\n{current_memory}");
 
         let ctx = AgentCtx {
             session_id: Uuid::new_v4(),

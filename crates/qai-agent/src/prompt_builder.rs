@@ -44,7 +44,7 @@ impl<'a> SystemPromptBuilder<'a> {
             let id = &persona.identity;
             let name_line = match &id.emoji {
                 Some(e) => format!("You are {} {}.", id.name, e),
-                None    => format!("You are {}.", id.name),
+                None => format!("You are {}.", id.name),
             };
             let mut identity_lines = vec![name_line];
             if let Some(mbti) = &id.mbti_str {
@@ -106,7 +106,12 @@ mod tests {
     use super::*;
     use qai_skills::{IdentityData, PersonaSkillData};
 
-    fn make_persona(name: &str, emoji: Option<&str>, mbti: Option<&str>, soul: &str) -> PersonaSkillData {
+    fn make_persona(
+        name: &str,
+        emoji: Option<&str>,
+        mbti: Option<&str>,
+        soul: &str,
+    ) -> PersonaSkillData {
         PersonaSkillData {
             identity: IdentityData {
                 name: name.to_string(),
@@ -132,7 +137,8 @@ mod tests {
             agent_memory: "",
             shared_max_words: 300,
             agent_max_words: 500,
-        }.build();
+        }
+        .build();
 
         assert!(result.contains("SOUL content"));
         assert!(result.contains("IDENTITY content"));
@@ -153,7 +159,8 @@ mod tests {
             agent_memory: "",
             shared_max_words: 300,
             agent_max_words: 500,
-        }.build();
+        }
+        .build();
 
         assert!(result.contains("You are Rex 🦅."));
         assert!(result.contains("INTJ"));
@@ -172,7 +179,8 @@ mod tests {
             agent_memory: "",
             shared_max_words: 300,
             agent_max_words: 500,
-        }.build();
+        }
+        .build();
 
         assert!(result.contains("Cognitive Architecture"));
         assert!(result.contains("Dominant"));
@@ -191,7 +199,8 @@ mod tests {
             agent_memory: "",
             shared_max_words: 300,
             agent_max_words: 500,
-        }.build();
+        }
+        .build();
 
         assert!(result.contains("SOUL_INJECTION_TEXT"));
     }
@@ -208,7 +217,8 @@ mod tests {
             agent_memory: "",
             shared_max_words: 300,
             agent_max_words: 500,
-        }.build();
+        }
+        .build();
 
         let identity_pos = result.find("You are Rex").unwrap();
         let cognitive_pos = result.find("Cognitive Architecture").unwrap();
@@ -217,8 +227,14 @@ mod tests {
         let skills_pos = result.find("SKILLS").unwrap();
 
         assert!(identity_pos < cognitive_pos, "identity before cognitive");
-        assert!(cognitive_pos < soul_injection_pos, "cognitive before soul-injection");
-        assert!(soul_injection_pos < soul_md_pos, "soul-injection before SOUL.md");
+        assert!(
+            cognitive_pos < soul_injection_pos,
+            "cognitive before soul-injection"
+        );
+        assert!(
+            soul_injection_pos < soul_md_pos,
+            "soul-injection before SOUL.md"
+        );
         assert!(soul_md_pos < skills_pos, "SOUL.md before skills");
     }
 
@@ -235,7 +251,8 @@ mod tests {
             agent_memory: "",
             shared_max_words: 300,
             agent_max_words: 500,
-        }.build();
+        }
+        .build();
 
         assert!(!result.contains("RAW_IDENTITY_SHOULD_NOT_APPEAR"));
     }
@@ -251,7 +268,8 @@ mod tests {
             agent_memory: "agent mem",
             shared_max_words: 300,
             agent_max_words: 500,
-        }.build();
+        }
+        .build();
 
         assert!(result.contains("群组共享记忆"));
         assert!(result.contains("shared mem"));
@@ -270,7 +288,8 @@ mod tests {
             agent_memory: "",
             shared_max_words: 300,
             agent_max_words: 500,
-        }.build();
+        }
+        .build();
 
         assert!(result.is_empty());
     }
@@ -287,9 +306,13 @@ mod tests {
             agent_memory: "\n\n",
             shared_max_words: 300,
             agent_max_words: 500,
-        }.build();
+        }
+        .build();
 
-        assert!(result.is_empty(), "whitespace-only inputs should produce an empty prompt");
+        assert!(
+            result.is_empty(),
+            "whitespace-only inputs should produce an empty prompt"
+        );
     }
 
     #[test]
@@ -303,13 +326,20 @@ mod tests {
             agent_memory: "AGENT_MEM",
             shared_max_words: 300,
             agent_max_words: 500,
-        }.build();
+        }
+        .build();
 
-        let shared_pos  = result.find("SHARED_MEM").unwrap();
-        let agent_pos   = result.find("AGENT_MEM").unwrap();
-        let skills_pos  = result.find("SKILLS").unwrap();
+        let shared_pos = result.find("SHARED_MEM").unwrap();
+        let agent_pos = result.find("AGENT_MEM").unwrap();
+        let skills_pos = result.find("SKILLS").unwrap();
 
-        assert!(shared_pos < skills_pos, "shared memory must appear before skills");
-        assert!(agent_pos  < skills_pos, "agent memory must appear before skills");
+        assert!(
+            shared_pos < skills_pos,
+            "shared memory must appear before skills"
+        );
+        assert!(
+            agent_pos < skills_pos,
+            "agent memory must appear before skills"
+        );
     }
 }

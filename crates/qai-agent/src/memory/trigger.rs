@@ -1,5 +1,5 @@
-use crate::memory::{MemoryDistiller, MemoryStore};
 use crate::memory::event::MemoryEvent;
+use crate::memory::{MemoryDistiller, MemoryStore};
 use async_trait::async_trait;
 use std::sync::Arc;
 
@@ -25,9 +25,18 @@ mod tests {
     struct AlwaysMatch;
     #[async_trait::async_trait]
     impl MemoryTrigger for AlwaysMatch {
-        fn name(&self) -> &str { "always" }
-        fn matches(&self, _: &MemoryEvent) -> bool { true }
-        async fn fire(&self, _: MemoryEvent, _: Arc<dyn MemoryStore>, _: Arc<dyn MemoryDistiller>) -> anyhow::Result<()> {
+        fn name(&self) -> &str {
+            "always"
+        }
+        fn matches(&self, _: &MemoryEvent) -> bool {
+            true
+        }
+        async fn fire(
+            &self,
+            _: MemoryEvent,
+            _: Arc<dyn MemoryStore>,
+            _: Arc<dyn MemoryDistiller>,
+        ) -> anyhow::Result<()> {
             Ok(())
         }
     }
