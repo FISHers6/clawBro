@@ -126,6 +126,33 @@ impl TeamSession {
             blocking.join(", ")
         };
 
+        // Collect upstream completion notes for completed dependency tasks
+        let upstream_notes: Vec<String> = deps
+            .iter()
+            .filter_map(|dep_id| {
+                registry.get_task(dep_id).ok().flatten().and_then(|t| {
+                    t.completion_note.as_ref().map(|note| {
+                        format!(
+                            "[{}] {}（{}，已完成）：\n{}",
+                            dep_id,
+                            t.title,
+                            t.assignee_hint.as_deref().unwrap_or("unknown"),
+                            note
+                        )
+                    })
+                })
+            })
+            .collect();
+
+        let upstream_section = if upstream_notes.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\n── 上游任务结果 ──────────────────────────\n{}\n─────────────────────────────────────────",
+                upstream_notes.join("\n\n")
+            )
+        };
+
         format!(
             "══════ 当前任务（自动注入，最高优先级）══════\n\
              任务ID: {id}\n\
@@ -141,7 +168,9 @@ impl TeamSession {
              1. 完成后在回复**最后一行**加 [DONE: {id}] 标记，否则系统不会更新任务状态\n\
              2. 如遇阻塞，在回复最后一行加 [BLOCKED: <原因>] 标记\n\
              3. 重要产出（文件路径、关键发现）写在回复正文\n\
-             ══════════════════════════════════════════",
+             4. 完成任务时调用工具 `complete_task(task_id, note)` 或输出 `[DONE: {id}]`。\n\
+             5. 遇到阻塞时调用工具 `block_task(task_id, reason)` 或输出 `[BLOCKED: reason]`。\n\
+             ══════════════════════════════════════════{upstream_section}",
             id = task.id,
             title = task.title,
             spec = task.spec.as_deref().unwrap_or("（无详细说明）"),
@@ -151,6 +180,7 @@ impl TeamSession {
                 .success_criteria
                 .as_deref()
                 .unwrap_or("完成任务说明中描述的工作"),
+            upstream_section = upstream_section,
         )
     }
 
@@ -232,6 +262,36 @@ mod tests {
     }
 
     #[test]
+    fn test_build_task_reminder_injects_upstream_notes() {
+        let (session, _tmp) = make_session();
+        let registry = TaskRegistry::new_in_memory().unwrap();
+
+        // T001 is a dependency with a completion note
+        registry.create_task(CreateTask {
+            id: "T001".into(),
+            title: "Design schema".into(),
+            ..Default::default()
+        }).unwrap();
+        registry.try_claim("T001", "codex").unwrap();
+        registry.mark_done("T001", "Created users table with uuid pk").unwrap();
+
+        // T002 depends on T001
+        registry.create_task(CreateTask {
+            id: "T002".into(),
+            title: "Implement model".into(),
+            deps: vec!["T001".into()],
+            ..Default::default()
+        }).unwrap();
+
+        let task = registry.get_task("T002").unwrap().unwrap();
+        let reminder = session.build_task_reminder(&task, &registry);
+
+        assert!(reminder.contains("上游任务结果"), "must have upstream section header");
+        assert!(reminder.contains("T001"), "must mention T001");
+        assert!(reminder.contains("Created users table"), "must include T001 completion note");
+    }
+
+    #[test]
     fn test_build_task_reminder_contains_done_marker() {
         let (session, _tmp) = make_session();
         let registry = TaskRegistry::new_in_memory().unwrap();
@@ -249,5 +309,7 @@ mod tests {
         assert!(reminder.contains("[DONE: T003]"), "must include DONE marker");
         assert!(reminder.contains("Implement JWT"));
         assert!(reminder.contains("JWT token is generated"));
+        assert!(reminder.contains("complete_task"), "must mention complete_task MCP tool");
+        assert!(reminder.contains("block_task"), "must mention block_task MCP tool");
     }
 }
