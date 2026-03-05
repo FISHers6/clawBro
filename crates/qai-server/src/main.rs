@@ -413,6 +413,7 @@ async fn main() -> Result<()> {
                         timestamp: chrono::Utc::now(),
                         thread_ts: None,
                         target_agent: agent_opt,
+                        source: qai_protocol::MsgSource::Cron,
                     };
                     match registry.handle(msg).await {
                         Ok(Some(result)) => {

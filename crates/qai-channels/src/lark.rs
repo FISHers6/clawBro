@@ -509,6 +509,7 @@ async fn handle_event(
         timestamp: Utc::now(),
         thread_ts: None,
         target_agent,
+        source: qai_protocol::MsgSource::Human,
     };
 
     let _ = tx.send(inbound).await;

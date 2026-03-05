@@ -66,6 +66,7 @@ impl MemoryDistiller for AcpDistiller {
             history: vec![],
             system_injection: DISTILL_PROMPT.to_string(),
             workspace_dir: None,
+            ..AgentCtx::default()
         };
 
         // Broadcast receiver is intentionally discarded: distillation runs in the background

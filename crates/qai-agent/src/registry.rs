@@ -403,6 +403,9 @@ impl SessionRegistry {
                     agent_memory: &agent_memory,
                     shared_max_words: 300,
                     agent_max_words: 500,
+                    agent_role: crate::traits::AgentRole::Solo,
+                    task_reminder: None,
+                    team_manifest: None,
                 }
                 .build()
             } else {
@@ -434,6 +437,7 @@ impl SessionRegistry {
             history,
             system_injection,
             workspace_dir: workspace_dir_resolved,
+            ..AgentCtx::default()
         };
 
         // Per-call event channel: forward to global_tx + ws_subs
@@ -832,6 +836,7 @@ mod tests {
             history: vec![],
             system_injection: String::new(),
             workspace_dir: Some(std::path::PathBuf::from("/projects/test")),
+            ..AgentCtx::default()
         };
         assert!(ctx.workspace_dir.is_some());
     }
@@ -880,6 +885,7 @@ mod tests {
             timestamp: chrono::Utc::now(),
             thread_ts: None,
             target_agent: None,
+            source: qai_protocol::MsgSource::Human,
         };
         let result = registry.handle(inbound).await.unwrap();
         assert!(result.unwrap().contains("已清除"));
@@ -897,6 +903,7 @@ mod tests {
             timestamp: chrono::Utc::now(),
             thread_ts: None,
             target_agent: None,
+            source: qai_protocol::MsgSource::Human,
         };
         let result = registry.handle(inbound).await.unwrap();
         assert!(result.unwrap().contains("/engine"));
@@ -986,6 +993,7 @@ mod tests {
             timestamp: chrono::Utc::now(),
             thread_ts: None,
             target_agent: None,
+            source: qai_protocol::MsgSource::Human,
         };
         let result = registry.handle(inbound).await.unwrap();
         let text = result.unwrap();
@@ -1007,6 +1015,7 @@ mod tests {
             timestamp: chrono::Utc::now(),
             thread_ts: None,
             target_agent: None,
+            source: qai_protocol::MsgSource::Human,
         };
         let result = registry.handle(inbound).await.unwrap();
         let text = result.unwrap();
@@ -1041,6 +1050,7 @@ mod tests {
             timestamp: chrono::Utc::now(),
             thread_ts: None,
             target_agent: None,
+            source: qai_protocol::MsgSource::Human,
         };
         let result = registry.handle(inbound).await.unwrap().unwrap();
         assert!(result.contains("⚠️"));
@@ -1062,6 +1072,7 @@ mod tests {
             timestamp: chrono::Utc::now(),
             thread_ts: None,
             target_agent: None,
+            source: qai_protocol::MsgSource::Human,
         };
         registry.handle(inbound1).await.unwrap();
 
@@ -1075,6 +1086,7 @@ mod tests {
             timestamp: chrono::Utc::now(),
             thread_ts: None,
             target_agent: None,
+            source: qai_protocol::MsgSource::Human,
         };
         let result = registry.handle(inbound2).await.unwrap().unwrap();
         assert!(result.contains("✅"));
@@ -1117,6 +1129,7 @@ mod tests {
             timestamp: chrono::Utc::now(),
             thread_ts: None,
             target_agent: None,
+            source: qai_protocol::MsgSource::Human,
         };
         let result = registry.handle(inbound).await.unwrap().unwrap();
         assert!(
@@ -1257,6 +1270,7 @@ mod tests {
             timestamp: chrono::Utc::now(),
             thread_ts: None,
             target_agent: None,
+            source: qai_protocol::MsgSource::Human,
         };
         let result = registry.handle(inbound).await.unwrap().unwrap();
         assert!(

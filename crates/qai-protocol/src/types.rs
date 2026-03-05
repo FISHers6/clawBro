@@ -1,6 +1,23 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// 消息来源（区分人工、Bot 触发、内部调度等）
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MsgSource {
+    /// 人工在 IM 发送的消息（默认）
+    #[default]
+    Human,
+    /// Bot A 输出触发 Bot B（MentionTrigger 扫描 @mention）
+    BotMention,
+    /// RelayEngine 内部同步委托（`[RELAY: @agent ...]` 语法）
+    Relay,
+    /// Cron 定时任务触发
+    Cron,
+    /// OrchestratorHeartbeat 派发给 Specialist
+    Heartbeat,
+}
+
 /// 入站消息（来自任意 Channel 或 WebSocket 客户端）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InboundMsg {
@@ -13,6 +30,9 @@ pub struct InboundMsg {
     pub thread_ts: Option<String>,
     #[serde(default)]
     pub target_agent: Option<String>, // @mention extracted by Channel (e.g. "@claude")
+    /// 消息来源（默认 Human，向后兼容）
+    #[serde(default)]
+    pub source: MsgSource,
 }
 
 /// 会话定位键（参考 zeroclaw dmScope 设计）

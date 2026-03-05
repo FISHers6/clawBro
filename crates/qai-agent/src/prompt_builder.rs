@@ -1,18 +1,22 @@
 // quickai-gateway/crates/qai-agent/src/prompt_builder.rs
-//! SystemPromptBuilder: assembles the 6-layer system prompt in the canonical order
+//! SystemPromptBuilder: assembles the 7-layer system prompt in the canonical order
 //! defined in docs/人格实现研究.md.
 
 use crate::memory::cap_to_words;
+use crate::traits::AgentRole;
 use qai_skills::PersonaSkillData;
 
 /// Assembles the full system prompt for a single agent turn.
 ///
 /// Layer order (persona present):
+///   0. Task reminder（最高优先级，仅 Lead/Specialist 有任务时注入）
 ///   1. IDENTITY block (name, emoji, MBTI label, vibe)
 ///   2. Cognitive stack (4 Jung functions with position-weighted directive texts)
 ///   3. soul-injection.md (full persona narrative)
 ///   4. SOUL.md (operator customization, raw text from persona_dir)
-///   5. Shared memory + agent memory (word-capped)
+///      Team manifest（TEAM.md，Lead/Specialist 模式）
+///   5. Shared memory（Solo/Lead: 群组历史摘要；Specialist: CONTEXT.md 任务背景）
+///      Agent memory（仅 Solo/Lead；Specialist 跳过，Ralph Loop 核心）
 ///   6. Skills injection (capability text)
 ///
 /// Without persona (backward compat):
@@ -28,16 +32,33 @@ pub struct SystemPromptBuilder<'a> {
     /// Combined skills capability text (regular skills + persona capability body).
     pub skills_injection: &'a str,
     /// Shared group memory text.
+    /// Solo/Lead: FileMemoryStore 群组历史摘要；Specialist: CONTEXT.md 任务背景
     pub shared_memory: &'a str,
-    /// Per-agent memory text.
+    /// Per-agent memory text（Specialist 模式下忽略，不注入）
     pub agent_memory: &'a str,
     pub shared_max_words: usize,
     pub agent_max_words: usize,
+    /// Agent 在团队中的角色（控制 memory 注入行为）
+    pub agent_role: AgentRole,
+    /// Layer 0 任务提醒（最高优先级，覆盖一切；None 时跳过）
+    pub task_reminder: Option<&'a str>,
+    /// TEAM.md 内容（团队职责说明，Lead/Specialist 有效）
+    pub team_manifest: Option<&'a str>,
 }
 
 impl<'a> SystemPromptBuilder<'a> {
     pub fn build(&self) -> String {
         let mut parts: Vec<String> = Vec::new();
+
+        // ── Layer 0: Task Reminder（最高优先级，仅 Lead/Specialist 有任务时注入）──
+        if let Some(reminder) = self.task_reminder {
+            if !reminder.trim().is_empty() {
+                parts.push(format!(
+                    "══════ 当前任务（自动注入，最高优先级）══════\n{}\n══════════════════════════════════════════",
+                    reminder
+                ));
+            }
+        }
 
         if let Some(persona) = self.persona {
             // ── Layer 1: IDENTITY block ──
@@ -80,14 +101,26 @@ impl<'a> SystemPromptBuilder<'a> {
             parts.push(self.identity_raw.to_string());
         }
 
-        // ── Layer 5a: Shared memory ──
-        if !self.shared_memory.trim().is_empty() {
-            let capped = cap_to_words(self.shared_memory, self.shared_max_words);
-            parts.push(format!("## 群组共享记忆\n\n{capped}"));
+        // ── Layer 4c: TEAM.md（Lead/Specialist 模式下的团队职责说明）──
+        if let Some(manifest) = self.team_manifest {
+            if !manifest.trim().is_empty() {
+                parts.push(format!("## 团队职责\n\n{}", manifest));
+            }
         }
 
-        // ── Layer 5b: Agent memory ──
-        if !self.agent_memory.trim().is_empty() {
+        // ── Layer 5a: Shared memory ──
+        // Solo/Lead → 群组历史摘要；Specialist → CONTEXT.md 任务背景（调用方负责传入正确内容）
+        if !self.shared_memory.trim().is_empty() {
+            let capped = cap_to_words(self.shared_memory, self.shared_max_words);
+            let label = match self.agent_role {
+                AgentRole::Specialist => "## 任务背景（团队上下文）",
+                _ => "## 群组共享记忆",
+            };
+            parts.push(format!("{label}\n\n{capped}"));
+        }
+
+        // ── Layer 5b: Agent memory（仅 Solo/Lead；Specialist 跳过 ← Ralph Loop 核心）──
+        if !matches!(self.agent_role, AgentRole::Specialist) && !self.agent_memory.trim().is_empty() {
             let capped = cap_to_words(self.agent_memory, self.agent_max_words);
             parts.push(format!("## 长期记忆\n\n{capped}"));
         }
@@ -137,6 +170,9 @@ mod tests {
             agent_memory: "",
             shared_max_words: 300,
             agent_max_words: 500,
+            agent_role: AgentRole::Solo,
+            task_reminder: None,
+            team_manifest: None,
         }
         .build();
 
@@ -159,6 +195,9 @@ mod tests {
             agent_memory: "",
             shared_max_words: 300,
             agent_max_words: 500,
+            agent_role: AgentRole::Solo,
+            task_reminder: None,
+            team_manifest: None,
         }
         .build();
 
@@ -179,6 +218,9 @@ mod tests {
             agent_memory: "",
             shared_max_words: 300,
             agent_max_words: 500,
+            agent_role: AgentRole::Solo,
+            task_reminder: None,
+            team_manifest: None,
         }
         .build();
 
@@ -199,6 +241,9 @@ mod tests {
             agent_memory: "",
             shared_max_words: 300,
             agent_max_words: 500,
+            agent_role: AgentRole::Solo,
+            task_reminder: None,
+            team_manifest: None,
         }
         .build();
 
@@ -217,6 +262,9 @@ mod tests {
             agent_memory: "",
             shared_max_words: 300,
             agent_max_words: 500,
+            agent_role: AgentRole::Solo,
+            task_reminder: None,
+            team_manifest: None,
         }
         .build();
 
@@ -251,6 +299,9 @@ mod tests {
             agent_memory: "",
             shared_max_words: 300,
             agent_max_words: 500,
+            agent_role: AgentRole::Solo,
+            task_reminder: None,
+            team_manifest: None,
         }
         .build();
 
@@ -268,6 +319,9 @@ mod tests {
             agent_memory: "agent mem",
             shared_max_words: 300,
             agent_max_words: 500,
+            agent_role: AgentRole::Solo,
+            task_reminder: None,
+            team_manifest: None,
         }
         .build();
 
@@ -288,6 +342,9 @@ mod tests {
             agent_memory: "",
             shared_max_words: 300,
             agent_max_words: 500,
+            agent_role: AgentRole::Solo,
+            task_reminder: None,
+            team_manifest: None,
         }
         .build();
 
@@ -306,6 +363,9 @@ mod tests {
             agent_memory: "\n\n",
             shared_max_words: 300,
             agent_max_words: 500,
+            agent_role: AgentRole::Solo,
+            task_reminder: None,
+            team_manifest: None,
         }
         .build();
 
@@ -326,6 +386,9 @@ mod tests {
             agent_memory: "AGENT_MEM",
             shared_max_words: 300,
             agent_max_words: 500,
+            agent_role: AgentRole::Solo,
+            task_reminder: None,
+            team_manifest: None,
         }
         .build();
 
@@ -341,5 +404,114 @@ mod tests {
             agent_pos < skills_pos,
             "agent memory must appear before skills"
         );
+    }
+
+    #[test]
+    fn test_specialist_excludes_agent_memory() {
+        let result = SystemPromptBuilder {
+            persona: None,
+            soul_md: "soul content",
+            identity_raw: "",
+            skills_injection: "",
+            shared_memory: "",
+            agent_memory: "secret project memory",
+            shared_max_words: 300,
+            agent_max_words: 500,
+            agent_role: AgentRole::Specialist,
+            task_reminder: None,
+            team_manifest: None,
+        }
+        .build();
+
+        assert!(
+            !result.contains("secret project memory"),
+            "Specialist should NOT see MEMORY.md"
+        );
+        assert!(result.contains("soul content"), "Specialist always sees SOUL.md");
+    }
+
+    #[test]
+    fn test_specialist_shared_memory_label() {
+        let result = SystemPromptBuilder {
+            persona: None,
+            soul_md: "",
+            identity_raw: "",
+            skills_injection: "",
+            shared_memory: "task context background",
+            agent_memory: "",
+            shared_max_words: 300,
+            agent_max_words: 500,
+            agent_role: AgentRole::Specialist,
+            task_reminder: None,
+            team_manifest: None,
+        }
+        .build();
+
+        assert!(result.contains("任务背景"), "Specialist shared_memory label should be 任务背景");
+        assert!(!result.contains("群组共享记忆"), "Specialist must NOT see 群组共享记忆");
+    }
+
+    #[test]
+    fn test_task_reminder_appears_first() {
+        let result = SystemPromptBuilder {
+            persona: None,
+            soul_md: "soul content",
+            identity_raw: "",
+            skills_injection: "",
+            shared_memory: "",
+            agent_memory: "",
+            shared_max_words: 300,
+            agent_max_words: 500,
+            agent_role: AgentRole::Specialist,
+            task_reminder: Some("URGENT: T003 implement JWT"),
+            team_manifest: None,
+        }
+        .build();
+
+        let reminder_pos = result.find("URGENT: T003").unwrap();
+        let soul_pos = result.find("soul content").unwrap();
+        assert!(reminder_pos < soul_pos, "task_reminder must appear before SOUL.md");
+    }
+
+    #[test]
+    fn test_solo_includes_agent_memory() {
+        let result = SystemPromptBuilder {
+            persona: None,
+            soul_md: "",
+            identity_raw: "",
+            skills_injection: "",
+            shared_memory: "",
+            agent_memory: "long term memory",
+            shared_max_words: 300,
+            agent_max_words: 500,
+            agent_role: AgentRole::Solo,
+            task_reminder: None,
+            team_manifest: None,
+        }
+        .build();
+
+        assert!(result.contains("long term memory"), "Solo MUST see MEMORY.md");
+        assert!(result.contains("长期记忆"));
+    }
+
+    #[test]
+    fn test_team_manifest_injected() {
+        let result = SystemPromptBuilder {
+            persona: None,
+            soul_md: "",
+            identity_raw: "",
+            skills_injection: "",
+            shared_memory: "",
+            agent_memory: "",
+            shared_max_words: 300,
+            agent_max_words: 500,
+            agent_role: AgentRole::Lead,
+            task_reminder: None,
+            team_manifest: Some("Claude: Lead\nCodex: Specialist"),
+        }
+        .build();
+
+        assert!(result.contains("团队职责"));
+        assert!(result.contains("Claude: Lead"));
     }
 }

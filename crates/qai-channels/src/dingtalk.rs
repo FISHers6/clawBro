@@ -274,6 +274,7 @@ impl Channel for DingTalkChannel {
                                     timestamp: Utc::now(),
                                     thread_ts: session_webhook,
                                     target_agent,
+                                    source: qai_protocol::MsgSource::Human,
                                 };
                                 let _ = tx.send(inbound).await;
                             }
