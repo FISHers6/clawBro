@@ -16,9 +16,24 @@ use std::sync::Arc;
 use tokio::task::JoinHandle;
 
 use super::bus::{InternalBus, InternalMsg, InternalMsgType};
-use super::heartbeat::{DispatchFn, OrchestratorHeartbeat};
+use super::heartbeat::DispatchFn;
 use super::registry::TaskRegistry;
 use super::session::TeamSession;
+
+// ─── TeamState ────────────────────────────────────────────────────────────────
+
+/// Team Mode 执行状态机
+#[derive(Debug, Clone, PartialEq)]
+pub enum TeamState {
+    /// Lead 正在通过 create_task() 建立任务图
+    Planning,
+    /// Lead 调用了 request_confirmation()，等待用户确认
+    AwaitingConfirm,
+    /// 任务执行中（Heartbeat 运行）
+    Running,
+    /// 所有任务已完成
+    Done,
+}
 
 // ─── TeamPlan ─────────────────────────────────────────────────────────────────
 
@@ -63,6 +78,12 @@ pub struct TeamOrchestrator {
     mcp_server_handle: tokio::sync::Mutex<Option<super::mcp_server::TeamMcpServerHandle>>,
     /// Bound port of the running MCP server (set once after start(), None until then).
     pub mcp_server_port: std::sync::OnceLock<u16>,
+    /// 当前 Team 执行状态（Planning / AwaitingConfirm / Running / Done）
+    pub team_state_inner: std::sync::Mutex<TeamState>,
+    /// Lead Agent 的 IM session key（设置后用于 TeamNotify 路由）
+    pub lead_session_key: std::sync::OnceLock<qai_protocol::SessionKey>,
+    /// Bound port of the Lead MCP server (set after spawn in main.rs).
+    pub lead_mcp_server_port: std::sync::OnceLock<u16>,
 }
 
 impl TeamOrchestrator {
@@ -84,6 +105,9 @@ impl TeamOrchestrator {
             notify_fn: std::sync::OnceLock::new(),
             mcp_server_handle: tokio::sync::Mutex::new(None),
             mcp_server_port: std::sync::OnceLock::new(),
+            team_state_inner: std::sync::Mutex::new(TeamState::Planning),
+            lead_session_key: std::sync::OnceLock::new(),
+            lead_mcp_server_port: std::sync::OnceLock::new(),
         })
     }
 
@@ -99,17 +123,105 @@ impl TeamOrchestrator {
         let _ = self.notify_fn.set(f);
     }
 
+    // ── Team 状态 ──────────────────────────────────────────────────────────────
+
+    /// 获取当前 TeamState（克隆副本）
+    pub fn team_state(&self) -> TeamState {
+        self.team_state_inner.lock().unwrap().clone()
+    }
+
+    /// 设置 Lead 的 IM session key（由 main.rs 在启动时调用）
+    pub fn set_lead_session_key(&self, key: qai_protocol::SessionKey) {
+        let _ = self.lead_session_key.set(key);
+    }
+
+    /// 向 IM 频道发布一条消息（Lead 调用 post_update 时使用）
+    pub fn post_message(&self, message: &str) {
+        if let (Some(f), Some(scope)) = (self.notify_fn.get(), self.scope.get()) {
+            (f)(scope.clone(), message.to_string());
+        }
+    }
+
+    // ── 增量任务注册（供 LeadMcpServer.create_task 调用）────────────────────
+
+    /// 在 Planning 阶段注册单个任务。只能在 state == Planning 或 AwaitingConfirm 时调用。
+    pub fn register_task(&self, task: super::registry::CreateTask) -> Result<String> {
+        let state = self.team_state_inner.lock().unwrap().clone();
+        if !matches!(state, TeamState::Planning | TeamState::AwaitingConfirm) {
+            anyhow::bail!("Cannot register task: team is already {:?}", state);
+        }
+        let id = task.id.clone();
+        self.registry.create_task(task)?;
+        Ok(format!("Task {} registered.", id))
+    }
+
+    // ── 激活执行（供 LeadMcpServer.start_execution 调用）──────────────────
+
+    /// 启动 Heartbeat + SpecialistMcpServer，设置 state → Running。
+    /// 只允许调用一次（OnceLock guard）。
+    pub async fn activate(self: &Arc<Self>) -> Result<String> {
+        // Guard: already running?
+        if self.mcp_server_port.get().is_some() {
+            anyhow::bail!("TeamOrchestrator::activate() called twice");
+        }
+        // Transition state
+        *self.team_state_inner.lock().unwrap() = TeamState::Running;
+
+        // Write TEAM.md if not yet written
+        let manifest = self.session.read_team_md();
+        if manifest.is_empty() {
+            let _ = self.session.write_team_md("Team execution started.");
+        }
+
+        // Sync TASKS.md snapshot
+        self.session.sync_tasks_md(&self.registry)?;
+
+        // Start Heartbeat
+        let heartbeat = std::sync::Arc::new(super::heartbeat::OrchestratorHeartbeat::new(
+            std::sync::Arc::clone(&self.registry),
+            std::sync::Arc::clone(&self.session),
+            std::sync::Arc::clone(&self.dispatch_fn),
+            self.heartbeat_interval,
+        ));
+        let handle = tokio::spawn({
+            let hb = std::sync::Arc::clone(&heartbeat);
+            async move { hb.run().await }
+        });
+        *self.heartbeat_handle.lock().unwrap() = Some(handle);
+
+        // Start SpecialistMcpServer
+        let mcp_srv = super::mcp_server::TeamToolServer::new(
+            std::sync::Arc::clone(&self.registry),
+            std::sync::Arc::clone(self),
+            self.session.team_id.clone(),
+        );
+        let mcp_handle = mcp_srv.spawn().await?;
+        let _ = self.mcp_server_port.set(mcp_handle.port);
+        *self.mcp_server_handle.lock().await = Some(mcp_handle);
+
+        tracing::info!(
+            team_id = %self.session.team_id,
+            mcp_port = ?self.mcp_server_port.get(),
+            "Team activated"
+        );
+        Ok("Team execution started.".to_string())
+    }
+
     // ── 启动 ──────────────────────────────────────────────────────────────────
 
     /// 应用 TeamPlan：写 TEAM.md / TASKS.md，注册任务，启动 Heartbeat，启动 MCP Server
     pub async fn start(self: &Arc<Self>, plan: &TeamPlan) -> Result<()> {
-        // 1. 写 TEAM.md
+        // Guard against double-start
+        if self.mcp_server_port.get().is_some() {
+            anyhow::bail!("TeamOrchestrator::start() called twice for team '{}'", self.session.team_id);
+        }
+
+        // 1. Write TEAM.md
         self.session.write_team_md(&plan.team_manifest)?;
 
-        // 2. 注册所有任务到 TaskRegistry
+        // 2. Register all tasks (sets state check, but start() bypasses it by writing directly to registry)
         for task in &plan.tasks {
-            use super::registry::CreateTask;
-            self.registry.create_task(CreateTask {
+            self.registry.create_task(super::registry::CreateTask {
                 id: task.id.clone(),
                 title: task.title.clone(),
                 assignee_hint: task.assignee.clone(),
@@ -120,37 +232,13 @@ impl TeamOrchestrator {
             })?;
         }
 
-        // 3. 导出初始 TASKS.md 快照
-        self.session.sync_tasks_md(&self.registry)?;
-
-        // 4. 启动 OrchestratorHeartbeat
-        let heartbeat = Arc::new(OrchestratorHeartbeat::new(
-            Arc::clone(&self.registry),
-            Arc::clone(&self.session),
-            Arc::clone(&self.dispatch_fn),
-            self.heartbeat_interval,
-        ));
-        let handle = tokio::spawn({
-            let hb = Arc::clone(&heartbeat);
-            async move { hb.run().await }
-        });
-        *self.heartbeat_handle.lock().unwrap() = Some(handle);
-
-        // 5. 启动 per-team MCP Server
-        let mcp_srv = super::mcp_server::TeamToolServer::new(
-            Arc::clone(&self.registry),
-            Arc::clone(self),
-            self.session.team_id.clone(),
-        );
-        let handle = mcp_srv.spawn().await?;
-        let _ = self.mcp_server_port.set(handle.port);
-        *self.mcp_server_handle.lock().await = Some(handle);
+        // 3. Activate (syncs TASKS.md, starts Heartbeat + MCP)
+        self.activate().await?;
 
         tracing::info!(
             team_id = %self.session.team_id,
             tasks = plan.tasks.len(),
-            mcp_port = ?self.mcp_server_port.get(),
-            "Team started"
+            "Team started via start()"
         );
         Ok(())
     }
@@ -334,6 +422,39 @@ mod tests {
             std::time::Duration::from_secs(3600), // 测试中不实际触发
         );
         (orch, tmp)
+    }
+
+    #[test]
+    fn test_register_task_increments_registry() {
+        let (orch, _tmp) = make_orchestrator();
+        let result = orch.register_task(CreateTask {
+            id: "T001".into(),
+            title: "Write DB schema".into(),
+            ..Default::default()
+        });
+        assert!(result.is_ok());
+        assert!(result.unwrap().contains("T001"));
+        let task = orch.registry.get_task("T001").unwrap().unwrap();
+        assert_eq!(task.title, "Write DB schema");
+    }
+
+    #[test]
+    fn test_team_state_starts_planning() {
+        let (orch, _tmp) = make_orchestrator();
+        assert!(matches!(orch.team_state(), TeamState::Planning));
+    }
+
+    #[tokio::test]
+    async fn test_activate_starts_mcp_and_sets_running() {
+        let (orch, _tmp) = make_orchestrator();
+        orch.register_task(CreateTask {
+            id: "T001".into(),
+            title: "test".into(),
+            ..Default::default()
+        }).unwrap();
+        orch.activate().await.unwrap();
+        assert!(matches!(orch.team_state(), TeamState::Running));
+        assert!(orch.mcp_server_port.get().is_some());
     }
 
     #[test]
