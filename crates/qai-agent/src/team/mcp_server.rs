@@ -58,8 +58,9 @@ pub struct BlockTaskParams {
 /// MCP server that exposes task-management tools to specialist agents.
 #[derive(Clone)]
 pub struct TeamToolServer {
+    #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
-    pub registry: Arc<TaskRegistry>,
+    pub(crate) registry: Arc<TaskRegistry>,
     orchestrator: Arc<TeamOrchestrator>,
     team_id: String,
 }
@@ -83,43 +84,21 @@ impl TeamToolServer {
     /// described in the task specification and all success criteria are met.
     #[tool(description = "Mark a task as complete. Provide the task_id (e.g. T001) and a short completion note.")]
     async fn complete_task(&self, Parameters(p): Parameters<CompleteTaskParams>) -> String {
-        let CompleteTaskParams { task_id, note } = p;
-        // mark_done only succeeds when the task is in claimed state
-        if let Err(e) = self.registry.mark_done(&task_id, &note) {
-            return format!("Error marking task done: {e}");
+        match self.orchestrator.handle_specialist_done(&p.task_id, "mcp-tool", &p.note) {
+            Ok(()) => format!("Task {} marked done.", p.task_id),
+            Err(e) => format!("Error completing task {}: {e}", p.task_id),
         }
-        // trigger milestone checks / event logging via orchestrator
-        if let Err(e) = self
-            .orchestrator
-            .handle_specialist_done(&task_id, "mcp-tool", &note)
-        {
-            tracing::warn!(
-                team_id = %self.team_id,
-                task_id = %task_id,
-                error = %e,
-                "handle_specialist_done failed after mark_done"
-            );
-        }
-        format!("Task {task_id} marked done.")
     }
 
     /// Report that a task is blocked and cannot progress without intervention.
     /// This escalates the issue to the Lead agent via the internal bus.
     #[tool(description = "Report a task as blocked. Provide the task_id and the reason it is blocked.")]
     async fn block_task(&self, Parameters(p): Parameters<BlockTaskParams>) -> String {
-        let BlockTaskParams { task_id, reason } = p;
-        if let Err(e) = self
-            .orchestrator
-            .handle_specialist_blocked(&task_id, "mcp-tool", &reason)
-        {
-            tracing::warn!(
-                team_id = %self.team_id,
-                task_id = %task_id,
-                error = %e,
-                "handle_specialist_blocked failed"
-            );
+        let _ = self.registry.reset_claim(&p.task_id);
+        if let Err(e) = self.orchestrator.handle_specialist_blocked(&p.task_id, "mcp-tool", &p.reason) {
+            tracing::warn!(task_id = %p.task_id, "handle_specialist_blocked error: {e:#}");
         }
-        format!("Task {task_id} reported as blocked: {reason}")
+        format!("Task {} reported as blocked: {}", p.task_id, p.reason)
     }
 }
 

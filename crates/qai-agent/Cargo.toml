@@ -20,7 +20,7 @@ uuid.workspace       = true
 dashmap.workspace    = true
 agent-client-protocol = "0.9"
 tokio-util = { version = "0.7", features = ["compat"] }
-rmcp = { version = "0.8.3", features = ["server", "transport-sse-server"] }
+rmcp = { version = "=0.8.5", features = ["server", "transport-sse-server"] }
 chrono.workspace     = true
 dirs = "5"
 rusqlite = { version = "0.31", features = ["bundled"] }
