@@ -78,6 +78,9 @@ pub struct TeamOrchestrator {
     mcp_server_handle: tokio::sync::Mutex<Option<super::mcp_server::TeamMcpServerHandle>>,
     /// Bound port of the running MCP server (set once after start(), None until then).
     pub mcp_server_port: std::sync::OnceLock<u16>,
+    /// Running Lead MCP server handle (Some after LeadMcpServer is spawned in main.rs).
+    /// Kept alive here instead of leaking via mem::forget.
+    lead_mcp_server_handle: tokio::sync::Mutex<Option<super::lead_mcp_server::LeadMcpServerHandle>>,
     /// 当前 Team 执行状态（Planning / AwaitingConfirm / Running / Done）
     pub team_state_inner: std::sync::Mutex<TeamState>,
     /// Lead Agent 的 IM session key（设置后用于 TeamNotify 路由）
@@ -105,6 +108,7 @@ impl TeamOrchestrator {
             notify_fn: std::sync::OnceLock::new(),
             mcp_server_handle: tokio::sync::Mutex::new(None),
             mcp_server_port: std::sync::OnceLock::new(),
+            lead_mcp_server_handle: tokio::sync::Mutex::new(None),
             team_state_inner: std::sync::Mutex::new(TeamState::Planning),
             lead_session_key: std::sync::OnceLock::new(),
             lead_mcp_server_port: std::sync::OnceLock::new(),
@@ -133,6 +137,12 @@ impl TeamOrchestrator {
     /// 设置 Lead 的 IM session key（由 main.rs 在启动时调用）
     pub fn set_lead_session_key(&self, key: qai_protocol::SessionKey) {
         let _ = self.lead_session_key.set(key);
+    }
+
+    /// 存储 LeadMcpServer 句柄，防止其被 drop（替代 mem::forget）。
+    /// 由 main.rs 在 LeadMcpServer 启动成功后调用。
+    pub async fn store_lead_mcp_handle(&self, handle: super::lead_mcp_server::LeadMcpServerHandle) {
+        *self.lead_mcp_server_handle.lock().await = Some(handle);
     }
 
     /// 向 IM 频道发布一条消息（Lead 调用 post_update 时使用）

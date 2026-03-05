@@ -494,11 +494,12 @@ async fn main() -> Result<()> {
                 Ok(handle) => {
                     let _ = team_orch_for_lead.lead_mcp_server_port.set(handle.port);
                     tracing::info!(port = handle.port, "LeadMcpServer started");
-                    // Server runs until process exit — keep alive by leaking handle
-                    std::mem::forget(handle);
+                    team_orch_for_lead.store_lead_mcp_handle(handle).await;
                 }
                 Err(e) => {
-                    tracing::error!("Failed to start LeadMcpServer: {e}");
+                    tracing::error!(
+                        "Failed to start LeadMcpServer: {e}. Lead Agent will have no MCP tools available."
+                    );
                 }
             }
         }
