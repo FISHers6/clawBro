@@ -170,14 +170,43 @@ impl TaskRegistry {
         Ok(rows == 1)
     }
 
-    /// 标记任务完成
+    /// 标记任务完成（仅允许从 claimed 状态转换，防止误完成）
     pub fn mark_done(&self, task_id: &str, note: &str) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE tasks SET status = 'done', completion_note = ?1, done_at = ?2 WHERE id = ?3",
+        let rows = conn.execute(
+            "UPDATE tasks SET status = 'done', completion_note = ?1, done_at = ?2 \
+             WHERE id = ?3 AND status LIKE 'claimed%'",
             params![note, now, task_id],
         )?;
+        if rows == 0 {
+            tracing::warn!(task_id = %task_id, "mark_done: task not in claimed state, ignoring");
+        }
+        Ok(())
+    }
+
+    /// Return all tasks ordered by creation time (for get_task_status snapshot).
+    pub fn all_tasks(&self) -> Result<Vec<Task>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, title, status, deps_json, assignee_hint, retry_count,
+                    timeout_secs, spec, success_criteria, completion_note,
+                    created_at, done_at
+             FROM tasks ORDER BY created_at ASC",
+        )?;
+        Self::rows_to_tasks(&mut stmt)
+    }
+
+    /// Re-assign a task to a new agent. Only valid when status = 'pending'.
+    pub fn reassign_task(&self, task_id: &str, new_assignee: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let rows_changed = conn.execute(
+            "UPDATE tasks SET assignee_hint = ?1 WHERE id = ?2 AND status = 'pending'",
+            rusqlite::params![new_assignee, task_id],
+        )?;
+        if rows_changed == 0 {
+            anyhow::bail!("Task {} not found or not in pending state", task_id);
+        }
         Ok(())
     }
 
@@ -196,7 +225,7 @@ impl TaskRegistry {
     pub fn reset_claim(&self, task_id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE tasks SET status = 'pending' WHERE id = ?1",
+            "UPDATE tasks SET status = 'pending' WHERE id = ?1 AND status LIKE 'claimed%'",
             params![task_id],
         )?;
         Ok(())
@@ -314,6 +343,35 @@ impl TaskRegistry {
         });
 
         Ok(lines.join("\n"))
+    }
+
+    /// 检查是否所有任务都已完成
+    ///
+    /// 若任务表为空（尚未注册任何任务），返回 false（防止误广播 all_done 里程碑）。
+    pub fn all_done(&self) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let total: i64 =
+            conn.query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))?;
+        if total == 0 {
+            return Ok(false);
+        }
+        let not_done: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM tasks WHERE status != 'done'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(not_done == 0)
+    }
+
+    /// 获取所有任务（用于 TeamOrchestrator 生成摘要）
+    pub fn list_all(&self) -> Result<Vec<Task>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, title, status, deps_json, assignee_hint, retry_count,
+                    timeout_secs, spec, success_criteria, completion_note, created_at, done_at
+             FROM tasks ORDER BY created_at",
+        )?;
+        Self::rows_to_tasks(&mut stmt)
     }
 
     /// 查找所有被 given_id 阻塞的任务 ID
@@ -531,5 +589,55 @@ mod tests {
 
         let blocked = registry.tasks_blocked_by("T001");
         assert!(blocked.contains(&"T002".to_string()));
+    }
+
+    #[test]
+    fn test_all_done_empty_table_returns_false() {
+        // 空表不应误触发 all_done 里程碑
+        let registry = TaskRegistry::new_in_memory().unwrap();
+        assert!(!registry.all_done().unwrap());
+    }
+
+    #[test]
+    fn test_all_tasks_returns_all() {
+        let registry = TaskRegistry::new_in_memory().unwrap();
+        registry
+            .create_task(CreateTask {
+                id: "T001".into(),
+                title: "A".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        registry
+            .create_task(CreateTask {
+                id: "T002".into(),
+                title: "B".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let tasks = registry.all_tasks().unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].id, "T001");
+        assert_eq!(tasks[1].id, "T002");
+    }
+
+    #[test]
+    fn test_reassign_task_pending_only() {
+        let registry = TaskRegistry::new_in_memory().unwrap();
+        registry
+            .create_task(CreateTask {
+                id: "T001".into(),
+                title: "A".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        // Should succeed for pending task
+        registry.reassign_task("T001", "claude").unwrap();
+        let task = registry.get_task("T001").unwrap().unwrap();
+        assert_eq!(task.assignee_hint.as_deref(), Some("claude"));
+        // Should fail for claimed task
+        registry.try_claim("T001", "codex").unwrap();
+        let result = registry.reassign_task("T001", "gemini");
+        assert!(result.is_err());
     }
 }
