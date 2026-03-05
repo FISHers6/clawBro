@@ -1,0 +1,535 @@
+//! TaskRegistry — SQLite 任务状态机
+//!
+//! SQLite 是唯一真相源（single source of truth）。
+//! TASKS.md 是定期从 SQLite 导出的只读快照（由 TeamSession::write_tasks_md 调用）。
+//!
+//! 状态机：Pending → Claimed → Done / Failed
+//!   - Pending  → Claimed  : try_claim()（乐观锁，原子 UPDATE）
+//!   - Claimed  → Pending  : reset_claim()（超时后由 Heartbeat 重置）
+//!   - Claimed  → Done     : mark_done()
+//!   - Claimed  → Failed   : mark_failed()（retry_count >= 3）
+
+use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+use rusqlite::{params, Connection};
+use std::sync::{Arc, Mutex};
+
+// ─── 类型 ───────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TaskStatus {
+    Pending,
+    Claimed { agent: String, at: DateTime<Utc> },
+    Done,
+    Failed(String),
+    Retrying(u32),
+}
+
+#[derive(Debug, Clone)]
+pub struct Task {
+    pub id: String,
+    pub title: String,
+    /// 编码为字符串："pending" | "claimed:{agent}:{iso8601}" | "done" | "failed:{msg}" | "retrying:{n}"
+    pub status_raw: String,
+    /// JSON 数组 ["T001", "T002"]
+    pub deps_json: String,
+    pub assignee_hint: Option<String>,
+    pub retry_count: i32,
+    pub timeout_secs: i32,
+    pub spec: Option<String>,
+    pub success_criteria: Option<String>,
+    pub completion_note: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub done_at: Option<DateTime<Utc>>,
+}
+
+impl Task {
+    pub fn status_parsed(&self) -> TaskStatus {
+        let s = &self.status_raw;
+        if s == "pending" {
+            TaskStatus::Pending
+        } else if s == "done" {
+            TaskStatus::Done
+        } else if let Some(rest) = s.strip_prefix("claimed:") {
+            // "claimed:codex:2026-03-05T10:00:00Z"
+            let mut parts = rest.splitn(2, ':');
+            let agent = parts.next().unwrap_or("unknown").to_string();
+            let at = parts
+                .next()
+                .and_then(|ts| ts.parse::<DateTime<Utc>>().ok())
+                .unwrap_or_else(Utc::now);
+            TaskStatus::Claimed { agent, at }
+        } else if let Some(msg) = s.strip_prefix("failed:") {
+            TaskStatus::Failed(msg.to_string())
+        } else if let Some(n) = s.strip_prefix("retrying:") {
+            TaskStatus::Retrying(n.parse().unwrap_or(0))
+        } else {
+            TaskStatus::Pending
+        }
+    }
+
+    pub fn deps(&self) -> Vec<String> {
+        serde_json::from_str::<Vec<String>>(&self.deps_json).unwrap_or_default()
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct CreateTask {
+    pub id: String,
+    pub title: String,
+    pub assignee_hint: Option<String>,
+    pub deps: Vec<String>,
+    pub timeout_secs: i32,
+    pub spec: Option<String>,
+    pub success_criteria: Option<String>,
+}
+
+// ─── TaskRegistry ────────────────────────────────────────────────────────────
+
+pub struct TaskRegistry {
+    conn: Arc<Mutex<Connection>>,
+}
+
+impl TaskRegistry {
+    /// 打开（或创建）指定路径的 SQLite 数据库
+    pub fn new(db_path: &str) -> Result<Self> {
+        let conn = Connection::open(db_path)
+            .with_context(|| format!("Failed to open task db: {}", db_path))?;
+        let registry = Self {
+            conn: Arc::new(Mutex::new(conn)),
+        };
+        registry.migrate()?;
+        Ok(registry)
+    }
+
+    /// 内存数据库（用于测试）
+    pub fn new_in_memory() -> Result<Self> {
+        let conn = Connection::open_in_memory().context("Failed to open in-memory task db")?;
+        let registry = Self {
+            conn: Arc::new(Mutex::new(conn)),
+        };
+        registry.migrate()?;
+        Ok(registry)
+    }
+
+    fn migrate(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS tasks (
+                id               TEXT PRIMARY KEY,
+                title            TEXT NOT NULL,
+                status           TEXT NOT NULL DEFAULT 'pending',
+                deps_json        TEXT NOT NULL DEFAULT '[]',
+                assignee_hint    TEXT,
+                retry_count      INTEGER NOT NULL DEFAULT 0,
+                timeout_secs     INTEGER NOT NULL DEFAULT 1800,
+                spec             TEXT,
+                success_criteria TEXT,
+                completion_note  TEXT,
+                created_at       TEXT NOT NULL,
+                done_at          TEXT
+            );",
+        )
+        .context("task table migration failed")
+    }
+
+    /// 创建任务（INSERT OR IGNORE，幂等）
+    pub fn create_task(&self, input: CreateTask) -> Result<String> {
+        let deps_json = serde_json::to_string(&input.deps)?;
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO tasks
+             (id, title, status, deps_json, assignee_hint, timeout_secs, spec, success_criteria, created_at)
+             VALUES (?1, ?2, 'pending', ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                input.id,
+                input.title,
+                deps_json,
+                input.assignee_hint,
+                input.timeout_secs,
+                input.spec,
+                input.success_criteria,
+                now,
+            ],
+        )?;
+        Ok(input.id)
+    }
+
+    /// 原子认领任务（乐观锁：只有 status='pending' 时才能认领）
+    /// 返回 true 表示认领成功，false 表示已被他人认领
+    pub fn try_claim(&self, task_id: &str, agent: &str) -> Result<bool> {
+        let now = Utc::now().to_rfc3339();
+        let status = format!("claimed:{}:{}", agent, now);
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "UPDATE tasks SET status = ?1, retry_count = retry_count + 1
+             WHERE id = ?2 AND status = 'pending'",
+            params![status, task_id],
+        )?;
+        Ok(rows == 1)
+    }
+
+    /// 标记任务完成
+    pub fn mark_done(&self, task_id: &str, note: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE tasks SET status = 'done', completion_note = ?1, done_at = ?2 WHERE id = ?3",
+            params![note, now, task_id],
+        )?;
+        Ok(())
+    }
+
+    /// 标记任务失败
+    pub fn mark_failed(&self, task_id: &str, error: &str) -> Result<()> {
+        let msg = format!("failed:{}", error);
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE tasks SET status = ?1 WHERE id = ?2",
+            params![msg, task_id],
+        )?;
+        Ok(())
+    }
+
+    /// 重置超时任务（Pending，retry_count 已在 try_claim 时递增）
+    pub fn reset_claim(&self, task_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE tasks SET status = 'pending' WHERE id = ?1",
+            params![task_id],
+        )?;
+        Ok(())
+    }
+
+    /// 查找所有 Pending 且依赖全部完成的任务（可派发的任务）
+    pub fn find_ready_tasks(&self) -> Result<Vec<Task>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, title, status, deps_json, assignee_hint, retry_count,
+                    timeout_secs, spec, success_criteria, completion_note, created_at, done_at
+             FROM tasks WHERE status = 'pending'",
+        )?;
+        let all_pending = Self::rows_to_tasks(&mut stmt)?;
+
+        // 获取所有已完成任务 ID
+        let mut done_stmt =
+            conn.prepare("SELECT id FROM tasks WHERE status = 'done'")?;
+        let done_ids: Vec<String> = done_stmt
+            .query_map([], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // 过滤：deps 都在 done_ids 中
+        let ready = all_pending
+            .into_iter()
+            .filter(|t| {
+                let deps = t.deps();
+                deps.is_empty() || deps.iter().all(|d| done_ids.contains(d))
+            })
+            .collect();
+
+        Ok(ready)
+    }
+
+    /// 查找超时的 Claimed 任务
+    pub fn find_stale_claimed(&self) -> Result<Vec<Task>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, title, status, deps_json, assignee_hint, retry_count,
+                    timeout_secs, spec, success_criteria, completion_note, created_at, done_at
+             FROM tasks WHERE status LIKE 'claimed:%'",
+        )?;
+        let claimed = Self::rows_to_tasks(&mut stmt)?;
+
+        let now = Utc::now();
+        let stale = claimed
+            .into_iter()
+            .filter(|t| {
+                if let TaskStatus::Claimed { at, .. } = t.status_parsed() {
+                    let elapsed = now.signed_duration_since(at).num_seconds();
+                    elapsed > t.timeout_secs as i64
+                } else {
+                    false
+                }
+            })
+            .collect();
+
+        Ok(stale)
+    }
+
+    /// 获取单个任务
+    pub fn get_task(&self, task_id: &str) -> Result<Option<Task>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, title, status, deps_json, assignee_hint, retry_count,
+                    timeout_secs, spec, success_criteria, completion_note, created_at, done_at
+             FROM tasks WHERE id = ?1",
+        )?;
+        let mut tasks = Self::rows_to_tasks_with_params(&mut stmt, params![task_id])?;
+        Ok(tasks.pop())
+    }
+
+    /// 导出 TASKS.md 快照（人类可读，Specialist 通过 task_reminder 获取任务，此文件为调试用）
+    pub fn export_tasks_md(&self) -> Result<String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, title, status, assignee_hint, retry_count, done_at
+             FROM tasks ORDER BY created_at",
+        )?;
+
+        let mut lines = vec!["# Team Tasks\n".to_string()];
+        stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, i32>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .for_each(|(id, title, status, assignee, retries, done_at)| {
+            let icon = if status == "done" {
+                "✅"
+            } else if status.starts_with("failed") {
+                "❌"
+            } else if status.starts_with("claimed") {
+                "🔄"
+            } else {
+                "⏳"
+            };
+            let assignee_str = assignee.map(|a| format!(" [@{}]", a)).unwrap_or_default();
+            let retry_str = if retries > 0 {
+                format!(" (retry: {})", retries)
+            } else {
+                String::new()
+            };
+            let done_str = done_at.map(|d| format!(" ✓ {}", d)).unwrap_or_default();
+            lines.push(format!(
+                "- {} **{}** — {}{}{}{}",
+                icon, id, title, assignee_str, retry_str, done_str
+            ));
+        });
+
+        Ok(lines.join("\n"))
+    }
+
+    /// 查找所有被 given_id 阻塞的任务 ID
+    pub fn tasks_blocked_by(&self, given_id: &str) -> Vec<String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare("SELECT id, deps_json FROM tasks WHERE status = 'pending'") {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|r| r.ok())
+        .filter_map(|(id, deps_json)| {
+            let deps: Vec<String> = serde_json::from_str(&deps_json).unwrap_or_default();
+            if deps.contains(&given_id.to_string()) {
+                Some(id)
+            } else {
+                None
+            }
+        })
+        .collect()
+    }
+
+    // ── 内部辅助 ───────────────────────────────────────────────────────────
+
+    fn rows_to_tasks(stmt: &mut rusqlite::Statement<'_>) -> Result<Vec<Task>> {
+        Self::rows_to_tasks_with_params(stmt, [])
+    }
+
+    fn rows_to_tasks_with_params(
+        stmt: &mut rusqlite::Statement<'_>,
+        params: impl rusqlite::Params,
+    ) -> Result<Vec<Task>> {
+        let tasks = stmt
+            .query_map(params, |row| {
+                let created_str: String = row.get(10)?;
+                let done_str: Option<String> = row.get(11)?;
+                let created_at = created_str
+                    .parse::<DateTime<Utc>>()
+                    .unwrap_or_else(|_| Utc::now());
+                let done_at = done_str.and_then(|s| s.parse::<DateTime<Utc>>().ok());
+                Ok(Task {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    status_raw: row.get(2)?,
+                    deps_json: row.get(3)?,
+                    assignee_hint: row.get(4)?,
+                    retry_count: row.get(5)?,
+                    timeout_secs: row.get(6)?,
+                    spec: row.get(7)?,
+                    success_criteria: row.get(8)?,
+                    completion_note: row.get(9)?,
+                    created_at,
+                    done_at,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(tasks)
+    }
+}
+
+// ─── 测试 ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_create_and_claim_task() {
+        let registry = TaskRegistry::new_in_memory().unwrap();
+
+        let task_id = registry
+            .create_task(CreateTask {
+                id: "T001".to_string(),
+                title: "Define AuthToken struct".to_string(),
+                assignee_hint: None,
+                deps: vec![],
+                timeout_secs: 1800,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(task_id, "T001");
+
+        // 认领成功
+        let claimed = registry.try_claim("T001", "codex").unwrap();
+        assert!(claimed, "should successfully claim T001");
+
+        // 重复认领失败（乐观锁）
+        let claimed2 = registry.try_claim("T001", "claude").unwrap();
+        assert!(!claimed2, "T001 already claimed, should fail");
+
+        // 完成任务
+        registry.mark_done("T001", "created src/auth/jwt.rs").unwrap();
+        let task = registry.get_task("T001").unwrap().unwrap();
+        assert!(matches!(task.status_parsed(), TaskStatus::Done));
+    }
+
+    #[test]
+    fn test_idempotent_create() {
+        let registry = TaskRegistry::new_in_memory().unwrap();
+        registry
+            .create_task(CreateTask {
+                id: "T001".into(),
+                title: "first".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        // 重复创建不报错（INSERT OR IGNORE）
+        let result = registry.create_task(CreateTask {
+            id: "T001".into(),
+            title: "second".into(),
+            ..Default::default()
+        });
+        assert!(result.is_ok());
+        // 原始 title 保留
+        let task = registry.get_task("T001").unwrap().unwrap();
+        assert_eq!(task.title, "first");
+    }
+
+    #[test]
+    fn test_deps_gate() {
+        let registry = TaskRegistry::new_in_memory().unwrap();
+        registry
+            .create_task(CreateTask {
+                id: "T001".into(),
+                title: "base".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        registry
+            .create_task(CreateTask {
+                id: "T002".into(),
+                title: "dependent".into(),
+                deps: vec!["T001".to_string()],
+                ..Default::default()
+            })
+            .unwrap();
+
+        // T001 未完成，T002 不可认领
+        let ready = registry.find_ready_tasks().unwrap();
+        assert!(!ready.iter().any(|t| t.id == "T002"), "T002 blocked by T001");
+        assert!(ready.iter().any(|t| t.id == "T001"), "T001 should be ready");
+
+        // T001 完成后，T002 可认领
+        registry.try_claim("T001", "claude").unwrap();
+        registry.mark_done("T001", "done").unwrap();
+        let ready2 = registry.find_ready_tasks().unwrap();
+        assert!(ready2.iter().any(|t| t.id == "T002"), "T002 now unblocked");
+    }
+
+    #[test]
+    fn test_stale_claimed_detection() {
+        let registry = TaskRegistry::new_in_memory().unwrap();
+        registry
+            .create_task(CreateTask {
+                id: "T001".into(),
+                title: "stale test".into(),
+                timeout_secs: -1, // 负数 → 立即超时
+                ..Default::default()
+            })
+            .unwrap();
+        registry.try_claim("T001", "codex").unwrap();
+
+        let stale = registry.find_stale_claimed().unwrap();
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].id, "T001");
+
+        registry.reset_claim("T001").unwrap();
+        let task = registry.get_task("T001").unwrap().unwrap();
+        assert!(matches!(task.status_parsed(), TaskStatus::Pending));
+    }
+
+    #[test]
+    fn test_export_tasks_md() {
+        let registry = TaskRegistry::new_in_memory().unwrap();
+        registry
+            .create_task(CreateTask {
+                id: "T001".into(),
+                title: "Setup DB".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        registry.try_claim("T001", "codex").unwrap();
+        registry.mark_done("T001", "done").unwrap();
+
+        let md = registry.export_tasks_md().unwrap();
+        assert!(md.contains("T001"));
+        assert!(md.contains("Setup DB"));
+        assert!(md.contains("✅"));
+    }
+
+    #[test]
+    fn test_tasks_blocked_by() {
+        let registry = TaskRegistry::new_in_memory().unwrap();
+        registry
+            .create_task(CreateTask {
+                id: "T001".into(),
+                title: "base".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        registry
+            .create_task(CreateTask {
+                id: "T002".into(),
+                title: "downstream".into(),
+                deps: vec!["T001".to_string()],
+                ..Default::default()
+            })
+            .unwrap();
+
+        let blocked = registry.tasks_blocked_by("T001");
+        assert!(blocked.contains(&"T002".to_string()));
+    }
+}

@@ -1,0 +1,253 @@
+//! TeamSession — Team Mode 的目录结构与工具函数
+//!
+//! 目录布局：
+//!   ~/.quickai/team-sessions/{group_hash}-{team_id}/
+//!     TEAM.md        — 团队职责宣言（Lead 在 /team start 时写入）
+//!     CONTEXT.md     — 任务背景（Lead 维护，注入 Specialist 的 shared_memory）
+//!     TASKS.md       — 任务快照（由 TaskRegistry::export_tasks_md 导出，只读）
+//!     events.jsonl   — 事件日志（调试用）
+
+use anyhow::{Context, Result};
+use qai_protocol::SessionKey;
+use std::path::PathBuf;
+
+use super::registry::{Task, TaskRegistry};
+
+pub struct TeamSession {
+    pub team_id: String,
+    pub dir: PathBuf,
+}
+
+impl TeamSession {
+    /// 创建 TeamSession（自动创建目录）
+    ///
+    /// `group_scope` — 群组 SessionKey 的 scope 字段（如 "group:oc_xxx"）
+    /// `team_id`     — 本次团队协作的唯一 ID（UUID）
+    pub fn new(group_scope: &str, team_id: &str) -> Result<Self> {
+        // 将 group_scope 中的特殊字符替换为连字符，用于目录名
+        let safe_scope: String = group_scope
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
+            .collect();
+
+        let base = dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join(".quickai")
+            .join("team-sessions")
+            .join(format!("{}-{}", safe_scope, team_id));
+
+        std::fs::create_dir_all(&base)
+            .with_context(|| format!("Failed to create team session dir: {}", base.display()))?;
+
+        Ok(Self {
+            team_id: team_id.to_string(),
+            dir: base,
+        })
+    }
+
+    /// 从已有路径恢复 TeamSession（不创建目录）
+    pub fn from_dir(team_id: &str, dir: PathBuf) -> Self {
+        Self {
+            team_id: team_id.to_string(),
+            dir,
+        }
+    }
+
+    // ── 派生 SessionKey ──────────────────────────────────────────────────────
+
+    /// 生成 Specialist 的隔离 SessionKey
+    ///
+    /// 专才使用独立的 SessionKey，与主线群组 key 不同：
+    ///   - 独立的 LaneQueue → 并行执行（不堵塞主线）
+    ///   - 独立的 session history → 不包含群组噪音
+    ///   - workspace_dir 指向 team-session 目录 → 读 CONTEXT.md/TASKS.md
+    pub fn specialist_session_key(&self, agent_name: &str) -> SessionKey {
+        SessionKey::new("team", format!("{}:{}", self.team_id, agent_name))
+    }
+
+    // ── 读写文件 ─────────────────────────────────────────────────────────────
+
+    pub fn write_team_md(&self, content: &str) -> Result<()> {
+        self.write_file("TEAM.md", content)
+    }
+
+    pub fn write_context_md(&self, content: &str) -> Result<()> {
+        self.write_file("CONTEXT.md", content)
+    }
+
+    /// 从 TaskRegistry 导出任务快照到 TASKS.md
+    pub fn sync_tasks_md(&self, registry: &TaskRegistry) -> Result<()> {
+        let md = registry.export_tasks_md()?;
+        self.write_file("TASKS.md", &md)
+    }
+
+    pub fn read_team_md(&self) -> String {
+        self.read_file("TEAM.md")
+    }
+
+    /// 读取 CONTEXT.md（注入 Specialist 的 shared_memory）
+    pub fn read_context_md(&self) -> String {
+        self.read_file("CONTEXT.md")
+    }
+
+    pub fn read_tasks_md(&self) -> String {
+        self.read_file("TASKS.md")
+    }
+
+    /// 追加事件日志（JSONL 格式，调试用）
+    pub fn append_event(&self, event: &str) -> Result<()> {
+        use std::io::Write;
+        let path = self.dir.join("events.jsonl");
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        writeln!(file, "{}", event)?;
+        Ok(())
+    }
+
+    // ── task_reminder 构建 ───────────────────────────────────────────────────
+
+    /// 构建注入 Specialist system prompt Layer 0 的任务提醒文本
+    ///
+    /// 对齐 hiClaw spec.md 格式：完整任务说明 + 成功标准 + 必须遵守的协议。
+    pub fn build_task_reminder(&self, task: &Task, registry: &TaskRegistry) -> String {
+        let blocking = registry.tasks_blocked_by(&task.id);
+        let deps = task.deps();
+
+        let deps_str = if deps.is_empty() {
+            "无".to_string()
+        } else {
+            deps.join(", ")
+        };
+        let blocking_str = if blocking.is_empty() {
+            "无".to_string()
+        } else {
+            blocking.join(", ")
+        };
+
+        format!(
+            "══════ 当前任务（自动注入，最高优先级）══════\n\
+             任务ID: {id}\n\
+             标题: {title}\n\
+             详细说明: {spec}\n\
+             依赖（已完成）: {deps}\n\
+             被阻塞的下游任务: {blocking}\n\
+             \n\
+             ── 成功标准 ──\n\
+             {criteria}\n\
+             \n\
+             ── 必须遵守 ──\n\
+             1. 完成后在回复**最后一行**加 [DONE: {id}] 标记，否则系统不会更新任务状态\n\
+             2. 如遇阻塞，在回复最后一行加 [BLOCKED: <原因>] 标记\n\
+             3. 重要产出（文件路径、关键发现）写在回复正文\n\
+             ══════════════════════════════════════════",
+            id = task.id,
+            title = task.title,
+            spec = task.spec.as_deref().unwrap_or("（无详细说明）"),
+            deps = deps_str,
+            blocking = blocking_str,
+            criteria = task
+                .success_criteria
+                .as_deref()
+                .unwrap_or("完成任务说明中描述的工作"),
+        )
+    }
+
+    // ── 归档 ────────────────────────────────────────────────────────────────
+
+    /// 归档 team session（移动到 archived/ 子目录）
+    pub fn archive(&self) -> Result<()> {
+        let archived = self
+            .dir
+            .parent()
+            .unwrap_or(&self.dir)
+            .join("archived")
+            .join(self.dir.file_name().unwrap_or_default());
+        std::fs::create_dir_all(archived.parent().unwrap())?;
+        std::fs::rename(&self.dir, &archived)?;
+        Ok(())
+    }
+
+    // ── 内部辅助 ─────────────────────────────────────────────────────────────
+
+    fn write_file(&self, name: &str, content: &str) -> Result<()> {
+        let path = self.dir.join(name);
+        std::fs::write(&path, content)
+            .with_context(|| format!("Failed to write {}", path.display()))
+    }
+
+    fn read_file(&self, name: &str) -> String {
+        std::fs::read_to_string(self.dir.join(name)).unwrap_or_default()
+    }
+}
+
+// ─── 测试 ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::team::registry::{CreateTask, TaskRegistry};
+    use tempfile::tempdir;
+
+    fn make_session() -> (TeamSession, tempfile::TempDir) {
+        let tmp = tempdir().unwrap();
+        let session = TeamSession::from_dir("team-001", tmp.path().to_path_buf());
+        (session, tmp)
+    }
+
+    #[test]
+    fn test_specialist_session_key_format() {
+        let (session, _tmp) = make_session();
+        let key = session.specialist_session_key("codex");
+        assert_eq!(key.channel, "team");
+        assert_eq!(key.scope, "team-001:codex");
+    }
+
+    #[test]
+    fn test_write_and_read_files() {
+        let (session, _tmp) = make_session();
+        session.write_team_md("Claude: Lead\nCodex: Backend").unwrap();
+        session.write_context_md("Task context here").unwrap();
+
+        assert_eq!(session.read_team_md(), "Claude: Lead\nCodex: Backend");
+        assert_eq!(session.read_context_md(), "Task context here");
+    }
+
+    #[test]
+    fn test_sync_tasks_md() {
+        let (session, _tmp) = make_session();
+        let registry = TaskRegistry::new_in_memory().unwrap();
+        registry
+            .create_task(CreateTask {
+                id: "T001".into(),
+                title: "Setup project".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        session.sync_tasks_md(&registry).unwrap();
+        let md = session.read_tasks_md();
+        assert!(md.contains("T001"));
+        assert!(md.contains("Setup project"));
+    }
+
+    #[test]
+    fn test_build_task_reminder_contains_done_marker() {
+        let (session, _tmp) = make_session();
+        let registry = TaskRegistry::new_in_memory().unwrap();
+        registry
+            .create_task(CreateTask {
+                id: "T003".into(),
+                title: "Implement JWT".into(),
+                success_criteria: Some("JWT token is generated and verified".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let task = registry.get_task("T003").unwrap().unwrap();
+        let reminder = session.build_task_reminder(&task, &registry);
+
+        assert!(reminder.contains("[DONE: T003]"), "must include DONE marker");
+        assert!(reminder.contains("Implement JWT"));
+        assert!(reminder.contains("JWT token is generated"));
+    }
+}

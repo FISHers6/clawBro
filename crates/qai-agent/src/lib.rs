@@ -1,4 +1,5 @@
 pub mod acp_engine;
+pub mod team;
 pub mod dedup;
 pub mod memory;
 pub mod output_sink;

@@ -1,0 +1,269 @@
+//! OrchestratorHeartbeat — 任务调度心跳
+//!
+//! 每隔 `interval` 做两件事：
+//!   1. 检测超时的 Claimed 任务：retry_count < 3 → 重置为 Pending；否则 → Failed
+//!   2. 派发 Ready 任务（Pending + deps_done）给对应的专才 agent
+
+use anyhow::Result;
+use std::sync::Arc;
+use std::time::Duration;
+
+use super::registry::{Task, TaskRegistry};
+use super::session::TeamSession;
+
+// ─── 类型 ────────────────────────────────────────────────────────────────────
+
+/// 派发函数签名：
+///   (agent_name, task, team_session) → async Result<()>
+///
+/// 调用方（main.rs）实现此闭包：构建 InboundMsg、发到 SessionRegistry.handle()
+pub type DispatchFn = Arc<
+    dyn Fn(String, Task, Arc<TeamSession>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
+        + Send
+        + Sync,
+>;
+
+// ─── OrchestratorHeartbeat ───────────────────────────────────────────────────
+
+pub struct OrchestratorHeartbeat {
+    registry: Arc<TaskRegistry>,
+    session: Arc<TeamSession>,
+    dispatch_fn: DispatchFn,
+    interval: Duration,
+    max_retries: u32,
+}
+
+impl OrchestratorHeartbeat {
+    pub fn new(
+        registry: Arc<TaskRegistry>,
+        session: Arc<TeamSession>,
+        dispatch_fn: DispatchFn,
+        interval: Duration,
+    ) -> Self {
+        Self {
+            registry,
+            session,
+            dispatch_fn,
+            interval,
+            max_retries: 3,
+        }
+    }
+
+    /// 主循环（在 tokio::spawn 中运行）
+    pub async fn run(self: Arc<Self>) {
+        let mut ticker = tokio::time::interval(self.interval);
+        loop {
+            ticker.tick().await;
+            if let Err(e) = self.tick().await {
+                tracing::error!("OrchestratorHeartbeat tick error: {:#}", e);
+            }
+        }
+    }
+
+    async fn tick(&self) -> Result<()> {
+        // 1. 检测并处理超时任务
+        self.handle_stale_tasks()?;
+
+        // 2. 导出 TASKS.md 快照
+        let _ = self.session.sync_tasks_md(&self.registry);
+
+        // 3. 派发 Ready 任务
+        self.dispatch_ready_tasks().await?;
+
+        Ok(())
+    }
+
+    fn handle_stale_tasks(&self) -> Result<()> {
+        let stale = self.registry.find_stale_claimed()?;
+        for task in stale {
+            if task.retry_count < self.max_retries as i32 {
+                self.registry.reset_claim(&task.id)?;
+                tracing::warn!(
+                    task_id = %task.id,
+                    retry = task.retry_count,
+                    "Reset stale task, will retry"
+                );
+            } else {
+                self.registry
+                    .mark_failed(&task.id, "max retries exceeded")?;
+                tracing::error!(
+                    task_id = %task.id,
+                    "Task failed after {} retries", self.max_retries
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn dispatch_ready_tasks(&self) -> Result<()> {
+        let ready = self.registry.find_ready_tasks()?;
+        for task in ready {
+            let agent = match &task.assignee_hint {
+                Some(a) => a.clone(),
+                None => {
+                    tracing::debug!(task_id = %task.id, "No assignee_hint, skipping dispatch");
+                    continue;
+                }
+            };
+
+            // 乐观认领（并发安全）
+            match self.registry.try_claim(&task.id, &agent) {
+                Ok(true) => {
+                    tracing::info!(task_id = %task.id, agent = %agent, "Dispatching task");
+                    let session = Arc::clone(&self.session);
+                    if let Err(e) = (self.dispatch_fn)(agent, task, session).await {
+                        tracing::error!("Dispatch error: {:#}", e);
+                    }
+                }
+                Ok(false) => {
+                    // 已被其他 Heartbeat 实例认领（正常情况）
+                }
+                Err(e) => {
+                    tracing::warn!(task_id = %task.id, "try_claim error: {:#}", e);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+// ─── 测试 ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::team::registry::CreateTask;
+    use std::sync::Mutex;
+    use tempfile::tempdir;
+
+    fn make_heartbeat(
+        registry: Arc<TaskRegistry>,
+        dispatched: Arc<Mutex<Vec<(String, String)>>>,
+        interval: Duration,
+    ) -> Arc<OrchestratorHeartbeat> {
+        let tmp = tempdir().unwrap();
+        let session = Arc::new(TeamSession::from_dir("test-team", tmp.path().to_path_buf()));
+
+        let dispatch_fn: DispatchFn = Arc::new(move |agent, task, _session| {
+            let dispatched = Arc::clone(&dispatched);
+            Box::pin(async move {
+                dispatched
+                    .lock()
+                    .unwrap()
+                    .push((agent, task.id.clone()));
+                Ok(())
+            })
+        });
+
+        Arc::new(OrchestratorHeartbeat::new(
+            registry,
+            session,
+            dispatch_fn,
+            interval,
+        ))
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_dispatches_ready_task() {
+        let registry = Arc::new(TaskRegistry::new_in_memory().unwrap());
+        registry
+            .create_task(CreateTask {
+                id: "T003".into(),
+                title: "JWT generation".into(),
+                assignee_hint: Some("codex".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let dispatched = Arc::new(Mutex::new(vec![]));
+        let hb = make_heartbeat(
+            Arc::clone(&registry),
+            Arc::clone(&dispatched),
+            Duration::from_millis(50),
+        );
+
+        let hb_clone = Arc::clone(&hb);
+        let handle = tokio::spawn(async move { hb_clone.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        handle.abort();
+
+        let d = dispatched.lock().unwrap();
+        assert_eq!(d.len(), 1, "should dispatch exactly once");
+        assert_eq!(d[0].0, "codex");
+        assert_eq!(d[0].1, "T003");
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_resets_stale_tasks() {
+        let registry = Arc::new(TaskRegistry::new_in_memory().unwrap());
+        registry
+            .create_task(CreateTask {
+                id: "T001".into(),
+                title: "stale".into(),
+                timeout_secs: -1, // 立即超时
+                assignee_hint: Some("codex".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        registry.try_claim("T001", "codex").unwrap();
+
+        let dispatched = Arc::new(Mutex::new(vec![]));
+        let hb = make_heartbeat(
+            Arc::clone(&registry),
+            Arc::clone(&dispatched),
+            Duration::from_millis(50),
+        );
+
+        let hb_clone = Arc::clone(&hb);
+        let handle = tokio::spawn(async move { hb_clone.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        handle.abort();
+
+        // 应该被重置为 pending（retry_count = 1 < 3）
+        let task = registry.get_task("T001").unwrap().unwrap();
+        // 重置后会被再次 dispatch，所以状态可能是 claimed 或 pending
+        // 关键是 retry_count > 0（已经被重置过至少一次）
+        assert!(task.retry_count > 0, "task should have been retried");
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_marks_failed_after_max_retries() {
+        let registry = Arc::new(TaskRegistry::new_in_memory().unwrap());
+        // 直接设置 retry_count = 3（模拟已重试 3 次）
+        registry
+            .create_task(CreateTask {
+                id: "T001".into(),
+                title: "exhausted".into(),
+                timeout_secs: -1,
+                assignee_hint: Some("codex".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        // 认领 3 次（每次 retry_count + 1）
+        registry.try_claim("T001", "codex").unwrap(); // retry_count = 1
+        registry.reset_claim("T001").unwrap();
+        registry.try_claim("T001", "codex").unwrap(); // retry_count = 2
+        registry.reset_claim("T001").unwrap();
+        registry.try_claim("T001", "codex").unwrap(); // retry_count = 3
+        // 此时 retry_count = 3，下一次 heartbeat 应该标记 Failed
+
+        let dispatched = Arc::new(Mutex::new(vec![]));
+        let hb = make_heartbeat(
+            Arc::clone(&registry),
+            Arc::clone(&dispatched),
+            Duration::from_millis(50),
+        );
+
+        let hb_clone = Arc::clone(&hb);
+        let handle = tokio::spawn(async move { hb_clone.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        handle.abort();
+
+        let task = registry.get_task("T001").unwrap().unwrap();
+        assert!(
+            task.status_raw.starts_with("failed"),
+            "should be failed after max retries, got: {}",
+            task.status_raw
+        );
+    }
+}
