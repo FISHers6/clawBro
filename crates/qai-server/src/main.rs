@@ -403,9 +403,10 @@ async fn main() -> Result<()> {
         }
     }
 
-    // TeamNotify redispatch channel — receiver loop set up after registry is ready
+    // TeamNotify redispatch channel — shared by SessionRegistry and TeamOrchestrator
     let (team_notify_tx, mut team_notify_rx) =
         tokio::sync::mpsc::channel::<qai_protocol::InboundMsg>(256);
+    let team_notify_tx_for_orch = team_notify_tx.clone();
     registry.set_team_notify_tx(team_notify_tx);
 
     // Wire TeamOrchestrator: TaskRegistry + DispatchFn + milestone notify_fn (C1 + I3).
@@ -435,6 +436,7 @@ async fn main() -> Result<()> {
                 let team_session = std::sync::Arc::clone(&team_session_for_dispatch);
                 Box::pin(async move {
                     let specialist_key = team_session.specialist_session_key(&agent);
+                    let specialist_channel = specialist_key.channel.clone();
                     let reminder = team_session.build_task_reminder(&task, &task_reg);
                     registry.set_task_reminder(specialist_key.clone(), reminder);
                     let msg = qai_protocol::InboundMsg {
@@ -444,7 +446,7 @@ async fn main() -> Result<()> {
                             task.spec.as_deref().unwrap_or(&task.title),
                         ),
                         sender: "orchestrator".to_string(),
-                        channel: "team".to_string(),
+                        channel: specialist_channel,
                         timestamp: chrono::Utc::now(),
                         thread_ts: None,
                         target_agent: Some(format!("@{}", agent)),
@@ -486,6 +488,9 @@ async fn main() -> Result<()> {
 
         let team_orch_for_lead = std::sync::Arc::clone(&team_orch);
         registry.set_team_orchestrator(team_orch);
+
+        // Wire TeamNotify sender into orchestrator (for handle_specialist_done + failure notify)
+        team_orch_for_lead.set_team_notify_tx(team_notify_tx_for_orch);
 
         // Spawn LeadMcpServer — provides 6 tools to Lead Agent
         {

@@ -3,12 +3,13 @@
 //! 职责：
 //!   - start()  : 写 TEAM.md + TASKS.md，启动 OrchestratorHeartbeat
 //!   - stop()   : 归档 team-session 目录
-//!   - parse_done_marker() : 从 Specialist 输出中提取 [DONE: Txxx]
-//!   - handle_specialist_done() : 更新 SQLite，检查里程碑
+//!   - handle_specialist_done() : 更新 SQLite，检查里程碑，推 TeamNotify 给 Lead
 //!
 //! 与 Heartbeat 分工：
 //!   Heartbeat  = 定期调度（派发 Ready 任务、重置超时任务）
 //!   Orchestrator = 事件响应（处理完成通知、检查里程碑、写文件）
+//!
+//! 注意：[DONE:]/[BLOCKED:] 文本标记已移除。完成通知通过 MCP complete_task 工具实现。
 
 use anyhow::Result;
 use chrono::Utc;
@@ -87,6 +88,9 @@ pub struct TeamOrchestrator {
     pub lead_session_key: std::sync::OnceLock<qai_protocol::SessionKey>,
     /// Bound port of the Lead MCP server (set after spawn in main.rs).
     pub lead_mcp_server_port: std::sync::OnceLock<u16>,
+    /// TeamNotify MPSC sender — wired from main.rs after registry is ready.
+    /// Used by handle_specialist_done() and failure handler to push notifications to Lead.
+    team_notify_tx: std::sync::OnceLock<tokio::sync::mpsc::Sender<qai_protocol::InboundMsg>>,
 }
 
 impl TeamOrchestrator {
@@ -112,6 +116,7 @@ impl TeamOrchestrator {
             team_state_inner: std::sync::Mutex::new(TeamState::Planning),
             lead_session_key: std::sync::OnceLock::new(),
             lead_mcp_server_port: std::sync::OnceLock::new(),
+            team_notify_tx: std::sync::OnceLock::new(),
         })
     }
 
@@ -137,6 +142,12 @@ impl TeamOrchestrator {
     /// 设置 Lead 的 IM session key（由 main.rs 在启动时调用）
     pub fn set_lead_session_key(&self, key: qai_protocol::SessionKey) {
         let _ = self.lead_session_key.set(key);
+    }
+
+    /// 注入 TeamNotify MPSC sender（main.rs 在启动时调用）。
+    /// handle_specialist_done() 和永久失败处理会用此 sender 推通知给 Lead。
+    pub fn set_team_notify_tx(&self, tx: tokio::sync::mpsc::Sender<qai_protocol::InboundMsg>) {
+        let _ = self.team_notify_tx.set(tx);
     }
 
     /// 存储 LeadMcpServer 句柄，防止其被 drop（替代 mem::forget）。
@@ -186,13 +197,21 @@ impl TeamOrchestrator {
         // Sync TASKS.md snapshot
         self.session.sync_tasks_md(&self.registry)?;
 
-        // Start Heartbeat
-        let heartbeat = std::sync::Arc::new(super::heartbeat::OrchestratorHeartbeat::new(
-            std::sync::Arc::clone(&self.registry),
-            std::sync::Arc::clone(&self.session),
-            std::sync::Arc::clone(&self.dispatch_fn),
-            self.heartbeat_interval,
-        ));
+        // Start Heartbeat (wire failure callback so permanent failures notify Lead)
+        let self_for_failure = std::sync::Arc::clone(self);
+        let failure_notify: super::heartbeat::FailureNotifyFn =
+            std::sync::Arc::new(move |task_id: String, reason: String| {
+                self_for_failure.dispatch_team_notify_failed(&task_id, &reason);
+            });
+        let heartbeat = std::sync::Arc::new(
+            super::heartbeat::OrchestratorHeartbeat::new(
+                std::sync::Arc::clone(&self.registry),
+                std::sync::Arc::clone(&self.session),
+                std::sync::Arc::clone(&self.dispatch_fn),
+                self.heartbeat_interval,
+            )
+            .with_failure_notify(failure_notify),
+        );
         let handle = tokio::spawn({
             let hb = std::sync::Arc::clone(&heartbeat);
             async move { hb.run().await }
@@ -255,43 +274,13 @@ impl TeamOrchestrator {
 
     // ── 完成处理 ──────────────────────────────────────────────────────────────
 
-    /// 从 Specialist 输出中提取 `[DONE: T003]` 标记（纯函数）
-    pub fn parse_done_marker(output: &str) -> Option<String> {
-        // 手动解析，避免 regex 依赖
-        if let Some(start) = output.find("[DONE:") {
-            let rest = &output[start + 6..]; // 跳过 "[DONE:"
-            let rest = rest.trim_start();
-            if let Some(end) = rest.find(']') {
-                let id = rest[..end].trim();
-                if !id.is_empty() {
-                    return Some(id.to_string());
-                }
-            }
-        }
-        None
-    }
-
-    /// 从 Specialist 输出中提取 `[BLOCKED: <原因>]` 标记（纯函数）
-    pub fn parse_blocked_marker(output: &str) -> Option<String> {
-        if let Some(start) = output.find("[BLOCKED:") {
-            let rest = &output[start + 9..];
-            let rest = rest.trim_start();
-            if let Some(end) = rest.find(']') {
-                let reason = rest[..end].trim();
-                if !reason.is_empty() {
-                    return Some(reason.to_string());
-                }
-            }
-        }
-        None
-    }
-
-    /// 处理 Specialist 完成通知
+    /// 处理 Specialist 完成通知（由 MCP complete_task 工具触发）（由 MCP complete_task 工具触发）
     ///
     /// 1. 更新 SQLite（mark_done）
     /// 2. 写事件日志
     /// 3. 导出 TASKS.md 快照
     /// 4. 检查里程碑（all_done 或新任务解锁）
+    /// 5. 推 TeamNotify 给 Lead Agent
     pub fn handle_specialist_done(
         &self,
         task_id: &str,
@@ -314,7 +303,9 @@ impl TeamOrchestrator {
         let _ = self.session.sync_tasks_md(&self.registry);
 
         // 4. 里程碑检查
-        if self.registry.all_done()? {
+        let all_done = self.registry.all_done()?;
+        if all_done {
+            *self.team_state_inner.lock().unwrap() = TeamState::Done;
             self.publish_milestone("all_done", "所有任务已完成 ✅")?;
         } else {
             let ready = self.registry.find_ready_tasks()?;
@@ -327,7 +318,92 @@ impl TeamOrchestrator {
             }
         }
 
+        // 5. 推 TeamNotify 给 Lead
+        self.dispatch_team_notify_done(task_id, agent, note, all_done);
+
         Ok(())
+    }
+
+    /// 构建并发送 TeamNotify InboundMsg 给 Lead（task 完成）
+    fn dispatch_team_notify_done(&self, task_id: &str, agent: &str, note: &str, all_done: bool) {
+        let lead_key = match self.lead_session_key.get().cloned() {
+            Some(k) => k,
+            None => return, // Lead key 未设置，静默跳过
+        };
+        let tx = match self.team_notify_tx.get() {
+            Some(t) => t.clone(),
+            None => return,
+        };
+        let tasks = self.registry.all_tasks().unwrap_or_default();
+        let notify_content = if all_done {
+            let summary = tasks.iter()
+                .map(|t| format!(
+                    "- {}（{}）：{}",
+                    t.id,
+                    t.assignee_hint.as_deref().unwrap_or("?"),
+                    t.completion_note.as_deref().unwrap_or("完成")
+                ))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "[团队通知] 所有任务已完成 ✅\n\n完成摘要：\n{}\n\n请生成最终汇总并通过 post_update 发送给用户。",
+                summary
+            )
+        } else {
+            let done_count = tasks.iter().filter(|t| t.status_raw == "done").count();
+            let total = tasks.len();
+            format!(
+                "[团队通知] 任务 {} 已完成（执行者：{}）\n\n完成摘要：\n{}\n\n当前进度：{} / {} 完成",
+                task_id, agent, note, done_count, total
+            )
+        };
+        let lead_channel = lead_key.channel.clone();
+        let msg = qai_protocol::InboundMsg {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_key: lead_key,
+            content: qai_protocol::MsgContent::text(notify_content),
+            sender: "gateway".to_string(),
+            channel: lead_channel,
+            timestamp: Utc::now(),
+            thread_ts: None,
+            target_agent: None,
+            source: qai_protocol::MsgSource::TeamNotify,
+        };
+        // try_send avoids blocking in sync context; channel capacity 256 is safe for normal load
+        if let Err(e) = tx.try_send(msg) {
+            tracing::warn!(task_id = %task_id, "TeamNotify dispatch failed: {e}");
+        }
+    }
+
+    /// 构建并发送 TeamNotify InboundMsg 给 Lead（task 永久失败）
+    pub fn dispatch_team_notify_failed(&self, task_id: &str, reason: &str) {
+        let lead_key = match self.lead_session_key.get().cloned() {
+            Some(k) => k,
+            None => return,
+        };
+        let tx = match self.team_notify_tx.get() {
+            Some(t) => t.clone(),
+            None => return,
+        };
+        let notify_content = format!(
+            "[团队通知] 任务 {} 永久失败（已超过最大重试次数）\n\n原因：{}\n\n请调用 assign_task() 重新分配或调用 get_task_status() 查看全局状态。",
+            task_id, reason
+        );
+        let lead_channel = lead_key.channel.clone();
+        let msg = qai_protocol::InboundMsg {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_key: lead_key,
+            content: qai_protocol::MsgContent::text(notify_content),
+            sender: "gateway".to_string(),
+            channel: lead_channel,
+            timestamp: Utc::now(),
+            thread_ts: None,
+            target_agent: None,
+            source: qai_protocol::MsgSource::TeamNotify,
+        };
+        if let Err(e) = tx.try_send(msg) {
+            tracing::warn!(task_id = %task_id, "TeamNotify (failed) dispatch failed: {e}");
+        }
     }
 
     /// 处理 Specialist 阻塞通知（Escalation → Lead）
@@ -465,31 +541,6 @@ mod tests {
         orch.activate().await.unwrap();
         assert!(matches!(orch.team_state(), TeamState::Running));
         assert!(orch.mcp_server_port.get().is_some());
-    }
-
-    #[test]
-    fn test_parse_done_marker() {
-        assert_eq!(
-            TeamOrchestrator::parse_done_marker("工作完成。[DONE: T003] 谢谢。"),
-            Some("T003".to_string())
-        );
-        assert_eq!(
-            TeamOrchestrator::parse_done_marker("[DONE: T001]"),
-            Some("T001".to_string())
-        );
-        assert_eq!(
-            TeamOrchestrator::parse_done_marker("没有标记的文本"),
-            None
-        );
-    }
-
-    #[test]
-    fn test_parse_blocked_marker() {
-        assert_eq!(
-            TeamOrchestrator::parse_blocked_marker("[BLOCKED: 需要数据库连接串]"),
-            Some("需要数据库连接串".to_string())
-        );
-        assert_eq!(TeamOrchestrator::parse_blocked_marker("正常文本"), None);
     }
 
     #[test]

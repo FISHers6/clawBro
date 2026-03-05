@@ -445,9 +445,8 @@ impl SessionRegistry {
         };
 
         // Early Specialist detection — needed before SystemPromptBuilder runs.
-        // Heartbeat-dispatched turns AND explicit "team" channel sessions are Specialist turns.
-        let early_is_specialist = inbound.source == MsgSource::Heartbeat
-            || session_key.channel.as_str() == "team";
+        // Only Heartbeat-dispatched turns (from TeamOrchestrator dispatch_fn) are Specialist turns.
+        let early_is_specialist = inbound.source == MsgSource::Heartbeat;
 
         // Detect Lead turn: session_key matches the stored lead_session_key in orchestrator
         let early_is_lead = !early_is_specialist && {
@@ -677,87 +676,6 @@ impl SessionRegistry {
         let full_text = engine.run(ctx, session_tx).await?;
 
         // ── Post-run hooks ─────────────────────────────────────────────────────
-
-        // Hook 1: [DONE: Txxx] / [BLOCKED: ...] marker scan (Team Mode Specialist only)
-        // Guard: only process markers from Specialist turns (Heartbeat-dispatched) to prevent
-        // accidental completion from arbitrary user messages containing the marker text.
-        if early_is_specialist {
-            if let Some(team_orch) = self.team_orchestrator.get() {
-                let agent = roster_match
-                    .as_ref()
-                    .map(|r| r.agent_name.as_str())
-                    .unwrap_or("unknown");
-
-                if let Some(task_id) = TeamOrchestrator::parse_done_marker(&full_text) {
-                    if let Err(e) = team_orch.handle_specialist_done(&task_id, agent, &full_text) {
-                        tracing::warn!(task_id = %task_id, "handle_specialist_done error: {:#}", e);
-                    }
-                    // Dispatch TeamNotify turn to Lead (async spawn to avoid re-entrant handle())
-                    if let Some(lead_key) = team_orch.lead_session_key.get().cloned() {
-                        let note = &full_text;
-                        let notify_content = if team_orch.registry.all_done().unwrap_or(false) {
-                            // All tasks done — set Done state and prompt Lead to synthesize
-                            *team_orch.team_state_inner.lock().unwrap() =
-                                crate::team::orchestrator::TeamState::Done;
-                            let tasks = team_orch.registry.all_tasks().unwrap_or_default();
-                            let summary: String = tasks
-                                .iter()
-                                .map(|t| {
-                                    format!(
-                                        "- {}（{}）：{}",
-                                        t.id,
-                                        t.assignee_hint.as_deref().unwrap_or("unknown"),
-                                        t.completion_note.as_deref().unwrap_or("完成")
-                                    )
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            format!(
-                                "[团队通知] 所有任务已完成 ✅\n\n完成摘要：\n{}\n\n请生成最终汇总并通过 post_update 发送给用户。",
-                                summary
-                            )
-                        } else {
-                            let tasks = team_orch.registry.all_tasks().unwrap_or_default();
-                            let done_count = tasks.iter().filter(|t| t.status_raw == "done").count();
-                            let total = tasks.len();
-                            format!(
-                                "[团队通知] 任务 {} 已完成（执行者：{}）\n\n完成摘要：\n{}\n\n当前进度：{} / {} 完成",
-                                task_id, agent, note, done_count, total
-                            )
-                        };
-
-                        if let Some(tx) = self.team_notify_tx.get() {
-                            let lead_channel = lead_key.channel.clone();
-                            let notify_msg = qai_protocol::InboundMsg {
-                                id: uuid::Uuid::new_v4().to_string(),
-                                session_key: lead_key,
-                                content: qai_protocol::MsgContent::text(notify_content),
-                                sender: "gateway".to_string(),
-                                channel: lead_channel,
-                                timestamp: chrono::Utc::now(),
-                                thread_ts: None,
-                                target_agent: None,
-                                source: qai_protocol::MsgSource::TeamNotify,
-                            };
-                            let tx = tx.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = tx.send(notify_msg).await {
-                                    tracing::warn!("TeamNotify dispatch error: {:#}", e);
-                                }
-                            });
-                        }
-                    }
-                } else if let Some(reason) = TeamOrchestrator::parse_blocked_marker(&full_text) {
-                    // TODO(P1-BUG): scope format is "team_id:agent_name", not "task_id:agent_name".
-                    // split(':').next() returns team_id, not task_id — wrong hint for blocked escalations.
-                    // Fix: extract task_id from the [BLOCKED: ...] payload or from task_reminder context.
-                    let task_id_hint = session_key.scope.split(':').next().unwrap_or("unknown");
-                    if let Err(e) = team_orch.handle_specialist_blocked(task_id_hint, agent, &reason) {
-                        tracing::warn!(agent = %agent, "handle_specialist_blocked error: {:#}", e);
-                    }
-                }
-            }
-        }
 
         // Hook 2: [RELAY: @agent <指令>] marker expansion (Relay Mode)
         let full_text = if let Some(relay) = self.relay_engine.get() {

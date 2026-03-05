@@ -62,7 +62,9 @@ impl TeamSession {
     ///   - 独立的 session history → 不包含群组噪音
     ///   - workspace_dir 指向 team-session 目录 → 读 CONTEXT.md/TASKS.md
     pub fn specialist_session_key(&self, agent_name: &str) -> SessionKey {
-        SessionKey::new("team", format!("{}:{}", self.team_id, agent_name))
+        // Uses "specialist" as the channel name — an internal routing identifier,
+        // NOT an IM channel. Only lark/dingtalk are real IM channels.
+        SessionKey::new("specialist", format!("{}:{}", self.team_id, agent_name))
     }
 
     // ── 读写文件 ─────────────────────────────────────────────────────────────
@@ -230,7 +232,7 @@ mod tests {
     fn test_specialist_session_key_format() {
         let (session, _tmp) = make_session();
         let key = session.specialist_session_key("codex");
-        assert_eq!(key.channel, "team");
+        assert_eq!(key.channel, "specialist");
         assert_eq!(key.scope, "team-001:codex");
     }
 

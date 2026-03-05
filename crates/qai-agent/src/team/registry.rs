@@ -180,7 +180,7 @@ impl TaskRegistry {
             params![note, now, task_id],
         )?;
         if rows == 0 {
-            tracing::warn!(task_id = %task_id, "mark_done: task not in claimed state, ignoring");
+            anyhow::bail!("mark_done: task '{}' not found or not in claimed state", task_id);
         }
         Ok(())
     }

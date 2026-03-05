@@ -25,12 +25,17 @@ pub type DispatchFn = Arc<
 
 // ─── OrchestratorHeartbeat ───────────────────────────────────────────────────
 
+/// 永久失败通知回调：(task_id, reason) → fire-and-forget
+pub type FailureNotifyFn = Arc<dyn Fn(String, String) + Send + Sync>;
+
 pub struct OrchestratorHeartbeat {
     registry: Arc<TaskRegistry>,
     session: Arc<TeamSession>,
     dispatch_fn: DispatchFn,
     interval: Duration,
     max_retries: u32,
+    /// Optional callback invoked when a task permanently fails (retries exhausted).
+    on_permanent_failure: Option<FailureNotifyFn>,
 }
 
 impl OrchestratorHeartbeat {
@@ -46,7 +51,14 @@ impl OrchestratorHeartbeat {
             dispatch_fn,
             interval,
             max_retries: 3,
+            on_permanent_failure: None,
         }
+    }
+
+    /// Set the callback invoked when a task permanently fails.
+    pub fn with_failure_notify(mut self, f: FailureNotifyFn) -> Self {
+        self.on_permanent_failure = Some(f);
+        self
     }
 
     /// 主循环（在 tokio::spawn 中运行）
@@ -84,12 +96,15 @@ impl OrchestratorHeartbeat {
                     "Reset stale task, will retry"
                 );
             } else {
-                self.registry
-                    .mark_failed(&task.id, "max retries exceeded")?;
+                let reason = "max retries exceeded";
+                self.registry.mark_failed(&task.id, reason)?;
                 tracing::error!(
                     task_id = %task.id,
                     "Task failed after {} retries", self.max_retries
                 );
+                if let Some(ref f) = self.on_permanent_failure {
+                    f(task.id.clone(), reason.to_string());
+                }
             }
         }
         Ok(())
