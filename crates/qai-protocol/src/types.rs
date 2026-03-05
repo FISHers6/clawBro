@@ -16,6 +16,8 @@ pub enum MsgSource {
     Cron,
     /// OrchestratorHeartbeat 派发给 Specialist
     Heartbeat,
+    /// Gateway → Lead: 通知 Specialist 任务完成 / 全部完成
+    TeamNotify,
 }
 
 /// 入站消息（来自任意 Channel 或 WebSocket 客户端）
@@ -106,5 +108,16 @@ mod tests {
         let msg = MsgContent::text("hello");
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"Text\""));
+    }
+
+    #[test]
+    fn test_team_notify_variant_exists() {
+        let src = MsgSource::TeamNotify;
+        // Must serialize without panic
+        let json = serde_json::to_string(&src).unwrap();
+        assert!(json.contains("team_notify"));
+        // Must deserialize back
+        let back: MsgSource = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, MsgSource::TeamNotify);
     }
 }
