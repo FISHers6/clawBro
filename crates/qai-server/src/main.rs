@@ -360,6 +360,235 @@ async fn main() -> Result<()> {
 
     let cron_channel_map = Arc::new(cron_channel_map);
 
+    // ── Swarm Wiring ─────────────────────────────────────────────────────────
+    // Wire RelayEngine: synchronous [RELAY: @agent <cmd>] delegation (C1 + I2).
+    // MsgSource::Relay is set on the inner InboundMsg so Hook 3 (MentionTrigger)
+    // does not recurse into the relay result.
+    {
+        let registry_for_relay = registry.clone();
+        let relay_dispatch: qai_agent::relay::RelayDispatchFn = Box::new(move |target_agent, content, session_key| {
+            let registry = registry_for_relay.clone();
+            Box::pin(async move {
+                let msg = qai_protocol::InboundMsg {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    session_key,
+                    content,
+                    sender: "relay".to_string(),
+                    channel: "relay".to_string(),
+                    timestamp: chrono::Utc::now(),
+                    thread_ts: None,
+                    target_agent: Some(target_agent),
+                    source: qai_protocol::MsgSource::Relay,
+                };
+                registry.handle(msg).await
+            })
+        });
+        registry.set_relay_engine(std::sync::Arc::new(
+            qai_agent::relay::RelayEngine::new(relay_dispatch),
+        ));
+        tracing::info!("RelayEngine wired");
+    }
+
+    // Wire MentionTrigger: scan bot output for @botname, re-inject as BotMention (C1).
+    let (redispatch_tx, mut redispatch_rx) =
+        tokio::sync::mpsc::channel::<qai_protocol::InboundMsg>(256);
+    {
+        let bot_names: Vec<String> = cfg.agent_roster.iter().map(|e| e.name.clone()).collect();
+        if !bot_names.is_empty() {
+            let trigger = std::sync::Arc::new(
+                qai_channels::mention_trigger::MentionTrigger::new(bot_names, redispatch_tx.clone()),
+            );
+            registry.set_mention_trigger(trigger);
+            tracing::info!("MentionTrigger wired ({} bots)", cfg.agent_roster.len());
+        }
+    }
+
+    // TeamNotify redispatch channel — receiver loop set up after registry is ready
+    let (team_notify_tx, mut team_notify_rx) =
+        tokio::sync::mpsc::channel::<qai_protocol::InboundMsg>(256);
+    registry.set_team_notify_tx(team_notify_tx);
+
+    // Wire TeamOrchestrator: TaskRegistry + DispatchFn + milestone notify_fn (C1 + I3).
+    {
+        use qai_agent::team::{
+            bus::InternalBus, heartbeat::DispatchFn, orchestrator::TeamOrchestrator,
+            registry::TaskRegistry, session::TeamSession,
+        };
+        use qai_agent::team::lead_mcp_server::LeadToolServer;
+
+        let task_registry = std::sync::Arc::new(TaskRegistry::new_in_memory()?);
+        let team_sessions_dir = dirs::home_dir()
+            .unwrap_or_default()
+            .join(".quickai")
+            .join("team-sessions");
+        tokio::fs::create_dir_all(&team_sessions_dir).await?;
+        let team_session = std::sync::Arc::new(TeamSession::from_dir("default", team_sessions_dir));
+        let team_bus = std::sync::Arc::new(InternalBus::new());
+
+        let registry_for_dispatch = registry.clone();
+        let task_reg_for_dispatch = std::sync::Arc::clone(&task_registry);
+        let team_session_for_dispatch = std::sync::Arc::clone(&team_session);
+        let dispatch_fn: DispatchFn = std::sync::Arc::new(
+            move |agent: String, task: qai_agent::team::registry::Task, _session: std::sync::Arc<TeamSession>| {
+                let registry = registry_for_dispatch.clone();
+                let task_reg = std::sync::Arc::clone(&task_reg_for_dispatch);
+                let team_session = std::sync::Arc::clone(&team_session_for_dispatch);
+                Box::pin(async move {
+                    let specialist_key = team_session.specialist_session_key(&agent);
+                    let reminder = team_session.build_task_reminder(&task, &task_reg);
+                    registry.set_task_reminder(specialist_key.clone(), reminder);
+                    let msg = qai_protocol::InboundMsg {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        session_key: specialist_key,
+                        content: qai_protocol::MsgContent::text(
+                            task.spec.as_deref().unwrap_or(&task.title),
+                        ),
+                        sender: "orchestrator".to_string(),
+                        channel: "team".to_string(),
+                        timestamp: chrono::Utc::now(),
+                        thread_ts: None,
+                        target_agent: Some(format!("@{}", agent)),
+                        source: qai_protocol::MsgSource::Heartbeat,
+                    };
+                    registry.handle(msg).await.map(|_| ())
+                })
+            },
+        );
+
+        let team_orch = TeamOrchestrator::new(
+            task_registry,
+            team_session,
+            std::sync::Arc::clone(&team_bus),
+            dispatch_fn,
+            Duration::from_secs(60),
+        );
+
+        // Wire I3: milestone events → IM channel
+        let cron_channels_for_notify = cron_channel_map.clone();
+        team_orch.set_notify_fn(std::sync::Arc::new(
+            move |scope: qai_protocol::SessionKey, msg: String| {
+                let channels = cron_channels_for_notify.clone();
+                tokio::spawn(async move {
+                    if let Some(ch) = channels.get(&scope.channel) {
+                        let outbound = qai_protocol::OutboundMsg {
+                            session_key: scope,
+                            content: qai_protocol::MsgContent::text(msg),
+                            reply_to: None,
+                            thread_ts: None,
+                        };
+                        if let Err(e) = ch.send(&outbound).await {
+                            tracing::error!("Milestone notify send error: {e}");
+                        }
+                    }
+                });
+            },
+        ));
+
+        let team_orch_for_lead = std::sync::Arc::clone(&team_orch);
+        registry.set_team_orchestrator(team_orch);
+
+        // Spawn LeadMcpServer — provides 6 tools to Lead Agent
+        {
+            let lead_srv = LeadToolServer::new(std::sync::Arc::clone(&team_orch_for_lead));
+            match lead_srv.spawn().await {
+                Ok(handle) => {
+                    let _ = team_orch_for_lead.lead_mcp_server_port.set(handle.port);
+                    tracing::info!(port = handle.port, "LeadMcpServer started");
+                    // Server runs until process exit — keep alive by leaking handle
+                    std::mem::forget(handle);
+                }
+                Err(e) => {
+                    tracing::error!("Failed to start LeadMcpServer: {e}");
+                }
+            }
+        }
+
+        // Wire lead_session_key from Team groups in config
+        for group in &cfg.groups {
+            if matches!(group.mode.interaction, qai_server::config::InteractionMode::Team) {
+                let channel_name = if cfg.channels.dingtalk.as_ref().map(|c| c.enabled).unwrap_or(false) {
+                    "dingtalk"
+                } else if cfg.channels.lark.as_ref().map(|c| c.enabled).unwrap_or(false) {
+                    "lark"
+                } else {
+                    "ws"
+                };
+                let lead_key = qai_protocol::SessionKey::new(channel_name, &group.scope);
+                team_orch_for_lead.set_lead_session_key(lead_key.clone());
+                team_orch_for_lead.set_scope(lead_key);
+                tracing::info!(scope = %group.scope, "Team group lead_session_key wired");
+                break; // MVP: one Team group per Gateway instance
+            }
+        }
+
+        tracing::info!("TeamOrchestrator wired");
+    }
+
+    // Spawn BotMention redispatch task: MentionTrigger → handle() → IM reply (C1).
+    {
+        let registry_for_redispatch = registry.clone();
+        let channels_for_redispatch = cron_channel_map.clone();
+        tokio::spawn(async move {
+            while let Some(inbound) = redispatch_rx.recv().await {
+                let channel_name = inbound.session_key.channel.clone();
+                let session_key = inbound.session_key.clone();
+                let thread_ts = inbound.thread_ts.clone();
+                let reply_to = Some(inbound.id.clone());
+                match registry_for_redispatch.handle(inbound).await {
+                    Ok(Some(reply)) => {
+                        if let Some(ch) = channels_for_redispatch.get(&channel_name) {
+                            let outbound = qai_protocol::OutboundMsg {
+                                session_key,
+                                content: qai_protocol::MsgContent::text(reply),
+                                reply_to,
+                                thread_ts,
+                            };
+                            if let Err(e) = ch.send(&outbound).await {
+                                tracing::error!("BotMention redispatch send error: {e}");
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => tracing::error!("BotMention redispatch handle error: {e}"),
+                }
+            }
+        });
+        tracing::info!("BotMention redispatch task started");
+    }
+
+    // Spawn TeamNotify redispatch task: registry → handle() → IM reply (TeamNotify loop)
+    {
+        let registry_for_notify = registry.clone();
+        let channels_for_notify = cron_channel_map.clone();
+        tokio::spawn(async move {
+            while let Some(inbound) = team_notify_rx.recv().await {
+                let channel_name = inbound.session_key.channel.clone();
+                let session_key = inbound.session_key.clone();
+                let thread_ts = inbound.thread_ts.clone();
+                let reply_to = Some(inbound.id.clone());
+                match registry_for_notify.handle(inbound).await {
+                    Ok(Some(reply)) => {
+                        if let Some(ch) = channels_for_notify.get(&channel_name) {
+                            let outbound = qai_protocol::OutboundMsg {
+                                session_key,
+                                content: qai_protocol::MsgContent::text(reply),
+                                reply_to,
+                                thread_ts,
+                            };
+                            if let Err(e) = ch.send(&outbound).await {
+                                tracing::error!("TeamNotify reply send error: {e}");
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => tracing::error!("TeamNotify handle error: {e}"),
+                }
+            }
+        });
+        tracing::info!("TeamNotify redispatch task started");
+    }
+    // ── End Swarm Wiring ─────────────────────────────────────────────────────
+
     // 启动 CronScheduler
     {
         let cron_registry = registry.clone();
