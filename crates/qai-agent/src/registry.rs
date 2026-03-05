@@ -748,7 +748,9 @@ impl SessionRegistry {
                         }
                     }
                 } else if let Some(reason) = TeamOrchestrator::parse_blocked_marker(&full_text) {
-                    // Extract task_id from session_key (format: "team_id:agent_name")
+                    // TODO(P1-BUG): scope format is "team_id:agent_name", not "task_id:agent_name".
+                    // split(':').next() returns team_id, not task_id — wrong hint for blocked escalations.
+                    // Fix: extract task_id from the [BLOCKED: ...] payload or from task_reminder context.
                     let task_id_hint = session_key.scope.split(':').next().unwrap_or("unknown");
                     if let Err(e) = team_orch.handle_specialist_blocked(task_id_hint, agent, &reason) {
                         tracing::warn!(agent = %agent, "handle_specialist_blocked error: {:#}", e);
