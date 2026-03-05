@@ -10,15 +10,18 @@ use crate::memory::cap_to_words;
 use crate::memory::{MemoryEvent, MemorySystem, MemoryTarget};
 use crate::persona::AgentPersona;
 use crate::prompt_builder::SystemPromptBuilder;
+use crate::relay::RelayEngine;
 use crate::roster::AgentRoster;
 use crate::selector::{EngineConfig, EngineSelector};
 use crate::slash::SlashCommand;
-use crate::traits::{AgentCtx, BoxEngine, HistoryMsg};
+use crate::team::orchestrator::TeamOrchestrator;
+use crate::traits::{AgentCtx, AgentRole, BoxEngine, HistoryMsg};
 use anyhow::Result;
 use dashmap::DashMap;
-use qai_protocol::{AgentEvent, InboundMsg, SessionKey};
+use qai_channels::mention_trigger::MentionTrigger;
+use qai_protocol::{AgentEvent, InboundMsg, MsgSource, SessionKey};
 use qai_session::{SessionManager, StoredMessage};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
@@ -70,6 +73,15 @@ pub struct SessionRegistry {
     /// Tracks which persona directories have already been initialized (SOUL.md created).
     /// Avoids repeated blocking filesystem calls per message.
     initialized_persona_dirs: dashmap::DashSet<std::path::PathBuf>,
+    /// Pre-registered task_reminder for Specialist turns.
+    /// DispatchFn sets this before calling handle(); handle() removes and injects into AgentCtx.
+    team_task_reminders: DashMap<SessionKey, String>,
+    /// Team orchestrator — processes [DONE: Txxx] markers from Specialist replies.
+    team_orchestrator: OnceLock<Arc<TeamOrchestrator>>,
+    /// Relay engine — processes [RELAY: @agent <指令>] markers synchronously.
+    relay_engine: OnceLock<Arc<RelayEngine>>,
+    /// Mention trigger — scans bot replies for @botname patterns.
+    mention_trigger: OnceLock<Arc<MentionTrigger>>,
 }
 
 impl SessionRegistry {
@@ -103,6 +115,10 @@ impl SessionRegistry {
             session_workspaces: DashMap::new(),
             skill_loader_dirs,
             initialized_persona_dirs: dashmap::DashSet::new(),
+            team_task_reminders: DashMap::new(),
+            team_orchestrator: OnceLock::new(),
+            relay_engine: OnceLock::new(),
+            mention_trigger: OnceLock::new(),
         });
 
         // Idle timer: check every 60s for sessions idle > 30 min
@@ -144,6 +160,26 @@ impl SessionRegistry {
         }
 
         (registry, global_rx)
+    }
+
+    /// Pre-register a task_reminder for a Specialist session (called by DispatchFn before handle()).
+    pub fn set_task_reminder(&self, key: SessionKey, reminder: String) {
+        self.team_task_reminders.insert(key, reminder);
+    }
+
+    /// Attach a TeamOrchestrator — processes [DONE: Txxx] markers from Specialist replies.
+    pub fn set_team_orchestrator(&self, orch: Arc<TeamOrchestrator>) {
+        let _ = self.team_orchestrator.set(orch);
+    }
+
+    /// Attach a RelayEngine — processes [RELAY: @agent <指令>] markers synchronously.
+    pub fn set_relay_engine(&self, engine: Arc<RelayEngine>) {
+        let _ = self.relay_engine.set(engine);
+    }
+
+    /// Attach a MentionTrigger — scans bot replies for @botname and dispatches BotMention msgs.
+    pub fn set_mention_trigger(&self, trigger: Arc<MentionTrigger>) {
+        let _ = self.mention_trigger.set(trigger);
     }
 
     /// Get-or-create per-session cached engine (used when no roster match)
@@ -361,6 +397,21 @@ impl SessionRegistry {
             }
         };
 
+        // Early Specialist detection — needed before SystemPromptBuilder runs.
+        // Heartbeat-dispatched turns AND explicit "team" channel sessions are Specialist turns.
+        let early_is_specialist = inbound.source == MsgSource::Heartbeat
+            || session_key.channel.as_str() == "team";
+        let early_agent_role = if early_is_specialist {
+            AgentRole::Specialist
+        } else {
+            AgentRole::Solo
+        };
+        // Peek at task_reminder (pre-registered by DispatchFn); keep in DashMap until AgentCtx build.
+        let early_task_reminder: Option<String> = self
+            .team_task_reminders
+            .get(&session_key)
+            .map(|r| r.value().clone());
+
         // Build the full system prompt via SystemPromptBuilder (6-layer persona-aware).
         let system_injection = {
             if roster_match.is_some() {
@@ -403,8 +454,8 @@ impl SessionRegistry {
                     agent_memory: &agent_memory,
                     shared_max_words: 300,
                     agent_max_words: 500,
-                    agent_role: crate::traits::AgentRole::Solo,
-                    task_reminder: None,
+                    agent_role: early_agent_role,
+                    task_reminder: early_task_reminder.as_deref(),
                     team_manifest: None,
                 }
                 .build()
@@ -430,14 +481,38 @@ impl SessionRegistry {
             }
         };
 
+        // Consume task_reminder from DashMap (was peeked earlier for system prompt building).
+        let task_reminder = self.team_task_reminders.remove(&session_key).map(|(_, v)| v);
+        let team_dir = if early_is_specialist {
+            self.team_orchestrator.get().map(|o| o.session.dir.clone())
+        } else {
+            None
+        };
+
+        // For Specialist turns, override workspace_dir with team_dir so the engine sees
+        // TEAM.md/TASKS.md/CONTEXT.md in its working directory (fixes I1).
+        let effective_workspace = team_dir.clone().or(workspace_dir_resolved);
+
+        let mcp_server_url: Option<String> = if early_is_specialist {
+            self.team_orchestrator
+                .get()
+                .and_then(|o| o.mcp_server_port.get().copied())
+                .map(|port| format!("http://127.0.0.1:{port}"))
+        } else {
+            None
+        };
+
         // Build AgentCtx for the engine
         let ctx = AgentCtx {
             session_id,
             user_text,
             history,
             system_injection,
-            workspace_dir: workspace_dir_resolved,
-            ..AgentCtx::default()
+            workspace_dir: effective_workspace,
+            agent_role: early_agent_role,
+            task_reminder,
+            team_dir,
+            mcp_server_url,
         };
 
         // Per-call event channel: forward to global_tx + ws_subs
@@ -490,6 +565,60 @@ impl SessionRegistry {
 
         // Run engine (blocks until turn completes)
         let full_text = engine.run(ctx, session_tx).await?;
+
+        // ── Post-run hooks ─────────────────────────────────────────────────────
+
+        // Hook 1: [DONE: Txxx] / [BLOCKED: ...] marker scan (Team Mode Specialist only)
+        // Guard: only process markers from Specialist turns (Heartbeat-dispatched) to prevent
+        // accidental completion from arbitrary user messages containing the marker text.
+        if early_is_specialist {
+            if let Some(team_orch) = self.team_orchestrator.get() {
+                let agent = roster_match
+                    .as_ref()
+                    .map(|r| r.agent_name.as_str())
+                    .unwrap_or("unknown");
+
+                if let Some(task_id) = TeamOrchestrator::parse_done_marker(&full_text) {
+                    if let Err(e) = team_orch.handle_specialist_done(&task_id, agent, &full_text) {
+                        tracing::warn!(task_id = %task_id, "handle_specialist_done error: {:#}", e);
+                    }
+                } else if let Some(reason) = TeamOrchestrator::parse_blocked_marker(&full_text) {
+                    // Extract task_id from session_key (format: "team_id:agent_name")
+                    let task_id_hint = session_key.scope.split(':').next().unwrap_or("unknown");
+                    if let Err(e) = team_orch.handle_specialist_blocked(task_id_hint, agent, &reason) {
+                        tracing::warn!(agent = %agent, "handle_specialist_blocked error: {:#}", e);
+                    }
+                }
+            }
+        }
+
+        // Hook 2: [RELAY: @agent <指令>] marker expansion (Relay Mode)
+        let full_text = if let Some(relay) = self.relay_engine.get() {
+            if full_text.contains("[RELAY:") {
+                match relay.process(&full_text, &session_key).await {
+                    Ok(processed) => processed,
+                    Err(e) => {
+                        tracing::warn!("relay engine error: {:#}", e);
+                        full_text
+                    }
+                }
+            } else {
+                full_text
+            }
+        } else {
+            full_text
+        };
+
+        // Hook 3: @botname scan → BotMention dispatch (anti-recursion: skip BotMention/Relay source)
+        if inbound.source != MsgSource::BotMention && inbound.source != MsgSource::Relay {
+            if let Some(trigger) = self.mention_trigger.get() {
+                let sender = roster_match
+                    .as_ref()
+                    .map(|r| r.agent_name.as_str())
+                    .unwrap_or("agent");
+                trigger.scan_and_dispatch(&full_text, sender, &session_key, &inbound.source);
+            }
+        }
 
         // Save assistant reply with sender annotation
         let assistant_msg = StoredMessage {

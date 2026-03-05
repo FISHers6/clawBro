@@ -7,7 +7,7 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 /// Agent 在团队中的角色（决定 SystemPromptBuilder 的行为）
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub enum AgentRole {
     /// 独立模式：读 MEMORY.md；无 team 文件（默认）
     #[default]
@@ -33,6 +33,9 @@ pub struct AgentCtx {
     pub team_dir: Option<PathBuf>,
     /// 注入 Layer 0 的任务提醒文本（Specialist / Lead 有任务时有效）
     pub task_reminder: Option<String>,
+    /// URL of the running TeamMcpServer (e.g. "http://127.0.0.1:54321/sse").
+    /// Set only for Specialist turns when TeamOrchestrator is wired and running.
+    pub mcp_server_url: Option<String>,
 }
 
 impl Default for AgentCtx {
@@ -46,6 +49,7 @@ impl Default for AgentCtx {
             agent_role: AgentRole::Solo,
             team_dir: None,
             task_reminder: None,
+            mcp_server_url: None,
         }
     }
 }
