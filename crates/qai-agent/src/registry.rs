@@ -82,6 +82,11 @@ pub struct SessionRegistry {
     relay_engine: OnceLock<Arc<RelayEngine>>,
     /// Mention trigger — scans bot replies for @botname patterns.
     mention_trigger: OnceLock<Arc<MentionTrigger>>,
+    /// Weak self-reference for spawning recursive handle() calls (TeamNotify dispatch).
+    weak_self: std::sync::Weak<Self>,
+    /// TeamNotify redispatch channel — set by main.rs, used to inject TeamNotify InboundMsgs
+    /// back into the main message loop without re-entering handle() recursively.
+    team_notify_tx: OnceLock<tokio::sync::mpsc::Sender<InboundMsg>>,
 }
 
 impl SessionRegistry {
@@ -97,7 +102,7 @@ impl SessionRegistry {
         skill_loader_dirs: Vec<std::path::PathBuf>,
     ) -> (Arc<Self>, broadcast::Receiver<AgentEvent>) {
         let (global_tx, global_rx) = broadcast::channel(256);
-        let registry = Arc::new(Self {
+        let registry = Arc::new_cyclic(|weak| Self {
             sessions: DashMap::new(),
             default_engine_cfg,
             session_manager,
@@ -119,7 +124,9 @@ impl SessionRegistry {
             team_orchestrator: OnceLock::new(),
             relay_engine: OnceLock::new(),
             mention_trigger: OnceLock::new(),
-        });
+            weak_self: weak.clone(),
+            team_notify_tx: OnceLock::new(),
+        });  // end of Arc::new_cyclic
 
         // Idle timer: check every 60s for sessions idle > 30 min
         if let Some(ms) = &registry.memory_system {
@@ -180,6 +187,12 @@ impl SessionRegistry {
     /// Attach a MentionTrigger — scans bot replies for @botname and dispatches BotMention msgs.
     pub fn set_mention_trigger(&self, trigger: Arc<MentionTrigger>) {
         let _ = self.mention_trigger.set(trigger);
+    }
+
+    /// Set TeamNotify redispatch sender (called by main.rs at startup).
+    /// TeamNotify messages are sent through this channel to the main message loop.
+    pub fn set_team_notify_tx(&self, tx: tokio::sync::mpsc::Sender<InboundMsg>) {
+        let _ = self.team_notify_tx.set(tx);
     }
 
     /// Get-or-create per-session cached engine (used when no roster match)
@@ -284,6 +297,40 @@ impl SessionRegistry {
         let session_key = inbound.session_key.clone();
         let user_text = inbound.content.as_text().unwrap_or("").to_string();
         let user_text_for_log = user_text.clone();
+
+        // ── Team Mode confirmation interceptor ──────────────────────────────────
+        // When Lead called request_confirmation(), the next Human message is the user's yes/no.
+        if inbound.source == qai_protocol::MsgSource::Human {
+            if let Some(team_orch) = self.team_orchestrator.get() {
+                if team_orch.team_state() == crate::team::orchestrator::TeamState::AwaitingConfirm {
+                    if let Some(lead_key) = team_orch.lead_session_key.get() {
+                        if &session_key == lead_key {
+                            let text_lower = user_text.to_lowercase();
+                            let confirmed = ["yes", "是", "确认", "ok", "好的", "开始"]
+                                .iter()
+                                .any(|kw| text_lower.contains(kw));
+                            if confirmed {
+                                if let Some(_arc_self) = self.weak_self.upgrade() {
+                                    let orch = std::sync::Arc::clone(team_orch);
+                                    tokio::spawn(async move {
+                                        match orch.activate().await {
+                                            Ok(msg) => tracing::info!("Team activated via confirmation: {}", msg),
+                                            Err(e) => tracing::error!("Team activate error: {e}"),
+                                        }
+                                    });
+                                }
+                                return Ok(Some("收到，开始执行。任务队列已启动。".to_string()));
+                            } else {
+                                // User said no or gave feedback — reset to Planning so Lead can adjust
+                                *team_orch.team_state_inner.lock().unwrap() =
+                                    crate::team::orchestrator::TeamState::Planning;
+                                // Fall through to normal routing (Lead handles the message)
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // Slash commands take priority (no engine involved)
         if let Some(cmd) = SlashCommand::parse(&user_text) {
@@ -401,16 +448,74 @@ impl SessionRegistry {
         // Heartbeat-dispatched turns AND explicit "team" channel sessions are Specialist turns.
         let early_is_specialist = inbound.source == MsgSource::Heartbeat
             || session_key.channel.as_str() == "team";
+
+        // Detect Lead turn: session_key matches the stored lead_session_key in orchestrator
+        let early_is_lead = !early_is_specialist && {
+            self.team_orchestrator
+                .get()
+                .and_then(|o| o.lead_session_key.get())
+                .map(|k| k == &session_key)
+                .unwrap_or(false)
+        };
+
+        // Override agent_role for Lead
         let early_agent_role = if early_is_specialist {
             AgentRole::Specialist
+        } else if early_is_lead {
+            AgentRole::Lead
         } else {
             AgentRole::Solo
         };
-        // Peek at task_reminder (pre-registered by DispatchFn); keep in DashMap until AgentCtx build.
-        let early_task_reminder: Option<String> = self
-            .team_task_reminders
-            .get(&session_key)
-            .map(|r| r.value().clone());
+
+        // When a TeamNotify arrives, lazily set lead_session_key + scope if not yet set
+        if inbound.source == qai_protocol::MsgSource::TeamNotify {
+            if let Some(team_orch) = self.team_orchestrator.get() {
+                team_orch.set_lead_session_key(session_key.clone());
+                team_orch.set_scope(session_key.clone());
+            }
+        }
+
+        // Build Lead Layer 0 (task_reminder for Lead turns based on TeamState)
+        let lead_layer_0: Option<String> = if early_is_lead {
+            let state = self.team_orchestrator
+                .get()
+                .map(|o| o.team_state())
+                .unwrap_or(crate::team::orchestrator::TeamState::Planning);
+            Some(match state {
+                crate::team::orchestrator::TeamState::Planning
+                | crate::team::orchestrator::TeamState::AwaitingConfirm => {
+                    "你是团队协调者。用户的请求需要多个 Agent 协作完成。\n\n\
+                     步骤：\n\
+                     1. 分析任务，调用 create_task() 定义所有子任务和依赖关系\n\
+                     2. 简单任务（≤3个、无复杂依赖）直接调用 start_execution()\n\
+                     3. 复杂任务先调用 request_confirmation(plan_summary)，等用户确认后再执行\n\
+                     4. 任务执行中你会收到 [团队通知] 消息，用 post_update() 向用户播报关键进度\n\
+                     5. 收到\"所有任务已完成\"通知后，合成最终结果并调用 post_update() 发给用户\n\n\
+                     可用工具：create_task, start_execution, request_confirmation, post_update, get_task_status, assign_task"
+                        .to_string()
+                }
+                crate::team::orchestrator::TeamState::Running
+                | crate::team::orchestrator::TeamState::Done => {
+                    "团队任务执行中。你会收到 [团队通知] 消息。\n\n\
+                     - 用 post_update(message) 向用户播报进度\n\
+                     - 用 get_task_status() 查看全局状态\n\
+                     - 用 assign_task(task_id, agent) 重新分配卡住的任务\n\
+                     - 收到\"所有任务已完成\"通知后，合成最终汇总并 post_update"
+                        .to_string()
+                }
+            })
+        } else {
+            None
+        };
+
+        // Lead turns use lead_layer_0 as task_reminder; Specialist turns use pre-registered reminder
+        let early_task_reminder: Option<String> = if early_is_lead {
+            lead_layer_0.clone()
+        } else {
+            self.team_task_reminders
+                .get(&session_key)
+                .map(|r| r.value().clone())
+        };
 
         // Build the full system prompt via SystemPromptBuilder (6-layer persona-aware).
         let system_injection = {
@@ -497,7 +602,12 @@ impl SessionRegistry {
             self.team_orchestrator
                 .get()
                 .and_then(|o| o.mcp_server_port.get().copied())
-                .map(|port| format!("http://127.0.0.1:{port}"))
+                .map(|port| format!("http://127.0.0.1:{port}/sse"))
+        } else if early_is_lead {
+            self.team_orchestrator
+                .get()
+                .and_then(|o| o.lead_mcp_server_port.get().copied())
+                .map(|port| format!("http://127.0.0.1:{port}/sse"))
         } else {
             None
         };
@@ -581,6 +691,61 @@ impl SessionRegistry {
                 if let Some(task_id) = TeamOrchestrator::parse_done_marker(&full_text) {
                     if let Err(e) = team_orch.handle_specialist_done(&task_id, agent, &full_text) {
                         tracing::warn!(task_id = %task_id, "handle_specialist_done error: {:#}", e);
+                    }
+                    // Dispatch TeamNotify turn to Lead (async spawn to avoid re-entrant handle())
+                    if let Some(lead_key) = team_orch.lead_session_key.get().cloned() {
+                        let note = &full_text;
+                        let notify_content = if team_orch.registry.all_done().unwrap_or(false) {
+                            // All tasks done — set Done state and prompt Lead to synthesize
+                            *team_orch.team_state_inner.lock().unwrap() =
+                                crate::team::orchestrator::TeamState::Done;
+                            let tasks = team_orch.registry.all_tasks().unwrap_or_default();
+                            let summary: String = tasks
+                                .iter()
+                                .map(|t| {
+                                    format!(
+                                        "- {}（{}）：{}",
+                                        t.id,
+                                        t.assignee_hint.as_deref().unwrap_or("unknown"),
+                                        t.completion_note.as_deref().unwrap_or("完成")
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            format!(
+                                "[团队通知] 所有任务已完成 ✅\n\n完成摘要：\n{}\n\n请生成最终汇总并通过 post_update 发送给用户。",
+                                summary
+                            )
+                        } else {
+                            let tasks = team_orch.registry.all_tasks().unwrap_or_default();
+                            let done_count = tasks.iter().filter(|t| t.status_raw == "done").count();
+                            let total = tasks.len();
+                            format!(
+                                "[团队通知] 任务 {} 已完成（执行者：{}）\n\n完成摘要：\n{}\n\n当前进度：{} / {} 完成",
+                                task_id, agent, note, done_count, total
+                            )
+                        };
+
+                        if let Some(tx) = self.team_notify_tx.get() {
+                            let lead_channel = lead_key.channel.clone();
+                            let notify_msg = qai_protocol::InboundMsg {
+                                id: uuid::Uuid::new_v4().to_string(),
+                                session_key: lead_key,
+                                content: qai_protocol::MsgContent::text(notify_content),
+                                sender: "gateway".to_string(),
+                                channel: lead_channel,
+                                timestamp: chrono::Utc::now(),
+                                thread_ts: None,
+                                target_agent: None,
+                                source: qai_protocol::MsgSource::TeamNotify,
+                            };
+                            let tx = tx.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = tx.send(notify_msg).await {
+                                    tracing::warn!("TeamNotify dispatch error: {:#}", e);
+                                }
+                            });
+                        }
                     }
                 } else if let Some(reason) = TeamOrchestrator::parse_blocked_marker(&full_text) {
                     // Extract task_id from session_key (format: "team_id:agent_name")
