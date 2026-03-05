@@ -144,7 +144,12 @@ pub struct LarkSection {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillsSection {
+    /// 主 skills 目录（通过 `quickai-skill add` 安装的技能）
     pub dir: PathBuf,
+    /// 全局附加 skills 目录（所有 agent 默认注入，含 skill-finder）
+    /// 在 config.toml 中配置：global_dirs = ["~/.quickai/skills"]
+    #[serde(default)]
+    pub global_dirs: Vec<PathBuf>,
 }
 
 impl Default for SkillsSection {
@@ -153,7 +158,10 @@ impl Default for SkillsSection {
             .unwrap_or_default()
             .join(".quickai")
             .join("skills");
-        Self { dir }
+        Self {
+            dir,
+            global_dirs: vec![],
+        }
     }
 }
 

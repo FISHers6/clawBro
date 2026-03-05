@@ -65,6 +65,7 @@ async fn test_gateway_e2e_deepseek() {
         timestamp: chrono::Utc::now(),
         thread_ts: None,
         target_agent: None,
+        source: qai_protocol::MsgSource::Human,
     };
 
     let json = serde_json::to_string(&inbound).unwrap();
@@ -168,6 +169,7 @@ async fn test_gateway_e2e_claude_agent() {
         timestamp: chrono::Utc::now(),
         thread_ts: None,
         target_agent: None,
+        source: qai_protocol::MsgSource::Human,
     };
 
     let json = serde_json::to_string(&inbound).unwrap();

@@ -75,8 +75,10 @@ async fn main() -> Result<()> {
     let storage = SessionStorage::new(cfg.session.dir.clone());
     let session_manager = Arc::new(SessionManager::new(storage));
 
-    // 加载 Skills
-    let skill_loader = SkillLoader::new(vec![cfg.skills.dir.clone()]);
+    // 加载 Skills（主目录 + global_dirs 合并）
+    let mut all_skill_dirs = vec![cfg.skills.dir.clone()];
+    all_skill_dirs.extend(cfg.skills.global_dirs.iter().cloned());
+    let skill_loader = SkillLoader::new(all_skill_dirs.clone());
     let skills = skill_loader.load_all();
     let system_injection = skill_loader.build_system_injection(&skills);
     tracing::info!("Loaded {} skills", skills.len());
@@ -114,7 +116,7 @@ async fn main() -> Result<()> {
         memory_system,
         Some(cfg.memory.shared_dir.clone()),
         cfg.gateway.default_workspace.clone(),
-        vec![cfg.skills.dir.clone()],
+        all_skill_dirs,
     );
     // 使用 registry 内部的 global_tx，确保事件正确广播
     let event_tx = registry.global_sender();
