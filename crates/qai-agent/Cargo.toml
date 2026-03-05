@@ -8,6 +8,7 @@ qai-protocol  = { path = "../qai-protocol" }
 qai-session   = { path = "../qai-session" }
 qai-skills    = { path = "../qai-skills" }
 qai-channels  = { path = "../qai-channels" }
+axum.workspace       = true
 tokio.workspace      = true
 futures.workspace    = true
 async-trait.workspace = true
