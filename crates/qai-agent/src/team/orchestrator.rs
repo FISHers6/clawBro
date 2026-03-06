@@ -444,10 +444,15 @@ impl TeamOrchestrator {
         if let Some(handle) = self.heartbeat_handle.lock().unwrap().take() {
             handle.abort();
         }
-        // Stop MCP server
+        // Stop Specialist MCP server
         if let Some(handle) = self.mcp_server_handle.lock().await.take() {
             handle.stop().await;
             tracing::info!(team_id = %self.session.team_id, "TeamMcpServer stopped");
+        }
+        // Stop Lead MCP server
+        if let Some(handle) = self.lead_mcp_server_handle.lock().await.take() {
+            handle.stop().await;
+            tracing::info!(team_id = %self.session.team_id, "LeadMcpServer stopped");
         }
         // Cleanup InternalBus
         self.bus.cleanup_team(&self.session.team_id);
