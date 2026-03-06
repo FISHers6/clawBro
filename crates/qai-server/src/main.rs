@@ -403,135 +403,143 @@ async fn main() -> Result<()> {
         }
     }
 
-    // TeamNotify redispatch channel — shared by SessionRegistry and TeamOrchestrator
+    // TeamNotify redispatch channel — used by TeamOrchestrator to send milestone notifications
+    // back to the Lead's IM channel via the main message loop.
     let (team_notify_tx, mut team_notify_rx) =
         tokio::sync::mpsc::channel::<qai_protocol::InboundMsg>(256);
     let team_notify_tx_for_orch = team_notify_tx.clone();
-    registry.set_team_notify_tx(team_notify_tx);
 
-    // Wire TeamOrchestrator: TaskRegistry + DispatchFn + milestone notify_fn (C1 + I3).
+    // Wire one TeamOrchestrator per Team group: per-group isolation + per-team SQLite (G+H).
     {
         use qai_agent::team::{
-            bus::InternalBus, heartbeat::DispatchFn, orchestrator::TeamOrchestrator,
+            heartbeat::DispatchFn, orchestrator::TeamOrchestrator,
             registry::TaskRegistry, session::TeamSession,
         };
-        use qai_agent::team::lead_mcp_server::LeadToolServer;
 
-        let task_registry = std::sync::Arc::new(TaskRegistry::new_in_memory()?);
-        let team_sessions_dir = dirs::home_dir()
-            .unwrap_or_default()
-            .join(".quickai")
-            .join("team-sessions");
-        tokio::fs::create_dir_all(&team_sessions_dir).await?;
-        let team_session = std::sync::Arc::new(TeamSession::from_dir("default", team_sessions_dir));
-        let team_bus = std::sync::Arc::new(InternalBus::new());
+        let team_groups: Vec<_> = cfg.groups.iter()
+            .filter(|g| matches!(g.mode.interaction, qai_server::config::InteractionMode::Team))
+            .collect();
 
-        let registry_for_dispatch = registry.clone();
-        let task_reg_for_dispatch = std::sync::Arc::clone(&task_registry);
-        let team_session_for_dispatch = std::sync::Arc::clone(&team_session);
-        let dispatch_fn: DispatchFn = std::sync::Arc::new(
-            move |agent: String, task: qai_agent::team::registry::Task, _session: std::sync::Arc<TeamSession>| {
-                let registry = registry_for_dispatch.clone();
-                let task_reg = std::sync::Arc::clone(&task_reg_for_dispatch);
-                let team_session = std::sync::Arc::clone(&team_session_for_dispatch);
-                Box::pin(async move {
-                    let specialist_key = team_session.specialist_session_key(&agent);
-                    let specialist_channel = specialist_key.channel.clone();
-                    let reminder = team_session.build_task_reminder(&task, &task_reg);
-                    registry.set_task_reminder(specialist_key.clone(), reminder);
-                    let msg = qai_protocol::InboundMsg {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        session_key: specialist_key,
-                        content: qai_protocol::MsgContent::text(
-                            task.spec.as_deref().unwrap_or(&task.title),
-                        ),
-                        sender: "orchestrator".to_string(),
-                        channel: specialist_channel,
-                        timestamp: chrono::Utc::now(),
-                        thread_ts: None,
-                        target_agent: Some(format!("@{}", agent)),
-                        source: qai_protocol::MsgSource::Heartbeat,
-                    };
-                    registry.handle(msg).await.map(|_| ())
-                })
-            },
-        );
+        for group in team_groups {
+            // Derive team_id from group scope (sanitized for filesystem use)
+            let team_id: String = group.scope
+                .chars()
+                .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
+                .collect();
 
-        let team_orch = TeamOrchestrator::new(
-            task_registry,
-            team_session,
-            std::sync::Arc::clone(&team_bus),
-            dispatch_fn,
-            Duration::from_secs(60),
-        );
-
-        // Wire I3: milestone events → IM channel
-        let cron_channels_for_notify = cron_channel_map.clone();
-        team_orch.set_notify_fn(std::sync::Arc::new(
-            move |scope: qai_protocol::SessionKey, msg: String| {
-                let channels = cron_channels_for_notify.clone();
-                tokio::spawn(async move {
-                    if let Some(ch) = channels.get(&scope.channel) {
-                        let outbound = qai_protocol::OutboundMsg {
-                            session_key: scope,
-                            content: qai_protocol::MsgContent::text(msg),
-                            reply_to: None,
-                            thread_ts: None,
-                        };
-                        if let Err(e) = ch.send(&outbound).await {
-                            tracing::error!("Milestone notify send error: {e}");
-                        }
-                    }
-                });
-            },
-        ));
-
-        let team_orch_for_lead = std::sync::Arc::clone(&team_orch);
-        registry.set_team_orchestrator(team_orch);
-
-        // Wire TeamNotify sender into orchestrator (for handle_specialist_done + failure notify)
-        team_orch_for_lead.set_team_notify_tx(team_notify_tx_for_orch);
-
-        // Spawn LeadMcpServer — provides 6 tools to Lead Agent
-        {
-            let lead_srv = LeadToolServer::new(std::sync::Arc::clone(&team_orch_for_lead));
-            match lead_srv.spawn().await {
-                Ok(handle) => {
-                    let _ = team_orch_for_lead.lead_mcp_server_port.set(handle.port);
-                    tracing::info!(port = handle.port, "LeadMcpServer started");
-                    team_orch_for_lead.store_lead_mcp_handle(handle).await;
-                }
+            // Per-group session directory and SQLite database (H: file-based, not in-memory)
+            let session = match TeamSession::new(&group.scope, &team_id) {
+                Ok(s) => std::sync::Arc::new(s),
                 Err(e) => {
-                    tracing::error!(
-                        "Failed to start LeadMcpServer: {e}. Lead Agent will have no MCP tools available."
-                    );
+                    tracing::error!(scope = %group.scope, "Failed to create TeamSession: {e:#}");
+                    continue;
                 }
+            };
+            let db_path = session.dir.join("tasks.db");
+            let task_registry = match TaskRegistry::new(db_path.to_str().unwrap_or(":memory:")) {
+                Ok(r) => std::sync::Arc::new(r),
+                Err(e) => {
+                    tracing::error!(scope = %group.scope, "Failed to open TaskRegistry: {e:#}");
+                    continue;
+                }
+            };
+
+            let registry_for_dispatch = registry.clone();
+            let task_reg_for_dispatch = std::sync::Arc::clone(&task_registry);
+            let team_session_for_dispatch = std::sync::Arc::clone(&session);
+            let dispatch_fn: DispatchFn = std::sync::Arc::new(
+                move |agent: String, task: qai_agent::team::registry::Task, _session: std::sync::Arc<TeamSession>| {
+                    let registry = registry_for_dispatch.clone();
+                    let task_reg = std::sync::Arc::clone(&task_reg_for_dispatch);
+                    let team_session = std::sync::Arc::clone(&team_session_for_dispatch);
+                    Box::pin(async move {
+                        let specialist_key = team_session.specialist_session_key(&agent);
+                        let specialist_channel = specialist_key.channel.clone();
+                        let reminder = team_session.build_task_reminder(&task, &task_reg);
+                        registry.set_task_reminder(specialist_key.clone(), reminder);
+                        let msg = qai_protocol::InboundMsg {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            session_key: specialist_key,
+                            content: qai_protocol::MsgContent::text(
+                                task.spec.as_deref().unwrap_or(&task.title),
+                            ),
+                            sender: "orchestrator".to_string(),
+                            channel: specialist_channel,
+                            timestamp: chrono::Utc::now(),
+                            thread_ts: None,
+                            target_agent: Some(format!("@{}", agent)),
+                            source: qai_protocol::MsgSource::Heartbeat,
+                        };
+                        registry.handle(msg).await.map(|_| ())
+                    })
+                },
+            );
+
+            let team_orch = TeamOrchestrator::new(
+                task_registry,
+                std::sync::Arc::clone(&session),
+                dispatch_fn,
+                Duration::from_secs(60),
+            );
+
+            // Wire I3: milestone events → IM channel
+            let cron_channels_for_notify = cron_channel_map.clone();
+            team_orch.set_notify_fn(std::sync::Arc::new(
+                move |scope: qai_protocol::SessionKey, msg: String| {
+                    let channels = cron_channels_for_notify.clone();
+                    tokio::spawn(async move {
+                        if let Some(ch) = channels.get(&scope.channel) {
+                            let outbound = qai_protocol::OutboundMsg {
+                                session_key: scope,
+                                content: qai_protocol::MsgContent::text(msg),
+                                reply_to: None,
+                                thread_ts: None,
+                            };
+                            if let Err(e) = ch.send(&outbound).await {
+                                tracing::error!("Milestone notify send error: {e}");
+                            }
+                        }
+                    });
+                },
+            ));
+
+            // Wire lead_session_key from group config
+            let channel_name: &str = if let Some(ref ch) = group.mode.channel {
+                ch.as_str()
+            } else if cfg.channels.dingtalk.as_ref().map(|c| c.enabled).unwrap_or(false) {
+                "dingtalk"
+            } else if cfg.channels.lark.as_ref().map(|c| c.enabled).unwrap_or(false) {
+                "lark"
+            } else {
+                "ws"
+            };
+            let lead_key = qai_protocol::SessionKey::new(channel_name, &group.scope);
+            team_orch.set_lead_session_key(lead_key.clone());
+            team_orch.set_scope(lead_key);
+            if let Some(front_bot) = &group.mode.front_bot {
+                team_orch.set_lead_agent_name(front_bot.clone());
+                tracing::info!(front_bot = %front_bot, scope = %group.scope, "Lead agent wired from front_bot");
             }
+            if !group.team.roster.is_empty() {
+                team_orch.set_available_specialists(group.team.roster.clone());
+                tracing::info!(specialists = ?group.team.roster, scope = %group.scope, "Available specialists wired");
+            }
+
+            // Wire TeamNotify sender into orchestrator
+            team_orch.set_team_notify_tx(team_notify_tx_for_orch.clone());
+
+            // Eagerly start SharedTeamMcpServer so both Lead and Specialist receive
+            // mcp_server_url from their very first turn (fixes chicken-and-egg issue).
+            match team_orch.start_mcp_server().await {
+                Ok(()) => tracing::info!(scope = %group.scope, team_id = %team_id, "SharedTeamMcpServer started"),
+                Err(e) => tracing::error!(scope = %group.scope, "Failed to start SharedTeamMcpServer: {e:#}"),
+            }
+
+            registry.register_team_orchestrator(team_id.clone(), team_orch);
+            tracing::info!(scope = %group.scope, team_id = %team_id, "TeamOrchestrator registered");
         }
 
-        // Wire lead_session_key from Team groups in config
-        for group in &cfg.groups {
-            if matches!(group.mode.interaction, qai_server::config::InteractionMode::Team) {
-                let channel_name = if cfg.channels.dingtalk.as_ref().map(|c| c.enabled).unwrap_or(false) {
-                    "dingtalk"
-                } else if cfg.channels.lark.as_ref().map(|c| c.enabled).unwrap_or(false) {
-                    "lark"
-                } else {
-                    "ws"
-                };
-                let lead_key = qai_protocol::SessionKey::new(channel_name, &group.scope);
-                team_orch_for_lead.set_lead_session_key(lead_key.clone());
-                team_orch_for_lead.set_scope(lead_key);
-                if let Some(front_bot) = &group.mode.front_bot {
-                    team_orch_for_lead.set_lead_agent_name(front_bot.clone());
-                    tracing::info!(front_bot = %front_bot, scope = %group.scope, "Lead agent wired from front_bot");
-                }
-                tracing::info!(scope = %group.scope, "Team group lead_session_key wired");
-                break; // MVP: one Team group per Gateway instance
-            }
-        }
-
-        tracing::info!("TeamOrchestrator wired");
+        tracing::info!("TeamOrchestrators wired");
     }
 
     // Spawn BotMention redispatch task: MentionTrigger → handle() → IM reply (C1).

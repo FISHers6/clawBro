@@ -76,17 +76,16 @@ pub struct SessionRegistry {
     /// Pre-registered task_reminder for Specialist turns.
     /// DispatchFn sets this before calling handle(); handle() removes and injects into AgentCtx.
     team_task_reminders: DashMap<SessionKey, String>,
-    /// Team orchestrator — processes [DONE: Txxx] markers from Specialist replies.
-    team_orchestrator: OnceLock<Arc<TeamOrchestrator>>,
+    /// Per-group team orchestrators, keyed by team_id (= TeamSession::team_id).
+    /// Supports multiple concurrent Team groups. Lead sessions route via lead_session_key scan;
+    /// Specialist sessions route via scope prefix "{team_id}:{agent_name}".
+    team_orchestrators: DashMap<String, Arc<TeamOrchestrator>>,
     /// Relay engine — processes [RELAY: @agent <指令>] markers synchronously.
     relay_engine: OnceLock<Arc<RelayEngine>>,
     /// Mention trigger — scans bot replies for @botname patterns.
     mention_trigger: OnceLock<Arc<MentionTrigger>>,
     /// Weak self-reference for spawning recursive handle() calls (TeamNotify dispatch).
     weak_self: std::sync::Weak<Self>,
-    /// TeamNotify redispatch channel — set by main.rs, used to inject TeamNotify InboundMsgs
-    /// back into the main message loop without re-entering handle() recursively.
-    team_notify_tx: OnceLock<tokio::sync::mpsc::Sender<InboundMsg>>,
 }
 
 impl SessionRegistry {
@@ -121,11 +120,10 @@ impl SessionRegistry {
             skill_loader_dirs,
             initialized_persona_dirs: dashmap::DashSet::new(),
             team_task_reminders: DashMap::new(),
-            team_orchestrator: OnceLock::new(),
+            team_orchestrators: DashMap::new(),
             relay_engine: OnceLock::new(),
             mention_trigger: OnceLock::new(),
             weak_self: weak.clone(),
-            team_notify_tx: OnceLock::new(),
         });  // end of Arc::new_cyclic
 
         // Idle timer: check every 60s for sessions idle > 30 min
@@ -174,9 +172,26 @@ impl SessionRegistry {
         self.team_task_reminders.insert(key, reminder);
     }
 
-    /// Attach a TeamOrchestrator — processes [DONE: Txxx] markers from Specialist replies.
-    pub fn set_team_orchestrator(&self, orch: Arc<TeamOrchestrator>) {
-        let _ = self.team_orchestrator.set(orch);
+    /// Register a TeamOrchestrator for a given team_id.
+    /// Supports multiple concurrent Team groups (one orchestrator per group).
+    pub fn register_team_orchestrator(&self, team_id: String, orch: Arc<TeamOrchestrator>) {
+        self.team_orchestrators.insert(team_id, orch);
+    }
+
+    /// Find the TeamOrchestrator responsible for this session.
+    ///
+    /// - Specialist sessions: channel == "specialist", scope == "{team_id}:{agent}" → look up by team_id prefix.
+    /// - Lead sessions: scan all orchestrators for one whose lead_session_key matches.
+    fn get_orchestrator_for_session(&self, session_key: &SessionKey) -> Option<Arc<TeamOrchestrator>> {
+        if session_key.channel.as_str() == "specialist" {
+            let team_id = session_key.scope.splitn(2, ':').next()?;
+            self.team_orchestrators.get(team_id).map(|r| Arc::clone(r.value()))
+        } else {
+            self.team_orchestrators
+                .iter()
+                .find(|entry| entry.value().lead_session_key.get() == Some(session_key))
+                .map(|entry| Arc::clone(entry.value()))
+        }
     }
 
     /// Attach a RelayEngine — processes [RELAY: @agent <指令>] markers synchronously.
@@ -187,12 +202,6 @@ impl SessionRegistry {
     /// Attach a MentionTrigger — scans bot replies for @botname and dispatches BotMention msgs.
     pub fn set_mention_trigger(&self, trigger: Arc<MentionTrigger>) {
         let _ = self.mention_trigger.set(trigger);
-    }
-
-    /// Set TeamNotify redispatch sender (called by main.rs at startup).
-    /// TeamNotify messages are sent through this channel to the main message loop.
-    pub fn set_team_notify_tx(&self, tx: tokio::sync::mpsc::Sender<InboundMsg>) {
-        let _ = self.team_notify_tx.set(tx);
     }
 
     /// Get-or-create per-session cached engine (used when no roster match)
@@ -298,10 +307,15 @@ impl SessionRegistry {
         let user_text = inbound.content.as_text().unwrap_or("").to_string();
         let user_text_for_log = user_text.clone();
 
+        // Resolve the responsible TeamOrchestrator once, reuse throughout handle().
+        // Must be computed before any usage below (confirmation interceptor, roster, etc.).
+        let session_team_orch: Option<Arc<TeamOrchestrator>> =
+            self.get_orchestrator_for_session(&session_key);
+
         // ── Team Mode confirmation interceptor ──────────────────────────────────
         // When Lead called request_confirmation(), the next Human message is the user's yes/no.
         if inbound.source == qai_protocol::MsgSource::Human {
-            if let Some(team_orch) = self.team_orchestrator.get() {
+            if let Some(team_orch) = session_team_orch.as_ref() {
                 if team_orch.team_state() == crate::team::orchestrator::TeamState::AwaitingConfirm {
                     if let Some(lead_key) = team_orch.lead_session_key.get() {
                         if &session_key == lead_key {
@@ -311,7 +325,7 @@ impl SessionRegistry {
                                 .any(|kw| text_lower.contains(kw));
                             if confirmed {
                                 if let Some(_arc_self) = self.weak_self.upgrade() {
-                                    let orch = std::sync::Arc::clone(team_orch);
+                                    let orch = std::sync::Arc::clone(&team_orch);
                                     tokio::spawn(async move {
                                         match orch.activate().await {
                                             Ok(msg) => tracing::info!("Team activated via confirmation: {}", msg),
@@ -342,13 +356,7 @@ impl SessionRegistry {
         // Early Specialist/Lead detection — must run before roster_match so Lead turns
         // without an explicit @mention can fall back to the configured front_bot engine.
         let early_is_specialist = inbound.source == MsgSource::Heartbeat;
-        let early_is_lead = !early_is_specialist && {
-            self.team_orchestrator
-                .get()
-                .and_then(|o| o.lead_session_key.get())
-                .map(|k| k == &session_key)
-                .unwrap_or(false)
-        };
+        let early_is_lead = !early_is_specialist && session_team_orch.is_some();
 
         // ── Generic routing via target_agent (set by Channel) ──
         // Clone needed data from roster match to avoid holding borrow across await.
@@ -370,8 +378,8 @@ impl SessionRegistry {
             .or_else(|| {
                 // Lead fallback: no @mention but this is a Lead turn → use front_bot engine
                 if early_is_lead {
-                    self.team_orchestrator
-                        .get()
+                    session_team_orch
+                        .as_ref()
                         .and_then(|o| o.lead_agent_name.get())
                         .and_then(|name| {
                             self.roster.as_ref()?.find_by_name(name).map(|entry| {
@@ -487,9 +495,10 @@ impl SessionRegistry {
             AgentRole::Solo
         };
 
-        // When a TeamNotify arrives, lazily set lead_session_key + scope if not yet set
+        // When a TeamNotify arrives, lazily set lead_session_key + scope if not yet set.
+        // TeamNotify session_key IS the lead's session_key — find the orchestrator by scanning all.
         if inbound.source == qai_protocol::MsgSource::TeamNotify {
-            if let Some(team_orch) = self.team_orchestrator.get() {
+            if let Some(team_orch) = session_team_orch.as_ref() {
                 team_orch.set_lead_session_key(session_key.clone());
                 team_orch.set_scope(session_key.clone());
             }
@@ -497,33 +506,46 @@ impl SessionRegistry {
 
         // Build Lead Layer 0 (task_reminder for Lead turns based on TeamState)
         let lead_layer_0: Option<String> = if early_is_lead {
-            let state = self.team_orchestrator
-                .get()
+            let state = session_team_orch
+                .as_ref()
                 .map(|o| o.team_state())
                 .unwrap_or(crate::team::orchestrator::TeamState::Planning);
-            Some(match state {
-                crate::team::orchestrator::TeamState::Planning
-                | crate::team::orchestrator::TeamState::AwaitingConfirm => {
-                    "你是团队协调者。用户的请求需要多个 Agent 协作完成。\n\n\
-                     步骤：\n\
-                     1. 分析任务，调用 create_task() 定义所有子任务和依赖关系\n\
-                     2. 简单任务（≤3个、无复杂依赖）直接调用 start_execution()\n\
-                     3. 复杂任务先调用 request_confirmation(plan_summary)，等用户确认后再执行\n\
-                     4. 任务执行中你会收到 [团队通知] 消息，用 post_update() 向用户播报关键进度\n\
-                     5. 收到\"所有任务已完成\"通知后，合成最终结果并调用 post_update() 发给用户\n\n\
-                     可用工具：create_task, start_execution, request_confirmation, post_update, get_task_status, assign_task"
-                        .to_string()
-                }
-                crate::team::orchestrator::TeamState::Running
-                | crate::team::orchestrator::TeamState::Done => {
-                    "团队任务执行中。你会收到 [团队通知] 消息。\n\n\
-                     - 用 post_update(message) 向用户播报进度\n\
-                     - 用 get_task_status() 查看全局状态\n\
-                     - 用 assign_task(task_id, agent) 重新分配卡住的任务\n\
-                     - 收到\"所有任务已完成\"通知后，合成最终汇总并 post_update"
-                        .to_string()
-                }
-            })
+            {
+                let specialists_list = session_team_orch
+                    .as_ref()
+                    .and_then(|o| o.available_specialists.get())
+                    .map(|v| v.join(", "))
+                    .unwrap_or_else(|| "（未配置）".to_string());
+                Some(match state {
+                    crate::team::orchestrator::TeamState::Planning
+                    | crate::team::orchestrator::TeamState::AwaitingConfirm => {
+                        format!(
+                            "你是团队协调者。用户的请求需要多个 Agent 协作完成。\n\n\
+                             可分配的 Specialist：{specialists_list}\n\n\
+                             步骤：\n\
+                             1. 分析任务，调用 create_task() 定义所有子任务和依赖关系（assignee 填 Specialist 名称）\n\
+                             2. 简单任务（≤3个、无复杂依赖）直接调用 start_execution()\n\
+                             3. 复杂任务先调用 request_confirmation(plan_summary)，等用户确认后再执行\n\
+                             4. 任务执行中你会收到 [团队通知] 消息，用 post_update() 向用户播报关键进度\n\
+                             5. 收到\"所有任务已完成\"通知后，合成最终结果并调用 post_update() 发给用户\n\n\
+                             可用工具：create_task, start_execution, request_confirmation, post_update, get_task_status, assign_task",
+                            specialists_list = specialists_list,
+                        )
+                    }
+                    crate::team::orchestrator::TeamState::Running
+                    | crate::team::orchestrator::TeamState::Done => {
+                        format!(
+                            "团队任务执行中。可分配的 Specialist：{specialists_list}\n\n\
+                             你会收到 [团队通知] 消息：\n\
+                             - 用 post_update(message) 向用户播报进度\n\
+                             - 用 get_task_status() 查看全局状态\n\
+                             - 用 assign_task(task_id, agent) 重新分配卡住的任务（agent 填 Specialist 名称）\n\
+                             - 收到\"所有任务已完成\"通知后，合成最终汇总并 post_update",
+                            specialists_list = specialists_list,
+                        )
+                    }
+                })
+            }
         } else {
             None
         };
@@ -608,8 +630,9 @@ impl SessionRegistry {
 
         // Consume task_reminder from DashMap (was peeked earlier for system prompt building).
         let task_reminder = self.team_task_reminders.remove(&session_key).map(|(_, v)| v);
+        // session_team_orch was resolved once at top of handle() — reuse here.
         let team_dir = if early_is_specialist {
-            self.team_orchestrator.get().map(|o| o.session.dir.clone())
+            session_team_orch.as_ref().map(|o| o.session.dir.clone())
         } else {
             None
         };
@@ -618,19 +641,12 @@ impl SessionRegistry {
         // TEAM.md/TASKS.md/CONTEXT.md in its working directory (fixes I1).
         let effective_workspace = team_dir.clone().or(workspace_dir_resolved);
 
-        let mcp_server_url: Option<String> = if early_is_specialist {
-            self.team_orchestrator
-                .get()
-                .and_then(|o| o.mcp_server_port.get().copied())
-                .map(|port| format!("http://127.0.0.1:{port}/sse"))
-        } else if early_is_lead {
-            self.team_orchestrator
-                .get()
-                .and_then(|o| o.lead_mcp_server_port.get().copied())
-                .map(|port| format!("http://127.0.0.1:{port}/sse"))
-        } else {
-            None
-        };
+        // Both Lead and Specialist get the same unified MCP server URL (SharedTeamToolServer).
+        // System prompts guide which of the 8 tools are relevant per role.
+        let mcp_server_url: Option<String> = session_team_orch
+            .as_ref()
+            .and_then(|o| o.mcp_server_port.get().copied())
+            .map(|port| format!("http://127.0.0.1:{port}/sse"));
 
         // Build AgentCtx for the engine
         let ctx = AgentCtx {
@@ -1167,22 +1183,21 @@ mod tests {
     /// use the orchestrator's lead_agent_name to look up the roster by name.
     #[test]
     fn test_lead_fallback_uses_front_bot_roster_entry() {
-        use crate::team::{bus::InternalBus, heartbeat::DispatchFn, orchestrator::TeamOrchestrator, registry::TaskRegistry, session::TeamSession};
+        use crate::team::{heartbeat::DispatchFn, orchestrator::TeamOrchestrator, registry::TaskRegistry, session::TeamSession};
         use tempfile::tempdir;
 
         let (registry, _rx) = make_registry_with_roster();
         let tmp = tempdir().unwrap();
         let task_registry = Arc::new(TaskRegistry::new_in_memory().unwrap());
         let session = Arc::new(TeamSession::from_dir("t", tmp.path().to_path_buf()));
-        let bus = Arc::new(InternalBus::new());
         let dispatch_fn: DispatchFn = Arc::new(|_, _, _| Box::pin(async { Ok(()) }));
-        let orch = TeamOrchestrator::new(task_registry, session, bus, dispatch_fn, std::time::Duration::from_secs(60));
+        let orch = TeamOrchestrator::new(task_registry, session, dispatch_fn, std::time::Duration::from_secs(60));
 
         // Wire: lead_session_key + lead_agent_name = "mybot"
         let lead_key = qai_protocol::SessionKey::new("lark", "group:123");
         orch.set_lead_session_key(lead_key.clone());
         orch.set_lead_agent_name("mybot".to_string());
-        registry.set_team_orchestrator(orch);
+        registry.register_team_orchestrator("t".to_string(), orch);
 
         // Confirm roster has "mybot"
         let entry = registry.roster.as_ref().unwrap().find_by_name("mybot").unwrap();
@@ -1192,8 +1207,8 @@ mod tests {
         // The early_is_lead detection and Lead fallback in roster_match should pick "mybot".
         // We verify via direct roster lookup since we can't run the full async handle() in a unit test.
         let resolved = registry
-            .team_orchestrator
-            .get()
+            .get_orchestrator_for_session(&lead_key)
+            .as_ref()
             .and_then(|o| o.lead_agent_name.get())
             .and_then(|name| registry.roster.as_ref()?.find_by_name(name));
         assert!(resolved.is_some(), "Lead fallback should resolve front_bot roster entry");
