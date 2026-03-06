@@ -522,6 +522,10 @@ async fn main() -> Result<()> {
                 let lead_key = qai_protocol::SessionKey::new(channel_name, &group.scope);
                 team_orch_for_lead.set_lead_session_key(lead_key.clone());
                 team_orch_for_lead.set_scope(lead_key);
+                if let Some(front_bot) = &group.mode.front_bot {
+                    team_orch_for_lead.set_lead_agent_name(front_bot.clone());
+                    tracing::info!(front_bot = %front_bot, scope = %group.scope, "Lead agent wired from front_bot");
+                }
                 tracing::info!(scope = %group.scope, "Team group lead_session_key wired");
                 break; // MVP: one Team group per Gateway instance
             }

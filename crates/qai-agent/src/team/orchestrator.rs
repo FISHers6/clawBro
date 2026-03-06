@@ -86,6 +86,10 @@ pub struct TeamOrchestrator {
     pub team_state_inner: std::sync::Mutex<TeamState>,
     /// Lead Agent 的 IM session key（设置后用于 TeamNotify 路由）
     pub lead_session_key: std::sync::OnceLock<qai_protocol::SessionKey>,
+    /// Configured Lead agent name from `front_bot` in config.toml.
+    /// When set, registry uses this name to look up the roster engine for Lead turns
+    /// that arrive without an explicit @mention.
+    pub lead_agent_name: std::sync::OnceLock<String>,
     /// Bound port of the Lead MCP server (set after spawn in main.rs).
     pub lead_mcp_server_port: std::sync::OnceLock<u16>,
     /// TeamNotify MPSC sender — wired from main.rs after registry is ready.
@@ -115,6 +119,7 @@ impl TeamOrchestrator {
             lead_mcp_server_handle: tokio::sync::Mutex::new(None),
             team_state_inner: std::sync::Mutex::new(TeamState::Planning),
             lead_session_key: std::sync::OnceLock::new(),
+            lead_agent_name: std::sync::OnceLock::new(),
             lead_mcp_server_port: std::sync::OnceLock::new(),
             team_notify_tx: std::sync::OnceLock::new(),
         })
@@ -148,6 +153,12 @@ impl TeamOrchestrator {
     /// handle_specialist_done() 和永久失败处理会用此 sender 推通知给 Lead。
     pub fn set_team_notify_tx(&self, tx: tokio::sync::mpsc::Sender<qai_protocol::InboundMsg>) {
         let _ = self.team_notify_tx.set(tx);
+    }
+
+    /// Set the Lead agent name (from `front_bot` in config.toml).
+    /// Called by main.rs during wiring.
+    pub fn set_lead_agent_name(&self, name: String) {
+        let _ = self.lead_agent_name.set(name);
     }
 
     /// 存储 LeadMcpServer 句柄，防止其被 drop（替代 mem::forget）。

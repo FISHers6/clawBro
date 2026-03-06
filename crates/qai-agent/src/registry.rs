@@ -339,8 +339,21 @@ impl SessionRegistry {
                 .await;
         }
 
+        // Early Specialist/Lead detection — must run before roster_match so Lead turns
+        // without an explicit @mention can fall back to the configured front_bot engine.
+        let early_is_specialist = inbound.source == MsgSource::Heartbeat;
+        let early_is_lead = !early_is_specialist && {
+            self.team_orchestrator
+                .get()
+                .and_then(|o| o.lead_session_key.get())
+                .map(|k| k == &session_key)
+                .unwrap_or(false)
+        };
+
         // ── Generic routing via target_agent (set by Channel) ──
-        // Clone needed data from roster match to avoid holding borrow across await
+        // Clone needed data from roster match to avoid holding borrow across await.
+        // For Lead turns without an explicit @mention, fall back to the configured
+        // front_bot agent (set via `front_bot` in [[group]] config).
         let roster_match: Option<RosterMatchData> =
             inbound.target_agent.as_deref().and_then(|mention| {
                 self.roster
@@ -353,6 +366,27 @@ impl SessionRegistry {
                         workspace_dir: entry.workspace_dir.clone(),
                         extra_skills_dirs: entry.extra_skills_dirs.clone(),
                     })
+            })
+            .or_else(|| {
+                // Lead fallback: no @mention but this is a Lead turn → use front_bot engine
+                if early_is_lead {
+                    self.team_orchestrator
+                        .get()
+                        .and_then(|o| o.lead_agent_name.get())
+                        .and_then(|name| {
+                            self.roster.as_ref()?.find_by_name(name).map(|entry| {
+                                RosterMatchData {
+                                    engine_cfg: entry.engine.clone(),
+                                    agent_name: entry.name.clone(),
+                                    persona_dir: entry.persona_dir.clone(),
+                                    workspace_dir: entry.workspace_dir.clone(),
+                                    extra_skills_dirs: entry.extra_skills_dirs.clone(),
+                                }
+                            })
+                        })
+                } else {
+                    None
+                }
             });
 
         // Select engine: roster match → fresh engine per turn; no match → session-cached engine
@@ -442,19 +476,6 @@ impl SessionRegistry {
                 let persona = personas.into_iter().next();
                 (injection, persona)
             }
-        };
-
-        // Early Specialist detection — needed before SystemPromptBuilder runs.
-        // Only Heartbeat-dispatched turns (from TeamOrchestrator dispatch_fn) are Specialist turns.
-        let early_is_specialist = inbound.source == MsgSource::Heartbeat;
-
-        // Detect Lead turn: session_key matches the stored lead_session_key in orchestrator
-        let early_is_lead = !early_is_specialist && {
-            self.team_orchestrator
-                .get()
-                .and_then(|o| o.lead_session_key.get())
-                .map(|k| k == &session_key)
-                .unwrap_or(false)
         };
 
         // Override agent_role for Lead
@@ -1139,6 +1160,44 @@ mod tests {
     fn test_registry_no_roster_is_none() {
         let (registry, _rx) = make_registry();
         assert!(registry.roster.is_none());
+    }
+
+    /// Verify that lead_agent_name fallback resolves the correct RosterMatchData.
+    /// When early_is_lead is true and no @mention is present, the registry should
+    /// use the orchestrator's lead_agent_name to look up the roster by name.
+    #[test]
+    fn test_lead_fallback_uses_front_bot_roster_entry() {
+        use crate::team::{bus::InternalBus, heartbeat::DispatchFn, orchestrator::TeamOrchestrator, registry::TaskRegistry, session::TeamSession};
+        use tempfile::tempdir;
+
+        let (registry, _rx) = make_registry_with_roster();
+        let tmp = tempdir().unwrap();
+        let task_registry = Arc::new(TaskRegistry::new_in_memory().unwrap());
+        let session = Arc::new(TeamSession::from_dir("t", tmp.path().to_path_buf()));
+        let bus = Arc::new(InternalBus::new());
+        let dispatch_fn: DispatchFn = Arc::new(|_, _, _| Box::pin(async { Ok(()) }));
+        let orch = TeamOrchestrator::new(task_registry, session, bus, dispatch_fn, std::time::Duration::from_secs(60));
+
+        // Wire: lead_session_key + lead_agent_name = "mybot"
+        let lead_key = qai_protocol::SessionKey::new("lark", "group:123");
+        orch.set_lead_session_key(lead_key.clone());
+        orch.set_lead_agent_name("mybot".to_string());
+        registry.set_team_orchestrator(orch);
+
+        // Confirm roster has "mybot"
+        let entry = registry.roster.as_ref().unwrap().find_by_name("mybot").unwrap();
+        assert_eq!(entry.name, "mybot");
+
+        // Simulate a Lead turn with no @mention: session_key == lead_key, source == Human
+        // The early_is_lead detection and Lead fallback in roster_match should pick "mybot".
+        // We verify via direct roster lookup since we can't run the full async handle() in a unit test.
+        let resolved = registry
+            .team_orchestrator
+            .get()
+            .and_then(|o| o.lead_agent_name.get())
+            .and_then(|name| registry.roster.as_ref()?.find_by_name(name));
+        assert!(resolved.is_some(), "Lead fallback should resolve front_bot roster entry");
+        assert_eq!(resolved.unwrap().name, "mybot");
     }
 
     #[test]
