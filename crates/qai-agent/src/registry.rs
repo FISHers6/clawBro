@@ -84,6 +84,10 @@ pub struct SessionRegistry {
     relay_engine: OnceLock<Arc<RelayEngine>>,
     /// Mention trigger — scans bot replies for @botname patterns.
     mention_trigger: OnceLock<Arc<MentionTrigger>>,
+    /// Scopes where auto_promote = true (configured per-group in gateway.toml).
+    /// When a matching message arrives with team trigger keywords, the turn is
+    /// treated as a Lead turn even if no orchestrator is registered.
+    auto_promote_scopes: dashmap::DashSet<String>,
     /// Weak self-reference for spawning recursive handle() calls (TeamNotify dispatch).
     weak_self: std::sync::Weak<Self>,
 }
@@ -123,6 +127,7 @@ impl SessionRegistry {
             team_orchestrators: DashMap::new(),
             relay_engine: OnceLock::new(),
             mention_trigger: OnceLock::new(),
+            auto_promote_scopes: dashmap::DashSet::new(),
             weak_self: weak.clone(),
         });  // end of Arc::new_cyclic
 
@@ -202,6 +207,13 @@ impl SessionRegistry {
     /// Attach a MentionTrigger — scans bot replies for @botname and dispatches BotMention msgs.
     pub fn set_mention_trigger(&self, trigger: Arc<MentionTrigger>) {
         let _ = self.mention_trigger.set(trigger);
+    }
+
+    /// Register a scope for keyword-based auto-promotion (auto_promote = true in config).
+    /// When a user message in this scope contains team trigger keywords, the turn is
+    /// treated as a Lead turn even if no orchestrator is currently registered for the scope.
+    pub fn add_auto_promote_scope(&self, scope: String) {
+        self.auto_promote_scopes.insert(scope);
     }
 
     /// Get-or-create per-session cached engine (used when no roster match)
@@ -356,7 +368,16 @@ impl SessionRegistry {
         // Early Specialist/Lead detection — must run before roster_match so Lead turns
         // without an explicit @mention can fall back to the configured front_bot engine.
         let early_is_specialist = inbound.source == MsgSource::Heartbeat;
-        let early_is_lead = !early_is_specialist && session_team_orch.is_some();
+        // Auto-promote check: if no orchestrator registered but this scope has auto_promote = true
+        // AND the message contains team trigger keywords, treat as Lead turn.
+        let auto_promote_active = !early_is_specialist
+            && session_team_orch.is_none()
+            && inbound.source == MsgSource::Human
+            && self.auto_promote_scopes.contains(&session_key.scope)
+            && crate::mode_selector::is_team_trigger(
+                inbound.content.as_text().unwrap_or(""),
+            );
+        let early_is_lead = !early_is_specialist && (session_team_orch.is_some() || auto_promote_active);
 
         // ── Generic routing via target_agent (set by Channel) ──
         // Clone needed data from roster match to avoid holding borrow across await.

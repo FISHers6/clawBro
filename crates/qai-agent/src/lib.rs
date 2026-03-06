@@ -1,4 +1,5 @@
 pub mod acp_engine;
+pub mod mode_selector;
 pub mod relay;
 pub mod team;
 pub mod dedup;

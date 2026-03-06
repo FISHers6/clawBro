@@ -547,6 +547,13 @@ async fn main() -> Result<()> {
         }
 
         tracing::info!("TeamOrchestrators wired");
+
+        // Wire auto_promote scopes: groups with auto_promote = true but no team orchestrator
+        // can still trigger Lead behavior via keyword detection in mode_selector.
+        for group in cfg.groups.iter().filter(|g| g.mode.auto_promote) {
+            registry.add_auto_promote_scope(group.scope.clone());
+            tracing::info!(scope = %group.scope, "auto_promote keyword detection enabled");
+        }
     }
 
     // Spawn BotMention redispatch task: MentionTrigger → handle() → IM reply (C1).
