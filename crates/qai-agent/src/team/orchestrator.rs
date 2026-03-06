@@ -16,7 +16,6 @@ use chrono::Utc;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 
-use super::bus::{InternalBus, InternalMsg, InternalMsgType};
 use super::heartbeat::DispatchFn;
 use super::registry::TaskRegistry;
 use super::session::TeamSession;
@@ -66,7 +65,6 @@ pub type NotifyFn = Arc<dyn Fn(qai_protocol::SessionKey, String) + Send + Sync>;
 pub struct TeamOrchestrator {
     pub registry: Arc<TaskRegistry>,
     pub session: Arc<TeamSession>,
-    pub bus: Arc<InternalBus>,
     heartbeat_handle: std::sync::Mutex<Option<JoinHandle<()>>>,
     dispatch_fn: DispatchFn,
     heartbeat_interval: std::time::Duration,
@@ -74,26 +72,20 @@ pub struct TeamOrchestrator {
     scope: std::sync::OnceLock<qai_protocol::SessionKey>,
     /// Sends milestone message to the IM channel (injected from main.rs).
     notify_fn: std::sync::OnceLock<NotifyFn>,
-    /// Running HTTP MCP server handle (Some after start(), taken on stop()).
+    /// Unified MCP server handle (Lead + Specialist tools on one port, spawned at startup).
     /// Uses tokio::sync::Mutex because stop() is async.
-    mcp_server_handle: tokio::sync::Mutex<Option<super::mcp_server::TeamMcpServerHandle>>,
-    /// Bound port of the running MCP server (set once after start(), None until then).
+    mcp_server_handle: tokio::sync::Mutex<Option<super::shared_mcp_server::SharedMcpServerHandle>>,
+    /// Bound port of the unified MCP server (set once after spawn, used by all agents).
     pub mcp_server_port: std::sync::OnceLock<u16>,
-    /// Running Lead MCP server handle (Some after LeadMcpServer is spawned in main.rs).
-    /// Kept alive here instead of leaking via mem::forget.
-    lead_mcp_server_handle: tokio::sync::Mutex<Option<super::lead_mcp_server::LeadMcpServerHandle>>,
     /// 当前 Team 执行状态（Planning / AwaitingConfirm / Running / Done）
     pub team_state_inner: std::sync::Mutex<TeamState>,
     /// Lead Agent 的 IM session key（设置后用于 TeamNotify 路由）
     pub lead_session_key: std::sync::OnceLock<qai_protocol::SessionKey>,
     /// Configured Lead agent name from `front_bot` in config.toml.
-    /// When set, registry uses this name to look up the roster engine for Lead turns
-    /// that arrive without an explicit @mention.
     pub lead_agent_name: std::sync::OnceLock<String>,
-    /// Bound port of the Lead MCP server (set after spawn in main.rs).
-    pub lead_mcp_server_port: std::sync::OnceLock<u16>,
+    /// List of Specialist agent names (from `team.roster` in config.toml).
+    pub available_specialists: std::sync::OnceLock<Vec<String>>,
     /// TeamNotify MPSC sender — wired from main.rs after registry is ready.
-    /// Used by handle_specialist_done() and failure handler to push notifications to Lead.
     team_notify_tx: std::sync::OnceLock<tokio::sync::mpsc::Sender<qai_protocol::InboundMsg>>,
 }
 
@@ -101,14 +93,12 @@ impl TeamOrchestrator {
     pub fn new(
         registry: Arc<TaskRegistry>,
         session: Arc<TeamSession>,
-        bus: Arc<InternalBus>,
         dispatch_fn: DispatchFn,
         heartbeat_interval: std::time::Duration,
     ) -> Arc<Self> {
         Arc::new(Self {
             registry,
             session,
-            bus,
             heartbeat_handle: std::sync::Mutex::new(None),
             dispatch_fn,
             heartbeat_interval,
@@ -116,11 +106,10 @@ impl TeamOrchestrator {
             notify_fn: std::sync::OnceLock::new(),
             mcp_server_handle: tokio::sync::Mutex::new(None),
             mcp_server_port: std::sync::OnceLock::new(),
-            lead_mcp_server_handle: tokio::sync::Mutex::new(None),
             team_state_inner: std::sync::Mutex::new(TeamState::Planning),
             lead_session_key: std::sync::OnceLock::new(),
             lead_agent_name: std::sync::OnceLock::new(),
-            lead_mcp_server_port: std::sync::OnceLock::new(),
+            available_specialists: std::sync::OnceLock::new(),
             team_notify_tx: std::sync::OnceLock::new(),
         })
     }
@@ -161,10 +150,10 @@ impl TeamOrchestrator {
         let _ = self.lead_agent_name.set(name);
     }
 
-    /// 存储 LeadMcpServer 句柄，防止其被 drop（替代 mem::forget）。
-    /// 由 main.rs 在 LeadMcpServer 启动成功后调用。
-    pub async fn store_lead_mcp_handle(&self, handle: super::lead_mcp_server::LeadMcpServerHandle) {
-        *self.lead_mcp_server_handle.lock().await = Some(handle);
+    /// Set the list of available Specialist agents (from `team.roster` in config.toml).
+    /// Called by main.rs during wiring so lead_layer_0 can list assignable agents.
+    pub fn set_available_specialists(&self, agents: Vec<String>) {
+        let _ = self.available_specialists.set(agents);
     }
 
     /// 向 IM 频道发布一条消息（Lead 调用 post_update 时使用）
@@ -189,11 +178,38 @@ impl TeamOrchestrator {
 
     // ── 激活执行（供 LeadMcpServer.start_execution 调用）──────────────────
 
-    /// 启动 Heartbeat + SpecialistMcpServer，设置 state → Running。
-    /// 只允许调用一次（OnceLock guard）。
+    /// Eagerly start the unified SharedTeamMcpServer so both Lead and Specialist
+    /// agents receive `mcp_server_url` from the very first turn.
+    ///
+    /// Called from `main.rs` immediately after creating the orchestrator, before any
+    /// agent turn runs.  `activate()` (called later by the Lead via `start_execution`)
+    /// skips the MCP spawn if the port is already set.
+    pub async fn start_mcp_server(self: &Arc<Self>) -> Result<()> {
+        if self.mcp_server_port.get().is_some() {
+            return Ok(()); // already started
+        }
+        let mcp_srv = super::shared_mcp_server::SharedTeamToolServer::new(Arc::clone(self));
+        let mcp_handle = mcp_srv.spawn().await?;
+        let _ = self.mcp_server_port.set(mcp_handle.port);
+        *self.mcp_server_handle.lock().await = Some(mcp_handle);
+        tracing::info!(
+            team_id = %self.session.team_id,
+            mcp_port = ?self.mcp_server_port.get(),
+            "SharedTeamMcpServer started eagerly"
+        );
+        Ok(())
+    }
+
+    /// 启动 Heartbeat，设置 state → Running。
+    /// MCP server is started eagerly via `start_mcp_server()`; this method only starts
+    /// the heartbeat dispatch loop and writes team manifest files.
     pub async fn activate(self: &Arc<Self>) -> Result<String> {
         // Guard: already running?
-        if self.mcp_server_port.get().is_some() {
+        let already_activated = {
+            let state = self.team_state_inner.lock().unwrap();
+            *state == TeamState::Running || *state == TeamState::Done
+        };
+        if already_activated {
             anyhow::bail!("TeamOrchestrator::activate() called twice");
         }
         // Transition state
@@ -204,6 +220,49 @@ impl TeamOrchestrator {
         if manifest.is_empty() {
             let _ = self.session.write_team_md("Team execution started.");
         }
+
+        // Write AGENTS.md — claude-code reads this automatically from workspace_dir,
+        // providing true system-level context for both Lead and Specialists.
+        let specialists_list = self
+            .available_specialists
+            .get()
+            .map(|v| {
+                v.iter()
+                    .map(|s| format!("- **{}**", s))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_else(|| "（未配置）".to_string());
+        let lead_name = self
+            .lead_agent_name
+            .get()
+            .map(|s| s.as_str())
+            .unwrap_or("Lead");
+        let agents_md = format!(
+            "# Team Mode — Agent Roster\n\n\
+             ## Lead Agent: {lead_name}\n\
+             负责任务规划和协调。可用工具：\n\
+             - `create_task(id, title, spec, deps, assignee, success_criteria)` — 注册子任务\n\
+             - `start_execution()` — 启动所有 Ready 任务的并行执行\n\
+             - `request_confirmation(plan_summary)` — 复杂任务执行前请求用户确认\n\
+             - `post_update(message)` — 向用户播报进度\n\
+             - `get_task_status()` — 查看全部任务状态\n\
+             - `assign_task(task_id, agent)` — 重新分配任务给指定 Specialist\n\n\
+             ## Specialist Agents\n\
+             {specialists_list}\n\n\
+             各 Specialist 独立执行分配的任务，完成后调用：\n\
+             - `complete_task(task_id, note)` — 标记任务完成，note 为关键产出摘要\n\
+             - `block_task(task_id, reason)` — 任务无法完成时上报阻塞原因\n\n\
+             ## 工作流\n\
+             1. Lead 调用 `create_task()` 定义任务图（含依赖关系）\n\
+             2. Lead 调用 `start_execution()` 触发调度\n\
+             3. Heartbeat 自动将 Ready 任务派发给对应 Specialist\n\
+             4. Specialist 完成后调用 `complete_task()`，Lead 收到 `[团队通知]`\n\
+             5. 所有任务完成后 Lead 合成最终结果并 `post_update()` 给用户\n",
+            lead_name = lead_name,
+            specialists_list = specialists_list,
+        );
+        let _ = self.session.write_agents_md(&agents_md);
 
         // Sync TASKS.md snapshot
         self.session.sync_tasks_md(&self.registry)?;
@@ -229,15 +288,14 @@ impl TeamOrchestrator {
         });
         *self.heartbeat_handle.lock().unwrap() = Some(handle);
 
-        // Start SpecialistMcpServer
-        let mcp_srv = super::mcp_server::TeamToolServer::new(
-            std::sync::Arc::clone(&self.registry),
-            std::sync::Arc::clone(self),
-            self.session.team_id.clone(),
-        );
-        let mcp_handle = mcp_srv.spawn().await?;
-        let _ = self.mcp_server_port.set(mcp_handle.port);
-        *self.mcp_server_handle.lock().await = Some(mcp_handle);
+        // MCP server was already started eagerly by start_mcp_server() in main.rs.
+        // If somehow not started yet (e.g. in tests that call activate() directly),
+        // start it now as a fallback.
+        if self.mcp_server_port.get().is_none() {
+            if let Err(e) = self.start_mcp_server().await {
+                tracing::error!(team_id = %self.session.team_id, "MCP server start failed: {e:#}");
+            }
+        }
 
         tracing::info!(
             team_id = %self.session.team_id,
@@ -249,10 +307,14 @@ impl TeamOrchestrator {
 
     // ── 启动 ──────────────────────────────────────────────────────────────────
 
-    /// 应用 TeamPlan：写 TEAM.md / TASKS.md，注册任务，启动 Heartbeat，启动 MCP Server
+    /// 应用 TeamPlan：写 TEAM.md / TASKS.md，注册任务，启动 Heartbeat
     pub async fn start(self: &Arc<Self>, plan: &TeamPlan) -> Result<()> {
-        // Guard against double-start
-        if self.mcp_server_port.get().is_some() {
+        // Guard against double-start (use state, not mcp_server_port — port is now always set eagerly)
+        let already_started = {
+            let state = self.team_state_inner.lock().unwrap();
+            *state == TeamState::Running || *state == TeamState::Done
+        };
+        if already_started {
             anyhow::bail!("TeamOrchestrator::start() called twice for team '{}'", self.session.team_id);
         }
 
@@ -298,8 +360,8 @@ impl TeamOrchestrator {
         agent: &str,
         note: &str,
     ) -> Result<()> {
-        // 1. 更新状态
-        self.registry.mark_done(task_id, note)?;
+        // 1. 更新状态（校验认领者身份）
+        self.registry.mark_done(task_id, agent, note)?;
 
         // 2. 事件日志
         let event = format!(
@@ -417,7 +479,7 @@ impl TeamOrchestrator {
         }
     }
 
-    /// 处理 Specialist 阻塞通知（Escalation → Lead）
+    /// 处理 Specialist 阻塞通知（Escalation → Lead via team_notify_tx）
     pub fn handle_specialist_blocked(
         &self,
         task_id: &str,
@@ -433,18 +495,41 @@ impl TeamOrchestrator {
         );
         let _ = self.session.append_event(&event);
 
-        // Escalation → Lead（通过 InternalBus）
-        let msg = InternalMsg::new(
-            format!("@{}", agent),
-            "@lead",
-            format!("Task {} blocked: {}", task_id, reason),
-            InternalMsgType::Escalation,
-            &self.session.team_id,
-        );
-        // 发送失败不中断流程（Lead 可能还未订阅）
-        let _ = self.bus.send(msg);
+        // Escalation → Lead via team_notify_tx (same path as task completion)
+        self.dispatch_team_notify_blocked(task_id, agent, reason);
 
         Ok(())
+    }
+
+    /// 构建并发送 TeamNotify InboundMsg 给 Lead（task 阻塞）
+    fn dispatch_team_notify_blocked(&self, task_id: &str, agent: &str, reason: &str) {
+        let lead_key = match self.lead_session_key.get().cloned() {
+            Some(k) => k,
+            None => return,
+        };
+        let tx = match self.team_notify_tx.get() {
+            Some(t) => t.clone(),
+            None => return,
+        };
+        let notify_content = format!(
+            "[团队通知] 任务 {} 已阻塞（执行者：{}）\n\n阻塞原因：{}\n\n请调用 assign_task() 重新分配或 post_update() 告知用户。",
+            task_id, agent, reason
+        );
+        let lead_channel = lead_key.channel.clone();
+        let msg = qai_protocol::InboundMsg {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_key: lead_key,
+            content: qai_protocol::MsgContent::text(notify_content),
+            sender: "gateway".to_string(),
+            channel: lead_channel,
+            timestamp: Utc::now(),
+            thread_ts: None,
+            target_agent: None,
+            source: qai_protocol::MsgSource::TeamNotify,
+        };
+        if let Err(e) = tx.try_send(msg) {
+            tracing::warn!(task_id = %task_id, "TeamNotify (blocked) dispatch failed: {e}");
+        }
     }
 
     // ── 停止 ──────────────────────────────────────────────────────────────────
@@ -455,18 +540,11 @@ impl TeamOrchestrator {
         if let Some(handle) = self.heartbeat_handle.lock().unwrap().take() {
             handle.abort();
         }
-        // Stop Specialist MCP server
+        // Stop unified MCP server
         if let Some(handle) = self.mcp_server_handle.lock().await.take() {
             handle.stop().await;
-            tracing::info!(team_id = %self.session.team_id, "TeamMcpServer stopped");
+            tracing::info!(team_id = %self.session.team_id, "SharedTeamMcpServer stopped");
         }
-        // Stop Lead MCP server
-        if let Some(handle) = self.lead_mcp_server_handle.lock().await.take() {
-            handle.stop().await;
-            tracing::info!(team_id = %self.session.team_id, "LeadMcpServer stopped");
-        }
-        // Cleanup InternalBus
-        self.bus.cleanup_team(&self.session.team_id);
         // Archive directory
         self.session.archive()?;
         tracing::info!(team_id = %self.session.team_id, "Team stopped and archived");
@@ -476,16 +554,7 @@ impl TeamOrchestrator {
     // ── 里程碑 ────────────────────────────────────────────────────────────────
 
     fn publish_milestone(&self, kind: &str, message: &str) -> Result<()> {
-        let msg = InternalMsg::new(
-            "@orchestrator",
-            "broadcast",
-            message,
-            InternalMsgType::MilestoneUpdate,
-            &self.session.team_id,
-        );
-        self.bus.broadcast_to_team(&self.session.team_id, msg);
-
-        // Forward to IM channel if scope + notify_fn are wired (set at team-start time).
+        // Forward to IM channel via notify_fn (wired from main.rs at startup).
         if let (Some(f), Some(scope)) = (self.notify_fn.get(), self.scope.get()) {
             (f)(scope.clone(), message.to_string());
         }
@@ -505,21 +574,18 @@ impl TeamOrchestrator {
 mod tests {
     use super::*;
     use crate::team::registry::CreateTask;
-    use std::sync::Mutex;
     use tempfile::tempdir;
 
     fn make_orchestrator() -> (Arc<TeamOrchestrator>, tempfile::TempDir) {
         let tmp = tempdir().unwrap();
         let registry = Arc::new(TaskRegistry::new_in_memory().unwrap());
         let session = Arc::new(TeamSession::from_dir("test-team", tmp.path().to_path_buf()));
-        let bus = Arc::new(InternalBus::new());
-        let dispatch_fn: DispatchFn = Arc::new(|_agent, _task, _session| {
+        let dispatch_fn: DispatchFn = Arc::new(|_agent, _task| {
             Box::pin(async { Ok(()) })
         });
         let orch = TeamOrchestrator::new(
             registry,
             session,
-            bus,
             dispatch_fn,
             std::time::Duration::from_secs(3600), // 测试中不实际触发
         );
@@ -581,18 +647,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_all_done_triggers_milestone_broadcast() {
+    async fn test_all_done_triggers_milestone_notify_fn() {
         let (orch, _tmp) = make_orchestrator();
-        let received = Arc::new(Mutex::new(vec![]));
+        let received = Arc::new(std::sync::Mutex::new(vec![]));
         let received_clone = Arc::clone(&received);
-        let mut rx = orch.bus.subscribe("test-team", "@listener");
 
-        // 在后台收消息
-        tokio::spawn(async move {
-            while let Some(msg) = rx.recv().await {
-                received_clone.lock().unwrap().push(msg.content.clone());
-            }
-        });
+        // Wire notify_fn to capture milestone messages
+        orch.set_notify_fn(Arc::new(move |_scope, msg| {
+            received_clone.lock().unwrap().push(msg);
+        }));
+        orch.set_scope(qai_protocol::SessionKey::new("test", "test-scope"));
 
         orch.registry
             .create_task(CreateTask {
@@ -603,7 +667,10 @@ mod tests {
             .unwrap();
         orch.registry.try_claim("T001", "codex").unwrap();
         orch.handle_specialist_done("T001", "codex", "done").unwrap();
-        // publish_milestone 广播 → bus → @listener
+
+        let msgs = received.lock().unwrap();
+        assert!(!msgs.is_empty(), "notify_fn should be called on milestone");
+        assert!(msgs[0].contains("所有任务已完成"), "unexpected: {}", msgs[0]);
     }
 
     #[tokio::test]

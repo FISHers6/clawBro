@@ -1190,7 +1190,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let task_registry = Arc::new(TaskRegistry::new_in_memory().unwrap());
         let session = Arc::new(TeamSession::from_dir("t", tmp.path().to_path_buf()));
-        let dispatch_fn: DispatchFn = Arc::new(|_, _, _| Box::pin(async { Ok(()) }));
+        let dispatch_fn: DispatchFn = Arc::new(|_, _| Box::pin(async { Ok(()) }));
         let orch = TeamOrchestrator::new(task_registry, session, dispatch_fn, std::time::Duration::from_secs(60));
 
         // Wire: lead_session_key + lead_agent_name = "mybot"

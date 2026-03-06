@@ -7,6 +7,7 @@
 use anyhow::Result;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
 
 use super::registry::{Task, TaskRegistry};
 use super::session::TeamSession;
@@ -14,11 +15,11 @@ use super::session::TeamSession;
 // ─── 类型 ────────────────────────────────────────────────────────────────────
 
 /// 派发函数签名：
-///   (agent_name, task, team_session) → async Result<()>
+///   (agent_name, task) → async Result<()>
 ///
 /// 调用方（main.rs）实现此闭包：构建 InboundMsg、发到 SessionRegistry.handle()
 pub type DispatchFn = Arc<
-    dyn Fn(String, Task, Arc<TeamSession>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
+    dyn Fn(String, Task) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
         + Send
         + Sync,
 >;
@@ -36,6 +37,8 @@ pub struct OrchestratorHeartbeat {
     max_retries: u32,
     /// Optional callback invoked when a task permanently fails (retries exhausted).
     on_permanent_failure: Option<FailureNotifyFn>,
+    /// Limits concurrent task dispatches to avoid overwhelming downstream agents.
+    dispatch_semaphore: Arc<Semaphore>,
 }
 
 impl OrchestratorHeartbeat {
@@ -52,6 +55,7 @@ impl OrchestratorHeartbeat {
             interval,
             max_retries: 3,
             on_permanent_failure: None,
+            dispatch_semaphore: Arc::new(Semaphore::new(4)),
         }
     }
 
@@ -125,10 +129,20 @@ impl OrchestratorHeartbeat {
             match self.registry.try_claim(&task.id, &agent) {
                 Ok(true) => {
                     tracing::info!(task_id = %task.id, agent = %agent, "Dispatching task");
-                    let session = Arc::clone(&self.session);
-                    if let Err(e) = (self.dispatch_fn)(agent, task, session).await {
-                        tracing::error!("Dispatch error: {:#}", e);
-                    }
+                    let dispatch_fn = Arc::clone(&self.dispatch_fn);
+                    let sem = Arc::clone(&self.dispatch_semaphore);
+                    tokio::spawn(async move {
+                        // Acquire owned permit before dispatching (max 4 concurrent).
+                        // acquire_owned() is 'static-safe and keeps the permit alive
+                        // until the task completes (drops at end of block).
+                        let _permit = match sem.acquire_owned().await {
+                            Ok(p) => p,
+                            Err(_) => return, // semaphore closed (gateway shutting down)
+                        };
+                        if let Err(e) = dispatch_fn(agent, task).await {
+                            tracing::error!("Dispatch error: {:#}", e);
+                        }
+                    });
                 }
                 Ok(false) => {
                     // 已被其他 Heartbeat 实例认领（正常情况）
@@ -159,7 +173,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let session = Arc::new(TeamSession::from_dir("test-team", tmp.path().to_path_buf()));
 
-        let dispatch_fn: DispatchFn = Arc::new(move |agent, task, _session| {
+        let dispatch_fn: DispatchFn = Arc::new(move |agent, task| {
             let dispatched = Arc::clone(&dispatched);
             Box::pin(async move {
                 dispatched

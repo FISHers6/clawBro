@@ -448,7 +448,7 @@ async fn main() -> Result<()> {
             let task_reg_for_dispatch = std::sync::Arc::clone(&task_registry);
             let team_session_for_dispatch = std::sync::Arc::clone(&session);
             let dispatch_fn: DispatchFn = std::sync::Arc::new(
-                move |agent: String, task: qai_agent::team::registry::Task, _session: std::sync::Arc<TeamSession>| {
+                move |agent: String, task: qai_agent::team::registry::Task| {
                     let registry = registry_for_dispatch.clone();
                     let task_reg = std::sync::Arc::clone(&task_reg_for_dispatch);
                     let team_session = std::sync::Arc::clone(&team_session_for_dispatch);
