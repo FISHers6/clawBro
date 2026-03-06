@@ -6,6 +6,26 @@ use crate::memory::cap_to_words;
 use crate::traits::AgentRole;
 use qai_skills::PersonaSkillData;
 
+/// System-level protocol guidance injected into Lead agent turns only.
+/// Explains how the Lead should handle [团队通知] milestone messages from TeamNotify.
+const TEAM_NOTIFY_PROTOCOL: &str = "\
+## TeamNotify 协议（系统内部通知）
+
+当你收到以 `[团队通知]` 开头的消息时，这是来自系统的内部协调信号，不是用户消息。
+
+**收到任务完成通知时：**
+- 如果显示「所有任务已完成」：调用 `post_update` 工具生成最终汇总，向用户报告成果
+- 如果显示部分完成：无需立即响应，等待所有任务完成
+
+**收到任务阻塞通知时：**
+- 调用 `assign_task(task_id, new_assignee)` 重新分配，或
+- 调用 `post_update` 向用户说明情况
+
+**收到任务永久失败通知时：**
+- 调用 `post_update` 向用户报告失败，并说明原因
+
+**不要**将 `[团队通知]` 内容直接转发给用户——总结后再发送。";
+
 /// Assembles the full system prompt for a single agent turn.
 ///
 /// Layer order (persona present):
@@ -128,6 +148,11 @@ impl<'a> SystemPromptBuilder<'a> {
         // ── Layer 6: Skills injection ──
         if !self.skills_injection.trim().is_empty() {
             parts.push(self.skills_injection.to_string());
+        }
+
+        // ── Layer 7: TeamNotify protocol（仅 Lead 模式注入）──
+        if matches!(self.agent_role, AgentRole::Lead) {
+            parts.push(TEAM_NOTIFY_PROTOCOL.to_string());
         }
 
         parts.join("\n\n")
@@ -513,5 +538,75 @@ mod tests {
 
         assert!(result.contains("团队职责"));
         assert!(result.contains("Claude: Lead"));
+    }
+
+    #[test]
+    fn test_lead_prompt_includes_team_notify_protocol() {
+        let builder = SystemPromptBuilder {
+            agent_role: AgentRole::Lead,
+            persona: None,
+            soul_md: "",
+            identity_raw: "",
+            skills_injection: "",
+            shared_memory: "",
+            agent_memory: "",
+            task_reminder: None,
+            team_manifest: None,
+            shared_max_words: 300,
+            agent_max_words: 500,
+        };
+        let prompt = builder.build();
+        assert!(
+            prompt.contains("TeamNotify"),
+            "Lead prompt must include TeamNotify protocol"
+        );
+        assert!(
+            prompt.contains("post_update"),
+            "Lead prompt must mention post_update tool"
+        );
+    }
+
+    #[test]
+    fn test_solo_prompt_excludes_team_notify_protocol() {
+        let builder = SystemPromptBuilder {
+            agent_role: AgentRole::Solo,
+            persona: None,
+            soul_md: "",
+            identity_raw: "",
+            skills_injection: "",
+            shared_memory: "",
+            agent_memory: "",
+            task_reminder: None,
+            team_manifest: None,
+            shared_max_words: 300,
+            agent_max_words: 500,
+        };
+        let prompt = builder.build();
+        assert!(
+            !prompt.contains("TeamNotify"),
+            "Solo prompt must NOT include TeamNotify protocol"
+        );
+    }
+
+    #[test]
+    fn test_specialist_prompt_excludes_team_notify_protocol() {
+        let builder = SystemPromptBuilder {
+            agent_role: AgentRole::Specialist,
+            persona: None,
+            soul_md: "",
+            identity_raw: "",
+            skills_injection: "",
+            shared_memory: "",
+            agent_memory: "",
+            task_reminder: None,
+            team_manifest: None,
+            shared_max_words: 300,
+            agent_max_words: 500,
+        };
+        let prompt = builder.build();
+        assert!(
+            !prompt.contains("TeamNotify"),
+            "Specialist prompt must NOT include TeamNotify protocol"
+        );
     }
 }
