@@ -88,6 +88,10 @@ pub struct SessionRegistry {
     /// When a matching message arrives with team trigger keywords, the turn is
     /// treated as a Lead turn even if no orchestrator is registered.
     auto_promote_scopes: dashmap::DashSet<String>,
+    /// Per-session Semaphore(1): serializes concurrent handle() calls for the same session.
+    /// Prevents two engine invocations running simultaneously for the same session_key,
+    /// replacing the broken LaneQueue serial guarantee.
+    session_semaphores: DashMap<SessionKey, Arc<tokio::sync::Semaphore>>,
     /// Weak self-reference for spawning recursive handle() calls (TeamNotify dispatch).
     weak_self: std::sync::Weak<Self>,
 }
@@ -128,6 +132,7 @@ impl SessionRegistry {
             relay_engine: OnceLock::new(),
             mention_trigger: OnceLock::new(),
             auto_promote_scopes: dashmap::DashSet::new(),
+            session_semaphores: DashMap::new(),
             weak_self: weak.clone(),
         });  // end of Arc::new_cyclic
 
@@ -316,6 +321,21 @@ impl SessionRegistry {
         }
 
         let session_key = inbound.session_key.clone();
+
+        // Per-session serial execution guard.
+        // Acquires a Semaphore(1) for this session_key, preventing concurrent engine calls.
+        // The permit is held for the full duration of handle() and dropped on return.
+        // Must clone the Arc before awaiting to drop the DashMap guard (not Send across await).
+        let _session_permit = {
+            let sem = self
+                .session_semaphores
+                .entry(session_key.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(1)))
+                .clone();
+            sem.acquire_owned()
+                .await
+                .map_err(|e| anyhow::anyhow!("Session semaphore closed: {e}"))?
+        };
         let user_text = inbound.content.as_text().unwrap_or("").to_string();
         let user_text_for_log = user_text.clone();
 
