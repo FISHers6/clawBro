@@ -11,7 +11,7 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::sync::{Arc, Mutex};
 
 // ─── 类型 ───────────────────────────────────────────────────────────────────
@@ -170,17 +170,39 @@ impl TaskRegistry {
         Ok(rows == 1)
     }
 
-    /// 标记任务完成（仅允许从 claimed 状态转换，防止误完成）
-    pub fn mark_done(&self, task_id: &str, note: &str) -> Result<()> {
+    /// 标记任务完成（仅允许从 claimed 状态转换，且需校验认领者身份）
+    ///
+    /// `agent` — 声明完成的执行者名称。必须与 claimed:agent:ts 中的 agent 匹配。
+    pub fn mark_done(&self, task_id: &str, agent: &str, note: &str) -> Result<()> {
         let now = Utc::now().to_rfc3339();
+        // Build the expected status prefix "claimed:<agent>:"
+        let claimed_prefix = format!("claimed:{}:", agent);
         let conn = self.conn.lock().unwrap();
         let rows = conn.execute(
             "UPDATE tasks SET status = 'done', completion_note = ?1, done_at = ?2 \
-             WHERE id = ?3 AND status LIKE 'claimed%'",
-            params![note, now, task_id],
+             WHERE id = ?3 AND status LIKE ?4",
+            params![note, now, task_id, format!("{}%", claimed_prefix)],
         )?;
         if rows == 0 {
-            anyhow::bail!("mark_done: task '{}' not found or not in claimed state", task_id);
+            // Diagnose: task not found, or claimed by another agent
+            let status: Option<String> = conn.query_row(
+                "SELECT status FROM tasks WHERE id = ?1",
+                params![task_id],
+                |r| r.get(0),
+            ).ok();
+            match status {
+                None => anyhow::bail!("mark_done: task '{}' not found", task_id),
+                Some(s) if s.starts_with("claimed:") => {
+                    anyhow::bail!(
+                        "mark_done: task '{}' was claimed by another agent (status: {}), cannot be completed by '{}'",
+                        task_id, s, agent
+                    )
+                }
+                Some(s) => anyhow::bail!(
+                    "mark_done: task '{}' not in claimed state (current: {})",
+                    task_id, s
+                ),
+            }
         }
         Ok(())
     }
@@ -219,6 +241,21 @@ impl TaskRegistry {
             params![msg, task_id],
         )?;
         Ok(())
+    }
+
+    /// Returns true if task is currently claimed by `agent`.
+    /// The status format is `claimed:{agent}:{timestamp}`.
+    pub fn is_claimed_by(&self, task_id: &str, agent: &str) -> Result<bool> {
+        let expected_prefix = format!("claimed:{}:", agent);
+        let conn = self.conn.lock().unwrap();
+        let status: Option<String> = conn
+            .query_row(
+                "SELECT status FROM tasks WHERE id = ?1",
+                params![task_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(status.map(|s| s.starts_with(&expected_prefix)).unwrap_or(false))
     }
 
     /// 重置超时任务（Pending，retry_count 已在 try_claim 时递增）
@@ -468,8 +505,8 @@ mod tests {
         let claimed2 = registry.try_claim("T001", "claude").unwrap();
         assert!(!claimed2, "T001 already claimed, should fail");
 
-        // 完成任务
-        registry.mark_done("T001", "created src/auth/jwt.rs").unwrap();
+        // 完成任务（传入认领者 "codex"）
+        registry.mark_done("T001", "codex", "created src/auth/jwt.rs").unwrap();
         let task = registry.get_task("T001").unwrap().unwrap();
         assert!(matches!(task.status_parsed(), TaskStatus::Done));
     }
@@ -522,7 +559,7 @@ mod tests {
 
         // T001 完成后，T002 可认领
         registry.try_claim("T001", "claude").unwrap();
-        registry.mark_done("T001", "done").unwrap();
+        registry.mark_done("T001", "claude", "done").unwrap();
         let ready2 = registry.find_ready_tasks().unwrap();
         assert!(ready2.iter().any(|t| t.id == "T002"), "T002 now unblocked");
     }
@@ -560,7 +597,7 @@ mod tests {
             })
             .unwrap();
         registry.try_claim("T001", "codex").unwrap();
-        registry.mark_done("T001", "done").unwrap();
+        registry.mark_done("T001", "codex", "done").unwrap();
 
         let md = registry.export_tasks_md().unwrap();
         assert!(md.contains("T001"));
@@ -639,5 +676,34 @@ mod tests {
         registry.try_claim("T001", "codex").unwrap();
         let result = registry.reassign_task("T001", "gemini");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_is_claimed_by_returns_true_for_current_claimer() {
+        let registry = TaskRegistry::new_in_memory().unwrap();
+        registry
+            .create_task(CreateTask {
+                id: "T1".into(),
+                title: "t".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        registry.try_claim("T1", "alice").unwrap();
+        assert!(registry.is_claimed_by("T1", "alice").unwrap());
+        assert!(!registry.is_claimed_by("T1", "bob").unwrap());
+    }
+
+    #[test]
+    fn test_is_claimed_by_returns_false_for_pending_task() {
+        let registry = TaskRegistry::new_in_memory().unwrap();
+        registry
+            .create_task(CreateTask {
+                id: "T2".into(),
+                title: "t".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        // Task is pending (not claimed), so is_claimed_by must return false
+        assert!(!registry.is_claimed_by("T2", "alice").unwrap());
     }
 }

@@ -240,7 +240,26 @@ impl SharedTeamToolServer {
     #[tool(description = "Specialist only. Report a task as blocked. Provide the task_id, reason, and your agent name.")]
     async fn block_task(&self, Parameters(p): Parameters<BlockTaskParams>) -> String {
         let agent = p.agent.as_deref().unwrap_or("specialist");
-        let _ = self.orchestrator.registry.reset_claim(&p.task_id);
+        // Validate claim ownership before resetting
+        let owns_claim = self
+            .orchestrator
+            .registry
+            .is_claimed_by(&p.task_id, agent)
+            .unwrap_or(false);
+        if !owns_claim {
+            tracing::warn!(
+                task_id = %p.task_id,
+                agent = %agent,
+                "block_task rejected: agent does not hold claim"
+            );
+            return format!(
+                "Cannot block task {}: not currently claimed by {}.",
+                p.task_id, agent
+            );
+        }
+        if let Err(e) = self.orchestrator.registry.reset_claim(&p.task_id) {
+            tracing::warn!(task_id = %p.task_id, "reset_claim error: {e:#}");
+        }
         if let Err(e) = self.orchestrator.handle_specialist_blocked(&p.task_id, agent, &p.reason) {
             tracing::warn!(task_id = %p.task_id, "handle_specialist_blocked error: {e:#}");
         }
