@@ -77,6 +77,10 @@ impl TeamSession {
         self.write_file("CONTEXT.md", content)
     }
 
+    pub fn write_agents_md(&self, content: &str) -> Result<()> {
+        self.write_file("AGENTS.md", content)
+    }
+
     /// 从 TaskRegistry 导出任务快照到 TASKS.md
     pub fn sync_tasks_md(&self, registry: &TaskRegistry) -> Result<()> {
         let md = registry.export_tasks_md()?;
@@ -106,6 +110,20 @@ impl TeamSession {
             .open(&path)?;
         writeln!(file, "{}", event)?;
         Ok(())
+    }
+
+    /// Log a Specialist's reply text to events.jsonl (for observability/debugging).
+    pub fn append_specialist_reply(&self, agent: &str, task_id: &str, reply: &str) -> Result<()> {
+        // Escape newlines so one reply = one JSONL line
+        let escaped = reply.replace('\n', "\\n").replace('\r', "");
+        let event = format!(
+            r#"{{"event":"SPECIALIST_REPLY","agent":"{}","task":"{}","ts":"{}","text":"{}"}}"#,
+            agent,
+            task_id,
+            chrono::Utc::now().to_rfc3339(),
+            escaped,
+        );
+        self.append_event(&event)
     }
 
     // ── task_reminder 构建 ───────────────────────────────────────────────────
@@ -167,11 +185,9 @@ impl TeamSession {
              {criteria}\n\
              \n\
              ── 必须遵守 ──\n\
-             1. 完成后在回复**最后一行**加 [DONE: {id}] 标记，否则系统不会更新任务状态\n\
-             2. 如遇阻塞，在回复最后一行加 [BLOCKED: <原因>] 标记\n\
-             3. 重要产出（文件路径、关键发现）写在回复正文\n\
-             4. 完成任务时调用工具 `complete_task(task_id, note)` 或输出 `[DONE: {id}]`。\n\
-             5. 遇到阻塞时调用工具 `block_task(task_id, reason)` 或输出 `[BLOCKED: reason]`。\n\
+             1. 完成任务时必须调用 MCP 工具 `complete_task(task_id, note)`（agent 参数可选，填自己的名称更准确），系统才会更新任务状态\n\
+             2. 遇到阻塞时必须调用 MCP 工具 `block_task(task_id, reason)`，将任务上报给 Lead\n\
+             3. 重要产出（文件路径、关键发现）写在 complete_task 的 note 参数中\n\
              ══════════════════════════════════════════{upstream_section}",
             id = task.id,
             title = task.title,
@@ -275,7 +291,7 @@ mod tests {
             ..Default::default()
         }).unwrap();
         registry.try_claim("T001", "codex").unwrap();
-        registry.mark_done("T001", "Created users table with uuid pk").unwrap();
+        registry.mark_done("T001", "codex", "Created users table with uuid pk").unwrap();
 
         // T002 depends on T001
         registry.create_task(CreateTask {
@@ -308,10 +324,41 @@ mod tests {
         let task = registry.get_task("T003").unwrap().unwrap();
         let reminder = session.build_task_reminder(&task, &registry);
 
-        assert!(reminder.contains("[DONE: T003]"), "must include DONE marker");
+        assert!(!reminder.contains("[DONE:"), "must NOT contain legacy [DONE:] text marker");
+        assert!(!reminder.contains("[BLOCKED:"), "must NOT contain legacy [BLOCKED:] text marker");
         assert!(reminder.contains("Implement JWT"));
         assert!(reminder.contains("JWT token is generated"));
         assert!(reminder.contains("complete_task"), "must mention complete_task MCP tool");
         assert!(reminder.contains("block_task"), "must mention block_task MCP tool");
+    }
+
+    #[test]
+    fn test_append_specialist_reply_creates_jsonl_entry() {
+        let (session, _tmp) = make_session();
+        session
+            .append_specialist_reply("codex", "T001", "Created users table with UUID PK.")
+            .unwrap();
+
+        let path = _tmp.path().join("events.jsonl");
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("SPECIALIST_REPLY"));
+        assert!(contents.contains("codex"));
+        assert!(contents.contains("T001"));
+        assert!(contents.contains("Created users table"));
+        // Each entry must be on a single line (no literal newlines in content)
+        assert_eq!(contents.lines().count(), 1);
+    }
+
+    #[test]
+    fn test_append_specialist_reply_newlines_escaped() {
+        let (session, _tmp) = make_session();
+        session
+            .append_specialist_reply("codex", "T002", "Line 1\nLine 2\nLine 3")
+            .unwrap();
+        let path = _tmp.path().join("events.jsonl");
+        let contents = std::fs::read_to_string(&path).unwrap();
+        // Text content must not introduce extra lines
+        assert_eq!(contents.lines().count(), 1);
+        assert!(contents.contains("\\n"));
     }
 }

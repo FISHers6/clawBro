@@ -470,7 +470,14 @@ async fn main() -> Result<()> {
                             target_agent: Some(format!("@{}", agent)),
                             source: qai_protocol::MsgSource::Heartbeat,
                         };
-                        registry.handle(msg).await.map(|_| ())
+                        let result = registry.handle(msg).await;
+                        if let Ok(Some(ref reply_text)) = result {
+                            // Log Specialist reply to events.jsonl for observability.
+                            // Specialist replies are intentionally NOT forwarded to IM —
+                            // Lead learns of completion via TeamNotify.
+                            let _ = team_session.append_specialist_reply(&agent, &task.id, reply_text);
+                        }
+                        result.map(|_| ())
                     })
                 },
             );
