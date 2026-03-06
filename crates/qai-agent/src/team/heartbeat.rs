@@ -295,4 +295,64 @@ mod tests {
             task.status_raw
         );
     }
+
+    #[tokio::test]
+    async fn test_heartbeat_failure_callback_fires_on_max_retries() {
+        let registry = Arc::new(TaskRegistry::new_in_memory().unwrap());
+        registry
+            .create_task(CreateTask {
+                id: "T_CB".into(),
+                title: "will exhaust retries".into(),
+                timeout_secs: -1,
+                assignee_hint: Some("codex".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        // Exhaust retries: claim 3 times to set retry_count = 3
+        registry.try_claim("T_CB", "codex").unwrap();
+        registry.reset_claim("T_CB").unwrap();
+        registry.try_claim("T_CB", "codex").unwrap();
+        registry.reset_claim("T_CB").unwrap();
+        registry.try_claim("T_CB", "codex").unwrap(); // retry_count = 3
+
+        let notified_ids: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![]));
+        let notified_clone = Arc::clone(&notified_ids);
+
+        let dispatched = Arc::new(Mutex::new(vec![]));
+        let tmp = tempdir().unwrap();
+        let session = Arc::new(TeamSession::from_dir("test-team", tmp.path().to_path_buf()));
+
+        let dispatch_fn: DispatchFn = Arc::new(move |_agent, _task| {
+            let dispatched = Arc::clone(&dispatched);
+            Box::pin(async move {
+                dispatched.lock().unwrap().push((_agent, _task.id));
+                Ok(())
+            })
+        });
+
+        let hb = Arc::new(
+            OrchestratorHeartbeat::new(
+                Arc::clone(&registry),
+                session,
+                dispatch_fn,
+                Duration::from_millis(50),
+            )
+            .with_failure_notify(Arc::new(move |task_id, _reason| {
+                notified_clone.lock().unwrap().push(task_id);
+            })),
+        );
+
+        let hb_clone = Arc::clone(&hb);
+        let handle = tokio::spawn(async move { hb_clone.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        handle.abort();
+
+        // Callback must have fired for T_CB
+        let ids = notified_ids.lock().unwrap();
+        assert!(
+            ids.contains(&"T_CB".to_string()),
+            "failure_notify callback must fire when task exceeds max retries; got: {:?}",
+            ids
+        );
+    }
 }
