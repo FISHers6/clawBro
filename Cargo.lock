@@ -1349,6 +1349,7 @@ dependencies = [
  "agent-client-protocol",
  "anyhow",
  "async-trait",
+ "axum",
  "chrono",
  "dashmap",
  "dirs",

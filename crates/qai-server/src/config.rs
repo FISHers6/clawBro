@@ -93,6 +93,9 @@ pub struct GatewayConfig {
     pub memory: MemorySection,
     #[serde(default)]
     pub cron_jobs: Vec<CronJobConfig>,
+    /// 群组专项配置列表（`[[group]]` 段，可配置交互模式和 Team Mode 参数）
+    #[serde(default, rename = "group")]
+    pub groups: Vec<GroupConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -178,6 +181,92 @@ impl Default for SessionSection {
             .join("sessions");
         Self { dir }
     }
+}
+
+// ─── Group config ─────────────────────────────────────────────────────────────
+
+/// 群组交互模式（Solo / Relay / Team）
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractionMode {
+    /// 每个 @mention 独立响应，互不知晓
+    #[default]
+    Solo,
+    /// Lead 同步透明委托给 Specialist（[RELAY:] 标记）
+    Relay,
+    /// Lead 规划任务，Specialist 异步并行执行（Team Mode）
+    Team,
+}
+
+/// 群组级别的模式配置
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GroupModeConfig {
+    /// 基础交互模式
+    #[serde(default)]
+    pub interaction: InteractionMode,
+    /// true = 根据关键词自动升级模式（Solo→Relay→Team）
+    #[serde(default)]
+    pub auto_promote: bool,
+    /// 负责接收用户消息并协调其他 Specialist 的 Lead agent 名称
+    #[serde(default)]
+    pub front_bot: Option<String>,
+    /// IM channel name for lead_session_key (e.g. "lark", "dingtalk", "ws").
+    /// When set, overrides the auto-detected channel from enabled channels config.
+    #[serde(default)]
+    pub channel: Option<String>,
+    // TODO(consent_required): When true, Lead must call request_confirmation() and the user
+    // must reply with a confirmation keyword before activate() proceeds. The registry.rs
+    // AwaitingConfirm state machine already supports this flow; TeamOrchestrator.activate()
+    // needs a consent_required flag, and main.rs needs to wire it from config.
+    // Removed field to prevent silent misconfiguration (field parsed but never read).
+    // pub consent_required: bool,
+}
+
+/// 群组级别的 Team Mode 配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupTeamConfig {
+    /// Team 中参与的 agent 名称列表
+    #[serde(default)]
+    pub roster: Vec<String>,
+    /// 里程碑广播详细程度（minimal / normal / verbose）
+    #[serde(default = "default_public_updates")]
+    pub public_updates: String,
+    /// 最大并行任务数
+    #[serde(default = "default_max_parallel")]
+    pub max_parallel: usize,
+}
+
+impl Default for GroupTeamConfig {
+    fn default() -> Self {
+        Self {
+            roster: vec![],
+            public_updates: default_public_updates(),
+            max_parallel: default_max_parallel(),
+        }
+    }
+}
+
+fn default_public_updates() -> String {
+    "minimal".to_string()
+}
+fn default_max_parallel() -> usize {
+    3
+}
+
+/// 单个群组的完整配置（对应 `[[group]]` 段）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupConfig {
+    /// 匹配模式，如 `"group:lark:{chat_id}"` 或精确 scope
+    pub scope: String,
+    /// 可读名称（可选）
+    #[serde(default)]
+    pub name: Option<String>,
+    /// 交互模式配置
+    #[serde(default)]
+    pub mode: GroupModeConfig,
+    /// Team Mode 配置
+    #[serde(default)]
+    pub team: GroupTeamConfig,
 }
 
 impl GatewayConfig {
@@ -377,5 +466,80 @@ default_workspace = "/home/user/workspace"
     fn test_gateway_default_workspace_defaults_to_none() {
         let cfg = GatewayConfig::default();
         assert!(cfg.gateway.default_workspace.is_none());
+    }
+
+    #[test]
+    fn test_group_config_deserializes() {
+        let toml_str = r#"
+[[group]]
+scope = "group:lark:abc123"
+name = "后端研发群"
+
+[group.mode]
+interaction = "relay"
+auto_promote = true
+front_bot = "claude"
+
+[group.team]
+roster = ["codex", "researcher"]
+public_updates = "verbose"
+max_parallel = 5
+"#;
+        let cfg: GatewayConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.groups.len(), 1);
+        let g = &cfg.groups[0];
+        assert_eq!(g.scope, "group:lark:abc123");
+        assert_eq!(g.name.as_deref(), Some("后端研发群"));
+        assert_eq!(g.mode.interaction, InteractionMode::Relay);
+        assert!(g.mode.auto_promote);
+        assert_eq!(g.mode.front_bot.as_deref(), Some("claude"));
+        assert_eq!(g.team.roster, vec!["codex", "researcher"]);
+        assert_eq!(g.team.public_updates, "verbose");
+        assert_eq!(g.team.max_parallel, 5);
+    }
+
+    #[test]
+    fn test_group_config_defaults() {
+        let toml_str = r#"
+[[group]]
+scope = "group:lark:xyz"
+"#;
+        let cfg: GatewayConfig = toml::from_str(toml_str).unwrap();
+        let g = &cfg.groups[0];
+        assert_eq!(g.mode.interaction, InteractionMode::Solo);
+        assert!(!g.mode.auto_promote);
+        assert!(g.mode.front_bot.is_none());
+        assert!(g.team.roster.is_empty());
+        assert_eq!(g.team.public_updates, "minimal");
+        assert_eq!(g.team.max_parallel, 3);
+    }
+
+    #[test]
+    fn test_groups_empty_by_default() {
+        let cfg = GatewayConfig::default();
+        assert!(cfg.groups.is_empty());
+    }
+
+    #[test]
+    fn test_group_mode_channel_field_deserializes() {
+        let toml_str = r#"
+[[group]]
+scope = "group:lark:abc"
+
+[group.mode]
+interaction = "team"
+front_bot = "claude"
+channel = "lark"
+"#;
+        let cfg: GatewayConfig = toml::from_str(toml_str).unwrap();
+        let g = &cfg.groups[0];
+        assert_eq!(g.mode.channel.as_deref(), Some("lark"));
+    }
+
+    #[test]
+    fn test_group_mode_channel_defaults_to_none() {
+        let toml_str = "[[group]]\nscope = \"group:lark:xyz\"";
+        let cfg: GatewayConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.groups[0].mode.channel.is_none());
     }
 }

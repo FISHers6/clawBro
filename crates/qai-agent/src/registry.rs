@@ -96,6 +96,48 @@ pub struct SessionRegistry {
     weak_self: std::sync::Weak<Self>,
 }
 
+/// Returns `true` if the current inbound turn should be handled by the Lead agent.
+///
+/// A turn is a "Lead turn" when:
+/// - There is no `@mention` (user just typed to the group → default to front_bot / Lead)
+/// - The `@mention` explicitly targets the configured `front_bot`
+///
+/// A turn is NOT a Lead turn when the user explicitly `@mention`s a non-front_bot roster
+/// agent (e.g. `@codex` when front_bot = "claude"). Those turns get `AgentRole::Solo`.
+///
+/// If `lead_agent_name` is not yet configured on the orchestrator (edge case during wiring),
+/// this conservatively returns `true` so that the Lead fallback engine handles the message.
+fn is_front_bot_turn(
+    inbound: &InboundMsg,
+    orch: &Option<Arc<TeamOrchestrator>>,
+    roster: &Option<AgentRoster>,
+) -> bool {
+    let orch = match orch {
+        Some(o) => o,
+        None => return false,
+    };
+    let front_bot = match orch.lead_agent_name.get() {
+        Some(n) => n.as_str(),
+        // lead_agent_name not yet set → conservatively treat as Lead turn
+        None => return true,
+    };
+
+    match &inbound.target_agent {
+        // No @mention → default to front_bot → Lead turn
+        None => true,
+        // Explicit @mention: check if it resolves to front_bot
+        Some(mention) => {
+            let mention_bare = mention.trim_start_matches('@');
+            mention_bare.eq_ignore_ascii_case(front_bot)
+                || roster
+                    .as_ref()
+                    .and_then(|r| r.find_by_mention(mention))
+                    .map(|e| e.name.eq_ignore_ascii_case(front_bot))
+                    .unwrap_or(false)
+        }
+    }
+}
+
 impl SessionRegistry {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -356,16 +398,18 @@ impl SessionRegistry {
                                 .iter()
                                 .any(|kw| text_lower.contains(kw));
                             if confirmed {
-                                if let Some(_arc_self) = self.weak_self.upgrade() {
-                                    let orch = std::sync::Arc::clone(&team_orch);
-                                    tokio::spawn(async move {
-                                        match orch.activate().await {
-                                            Ok(msg) => tracing::info!("Team activated via confirmation: {}", msg),
-                                            Err(e) => tracing::error!("Team activate error: {e}"),
-                                        }
-                                    });
-                                }
-                                return Ok(Some("收到，开始执行。任务队列已启动。".to_string()));
+                                // Await activate() synchronously so the user sees the real outcome.
+                                // Spawning it in the background would silently swallow activation errors.
+                                return match team_orch.activate().await {
+                                    Ok(_) => {
+                                        tracing::info!("Team activated via user confirmation");
+                                        Ok(Some("收到，开始执行。任务队列已启动。".to_string()))
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("Team activate error: {e}");
+                                        Ok(Some(format!("启动团队任务失败：{e}")))
+                                    }
+                                };
                             } else {
                                 // User said no or gave feedback — reset to Planning so Lead can adjust
                                 *team_orch.team_state_inner.lock().unwrap() =
@@ -388,16 +432,52 @@ impl SessionRegistry {
         // Early Specialist/Lead detection — must run before roster_match so Lead turns
         // without an explicit @mention can fall back to the configured front_bot engine.
         let early_is_specialist = inbound.source == MsgSource::Heartbeat;
-        // Auto-promote check: if no orchestrator registered but this scope has auto_promote = true
-        // AND the message contains team trigger keywords, treat as Lead turn.
-        let auto_promote_active = !early_is_specialist
+        // Auto-promote check: scope has auto_promote=true AND message contains team trigger keywords.
+        // We then try to find an unclaimed orchestrator (lead_session_key not yet set) to attach.
+        // If no orchestrator is found, fall back to Solo to avoid injecting Lead tools with no MCP URL.
+        let is_auto_promote_candidate = !early_is_specialist
             && session_team_orch.is_none()
             && inbound.source == MsgSource::Human
             && self.auto_promote_scopes.contains(&session_key.scope)
             && crate::mode_selector::is_team_trigger(
                 inbound.content.as_text().unwrap_or(""),
             );
-        let early_is_lead = !early_is_specialist && (session_team_orch.is_some() || auto_promote_active);
+        // For auto_promote candidates, find the orchestrator bound to this exact scope.
+        // We match by lead_session_key.scope rather than "unclaimed" (is_none()), because:
+        //   - All Team orchestrators have lead_session_key preset at startup in main.rs.
+        //   - Matching by scope prevents cross-group binding in multi-group deployments.
+        //   - A group with both Team mode AND auto_promote=true can trigger Lead behavior
+        //     dynamically via keyword detection (e.g. before user types /team start).
+        let auto_promote_orch: Option<Arc<TeamOrchestrator>> = if is_auto_promote_candidate {
+            let found = self.team_orchestrators
+                .iter()
+                .find(|e| {
+                    e.value()
+                        .lead_session_key
+                        .get()
+                        .map(|k| k.scope == session_key.scope)
+                        .unwrap_or(false)
+                })
+                .map(|e| Arc::clone(e.value()));
+            if found.is_none() {
+                tracing::warn!(
+                    scope = %session_key.scope,
+                    "auto_promote triggered but no orchestrator found for this scope — falling back to Solo"
+                );
+            }
+            found
+        } else {
+            None
+        };
+        // Merge: for auto_promote, use the found orchestrator for all subsequent Lead logic.
+        let session_team_orch = session_team_orch.or(auto_promote_orch);
+        // Lead turn: must have an orchestrator AND the message must target front_bot
+        // (either no @mention → default to front_bot, or explicit @front_bot mention).
+        // Without the is_front_bot_turn() guard, @codex in a Team group would incorrectly
+        // receive Lead role and Lead system prompt (F2 fix).
+        let early_is_lead = !early_is_specialist
+            && session_team_orch.is_some()
+            && is_front_bot_turn(&inbound, &session_team_orch, &self.roster);
 
         // ── Generic routing via target_agent (set by Channel) ──
         // Clone needed data from roster match to avoid holding borrow across await.
@@ -456,9 +536,9 @@ impl SessionRegistry {
         let storage = self.session_manager.storage();
 
         // ── History: 50-message sliding window + sender prefix for LLM context ──
-        let stored = storage.load_messages(session_id).await?;
-        let start = stored.len().saturating_sub(50);
-        let recent = &stored[start..];
+        // load_recent_messages avoids deserializing the entire JSONL for long sessions.
+        let recent = storage.load_recent_messages(session_id, 50).await?;
+        let recent = &recent[..];
         let history: Vec<HistoryMsg> = recent
             .iter()
             .map(|m| {
@@ -591,13 +671,12 @@ impl SessionRegistry {
             None
         };
 
-        // Lead turns use lead_layer_0 as task_reminder; Specialist turns use pre-registered reminder
+        // Lead turns use lead_layer_0 as task_reminder; Specialist turns use pre-registered reminder.
+        // Use a single .remove() (not .get()) to consume the DashMap entry exactly once.
         let early_task_reminder: Option<String> = if early_is_lead {
             lead_layer_0.clone()
         } else {
-            self.team_task_reminders
-                .get(&session_key)
-                .map(|r| r.value().clone())
+            self.team_task_reminders.remove(&session_key).map(|(_, v)| v)
         };
 
         // Build the full system prompt via SystemPromptBuilder (6-layer persona-aware).
@@ -669,8 +748,8 @@ impl SessionRegistry {
             }
         };
 
-        // Consume task_reminder from DashMap (was peeked earlier for system prompt building).
-        let task_reminder = self.team_task_reminders.remove(&session_key).map(|(_, v)| v);
+        // Pass the already-consumed reminder into AgentCtx (same value used by SystemPromptBuilder).
+        let task_reminder = early_task_reminder.clone();
         // session_team_orch was resolved once at top of handle() — reuse here.
         let team_dir = if early_is_specialist {
             session_team_orch.as_ref().map(|o| o.session.dir.clone())
@@ -772,8 +851,17 @@ impl SessionRegistry {
             full_text
         };
 
-        // Hook 3: @botname scan → BotMention dispatch (anti-recursion: skip BotMention/Relay source)
-        if inbound.source != MsgSource::BotMention && inbound.source != MsgSource::Relay {
+        // Hook 3: @botname scan → BotMention dispatch
+        // Anti-recursion guard: do not scan replies that came from automated internal sources.
+        // - BotMention: would create direct recursion (Bot A → Bot B → Bot A)
+        // - Relay: Relay Specialist's reply is substituted into Lead's text; no further dispatch
+        // - TeamNotify: Lead's progress summary may mention other bots (e.g. "@codex has finished
+        //   task X"), which should not trigger new Specialist turns
+        // - Heartbeat: Specialist replies should not spawn additional bot calls
+        if !matches!(
+            inbound.source,
+            MsgSource::BotMention | MsgSource::Relay | MsgSource::TeamNotify | MsgSource::Heartbeat
+        ) {
             if let Some(trigger) = self.mention_trigger.get() {
                 let sender = roster_match
                     .as_ref()

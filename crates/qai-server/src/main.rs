@@ -280,6 +280,12 @@ async fn main() -> Result<()> {
                             // 2. Start throttled streaming consumer in a separate task.
                             //    It will get session_id itself and then consume events at 500ms
                             //    intervals, editing the placeholder message in-place.
+                            //
+                            //    cancel_tx / cancel_rx: handle() sends cancel when it returns
+                            //    Ok(None) (dedup hit) or Err, since in those cases no TurnComplete
+                            //    event will ever arrive and the stream would otherwise leak forever.
+                            let (cancel_tx, cancel_rx) =
+                                tokio::sync::oneshot::channel::<()>();
                             let channel2 = channel_clone.clone();
                             let registry2 = registry_clone.clone();
                             let sk2 = session_key.clone();
@@ -304,15 +310,35 @@ async fn main() -> Result<()> {
                                     session_key: sk2,
                                 };
 
-                                qai_agent::throttled_stream(event_rx, session_id, &sink, ph_id2)
-                                    .await;
+                                qai_agent::throttled_stream(
+                                    event_rx,
+                                    session_id,
+                                    &sink,
+                                    ph_id2,
+                                    cancel_rx,
+                                )
+                                .await;
                             });
 
                             // 3. Run handle() in its own task — emits events to broadcast channel.
+                            //    On Ok(None) or Err, signal the stream task to stop (no TurnComplete
+                            //    will ever fire in those cases).
                             let registry3 = registry_clone.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = registry3.handle(inbound).await {
-                                    tracing::error!("Lark registry handle error: {e}");
+                                match registry3.handle(inbound).await {
+                                    Ok(Some(_)) => {
+                                        // Engine ran and emitted TurnComplete — stream exits naturally.
+                                        // cancel_tx dropped here; stream already broke out of loop.
+                                    }
+                                    Ok(None) => {
+                                        // Dedup hit or no-op: no TurnComplete event will fire.
+                                        let _ = cancel_tx.send(());
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("Lark registry handle error: {e}");
+                                        // Error event may not have been emitted; cancel as safety net.
+                                        let _ = cancel_tx.send(());
+                                    }
                                 }
                             });
                         }
@@ -366,12 +392,27 @@ async fn main() -> Result<()> {
     // does not recurse into the relay result.
     {
         let registry_for_relay = registry.clone();
-        let relay_dispatch: qai_agent::relay::RelayDispatchFn = Box::new(move |target_agent, content, session_key| {
+        let relay_dispatch: qai_agent::relay::RelayDispatchFn = Box::new(move |target_agent, content, lead_session_key| {
             let registry = registry_for_relay.clone();
             Box::pin(async move {
+                // DEADLOCK FIX (C-2): Relay Specialist MUST NOT reuse the Lead's session_key.
+                //
+                // Lead's handle() holds Semaphore(1) for lead_session_key throughout its entire
+                // execution. Hook 2 (Relay) fires after engine.run() but before the permit drops.
+                // If we called registry.handle() with the same session_key, the inner handle()
+                // would block forever waiting for the same Semaphore(1) → deadlock.
+                //
+                // Fix: give the Relay Specialist a dedicated session_key:
+                //   channel = "relay"
+                //   scope   = "{lead_scope}:{agent_name}"
+                // This ensures an independent Semaphore and independent session history.
+                let agent_bare = target_agent.trim_start_matches('@');
+                let relay_scope = format!("{}:{}", lead_session_key.scope, agent_bare);
+                let relay_session_key = qai_protocol::SessionKey::new("relay", &relay_scope);
+
                 let msg = qai_protocol::InboundMsg {
                     id: uuid::Uuid::new_v4().to_string(),
-                    session_key,
+                    session_key: relay_session_key,
                     content,
                     sender: "relay".to_string(),
                     channel: "relay".to_string(),
@@ -588,29 +629,21 @@ async fn main() -> Result<()> {
         tracing::info!("BotMention redispatch task started");
     }
 
-    // Spawn TeamNotify redispatch task: registry → handle() → IM reply (TeamNotify loop)
+    // Spawn TeamNotify redispatch task: Lead receives [团队通知] and processes it.
+    // F3 fix: Lead's text reply is intentionally dropped here. User-visible output must flow
+    // through Lead's post_update() MCP tool call (notify_fn → ch.send()). Forwarding the
+    // text reply directly would double-send when Lead also calls post_update.
     {
         let registry_for_notify = registry.clone();
-        let channels_for_notify = cron_channel_map.clone();
         tokio::spawn(async move {
             while let Some(inbound) = team_notify_rx.recv().await {
-                let channel_name = inbound.session_key.channel.clone();
-                let session_key = inbound.session_key.clone();
-                let thread_ts = inbound.thread_ts.clone();
-                let reply_to = Some(inbound.id.clone());
                 match registry_for_notify.handle(inbound).await {
-                    Ok(Some(reply)) => {
-                        if let Some(ch) = channels_for_notify.get(&channel_name) {
-                            let outbound = qai_protocol::OutboundMsg {
-                                session_key,
-                                content: qai_protocol::MsgContent::text(reply),
-                                reply_to,
-                                thread_ts,
-                            };
-                            if let Err(e) = ch.send(&outbound).await {
-                                tracing::error!("TeamNotify reply send error: {e}");
-                            }
-                        }
+                    Ok(Some(_reply)) => {
+                        // F3 fix: TeamNotify-triggered Lead turns must NOT forward the text
+                        // reply to IM. User-visible output must flow through the Lead's
+                        // `post_update()` MCP tool call (which invokes notify_fn → ch.send()).
+                        // Forwarding _reply here would double-send when Lead also calls post_update.
+                        // Drop _reply silently — post_update() already handled IM delivery.
                     }
                     Ok(None) => {}
                     Err(e) => tracing::error!("TeamNotify handle error: {e}"),

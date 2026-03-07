@@ -239,7 +239,20 @@ impl SharedTeamToolServer {
     /// Report that a task is blocked.
     #[tool(description = "Specialist only. Report a task as blocked. Provide the task_id, reason, and your agent name.")]
     async fn block_task(&self, Parameters(p): Parameters<BlockTaskParams>) -> String {
-        let agent = p.agent.as_deref().unwrap_or("specialist");
+        // Resolve agent: explicit param first, then extract from claimed status (mirrors complete_task).
+        // Default "specialist" would always fail the ownership check when the actual claimer is a named agent.
+        let agent_owned = p.agent.as_deref().map(|s| s.to_string()).unwrap_or_else(|| {
+            self.orchestrator.registry.get_task(&p.task_id)
+                .ok()
+                .flatten()
+                .and_then(|t| {
+                    t.status_raw.strip_prefix("claimed:")
+                        .and_then(|s| s.splitn(2, ':').next())
+                        .map(|s| s.to_string())
+                })
+                .unwrap_or_else(|| "unknown".to_string())
+        });
+        let agent = agent_owned.as_str();
         // Validate claim ownership before resetting
         let owns_claim = self
             .orchestrator

@@ -90,6 +90,31 @@ impl SessionStorage {
         Ok(msgs)
     }
 
+    /// 读取该 session 最近 `limit` 条消息（避免长对话将完整 JSONL 全部反序列化）。
+    ///
+    /// I/O 仍为 O(n)（append-only JSONL 无法 seek），但只解析最后 limit 行，
+    /// 大幅减少长会话的堆分配。
+    pub async fn load_recent_messages(
+        &self,
+        session_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<StoredMessage>> {
+        let path = self.session_dir(session_id).join("messages.jsonl");
+        if !path.exists() {
+            return Ok(vec![]);
+        }
+        let content = tokio::fs::read_to_string(&path).await?;
+        let lines: Vec<&str> = content
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .collect();
+        let start = lines.len().saturating_sub(limit);
+        lines[start..]
+            .iter()
+            .map(|l| serde_json::from_str(l).map_err(|e| anyhow::anyhow!(e)))
+            .collect()
+    }
+
     /// 写入/覆盖 metadata.json（原子写：先写 tmp，再 rename）
     pub async fn save_meta(&self, meta: &SessionMeta) -> Result<()> {
         let dir = self.session_dir(meta.session_id);
@@ -193,6 +218,42 @@ mod tests {
         storage.append_message(session_id, &msg).await.unwrap();
         let loaded = storage.load_messages(session_id).await.unwrap();
         assert_eq!(loaded[0].sender.as_deref(), Some("@claude"));
+    }
+
+    #[tokio::test]
+    async fn test_load_recent_messages_respects_limit() {
+        let dir = tempdir().unwrap();
+        let storage = SessionStorage::new(dir.path().to_path_buf());
+        let session_id = Uuid::new_v4();
+
+        // Append 10 messages
+        for i in 0..10u32 {
+            let msg = StoredMessage {
+                id: Uuid::new_v4(),
+                role: "user".to_string(),
+                content: format!("msg-{i}"),
+                timestamp: Utc::now(),
+                sender: None,
+                tool_calls: None,
+            };
+            storage.append_message(session_id, &msg).await.unwrap();
+        }
+
+        // load_recent_messages(5) should return only the last 5
+        let recent = storage
+            .load_recent_messages(session_id, 5)
+            .await
+            .unwrap();
+        assert_eq!(recent.len(), 5);
+        assert_eq!(recent[0].content, "msg-5");
+        assert_eq!(recent[4].content, "msg-9");
+
+        // limit > total: should return all
+        let all = storage
+            .load_recent_messages(session_id, 100)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 10);
     }
 
     #[test]

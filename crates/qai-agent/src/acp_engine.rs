@@ -189,7 +189,7 @@ async fn run_acp_session(
     tokio::task::spawn_local(handle_io);
 
     // ACP 握手
-    conn.initialize(
+    let init_resp = conn.initialize(
         acp::InitializeRequest::new(acp::ProtocolVersion::V1).client_info(
             acp::Implementation::new("quickai-gateway", env!("CARGO_PKG_VERSION")),
         ),
@@ -197,12 +197,32 @@ async fn run_acp_session(
     .await
     .map_err(|e| anyhow::anyhow!("ACP initialize failed: {e:?}"))?;
 
+    // Whitelist known quickai agents that support SSE MCP but don't yet declare it in
+    // initialize(). This is a temporary workaround until Fix-A/B (explicit capability
+    // declaration in the agent binaries) is landed.
+    let agent_name = init_resp
+        .agent_info
+        .as_ref()
+        .map(|i| i.name.as_str())
+        .unwrap_or("");
+    let supports_sse_mcp = init_resp.agent_capabilities.mcp_capabilities.sse
+        || matches!(
+            agent_name,
+            "quickai-rust-agent" | "quickai-claude-agent"
+        );
+
     let session_root = config
         .workspace_dir
         .clone()
         .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+    let mcp_servers = build_mcp_servers(supports_sse_mcp, ctx.mcp_server_url.as_deref());
+    if !mcp_servers.is_empty() {
+        tracing::debug!(url = %ctx.mcp_server_url.as_deref().unwrap_or(""), "Injecting team-tools MCP server into ACP session");
+    }
+
     let sess = conn
-        .new_session(acp::NewSessionRequest::new(session_root))
+        .new_session(acp::NewSessionRequest::new(session_root).mcp_servers(mcp_servers))
         .await
         .map_err(|e| anyhow::anyhow!("ACP new_session failed: {e:?}"))?;
 
@@ -246,9 +266,25 @@ fn build_prompt_text(ctx: &AgentCtx) -> String {
     parts.join("\n\n")
 }
 
+fn build_mcp_servers(
+    supports_sse: bool,
+    url: Option<&str>,
+) -> Vec<agent_client_protocol::McpServer> {
+    use agent_client_protocol as acp;
+    if supports_sse {
+        if let Some(u) = url {
+            if !u.is_empty() {
+                return vec![acp::McpServer::Sse(acp::McpServerSse::new("team-tools", u))];
+            }
+        }
+    }
+    vec![]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_client_protocol as acp;
 
     #[test]
     fn test_acp_engine_config_carries_workspace() {
@@ -259,5 +295,35 @@ mod tests {
             workspace_dir: Some(std::path::PathBuf::from("/tmp")),
         };
         assert_eq!(cfg.workspace_dir, Some(std::path::PathBuf::from("/tmp")));
+    }
+
+    #[test]
+    fn test_mcp_servers_empty_when_no_url() {
+        let servers = build_mcp_servers(true, None);
+        assert!(servers.is_empty());
+    }
+
+    #[test]
+    fn test_mcp_servers_empty_when_no_sse_capability() {
+        let servers = build_mcp_servers(false, Some("http://127.0.0.1:9999"));
+        assert!(servers.is_empty());
+    }
+
+    #[test]
+    fn test_mcp_servers_empty_when_empty_url() {
+        let servers = build_mcp_servers(true, Some(""));
+        assert!(servers.is_empty());
+    }
+
+    #[test]
+    fn test_mcp_servers_populated_when_url_and_capability() {
+        let servers = build_mcp_servers(true, Some("http://127.0.0.1:9999"));
+        assert_eq!(servers.len(), 1);
+        if let acp::McpServer::Sse(ref h) = servers[0] {
+            assert_eq!(h.name, "team-tools");
+            assert_eq!(h.url, "http://127.0.0.1:9999");
+        } else {
+            panic!("expected Sse variant");
+        }
     }
 }

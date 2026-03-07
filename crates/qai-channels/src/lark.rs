@@ -36,6 +36,10 @@ pub struct LarkChannel {
     pub app_secret: String,
     client: reqwest::Client,
     require_mention_in_groups: bool,
+    /// Cached access token: (token_string, time_fetched).
+    /// Feishu app_access_token is valid for 7200s; we treat it as valid for 7000s
+    /// to provide a safety margin against clock skew and network latency.
+    token_cache: tokio::sync::Mutex<Option<(String, std::time::Instant)>>,
 }
 
 impl LarkChannel {
@@ -45,6 +49,7 @@ impl LarkChannel {
             app_secret,
             client: reqwest::Client::new(),
             require_mention_in_groups,
+            token_cache: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -60,6 +65,21 @@ impl LarkChannel {
     }
 
     async fn get_access_token(&self) -> Result<String> {
+        // Feishu app_access_token TTL is 7200s; cache for 7000s to avoid using an expired token.
+        const TOKEN_TTL_SECS: u64 = 7000;
+
+        // Fast path: return cached token if still valid.
+        // Lock is released before the HTTP request to avoid holding it across an await.
+        {
+            let cache = self.token_cache.lock().await;
+            if let Some((ref token, fetched_at)) = *cache {
+                if fetched_at.elapsed().as_secs() < TOKEN_TTL_SECS {
+                    return Ok(token.clone());
+                }
+            }
+        }
+
+        // Slow path: fetch a new token from Feishu.
         #[derive(Deserialize)]
         struct TokenResp {
             code: i32,
@@ -86,7 +106,14 @@ impl LarkChannel {
                 resp.msg
             );
         }
-        Ok(resp.app_access_token)
+        let token = resp.app_access_token;
+        // Update cache. Two concurrent fetches are harmless: both tokens are valid,
+        // and the second write simply overwrites the first with an equivalent token.
+        {
+            let mut cache = self.token_cache.lock().await;
+            *cache = Some((token.clone(), std::time::Instant::now()));
+        }
+        Ok(token)
     }
 
     /// Get the full WebSocket URL via Feishu's /callback/ws/endpoint.

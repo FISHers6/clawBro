@@ -364,12 +364,13 @@ impl TeamOrchestrator {
         self.registry.mark_done(task_id, agent, note)?;
 
         // 2. 事件日志
-        let event = format!(
-            r#"{{"event":"DONE","task":"{}","agent":"{}","ts":"{}"}}"#,
-            task_id,
-            agent,
-            Utc::now().to_rfc3339()
-        );
+        let event = serde_json::json!({
+            "event": "DONE",
+            "task": task_id,
+            "agent": agent,
+            "ts": Utc::now().to_rfc3339(),
+        })
+        .to_string();
         let _ = self.session.append_event(&event);
 
         // 3. 导出快照
@@ -442,10 +443,14 @@ impl TeamOrchestrator {
             target_agent: None,
             source: qai_protocol::MsgSource::TeamNotify,
         };
-        // try_send avoids blocking in sync context; channel capacity 256 is safe for normal load
-        if let Err(e) = tx.try_send(msg) {
-            tracing::warn!(task_id = %task_id, "TeamNotify dispatch failed: {e}");
-        }
+        // send().await via spawn: avoids blocking this sync fn while guaranteeing delivery.
+        // try_send was silently dropping notifications when the channel was full under load.
+        let task_id = task_id.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = tx.send(msg).await {
+                tracing::warn!(task_id = %task_id, "TeamNotify dispatch failed: {e}");
+            }
+        });
     }
 
     /// 构建并发送 TeamNotify InboundMsg 给 Lead（task 永久失败）
@@ -474,9 +479,12 @@ impl TeamOrchestrator {
             target_agent: None,
             source: qai_protocol::MsgSource::TeamNotify,
         };
-        if let Err(e) = tx.try_send(msg) {
-            tracing::warn!(task_id = %task_id, "TeamNotify (failed) dispatch failed: {e}");
-        }
+        let task_id = task_id.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = tx.send(msg).await {
+                tracing::warn!(task_id = %task_id, "TeamNotify (failed) dispatch failed: {e}");
+            }
+        });
     }
 
     /// 处理 Specialist 阻塞通知（Escalation → Lead via team_notify_tx）
@@ -486,13 +494,14 @@ impl TeamOrchestrator {
         agent: &str,
         reason: &str,
     ) -> Result<()> {
-        let event = format!(
-            r#"{{"event":"BLOCKED","task":"{}","agent":"{}","reason":"{}","ts":"{}"}}"#,
-            task_id,
-            agent,
-            reason,
-            Utc::now().to_rfc3339()
-        );
+        let event = serde_json::json!({
+            "event": "BLOCKED",
+            "task": task_id,
+            "agent": agent,
+            "reason": reason,
+            "ts": Utc::now().to_rfc3339(),
+        })
+        .to_string();
         let _ = self.session.append_event(&event);
 
         // Escalation → Lead via team_notify_tx (same path as task completion)
@@ -527,9 +536,12 @@ impl TeamOrchestrator {
             target_agent: None,
             source: qai_protocol::MsgSource::TeamNotify,
         };
-        if let Err(e) = tx.try_send(msg) {
-            tracing::warn!(task_id = %task_id, "TeamNotify (blocked) dispatch failed: {e}");
-        }
+        let task_id = task_id.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = tx.send(msg).await {
+                tracing::warn!(task_id = %task_id, "TeamNotify (blocked) dispatch failed: {e}");
+            }
+        });
     }
 
     // ── 停止 ──────────────────────────────────────────────────────────────────

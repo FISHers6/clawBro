@@ -114,15 +114,15 @@ impl TeamSession {
 
     /// Log a Specialist's reply text to events.jsonl (for observability/debugging).
     pub fn append_specialist_reply(&self, agent: &str, task_id: &str, reply: &str) -> Result<()> {
-        // Escape newlines so one reply = one JSONL line
-        let escaped = reply.replace('\n', "\\n").replace('\r', "");
-        let event = format!(
-            r#"{{"event":"SPECIALIST_REPLY","agent":"{}","task":"{}","ts":"{}","text":"{}"}}"#,
-            agent,
-            task_id,
-            chrono::Utc::now().to_rfc3339(),
-            escaped,
-        );
+        // Use serde_json to safely escape all string fields (prevents JSON injection via reply text)
+        let event = serde_json::json!({
+            "event": "SPECIALIST_REPLY",
+            "agent": agent,
+            "task": task_id,
+            "ts": chrono::Utc::now().to_rfc3339(),
+            "text": reply,
+        })
+        .to_string();
         self.append_event(&event)
     }
 

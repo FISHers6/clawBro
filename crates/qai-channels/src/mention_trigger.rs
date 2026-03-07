@@ -45,8 +45,15 @@ impl MentionTrigger {
         scope: &SessionKey,
         source: &MsgSource,
     ) {
-        // 防递归：BotMention 消息不再触发新的 BotMention
-        if *source == MsgSource::BotMention {
+        // 防递归（last-line defense）：automated 来源消息不触发新的 BotMention。
+        // 外层 registry.rs Hook 3 已过滤大部分情况；这里是模块内的独立防御：
+        // - BotMention: 直接递归 (Bot A → Bot B → Bot A)
+        // - Heartbeat: Specialist 回复不应再触发额外 bot 调用
+        // - TeamNotify: Lead 进度摘要中的 @bot 提及不应触发新 Specialist 任务
+        if matches!(
+            *source,
+            MsgSource::BotMention | MsgSource::Heartbeat | MsgSource::TeamNotify
+        ) {
             return;
         }
 
@@ -193,5 +200,31 @@ mod tests {
         // @unknown 不在 roster 中
         trigger.scan_and_dispatch("@unknown do something", "claude", &scope(), &MsgSource::Human);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_team_notify_source_no_recursion() {
+        let (trigger, mut rx) = make_trigger(&["claude", "codex"]);
+        // Lead 处理 TeamNotify 后回复中提到 @codex — 不应触发新 Specialist 调用
+        trigger.scan_and_dispatch(
+            "@codex 已完成任务 T001，感谢配合。",
+            "claude",
+            &scope(),
+            &MsgSource::TeamNotify,
+        );
+        assert!(rx.try_recv().is_err(), "TeamNotify source must not trigger BotMention");
+    }
+
+    #[test]
+    fn test_heartbeat_source_no_recursion() {
+        let (trigger, mut rx) = make_trigger(&["claude", "codex"]);
+        // Specialist 回复（Heartbeat 来源）不应触发额外 bot 调用
+        trigger.scan_and_dispatch(
+            "任务完成。请 @claude 确认结果。",
+            "codex",
+            &scope(),
+            &MsgSource::Heartbeat,
+        );
+        assert!(rx.try_recv().is_err(), "Heartbeat source must not trigger BotMention");
     }
 }

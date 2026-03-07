@@ -269,6 +269,15 @@ impl TaskRegistry {
     }
 
     /// 查找所有 Pending 且依赖全部完成的任务（可派发的任务）
+    ///
+    /// # Concurrency Safety
+    ///
+    /// Although the two SQL queries are not inside a single `BEGIN TRANSACTION`,
+    /// they are safe: both execute while holding the same `Mutex<Connection>` guard
+    /// (`conn = self.conn.lock().unwrap()`). Every other writer (mark_done, try_claim,
+    /// reset_claim) also requires this mutex, so no modification can occur between
+    /// the two queries. The Mutex provides equivalent isolation to a read transaction
+    /// in this single-process, single-connection setup.
     pub fn find_ready_tasks(&self) -> Result<Vec<Task>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -278,7 +287,7 @@ impl TaskRegistry {
         )?;
         let all_pending = Self::rows_to_tasks(&mut stmt)?;
 
-        // 获取所有已完成任务 ID
+        // 获取所有已完成任务 ID（在同一 conn guard 下，与上面查询等价于单事务）
         let mut done_stmt =
             conn.prepare("SELECT id FROM tasks WHERE status = 'done'")?;
         let done_ids: Vec<String> = done_stmt
