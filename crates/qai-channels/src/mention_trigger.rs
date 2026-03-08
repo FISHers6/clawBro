@@ -3,7 +3,7 @@
 //! 当任意 bot 回复后，扫描其输出中的 `@botname` 模式：
 //!   - 若 botname 在已注册的 roster 列表中
 //!   - 且当前消息来源不是 BotMention（防递归）
-//!   → 生成一条新 InboundMsg { source: BotMention } 发到 channel
+//!     → 生成一条新 InboundMsg { source: BotMention } 发到 channel
 //!
 //! 防递归设计：
 //!   - 单层：BotMention 消息不再触发 MentionTrigger（source 检查）

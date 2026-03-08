@@ -111,48 +111,52 @@ impl Channel for DingTalkChannel {
         if let Some(webhook_url) = &msg.thread_ts {
             // Preferred: in-thread reply via sessionWebhook (works for both group and DM).
             // No auth header needed — the access_token is embedded in the URL.
-            self.client
-                .post(webhook_url)
-                .json(&serde_json::json!({
-                    "msgtype": "text",
-                    "text": { "content": text }
-                }))
-                .send()
-                .await?
-                .error_for_status()?;
+            let client = self.client.clone();
+            let url = webhook_url.clone();
+            let body = serde_json::json!({
+                "msgtype": "text",
+                "text": { "content": text.clone() }
+            });
+            crate::send_with_retry(|| client.post(&url).json(&body)).await?;
         } else if let Some(conversation_id) = scope.strip_prefix("group:") {
             // Proactive group message via openConversationId.
             let token = self.get_access_token().await?;
-            self.client
-                .post("https://api.dingtalk.com/v1.0/robot/groupMessages/send")
-                .header("x-acs-dingtalk-access-token", &token)
-                .json(&serde_json::json!({
-                    "robotCode": self.config.app_key,
-                    "openConversationId": conversation_id,
-                    "msgKey": "sampleText",
-                    // DingTalk requires msgParam to be a JSON-encoded string, not an inline object.
-                    "msgParam": serde_json::json!({ "content": text }).to_string(),
-                }))
-                .send()
-                .await?
-                .error_for_status()?;
+            let client = self.client.clone();
+            let app_key = self.config.app_key.clone();
+            let body = serde_json::json!({
+                "robotCode": app_key,
+                "openConversationId": conversation_id,
+                "msgKey": "sampleText",
+                // DingTalk requires msgParam to be a JSON-encoded string, not an inline object.
+                "msgParam": serde_json::json!({ "content": text }).to_string(),
+            });
+            crate::send_with_retry(|| {
+                client
+                    .post("https://api.dingtalk.com/v1.0/robot/groupMessages/send")
+                    .header("x-acs-dingtalk-access-token", &token)
+                    .json(&body)
+            })
+            .await?;
         } else {
             // Proactive DM via batchSend — scope is "user:{senderId}".
             let user_id = scope.strip_prefix("user:").unwrap_or(scope.as_str());
             let token = self.get_access_token().await?;
-            self.client
-                .post("https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend")
-                .header("x-acs-dingtalk-access-token", &token)
-                .json(&serde_json::json!({
-                    "robotCode": self.config.app_key,
-                    "userIds": [user_id],
-                    "msgKey": "sampleText",
-                    // DingTalk requires msgParam to be a JSON-encoded string, not an inline object.
-                    "msgParam": serde_json::json!({ "content": text }).to_string(),
-                }))
-                .send()
-                .await?
-                .error_for_status()?;
+            let client = self.client.clone();
+            let app_key = self.config.app_key.clone();
+            let body = serde_json::json!({
+                "robotCode": app_key,
+                "userIds": [user_id],
+                "msgKey": "sampleText",
+                // DingTalk requires msgParam to be a JSON-encoded string, not an inline object.
+                "msgParam": serde_json::json!({ "content": text }).to_string(),
+            });
+            crate::send_with_retry(|| {
+                client
+                    .post("https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend")
+                    .header("x-acs-dingtalk-access-token", &token)
+                    .json(&body)
+            })
+            .await?;
         }
         Ok(())
     }
@@ -296,7 +300,14 @@ impl Channel for DingTalkChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{SEND_INITIAL_DELAY_MS, SEND_MAX_RETRIES};
     use std::sync::Mutex;
+
+    #[test]
+    fn retry_constants_are_reasonable() {
+        assert_eq!(SEND_MAX_RETRIES, 3);
+        assert!(SEND_INITIAL_DELAY_MS >= 100);
+    }
 
     // Serialize env-mutating tests to avoid races
     static ENV_LOCK: Mutex<()> = Mutex::new(());

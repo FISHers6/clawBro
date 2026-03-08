@@ -315,47 +315,37 @@ impl Channel for LarkChannel {
 
         if let Some(message_id) = &msg.reply_to {
             // Preferred: reply to the specific incoming message.
-            let resp = self
-                .client
-                .post(format!("{FEISHU_BASE}/im/v1/messages/{message_id}/reply"))
-                .header("Authorization", format!("Bearer {token}"))
-                .json(&serde_json::json!({
-                    "content": content_json,
-                    "msg_type": "text"
-                }))
-                .send()
-                .await?;
-            let status = resp.status();
-            if !status.is_success() {
-                let body = resp.text().await.unwrap_or_default();
-                let body_preview = &body[..body.len().min(200)];
-                anyhow::bail!("Feishu reply failed: HTTP {} body={}", status, body_preview);
-            }
+            let client = self.client.clone();
+            let url = format!("{FEISHU_BASE}/im/v1/messages/{message_id}/reply");
+            let auth = format!("Bearer {token}");
+            let body = serde_json::json!({
+                "content": content_json,
+                "msg_type": "text"
+            });
+            crate::send_with_retry(|| {
+                client
+                    .post(&url)
+                    .header("Authorization", &auth)
+                    .json(&body)
+            })
+            .await?;
         } else if let Some(chat_id) = scope.strip_prefix("group:") {
             // Proactive group message — send to chat_id.
-            let resp = self
-                .client
-                .post(format!(
-                    "{FEISHU_BASE}/im/v1/messages?receive_id_type=chat_id"
-                ))
-                .header("Authorization", format!("Bearer {token}"))
-                .json(&serde_json::json!({
-                    "receive_id": chat_id,
-                    "content": content_json,
-                    "msg_type": "text"
-                }))
-                .send()
-                .await?;
-            let status = resp.status();
-            if !status.is_success() {
-                let body = resp.text().await.unwrap_or_default();
-                let body_preview = &body[..body.len().min(200)];
-                anyhow::bail!(
-                    "Feishu group send failed: HTTP {} body={}",
-                    status,
-                    body_preview
-                );
-            }
+            let client = self.client.clone();
+            let url = format!("{FEISHU_BASE}/im/v1/messages?receive_id_type=chat_id");
+            let auth = format!("Bearer {token}");
+            let body = serde_json::json!({
+                "receive_id": chat_id,
+                "content": content_json,
+                "msg_type": "text"
+            });
+            crate::send_with_retry(|| {
+                client
+                    .post(&url)
+                    .header("Authorization", &auth)
+                    .json(&body)
+            })
+            .await?;
         } else {
             // Proactive DM — scope is "user:{open_id}".
             if !scope.starts_with("user:") {
@@ -365,29 +355,21 @@ impl Channel for LarkChannel {
                 );
             }
             let open_id = scope.strip_prefix("user:").unwrap_or(scope.as_str());
-            let resp = self
-                .client
-                .post(format!(
-                    "{FEISHU_BASE}/im/v1/messages?receive_id_type=open_id"
-                ))
-                .header("Authorization", format!("Bearer {token}"))
-                .json(&serde_json::json!({
-                    "receive_id": open_id,
-                    "content": content_json,
-                    "msg_type": "text"
-                }))
-                .send()
-                .await?;
-            let status = resp.status();
-            if !status.is_success() {
-                let body = resp.text().await.unwrap_or_default();
-                let body_preview = &body[..body.len().min(200)];
-                anyhow::bail!(
-                    "Feishu DM send failed: HTTP {} body={}",
-                    status,
-                    body_preview
-                );
-            }
+            let client = self.client.clone();
+            let url = format!("{FEISHU_BASE}/im/v1/messages?receive_id_type=open_id");
+            let auth = format!("Bearer {token}");
+            let body = serde_json::json!({
+                "receive_id": open_id,
+                "content": content_json,
+                "msg_type": "text"
+            });
+            crate::send_with_retry(|| {
+                client
+                    .post(&url)
+                    .header("Authorization", &auth)
+                    .json(&body)
+            })
+            .await?;
         }
         Ok(())
     }
