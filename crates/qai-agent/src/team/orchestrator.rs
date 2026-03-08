@@ -1110,6 +1110,10 @@ mod tests {
         orch.registry.try_claim("T002", "codex").unwrap();
 
         let result = orch.handle_specialist_blocked("T002", "codex", "stuck on auth");
-        assert!(result.is_ok(), "block_task should accept owner: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "block_task should accept owner: {:?}",
+            result.err()
+        );
     }
 }

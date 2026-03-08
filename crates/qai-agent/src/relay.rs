@@ -194,7 +194,7 @@ mod tests {
                     _ => panic!("expected text"),
                 };
                 assert!(text.contains("verify JWT"));
-                Ok(Some(format!("Codex回复: JWT已验证")))
+                Ok(Some("Codex回复: JWT已验证".to_string()))
             })
         }));
 

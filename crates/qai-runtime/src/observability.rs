@@ -31,4 +31,3 @@ pub fn team_id_from_scope(scope: &str) -> Option<&str> {
     let team_id = scope.split(':').next()?;
     (!team_id.is_empty() && scope.contains(':')).then_some(team_id)
 }
-

@@ -192,7 +192,7 @@ impl SharedTeamToolServer {
                     .and_then(|t| {
                         t.status_raw
                             .strip_prefix("claimed:")
-                            .and_then(|s| s.splitn(2, ':').next())
+                            .and_then(|s| s.split(':').next())
                             .map(|s| s.to_string())
                     })
             })

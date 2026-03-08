@@ -28,7 +28,9 @@ pub use helper_contract::{
     required_string_field, ParsedTeamHelperResult, TEAM_HELPER_CONTRACT, TEAM_HELPER_VERSION,
 };
 pub use native::QuickAiNativeBackendAdapter;
-pub use observability::{backend_family_name, runtime_role_name, team_id_from_scope, turn_mode_name};
+pub use observability::{
+    backend_family_name, runtime_role_name, team_id_from_scope, turn_mode_name,
+};
 pub use openclaw::OpenClawBackendAdapter;
 pub use registry::{BackendRegistry, BackendSpec};
 pub use tool_bridge::{

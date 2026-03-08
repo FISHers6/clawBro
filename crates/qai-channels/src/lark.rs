@@ -322,13 +322,8 @@ impl Channel for LarkChannel {
                 "content": content_json,
                 "msg_type": "text"
             });
-            crate::send_with_retry(|| {
-                client
-                    .post(&url)
-                    .header("Authorization", &auth)
-                    .json(&body)
-            })
-            .await?;
+            crate::send_with_retry(|| client.post(&url).header("Authorization", &auth).json(&body))
+                .await?;
         } else if let Some(chat_id) = scope.strip_prefix("group:") {
             // Proactive group message — send to chat_id.
             let client = self.client.clone();
@@ -339,13 +334,8 @@ impl Channel for LarkChannel {
                 "content": content_json,
                 "msg_type": "text"
             });
-            crate::send_with_retry(|| {
-                client
-                    .post(&url)
-                    .header("Authorization", &auth)
-                    .json(&body)
-            })
-            .await?;
+            crate::send_with_retry(|| client.post(&url).header("Authorization", &auth).json(&body))
+                .await?;
         } else {
             // Proactive DM — scope is "user:{open_id}".
             if !scope.starts_with("user:") {
@@ -363,13 +353,8 @@ impl Channel for LarkChannel {
                 "content": content_json,
                 "msg_type": "text"
             });
-            crate::send_with_retry(|| {
-                client
-                    .post(&url)
-                    .header("Authorization", &auth)
-                    .json(&body)
-            })
-            .await?;
+            crate::send_with_retry(|| client.post(&url).header("Authorization", &auth).json(&body))
+                .await?;
         }
         Ok(())
     }

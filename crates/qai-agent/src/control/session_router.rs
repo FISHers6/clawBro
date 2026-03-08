@@ -8,7 +8,7 @@ pub(crate) fn get_orchestrator_for_session(
     session_key: &SessionKey,
 ) -> Option<Arc<TeamOrchestrator>> {
     if session_key.channel.as_str() == "specialist" {
-        let team_id = session_key.scope.splitn(2, ':').next()?;
+        let team_id = session_key.scope.split(':').next()?;
         team_orchestrators
             .get(team_id)
             .map(|r| Arc::clone(r.value()))

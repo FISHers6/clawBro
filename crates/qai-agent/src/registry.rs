@@ -366,7 +366,7 @@ impl SessionRegistry {
                     .and_then(|t| {
                         t.status_raw
                             .strip_prefix("claimed:")
-                            .and_then(|s| s.splitn(2, ':').next())
+                            .and_then(|s| s.split(':').next())
                             .map(|s| s.to_string())
                     })
             })
@@ -1551,8 +1551,7 @@ impl SessionRegistry {
                     return Ok(Some(response));
                 } else {
                     return Ok(Some(
-                        "ℹ️ 当前 session 没有活跃的 Team。输入 /team plan 开始规划。"
-                            .to_string(),
+                        "ℹ️ 当前 session 没有活跃的 Team。输入 /team plan 开始规划。".to_string(),
                     ));
                 }
             }
@@ -2513,7 +2512,10 @@ mod tests {
         };
 
         // Lead turn: full_text must be returned unchanged (relay NOT invoked)
-        assert_eq!(result, full_text, "Lead turn must not trigger relay processing");
+        assert_eq!(
+            result, full_text,
+            "Lead turn must not trigger relay processing"
+        );
         assert!(
             !result.starts_with("relay-processed:"),
             "relay-processed prefix must not appear for Lead turns"

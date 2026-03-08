@@ -261,9 +261,6 @@ mod tests {
 
     #[test]
     fn test_parse_team_no_subcommand() {
-        assert_eq!(
-            SlashCommand::parse("/team"),
-            Some(SlashCommand::TeamStatus)
-        );
+        assert_eq!(SlashCommand::parse("/team"), Some(SlashCommand::TeamStatus));
     }
 }

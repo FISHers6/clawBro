@@ -431,8 +431,10 @@ mod tests {
         let mut saw_complete = false;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
         while tokio::time::Instant::now() < deadline {
-            match tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await {
-                Ok(Ok(event)) => match event {
+            if let Ok(Ok(event)) =
+                tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+            {
+                match event {
                     AgentEvent::Thinking { .. } => saw_thinking = true,
                     AgentEvent::ApprovalRequest {
                         approval_id,
@@ -448,8 +450,7 @@ mod tests {
                         saw_complete = true
                     }
                     _ => {}
-                },
-                _ => {}
+                }
             }
             if saw_thinking && saw_approval && saw_delta && saw_complete {
                 break;
