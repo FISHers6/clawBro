@@ -673,6 +673,15 @@ impl TeamOrchestrator {
         agent: &str,
         reason: &str,
     ) -> Result<()> {
+        // ── Identity check: only the agent that claimed this task can report it blocked ──
+        anyhow::ensure!(
+            self.registry.is_claimed_by(task_id, agent)?,
+            "block_task: agent '{}' does not own task '{}'",
+            agent,
+            task_id,
+        );
+        // ──────────────────────────────────────────────────────────────────────────────────
+
         let event = serde_json::json!({
             "event": "BLOCKED",
             "task": task_id,
@@ -1060,5 +1069,47 @@ mod tests {
 
         let task = orch.registry.get_task("T001").unwrap().unwrap();
         assert_eq!(task.title, "Setup");
+    }
+
+    #[test]
+    fn block_task_rejects_non_owner() {
+        use crate::team::registry::CreateTask;
+
+        let (orch, _tmp) = make_orchestrator();
+
+        orch.register_task(CreateTask {
+            id: "T001".into(),
+            title: "Test Task".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        orch.registry.try_claim("T001", "codex").unwrap();
+
+        // "gemini" tries to block "codex"'s task → should fail
+        let result = orch.handle_specialist_blocked("T001", "gemini", "stuck");
+        assert!(result.is_err(), "block_task should reject non-owner");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("gemini") || msg.contains("not own") || msg.contains("claimed"),
+            "error message should mention agent or ownership: {msg}"
+        );
+    }
+
+    #[test]
+    fn block_task_accepts_owner() {
+        use crate::team::registry::CreateTask;
+
+        let (orch, _tmp) = make_orchestrator();
+
+        orch.register_task(CreateTask {
+            id: "T002".into(),
+            title: "Another Task".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        orch.registry.try_claim("T002", "codex").unwrap();
+
+        let result = orch.handle_specialist_blocked("T002", "codex", "stuck on auth");
+        assert!(result.is_ok(), "block_task should accept owner: {:?}", result.err());
     }
 }
