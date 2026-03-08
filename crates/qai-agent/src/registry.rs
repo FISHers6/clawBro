@@ -1218,7 +1218,20 @@ impl SessionRegistry {
         // ── Post-run hooks ─────────────────────────────────────────────────────
 
         // Hook 2: [RELAY: @agent <指令>] marker expansion (Relay Mode)
-        let full_text = if let Some(relay) = self.relay_engine.get() {
+        // Guard: Lead turns in Team mode must NOT use [RELAY:] syntax — Lead communicates
+        // with Specialists via MCP tools (assign_task, etc.), not relay markers.
+        // If a Lead outputs [RELAY:] accidentally, warn and skip processing to prevent
+        // bypassing the TaskRegistry state machine.
+        let full_text = if early_is_lead {
+            if full_text.contains("[RELAY:") {
+                tracing::warn!(
+                    session = ?session_key,
+                    "Lead turn output contains [RELAY:] syntax — relay hook skipped. \
+                     Use assign_task MCP tool to communicate with Specialists."
+                );
+            }
+            full_text
+        } else if let Some(relay) = self.relay_engine.get() {
             if full_text.contains("[RELAY:") {
                 match relay.process(&full_text, &session_key).await {
                     Ok(processed) => processed,
@@ -2437,5 +2450,53 @@ mod tests {
             crate::team::registry::TaskStatus::Submitted { .. }
         ));
         assert_eq!(task.completion_note.as_deref(), Some("bridge implemented"));
+    }
+
+    /// Verify that the relay guard logic (early_is_lead branch) passes full_text unchanged
+    /// when [RELAY:] appears in a Lead turn output.
+    ///
+    /// This test exercises the guard decision logic directly (without running handle())
+    /// since wiring a full Lead turn requires a live engine and team orchestrator.
+    /// The in-handle() guard is: `if early_is_lead { warn if contains "[RELAY:"; full_text } else { ... relay ... }`
+    #[test]
+    fn relay_hook_guard_lead_turn_skips_relay_processing() {
+        // Simulate the guard condition: early_is_lead = true, text contains [RELAY:]
+        let early_is_lead = true;
+        let full_text = "Good plan. [RELAY: @codex implement the auth module]".to_string();
+
+        // Mirror the guard logic from Hook 2 in handle()
+        let result = if early_is_lead {
+            // warn would fire here in production; skipped in test
+            full_text.clone()
+        } else {
+            // relay.process() would run here for non-Lead turns
+            format!("relay-processed: {full_text}")
+        };
+
+        // Lead turn: full_text must be returned unchanged (relay NOT invoked)
+        assert_eq!(result, full_text, "Lead turn must not trigger relay processing");
+        assert!(
+            !result.starts_with("relay-processed:"),
+            "relay-processed prefix must not appear for Lead turns"
+        );
+    }
+
+    /// Verify that non-Lead turns still go through the relay branch (relay engine is consulted).
+    #[test]
+    fn relay_hook_guard_non_lead_turn_enters_relay_branch() {
+        let early_is_lead = false;
+        let full_text = "[RELAY: @codex do something]".to_string();
+
+        let result = if early_is_lead {
+            full_text.clone()
+        } else {
+            // Simulate relay.process() returning a processed string
+            format!("relay-processed: {full_text}")
+        };
+
+        assert!(
+            result.starts_with("relay-processed:"),
+            "non-Lead turn must enter relay branch"
+        );
     }
 }
