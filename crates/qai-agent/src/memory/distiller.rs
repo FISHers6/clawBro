@@ -45,33 +45,63 @@ impl AcpDistiller {
 #[async_trait]
 impl MemoryDistiller for AcpDistiller {
     async fn distill(&self, logs: &str, current_memory: &str) -> Result<String> {
-        use crate::acp_engine::{AcpEngine, AcpEngineConfig};
-        use crate::traits::{AgentCtx, AgentEngine};
-        use tokio::sync::broadcast;
-        use uuid::Uuid;
-
-        let engine = AcpEngine::new(AcpEngineConfig {
-            command: self.binary.clone(),
-            args: vec![],
-            env: vec![],
-            workspace_dir: None,
-        });
-
+        use qai_runtime::acp::session_driver::{run_command_turn, AcpCommandConfig};
+        use qai_runtime::{
+            ApprovalBroker, RuntimeContext, RuntimeRole, RuntimeSessionSpec, ToolSurfaceSpec,
+        };
         let user_text =
             format!("## Conversation Logs\n\n{logs}\n\n## Current Memory\n\n{current_memory}");
-
-        let ctx = AgentCtx {
-            session_id: Uuid::new_v4(),
-            user_text,
-            history: vec![],
-            system_injection: DISTILL_PROMPT.to_string(),
-            workspace_dir: None,
-            ..AgentCtx::default()
-        };
-
-        // Broadcast receiver is intentionally discarded: distillation runs in the background
-        // and streaming progress events are not surfaced to callers.
-        let (tx, _) = broadcast::channel(16);
-        engine.run(ctx, tx).await
+        let binary = self.binary.clone();
+        let turn = tokio::task::spawn_blocking(move || -> Result<_> {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let local = tokio::task::LocalSet::new();
+            rt.block_on(local.run_until(async move {
+                let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+                run_command_turn(
+                    &AcpCommandConfig {
+                        command: binary,
+                        args: vec![],
+                        env: vec![],
+                    },
+                    RuntimeSessionSpec {
+                        backend_id: "memory-distiller".into(),
+                        participant_name: None,
+                        session_key: qai_protocol::SessionKey::new("ws", "distiller"),
+                        role: RuntimeRole::Solo,
+                        workspace_dir: None,
+                        prompt_text: format!(
+                            "<system_context>\n{}\n</system_context>\n\n{}",
+                            DISTILL_PROMPT, user_text
+                        ),
+                        tool_surface: ToolSurfaceSpec {
+                            team_tools: false,
+                            local_skills: false,
+                            external_mcp: false,
+                            backend_native_tools: false,
+                        },
+                        tool_bridge_url: None,
+                        team_tool_url: None,
+                        context: RuntimeContext {
+                            system_prompt: Some(DISTILL_PROMPT.to_string()),
+                            workspace_native_files: Vec::new(),
+                            memory_summary: None,
+                            agent_memory: None,
+                            team_manifest: None,
+                            task_reminder: None,
+                            history_lines: Vec::new(),
+                            user_input: Some(user_text.clone()),
+                        },
+                    },
+                    qai_runtime::RuntimeEventSink::new(tx),
+                    ApprovalBroker::default(),
+                )
+                .await
+            }))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("memory distiller thread join failed: {e}"))??;
+        Ok(turn.full_text)
     }
 }

@@ -1,7 +1,8 @@
 use anyhow::Result;
 use qai_agent::roster::AgentEntry;
-use qai_agent::selector::EngineConfig;
+use qai_runtime::{BackendFamily, BackendSpec, LaunchSpec};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -89,6 +90,9 @@ pub struct GatewayConfig {
     pub session: SessionSection,
     #[serde(default)]
     pub agent_roster: Vec<AgentEntry>,
+    /// Canonical backend catalog (`[[backend]]`).
+    #[serde(default, rename = "backend")]
+    pub backends: Vec<BackendCatalogEntry>,
     #[serde(default)]
     pub memory: MemorySection,
     #[serde(default)]
@@ -122,9 +126,160 @@ impl Default for GatewaySection {
     }
 }
 
+impl GatewayConfig {
+    pub fn validate_runtime_topology(&self) -> Result<()> {
+        if self.backends.is_empty() {
+            anyhow::bail!("at least one [[backend]] entry is required");
+        }
+
+        let backend_ids: BTreeSet<&str> = self
+            .backends
+            .iter()
+            .map(|backend| backend.id.as_str())
+            .collect();
+
+        if !self.agent.backend_id.trim().is_empty() {
+            if !backend_ids.contains(self.agent.backend_id.as_str()) {
+                anyhow::bail!(
+                    "agent.backend_id `{}` is not present in [[backend]] catalog",
+                    self.agent.backend_id
+                );
+            }
+        } else if self.agent_roster.is_empty() {
+            anyhow::bail!("agent.backend_id is required when no [[agent_roster]] is configured");
+        }
+
+        for entry in &self.agent_roster {
+            let backend_id = entry.runtime_backend_id();
+            if !backend_ids.contains(backend_id) {
+                anyhow::bail!(
+                    "agent_roster `{}` resolves to backend `{}` which is not present in [[backend]] catalog",
+                    entry.name,
+                    backend_id
+                );
+            }
+        }
+
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AgentSection {
-    pub engine: EngineConfig,
+    #[serde(default)]
+    pub backend_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendFamilyConfig {
+    Acp,
+    OpenClawGateway,
+    QuickAiNative,
+}
+
+impl BackendFamilyConfig {
+    pub fn into_runtime_family(self) -> BackendFamily {
+        match self {
+            Self::Acp => BackendFamily::Acp,
+            Self::OpenClawGateway => BackendFamily::OpenClawGateway,
+            Self::QuickAiNative => BackendFamily::QuickAiNative,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum BackendLaunchConfig {
+    Command {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        env: BTreeMap<String, String>,
+    },
+    GatewayWs {
+        endpoint: String,
+        #[serde(default)]
+        token: Option<String>,
+        #[serde(default)]
+        password: Option<String>,
+        #[serde(default)]
+        role: Option<String>,
+        #[serde(default)]
+        scopes: Vec<String>,
+        #[serde(default)]
+        agent_id: Option<String>,
+        #[serde(default)]
+        team_helper_command: Option<String>,
+        #[serde(default)]
+        team_helper_args: Vec<String>,
+        #[serde(default)]
+        lead_helper_mode: bool,
+    },
+    Embedded,
+}
+
+impl BackendLaunchConfig {
+    pub fn into_launch_spec(self) -> LaunchSpec {
+        match self {
+            Self::Command { command, args, env } => LaunchSpec::Command {
+                command,
+                args,
+                env: env.into_iter().collect(),
+            },
+            Self::GatewayWs {
+                endpoint,
+                token,
+                password,
+                role,
+                scopes,
+                agent_id,
+                team_helper_command,
+                team_helper_args,
+                lead_helper_mode,
+            } => LaunchSpec::GatewayWs {
+                endpoint,
+                token,
+                password,
+                role,
+                scopes,
+                agent_id,
+                team_helper_command,
+                team_helper_args,
+                lead_helper_mode,
+            },
+            Self::Embedded => LaunchSpec::Embedded,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackendCatalogEntry {
+    pub id: String,
+    pub family: BackendFamilyConfig,
+    #[serde(default)]
+    pub adapter_key: Option<String>,
+    pub launch: BackendLaunchConfig,
+}
+
+impl BackendCatalogEntry {
+    pub fn adapter_key(&self) -> &str {
+        self.adapter_key.as_deref().unwrap_or(match self.family {
+            BackendFamilyConfig::Acp => "acp",
+            BackendFamilyConfig::OpenClawGateway => "openclaw",
+            BackendFamilyConfig::QuickAiNative => "native",
+        })
+    }
+
+    pub fn to_backend_spec(&self) -> BackendSpec {
+        BackendSpec {
+            backend_id: self.id.clone(),
+            family: self.family.clone().into_runtime_family(),
+            adapter_key: self.adapter_key().to_string(),
+            launch: self.launch.clone().into_launch_spec(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -300,21 +455,18 @@ port = 8080
 [[agent_roster]]
 name = "mybot"
 mentions = ["@mybot", "@dev"]
-
-[agent_roster.engine]
-type = "rust_agent"
+backend_id = "mybot-main"
 
 [[agent_roster]]
 name = "reviewer"
 mentions = ["@reviewer"]
-
-[agent_roster.engine]
-type = "codex_acp"
+backend_id = "reviewer-main"
 "#;
         let cfg: GatewayConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.agent_roster.len(), 2);
         assert_eq!(cfg.agent_roster[0].name, "mybot");
         assert_eq!(cfg.agent_roster[0].mentions, vec!["@mybot", "@dev"]);
+        assert_eq!(cfg.agent_roster[0].backend_id, "mybot-main");
         assert_eq!(cfg.agent_roster[1].name, "reviewer");
     }
 
@@ -323,6 +475,169 @@ type = "codex_acp"
         let toml_str = "[gateway]\nhost = \"127.0.0.1\"\nport = 0";
         let cfg: GatewayConfig = toml::from_str(toml_str).unwrap();
         assert!(cfg.agent_roster.is_empty());
+        assert!(cfg.backends.is_empty());
+    }
+
+    #[test]
+    fn test_backend_catalog_acp_deserializes() {
+        let toml = r#"
+[[backend]]
+id = "codex-main"
+family = "acp"
+adapter_key = "acp"
+
+[backend.launch]
+type = "command"
+command = "codex-acp"
+args = ["--stdio"]
+        "#;
+        let cfg: GatewayConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.backends.len(), 1);
+        let spec = cfg.backends[0].to_backend_spec();
+        assert_eq!(spec.backend_id, "codex-main");
+        assert_eq!(spec.family, BackendFamily::Acp);
+        assert_eq!(spec.adapter_key, "acp");
+        assert!(matches!(spec.launch, LaunchSpec::Command { .. }));
+    }
+
+    #[test]
+    fn test_backend_catalog_openclaw_deserializes() {
+        let toml = r#"
+[[backend]]
+id = "openclaw-main"
+family = "open_claw_gateway"
+
+[backend.launch]
+type = "gateway_ws"
+endpoint = "ws://127.0.0.1:18789"
+token = "test-token"
+scopes = ["operator.admin"]
+        "#;
+        let cfg: GatewayConfig = toml::from_str(toml).unwrap();
+        let spec = cfg.backends[0].to_backend_spec();
+        assert_eq!(spec.family, BackendFamily::OpenClawGateway);
+        assert_eq!(spec.adapter_key, "openclaw");
+        match spec.launch {
+            LaunchSpec::GatewayWs {
+                endpoint,
+                token,
+                password,
+                role,
+                scopes,
+                agent_id,
+                team_helper_command,
+                team_helper_args,
+                lead_helper_mode,
+            } => {
+                assert_eq!(endpoint, "ws://127.0.0.1:18789");
+                assert_eq!(token.as_deref(), Some("test-token"));
+                assert!(password.is_none());
+                assert!(role.is_none());
+                assert_eq!(scopes, vec!["operator.admin"]);
+                assert!(agent_id.is_none());
+                assert!(team_helper_command.is_none());
+                assert!(team_helper_args.is_empty());
+                assert!(!lead_helper_mode);
+            }
+            other => panic!("unexpected launch spec: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_backend_catalog_openclaw_lead_helper_mode_deserializes() {
+        let toml = r#"
+[[backend]]
+id = "openclaw-lead"
+family = "open_claw_gateway"
+
+[backend.launch]
+type = "gateway_ws"
+endpoint = "ws://127.0.0.1:18789"
+team_helper_command = "/bin/qai_team_cli"
+lead_helper_mode = true
+        "#;
+        let cfg: GatewayConfig = toml::from_str(toml).unwrap();
+        let spec = cfg.backends[0].to_backend_spec();
+        match spec.launch {
+            LaunchSpec::GatewayWs {
+                team_helper_command,
+                lead_helper_mode,
+                ..
+            } => {
+                assert_eq!(team_helper_command.as_deref(), Some("/bin/qai_team_cli"));
+                assert!(lead_helper_mode);
+            }
+            other => panic!("unexpected launch spec: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_backend_catalog_native_deserializes() {
+        let toml = r#"
+[[backend]]
+id = "native-main"
+family = "quick_ai_native"
+
+[backend.launch]
+type = "embedded"
+        "#;
+        let cfg: GatewayConfig = toml::from_str(toml).unwrap();
+        let spec = cfg.backends[0].to_backend_spec();
+        assert_eq!(spec.family, BackendFamily::QuickAiNative);
+        assert_eq!(spec.adapter_key, "native");
+        assert!(matches!(spec.launch, LaunchSpec::Embedded));
+    }
+
+    #[test]
+    fn test_agent_backend_id_deserializes() {
+        let toml = r#"
+[agent]
+backend_id = "native-main"
+        "#;
+        let cfg: GatewayConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.agent.backend_id, "native-main");
+    }
+
+    #[test]
+    fn test_validate_runtime_topology_accepts_backend_catalog_and_roster_binding() {
+        let toml = r#"
+[agent]
+backend_id = "native-main"
+
+[[backend]]
+id = "native-main"
+family = "quick_ai_native"
+
+[backend.launch]
+type = "embedded"
+
+[[agent_roster]]
+name = "reviewer"
+mentions = ["@reviewer"]
+backend_id = "native-main"
+        "#;
+        let cfg: GatewayConfig = toml::from_str(toml).unwrap();
+        cfg.validate_runtime_topology().unwrap();
+    }
+
+    #[test]
+    fn test_validate_runtime_topology_rejects_missing_backend_binding() {
+        let toml = r#"
+[agent]
+backend_id = "missing-main"
+
+[[backend]]
+id = "native-main"
+family = "quick_ai_native"
+
+[backend.launch]
+type = "embedded"
+        "#;
+        let cfg: GatewayConfig = toml::from_str(toml).unwrap();
+        let err = cfg.validate_runtime_topology().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("agent.backend_id `missing-main` is not present"));
     }
 
     #[test]

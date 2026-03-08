@@ -1,10 +1,13 @@
 // quickai-gateway/crates/qai-agent/src/registry.rs
-//! SessionRegistry: per-session engine management + generic @mention routing.
+//! SessionRegistry: per-session backend routing + generic @mention routing.
 //! Architectural role: Gateway orchestration layer (not platform-specific).
 //! - Channels extract @mentions → InboundMsg.target_agent
 //! - Registry resolves target_agent via AgentRoster (generic name lookup)
 //! - No platform-specific text parsing here
 
+use crate::control::role_resolver::is_front_bot_turn;
+use crate::control::session_router::get_orchestrator_for_session as route_orchestrator_for_session;
+use crate::control::turn_intent::build_turn_intent;
 use crate::dedup::DedupStore;
 use crate::memory::cap_to_words;
 use crate::memory::{MemoryEvent, MemorySystem, MemoryTarget};
@@ -12,14 +15,17 @@ use crate::persona::AgentPersona;
 use crate::prompt_builder::SystemPromptBuilder;
 use crate::relay::RelayEngine;
 use crate::roster::AgentRoster;
-use crate::selector::{EngineConfig, EngineSelector};
+use crate::runtime_dispatch::{default_runtime_dispatch, RuntimeDispatch, RuntimeDispatchRequest};
 use crate::slash::SlashCommand;
 use crate::team::orchestrator::TeamOrchestrator;
-use crate::traits::{AgentCtx, AgentRole, BoxEngine, HistoryMsg};
+use crate::traits::{AgentCtx, AgentRole, HistoryMsg};
+use crate::{ApprovalDecision, ApprovalResolver};
 use anyhow::Result;
 use dashmap::DashMap;
 use qai_channels::mention_trigger::MentionTrigger;
 use qai_protocol::{AgentEvent, InboundMsg, MsgSource, SessionKey};
+use qai_runtime::contract::{TeamCallback, TurnMode, TurnResult};
+use qai_runtime::{RuntimeEvent, TeamToolCall, TeamToolResponse};
 use qai_session::{SessionManager, StoredMessage};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
@@ -27,23 +33,23 @@ use uuid::Uuid;
 
 /// Cloned data extracted from a roster match to avoid holding a borrow across await points.
 struct RosterMatchData {
-    engine_cfg: EngineConfig,
     agent_name: String,
+    backend_id: String,
     persona_dir: Option<std::path::PathBuf>,
     workspace_dir: Option<std::path::PathBuf>,
     extra_skills_dirs: Vec<std::path::PathBuf>,
 }
 
-/// Single session state: holds a per-session engine (supports /engine override)
+/// Single session state: holds per-session runtime backend selection.
 pub struct Session {
     pub key: SessionKey,
-    pub engine: BoxEngine,
+    pub backend_id: Option<String>,
 }
 
 /// SessionRegistry: manages all per-session state with DashMap
 pub struct SessionRegistry {
     sessions: DashMap<SessionKey, Arc<Session>>,
-    default_engine_cfg: EngineConfig,
+    default_backend_id: Option<String>,
     session_manager: Arc<SessionManager>,
     dedup: DedupStore,
     /// WS subscriptions: session_key → list of WS client senders
@@ -92,56 +98,17 @@ pub struct SessionRegistry {
     /// Prevents two engine invocations running simultaneously for the same session_key,
     /// replacing the broken LaneQueue serial guarantee.
     session_semaphores: DashMap<SessionKey, Arc<tokio::sync::Semaphore>>,
-    /// Weak self-reference for spawning recursive handle() calls (TeamNotify dispatch).
-    weak_self: std::sync::Weak<Self>,
-}
-
-/// Returns `true` if the current inbound turn should be handled by the Lead agent.
-///
-/// A turn is a "Lead turn" when:
-/// - There is no `@mention` (user just typed to the group → default to front_bot / Lead)
-/// - The `@mention` explicitly targets the configured `front_bot`
-///
-/// A turn is NOT a Lead turn when the user explicitly `@mention`s a non-front_bot roster
-/// agent (e.g. `@codex` when front_bot = "claude"). Those turns get `AgentRole::Solo`.
-///
-/// If `lead_agent_name` is not yet configured on the orchestrator (edge case during wiring),
-/// this conservatively returns `true` so that the Lead fallback engine handles the message.
-fn is_front_bot_turn(
-    inbound: &InboundMsg,
-    orch: &Option<Arc<TeamOrchestrator>>,
-    roster: &Option<AgentRoster>,
-) -> bool {
-    let orch = match orch {
-        Some(o) => o,
-        None => return false,
-    };
-    let front_bot = match orch.lead_agent_name.get() {
-        Some(n) => n.as_str(),
-        // lead_agent_name not yet set → conservatively treat as Lead turn
-        None => return true,
-    };
-
-    match &inbound.target_agent {
-        // No @mention → default to front_bot → Lead turn
-        None => true,
-        // Explicit @mention: check if it resolves to front_bot
-        Some(mention) => {
-            let mention_bare = mention.trim_start_matches('@');
-            mention_bare.eq_ignore_ascii_case(front_bot)
-                || roster
-                    .as_ref()
-                    .and_then(|r| r.find_by_mention(mention))
-                    .map(|e| e.name.eq_ignore_ascii_case(front_bot))
-                    .unwrap_or(false)
-        }
-    }
+    /// Runtime boundary between control-plane intent building and backend execution.
+    runtime_dispatch: Arc<dyn RuntimeDispatch>,
+    /// Family-agnostic Team Tool RPC endpoint URL for local backends.
+    team_tool_url: OnceLock<String>,
+    approval_resolver: OnceLock<Arc<dyn ApprovalResolver>>,
 }
 
 impl SessionRegistry {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        default_engine_cfg: EngineConfig,
+        default_backend_id: Option<String>,
         session_manager: Arc<SessionManager>,
         system_injection: String,
         roster: Option<AgentRoster>,
@@ -150,10 +117,35 @@ impl SessionRegistry {
         default_workspace: Option<std::path::PathBuf>,
         skill_loader_dirs: Vec<std::path::PathBuf>,
     ) -> (Arc<Self>, broadcast::Receiver<AgentEvent>) {
+        Self::with_runtime_dispatch(
+            default_backend_id,
+            session_manager,
+            system_injection,
+            roster,
+            memory_system,
+            default_persona_dir,
+            default_workspace,
+            skill_loader_dirs,
+            default_runtime_dispatch(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_runtime_dispatch(
+        default_backend_id: Option<String>,
+        session_manager: Arc<SessionManager>,
+        system_injection: String,
+        roster: Option<AgentRoster>,
+        memory_system: Option<Arc<MemorySystem>>,
+        default_persona_dir: Option<std::path::PathBuf>,
+        default_workspace: Option<std::path::PathBuf>,
+        skill_loader_dirs: Vec<std::path::PathBuf>,
+        runtime_dispatch: Arc<dyn RuntimeDispatch>,
+    ) -> (Arc<Self>, broadcast::Receiver<AgentEvent>) {
         let (global_tx, global_rx) = broadcast::channel(256);
-        let registry = Arc::new_cyclic(|weak| Self {
+        let registry = Arc::new(Self {
             sessions: DashMap::new(),
-            default_engine_cfg,
+            default_backend_id,
             session_manager,
             dedup: DedupStore::new(),
             ws_subs: Arc::new(DashMap::new()),
@@ -175,8 +167,10 @@ impl SessionRegistry {
             mention_trigger: OnceLock::new(),
             auto_promote_scopes: dashmap::DashSet::new(),
             session_semaphores: DashMap::new(),
-            weak_self: weak.clone(),
-        });  // end of Arc::new_cyclic
+            runtime_dispatch,
+            team_tool_url: OnceLock::new(),
+            approval_resolver: OnceLock::new(),
+        });
 
         // Idle timer: check every 60s for sessions idle > 30 min
         if let Some(ms) = &registry.memory_system {
@@ -234,16 +228,11 @@ impl SessionRegistry {
     ///
     /// - Specialist sessions: channel == "specialist", scope == "{team_id}:{agent}" → look up by team_id prefix.
     /// - Lead sessions: scan all orchestrators for one whose lead_session_key matches.
-    fn get_orchestrator_for_session(&self, session_key: &SessionKey) -> Option<Arc<TeamOrchestrator>> {
-        if session_key.channel.as_str() == "specialist" {
-            let team_id = session_key.scope.splitn(2, ':').next()?;
-            self.team_orchestrators.get(team_id).map(|r| Arc::clone(r.value()))
-        } else {
-            self.team_orchestrators
-                .iter()
-                .find(|entry| entry.value().lead_session_key.get() == Some(session_key))
-                .map(|entry| Arc::clone(entry.value()))
-        }
+    fn get_orchestrator_for_session(
+        &self,
+        session_key: &SessionKey,
+    ) -> Option<Arc<TeamOrchestrator>> {
+        route_orchestrator_for_session(&self.team_orchestrators, session_key)
     }
 
     /// Attach a RelayEngine — processes [RELAY: @agent <指令>] markers synchronously.
@@ -263,26 +252,24 @@ impl SessionRegistry {
         self.auto_promote_scopes.insert(scope);
     }
 
-    /// Get-or-create per-session cached engine (used when no roster match)
+    /// Get-or-create per-session cached backend selection (used when no roster match)
     pub fn get_or_create_session(&self, key: &SessionKey) -> Arc<Session> {
         self.sessions
             .entry(key.clone())
             .or_insert_with(|| {
-                let engine = EngineSelector::build(&self.default_engine_cfg);
                 Arc::new(Session {
                     key: key.clone(),
-                    engine,
+                    backend_id: self.default_backend_id.clone(),
                 })
             })
             .clone()
     }
 
-    /// Override engine for a session (/engine slash command)
-    pub fn set_session_engine(&self, key: &SessionKey, config: EngineConfig) {
-        let engine = EngineSelector::build(&config);
+    /// Override runtime backend for a session (/backend slash command)
+    pub fn set_session_backend(&self, key: &SessionKey, backend_id: impl Into<String>) {
         let session = Arc::new(Session {
             key: key.clone(),
-            engine,
+            backend_id: Some(backend_id.into()),
         });
         self.sessions.insert(key.clone(), session);
     }
@@ -350,8 +337,318 @@ impl SessionRegistry {
         self.global_tx.clone()
     }
 
+    pub fn set_team_tool_url(&self, url: String) {
+        let _ = self.team_tool_url.set(url);
+    }
+
+    pub fn set_approval_resolver(&self, resolver: Arc<dyn ApprovalResolver>) {
+        let _ = self.approval_resolver.set(resolver);
+    }
+
     pub fn session_manager_ref(&self) -> &SessionManager {
         &self.session_manager
+    }
+
+    fn resolve_claimed_agent_for_tool(
+        &self,
+        team_orch: &TeamOrchestrator,
+        task_id: &str,
+        explicit: Option<&str>,
+    ) -> String {
+        explicit
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                team_orch
+                    .registry
+                    .get_task(task_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|t| {
+                        t.status_raw
+                            .strip_prefix("claimed:")
+                            .and_then(|s| s.splitn(2, ':').next())
+                            .map(|s| s.to_string())
+                    })
+            })
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    pub async fn invoke_team_tool(
+        &self,
+        session_key: &SessionKey,
+        call: TeamToolCall,
+    ) -> Result<TeamToolResponse> {
+        let team_orch = self
+            .get_orchestrator_for_session(session_key)
+            .ok_or_else(|| anyhow::anyhow!("no TeamOrchestrator found for session"))?;
+
+        let response = match call {
+            TeamToolCall::CreateTask {
+                id,
+                title,
+                assignee,
+                spec,
+                deps,
+                success_criteria,
+            } => TeamToolResponse {
+                ok: true,
+                message: team_orch.register_task(crate::team::registry::CreateTask {
+                    id,
+                    title,
+                    assignee_hint: assignee,
+                    deps,
+                    timeout_secs: 1800,
+                    spec,
+                    success_criteria,
+                })?,
+                payload: None,
+            },
+            TeamToolCall::StartExecution => TeamToolResponse {
+                ok: true,
+                message: team_orch.activate().await?,
+                payload: None,
+            },
+            TeamToolCall::RequestConfirmation { plan_summary } => {
+                let formatted = format!("**Plan for confirmation:**\n\n{}", plan_summary);
+                team_orch.post_message(&formatted);
+                *team_orch.team_state_inner.lock().unwrap() =
+                    crate::team::orchestrator::TeamState::AwaitingConfirm;
+                TeamToolResponse {
+                    ok: true,
+                    message: "Confirmation requested. Waiting for user reply.".to_string(),
+                    payload: None,
+                }
+            }
+            TeamToolCall::PostUpdate { message } => {
+                team_orch.post_message(&message);
+                TeamToolResponse {
+                    ok: true,
+                    message: "Posted.".to_string(),
+                    payload: None,
+                }
+            }
+            TeamToolCall::GetTaskStatus => {
+                let tasks = team_orch.registry.all_tasks()?;
+                let arr: Vec<serde_json::Value> = tasks
+                    .iter()
+                    .map(|t| {
+                        serde_json::json!({
+                            "id": t.id,
+                            "title": t.title,
+                            "status": t.status_raw,
+                            "assignee": t.assignee_hint,
+                            "deps": t.deps(),
+                            "retry_count": t.retry_count,
+                            "completion_note": t.completion_note,
+                        })
+                    })
+                    .collect();
+                let payload = serde_json::Value::Array(arr.clone());
+                TeamToolResponse {
+                    ok: true,
+                    message: serde_json::to_string_pretty(&arr)?,
+                    payload: Some(payload),
+                }
+            }
+            TeamToolCall::AssignTask {
+                task_id,
+                new_assignee,
+            } => {
+                team_orch.registry.reassign_task(&task_id, &new_assignee)?;
+                TeamToolResponse {
+                    ok: true,
+                    message: format!("Task {} reassigned to {}.", task_id, new_assignee),
+                    payload: None,
+                }
+            }
+            TeamToolCall::CheckpointTask {
+                task_id,
+                note,
+                agent,
+            } => {
+                let agent =
+                    self.resolve_claimed_agent_for_tool(&team_orch, &task_id, agent.as_deref());
+                team_orch.handle_specialist_checkpoint(&task_id, &agent, &note)?;
+                TeamToolResponse {
+                    ok: true,
+                    message: format!("Checkpoint recorded for task {}.", task_id),
+                    payload: None,
+                }
+            }
+            TeamToolCall::SubmitTaskResult {
+                task_id,
+                summary,
+                agent,
+            } => {
+                let agent =
+                    self.resolve_claimed_agent_for_tool(&team_orch, &task_id, agent.as_deref());
+                team_orch.handle_specialist_submitted(&task_id, &agent, &summary)?;
+                TeamToolResponse {
+                    ok: true,
+                    message: format!("Task {} submitted for review.", task_id),
+                    payload: None,
+                }
+            }
+            TeamToolCall::AcceptTask { task_id, by } => {
+                let by = by.as_deref().unwrap_or("leader");
+                team_orch.accept_submitted_task(&task_id, by)?;
+                TeamToolResponse {
+                    ok: true,
+                    message: format!("Task {} accepted by {}.", task_id, by),
+                    payload: None,
+                }
+            }
+            TeamToolCall::ReopenTask {
+                task_id,
+                reason,
+                by,
+            } => {
+                let by = by.as_deref().unwrap_or("leader");
+                team_orch.reopen_submitted_task(&task_id, &reason, by)?;
+                TeamToolResponse {
+                    ok: true,
+                    message: format!("Task {} reopened by {}.", task_id, by),
+                    payload: None,
+                }
+            }
+            TeamToolCall::BlockTask {
+                task_id,
+                reason,
+                agent,
+            } => {
+                let agent =
+                    self.resolve_claimed_agent_for_tool(&team_orch, &task_id, agent.as_deref());
+                if !team_orch
+                    .registry
+                    .is_claimed_by(&task_id, &agent)
+                    .unwrap_or(false)
+                {
+                    anyhow::bail!("task '{}' is not currently claimed by '{}'", task_id, agent);
+                }
+                let _ = team_orch.registry.reset_claim(&task_id);
+                team_orch.handle_specialist_blocked(&task_id, &agent, &reason)?;
+                TeamToolResponse {
+                    ok: true,
+                    message: format!("Task {} reported as blocked: {}", task_id, reason),
+                    payload: None,
+                }
+            }
+            TeamToolCall::RequestHelp {
+                task_id,
+                message,
+                agent,
+            } => {
+                let agent =
+                    self.resolve_claimed_agent_for_tool(&team_orch, &task_id, agent.as_deref());
+                if !team_orch
+                    .registry
+                    .is_claimed_by(&task_id, &agent)
+                    .unwrap_or(false)
+                {
+                    anyhow::bail!("task '{}' is not currently claimed by '{}'", task_id, agent);
+                }
+                team_orch.handle_specialist_help_requested(&task_id, &agent, &message)?;
+                TeamToolResponse {
+                    ok: true,
+                    message: format!("Help request sent for task {}.", task_id),
+                    payload: None,
+                }
+            }
+        };
+
+        Ok(response)
+    }
+
+    async fn apply_team_callback(
+        &self,
+        session_key: &SessionKey,
+        callback: TeamCallback,
+    ) -> Result<()> {
+        let call = match callback {
+            TeamCallback::TaskCreated {
+                task_id,
+                title,
+                assignee,
+            } => TeamToolCall::CreateTask {
+                id: task_id,
+                title,
+                assignee: Some(assignee),
+                spec: None,
+                deps: vec![],
+                success_criteria: None,
+            },
+            TeamCallback::TaskAssigned { task_id, assignee } => TeamToolCall::AssignTask {
+                task_id,
+                new_assignee: assignee,
+            },
+            TeamCallback::ExecutionStarted => TeamToolCall::StartExecution,
+            TeamCallback::PublicUpdatePosted { message } => TeamToolCall::PostUpdate { message },
+            TeamCallback::TaskCheckpoint {
+                task_id,
+                note,
+                agent,
+            } => TeamToolCall::CheckpointTask {
+                task_id,
+                note,
+                agent: Some(agent),
+            },
+            TeamCallback::TaskSubmitted {
+                task_id,
+                summary,
+                agent,
+            } => TeamToolCall::SubmitTaskResult {
+                task_id,
+                summary,
+                agent: Some(agent),
+            },
+            TeamCallback::TaskAccepted { task_id, by } => TeamToolCall::AcceptTask {
+                task_id,
+                by: Some(by),
+            },
+            TeamCallback::TaskReopened {
+                task_id,
+                reason,
+                by,
+            } => TeamToolCall::ReopenTask {
+                task_id,
+                reason,
+                by: Some(by),
+            },
+            TeamCallback::TaskBlocked {
+                task_id,
+                reason,
+                agent,
+            } => TeamToolCall::BlockTask {
+                task_id,
+                reason,
+                agent: Some(agent),
+            },
+            TeamCallback::TaskHelpRequested {
+                task_id,
+                message,
+                agent,
+            } => TeamToolCall::RequestHelp {
+                task_id,
+                message,
+                agent: Some(agent),
+            },
+        };
+        self.invoke_team_tool(session_key, call).await?;
+        Ok(())
+    }
+
+    async fn apply_runtime_events(
+        &self,
+        session_key: &SessionKey,
+        turn: &TurnResult,
+    ) -> Result<()> {
+        for event in &turn.events {
+            if let RuntimeEvent::ToolCallback(callback) = event {
+                self.apply_team_callback(session_key, callback.clone())
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     /// Process one inbound message. Generic: works for any channel.
@@ -363,6 +660,16 @@ impl SessionRegistry {
         }
 
         let session_key = inbound.session_key.clone();
+        let user_text = inbound.content.as_text().unwrap_or("").to_string();
+
+        // Slash commands are control-plane actions and must not wait behind the
+        // session turn semaphore. In particular, `/approve` must be able to
+        // resolve a pending runtime approval while the original turn is blocked.
+        if let Some(cmd) = SlashCommand::parse(&user_text) {
+            return self
+                .handle_slash(cmd, &session_key, inbound.target_agent.as_deref())
+                .await;
+        }
 
         // Per-session serial execution guard.
         // Acquires a Semaphore(1) for this session_key, preventing concurrent engine calls.
@@ -378,7 +685,6 @@ impl SessionRegistry {
                 .await
                 .map_err(|e| anyhow::anyhow!("Session semaphore closed: {e}"))?
         };
-        let user_text = inbound.content.as_text().unwrap_or("").to_string();
         let user_text_for_log = user_text.clone();
 
         // Resolve the responsible TeamOrchestrator once, reuse throughout handle().
@@ -422,13 +728,6 @@ impl SessionRegistry {
             }
         }
 
-        // Slash commands take priority (no engine involved)
-        if let Some(cmd) = SlashCommand::parse(&user_text) {
-            return self
-                .handle_slash(cmd, &session_key, inbound.target_agent.as_deref())
-                .await;
-        }
-
         // Early Specialist/Lead detection — must run before roster_match so Lead turns
         // without an explicit @mention can fall back to the configured front_bot engine.
         let early_is_specialist = inbound.source == MsgSource::Heartbeat;
@@ -439,9 +738,7 @@ impl SessionRegistry {
             && session_team_orch.is_none()
             && inbound.source == MsgSource::Human
             && self.auto_promote_scopes.contains(&session_key.scope)
-            && crate::mode_selector::is_team_trigger(
-                inbound.content.as_text().unwrap_or(""),
-            );
+            && crate::mode_selector::is_team_trigger(inbound.content.as_text().unwrap_or(""));
         // For auto_promote candidates, find the orchestrator bound to this exact scope.
         // We match by lead_session_key.scope rather than "unclaimed" (is_none()), because:
         //   - All Team orchestrators have lead_session_key preset at startup in main.rs.
@@ -449,7 +746,8 @@ impl SessionRegistry {
         //   - A group with both Team mode AND auto_promote=true can trigger Lead behavior
         //     dynamically via keyword detection (e.g. before user types /team start).
         let auto_promote_orch: Option<Arc<TeamOrchestrator>> = if is_auto_promote_candidate {
-            let found = self.team_orchestrators
+            let found = self
+                .team_orchestrators
                 .iter()
                 .find(|e| {
                     e.value()
@@ -483,14 +781,16 @@ impl SessionRegistry {
         // Clone needed data from roster match to avoid holding borrow across await.
         // For Lead turns without an explicit @mention, fall back to the configured
         // front_bot agent (set via `front_bot` in [[group]] config).
-        let roster_match: Option<RosterMatchData> =
-            inbound.target_agent.as_deref().and_then(|mention| {
+        let roster_match: Option<RosterMatchData> = inbound
+            .target_agent
+            .as_deref()
+            .and_then(|mention| {
                 self.roster
                     .as_ref()
                     .and_then(|r| r.find_by_mention(mention))
                     .map(|entry| RosterMatchData {
-                        engine_cfg: entry.engine.clone(),
                         agent_name: entry.name.clone(),
+                        backend_id: entry.runtime_backend_id().to_string(),
                         persona_dir: entry.persona_dir.clone(),
                         workspace_dir: entry.workspace_dir.clone(),
                         extra_skills_dirs: entry.extra_skills_dirs.clone(),
@@ -503,33 +803,73 @@ impl SessionRegistry {
                         .as_ref()
                         .and_then(|o| o.lead_agent_name.get())
                         .and_then(|name| {
-                            self.roster.as_ref()?.find_by_name(name).map(|entry| {
-                                RosterMatchData {
-                                    engine_cfg: entry.engine.clone(),
+                            self.roster
+                                .as_ref()?
+                                .find_by_name(name)
+                                .map(|entry| RosterMatchData {
                                     agent_name: entry.name.clone(),
+                                    backend_id: entry.runtime_backend_id().to_string(),
                                     persona_dir: entry.persona_dir.clone(),
                                     workspace_dir: entry.workspace_dir.clone(),
                                     extra_skills_dirs: entry.extra_skills_dirs.clone(),
-                                }
-                            })
+                                })
                         })
                 } else {
                     None
                 }
             });
 
-        // Select engine: roster match → fresh engine per turn; no match → session-cached engine
-        let (engine, sender_name): (BoxEngine, Option<String>) = if let Some(rm) = &roster_match {
-            // AcpEngine is stateless per-turn; no need to cache in session for roster entries
-            (
-                EngineSelector::build(&rm.engine_cfg),
-                Some(format!("@{}", rm.agent_name)),
-            )
+        let turn_mode = if early_is_specialist || early_is_lead {
+            TurnMode::Team
+        } else if inbound.source == MsgSource::Relay {
+            TurnMode::Relay
         } else {
-            // No @mention or no roster: use the session's persistent engine (supports /engine)
-            let session = self.get_or_create_session(&session_key);
-            (Arc::clone(&session.engine), None)
+            TurnMode::Solo
         };
+        let session_backend_id = if roster_match.is_none() {
+            self.get_or_create_session(&session_key).backend_id.clone()
+        } else {
+            None
+        };
+        let turn_intent = build_turn_intent(
+            &inbound,
+            turn_mode,
+            session_team_orch
+                .as_ref()
+                .and_then(|o| o.lead_agent_name.get())
+                .and_then(|name| {
+                    self.roster
+                        .as_ref()
+                        .and_then(|r| r.find_by_name(name))
+                        .map(|entry| entry.runtime_backend_id().to_string())
+                        .or_else(|| Some(name.clone()))
+                })
+                .as_deref(),
+            roster_match
+                .as_ref()
+                .map(|rm| rm.backend_id.as_str())
+                .or(session_backend_id.as_deref()),
+        );
+        tracing::debug!(
+            session = ?turn_intent.session_key,
+            mode = ?turn_intent.mode,
+            leader_candidate = ?turn_intent.leader_candidate,
+            target_backend = ?turn_intent.target_backend,
+            "built turn intent"
+        );
+
+        // Resolve runtime selection: roster match overrides the per-session backend selection.
+        let (fallback_backend_id, sender_name): (Option<String>, Option<String>) =
+            if let Some(rm) = &roster_match {
+                (
+                    Some(rm.backend_id.clone()),
+                    Some(format!("@{}", rm.agent_name)),
+                )
+            } else {
+                // No @mention or no roster: use the session's persistent backend selection.
+                let session = self.get_or_create_session(&session_key);
+                (session.backend_id.clone(), None)
+            };
 
         // Get-or-create persistent session record
         let session_id = self.session_manager.get_or_create(&session_key).await?;
@@ -647,9 +987,10 @@ impl SessionRegistry {
                              1. 分析任务，调用 create_task() 定义所有子任务和依赖关系（assignee 填 Specialist 名称）\n\
                              2. 简单任务（≤3个、无复杂依赖）直接调用 start_execution()\n\
                              3. 复杂任务先调用 request_confirmation(plan_summary)，等用户确认后再执行\n\
-                             4. 任务执行中你会收到 [团队通知] 消息，用 post_update() 向用户播报关键进度\n\
-                             5. 收到\"所有任务已完成\"通知后，合成最终结果并调用 post_update() 发给用户\n\n\
-                             可用工具：create_task, start_execution, request_confirmation, post_update, get_task_status, assign_task",
+                             4. Specialist 完成后通常会先提交结果；你收到待验收通知后，用 accept_task() 验收或 reopen_task() 打回\n\
+                             5. 任务执行中你会收到 [团队通知] 消息，用 post_update() 向用户播报关键进度\n\
+                             6. 收到\"所有任务已完成\"通知后，合成最终结果并调用 post_update() 发给用户\n\n\
+                             可用工具：create_task, start_execution, request_confirmation, post_update, get_task_status, assign_task, accept_task, reopen_task",
                             specialists_list = specialists_list,
                         )
                     }
@@ -661,6 +1002,7 @@ impl SessionRegistry {
                              - 用 post_update(message) 向用户播报进度\n\
                              - 用 get_task_status() 查看全局状态\n\
                              - 用 assign_task(task_id, agent) 重新分配卡住的任务（agent 填 Specialist 名称）\n\
+                             - 对 submitted 结果用 accept_task(task_id) 验收，或用 reopen_task(task_id, reason) 打回\n\
                              - 收到\"所有任务已完成\"通知后，合成最终汇总并 post_update",
                             specialists_list = specialists_list,
                         )
@@ -676,9 +1018,38 @@ impl SessionRegistry {
         let early_task_reminder: Option<String> = if early_is_lead {
             lead_layer_0.clone()
         } else {
-            self.team_task_reminders.remove(&session_key).map(|(_, v)| v)
+            self.team_task_reminders
+                .remove(&session_key)
+                .map(|(_, v)| v)
         };
 
+        let canonical_shared_memory = if early_is_specialist {
+            session_team_orch
+                .as_ref()
+                .map(|o| o.session.read_context_md())
+                .filter(|content| !content.trim().is_empty())
+        } else if let Some(ms) = &self.memory_system {
+            ms.store()
+                .load_shared_memory(&session_key)
+                .await
+                .ok()
+                .filter(|content| !content.trim().is_empty())
+        } else {
+            None
+        };
+        let canonical_team_manifest = if matches!(
+            early_agent_role,
+            crate::traits::AgentRole::Lead | crate::traits::AgentRole::Specialist
+        ) {
+            session_team_orch
+                .as_ref()
+                .map(|o| o.session.read_team_md())
+                .filter(|manifest| !manifest.trim().is_empty())
+        } else {
+            None
+        };
+
+        let mut canonical_agent_memory: Option<String> = None;
         // Build the full system prompt via SystemPromptBuilder (6-layer persona-aware).
         let system_injection = {
             if roster_match.is_some() {
@@ -690,15 +1061,7 @@ impl SessionRegistry {
                 } else {
                     (String::new(), String::new(), String::new())
                 };
-
-                let shared_mem = if let Some(ms) = &self.memory_system {
-                    ms.store()
-                        .load_shared_memory(&session_key)
-                        .await
-                        .unwrap_or_default()
-                } else {
-                    String::new()
-                };
+                canonical_agent_memory = (!agent_memory.trim().is_empty()).then_some(agent_memory);
 
                 // Persona capability body prepended to regular skill injection.
                 let combined_skills = match &first_persona {
@@ -717,12 +1080,12 @@ impl SessionRegistry {
                     soul_md: &soul_md,
                     identity_raw: &identity_raw,
                     skills_injection: &combined_skills,
-                    shared_memory: &shared_mem,
-                    agent_memory: &agent_memory,
+                    shared_memory: "",
+                    agent_memory: "",
                     shared_max_words: 300,
                     agent_max_words: 500,
                     agent_role: early_agent_role,
-                    task_reminder: early_task_reminder.as_deref(),
+                    task_reminder: None,
                     team_manifest: None,
                 }
                 .build()
@@ -767,10 +1130,15 @@ impl SessionRegistry {
             .as_ref()
             .and_then(|o| o.mcp_server_port.get().copied())
             .map(|port| format!("http://127.0.0.1:{port}/sse"));
+        let team_tool_url = session_team_orch
+            .as_ref()
+            .and_then(|_| self.team_tool_url.get().cloned());
 
         // Build AgentCtx for the engine
         let ctx = AgentCtx {
             session_id,
+            session_key: session_key.clone(),
+            participant_name: roster_match.as_ref().map(|rm| rm.agent_name.clone()),
             user_text,
             history,
             system_injection,
@@ -779,6 +1147,10 @@ impl SessionRegistry {
             task_reminder,
             team_dir,
             mcp_server_url,
+            team_tool_url,
+            shared_memory: canonical_shared_memory,
+            agent_memory: canonical_agent_memory,
+            team_manifest: canonical_team_manifest,
         };
 
         // Per-call event channel: forward to global_tx + ws_subs
@@ -829,8 +1201,19 @@ impl SessionRegistry {
             });
         }
 
-        // Run engine (blocks until turn completes)
-        let full_text = engine.run(ctx, session_tx).await?;
+        // Control-plane execution crosses a narrow runtime dispatch boundary into
+        // the canonical multi-backend conductor.
+        let turn = self
+            .runtime_dispatch
+            .dispatch(RuntimeDispatchRequest {
+                intent: turn_intent,
+                ctx,
+                fallback_backend_id,
+                event_tx: session_tx,
+            })
+            .await?;
+        self.apply_runtime_events(&session_key, &turn).await?;
+        let full_text = turn.full_text;
 
         // ── Post-run hooks ─────────────────────────────────────────────────────
 
@@ -944,26 +1327,14 @@ impl SessionRegistry {
         target_agent: Option<&str>,
     ) -> Result<Option<String>> {
         match &cmd {
-            SlashCommand::SetEngine(name) => {
-                // First try roster lookup by name (user-defined agent names)
-                let config = self
+            SlashCommand::SetBackend(name) => {
+                let backend_id = self
                     .roster
                     .as_ref()
                     .and_then(|r| r.find_by_name(name))
-                    .map(|entry| entry.engine.clone())
-                    .unwrap_or_else(|| {
-                        // Fall back to built-in shortcuts for convenience
-                        match name.as_str() {
-                            "rust" => EngineConfig::RustAgent { binary: None },
-                            "claude" => EngineConfig::ClaudeAgent { binary: None },
-                            "codex" => EngineConfig::CodexAcp { binary: None },
-                            other => EngineConfig::CustomAcp {
-                                command: other.to_string(),
-                                args: vec![],
-                            },
-                        }
-                    });
-                self.set_session_engine(session_key, config);
+                    .map(|entry| entry.runtime_backend_id().to_string())
+                    .unwrap_or_else(|| name.clone());
+                self.set_session_backend(session_key, backend_id);
             }
             SlashCommand::Reset => {
                 if let Ok(session_id) = self.session_manager.get_or_create(session_key).await {
@@ -1108,6 +1479,31 @@ impl SessionRegistry {
                     }
                 }
             }
+            SlashCommand::Approve {
+                approval_id,
+                decision,
+            } => {
+                let Some(parsed) = ApprovalDecision::parse(decision) else {
+                    return Ok(Some(
+                        "❌ 无效审批决定。使用：allow-once / allow-always / deny".to_string(),
+                    ));
+                };
+                let Some(resolver) = self.approval_resolver.get() else {
+                    return Ok(Some("❌ 当前运行实例未启用审批解析器。".to_string()));
+                };
+                let resolved = resolver.resolve(approval_id, parsed).await?;
+                if resolved {
+                    return Ok(Some(format!(
+                        "✅ 已处理审批 `{}` -> `{}`",
+                        approval_id,
+                        parsed.as_str()
+                    )));
+                }
+                return Ok(Some(format!(
+                    "⚠️ 审批 `{}` 不存在、已过期，或已被处理。",
+                    approval_id
+                )));
+            }
         }
         Ok(Some(cmd.confirmation_text()))
     }
@@ -1140,8 +1536,12 @@ mod tests {
     use super::*;
     use crate::memory::{distiller::NoopDistiller, store::FileMemoryStore, MemorySystem};
     use crate::roster::{AgentEntry, AgentRoster};
+    use crate::runtime_dispatch::{RuntimeDispatch, RuntimeDispatchRequest};
     use qai_protocol::{InboundMsg, MsgContent};
+    use qai_runtime::contract::{TeamCallback, TurnResult};
+    use qai_runtime::RuntimeEvent;
     use qai_session::SessionStorage;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
 
     fn make_registry() -> (Arc<SessionRegistry>, broadcast::Receiver<AgentEvent>) {
@@ -1149,7 +1549,7 @@ mod tests {
         let storage = SessionStorage::new(dir);
         let session_manager = Arc::new(SessionManager::new(storage));
         SessionRegistry::new(
-            EngineConfig::default(),
+            None,
             session_manager,
             String::new(),
             None,
@@ -1158,6 +1558,60 @@ mod tests {
             None,
             vec![],
         )
+    }
+
+    fn make_registry_with_default_backend(
+        backend_id: &str,
+    ) -> (Arc<SessionRegistry>, broadcast::Receiver<AgentEvent>) {
+        let dir = std::env::temp_dir().join(format!(
+            "test-registry-default-backend-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let storage = SessionStorage::new(dir);
+        let session_manager = Arc::new(SessionManager::new(storage));
+        SessionRegistry::new(
+            Some(backend_id.to_string()),
+            session_manager,
+            String::new(),
+            None,
+            None,
+            None,
+            None,
+            vec![],
+        )
+    }
+
+    struct FakeRuntimeDispatch {
+        calls: Arc<AtomicUsize>,
+        last_backend: Arc<std::sync::Mutex<Option<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeDispatch for FakeRuntimeDispatch {
+        async fn dispatch(&self, request: RuntimeDispatchRequest) -> Result<TurnResult> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            *self.last_backend.lock().unwrap() = request.intent.target_backend.clone();
+            Ok(TurnResult {
+                full_text: format!("fake-dispatch: {}", request.intent.user_text),
+                events: vec![],
+            })
+        }
+    }
+
+    struct FakeApprovalResolver {
+        decisions: Arc<std::sync::Mutex<Vec<(String, ApprovalDecision)>>>,
+        result: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ApprovalResolver for FakeApprovalResolver {
+        async fn resolve(&self, approval_id: &str, decision: ApprovalDecision) -> Result<bool> {
+            self.decisions
+                .lock()
+                .unwrap()
+                .push((approval_id.to_string(), decision));
+            Ok(self.result)
+        }
     }
 
     fn make_registry_with_memory() -> (Arc<SessionRegistry>, broadcast::Receiver<AgentEvent>) {
@@ -1171,7 +1625,7 @@ mod tests {
         let distiller: Arc<dyn crate::memory::MemoryDistiller> = Arc::new(NoopDistiller);
         let memory_system = MemorySystem::new(vec![], store, distiller);
         SessionRegistry::new(
-            EngineConfig::default(),
+            None,
             session_manager,
             String::new(),
             None,
@@ -1189,15 +1643,13 @@ mod tests {
         let roster = AgentRoster::new(vec![AgentEntry {
             name: "mybot".to_string(),
             mentions: vec!["@mybot".to_string()],
-            engine: EngineConfig::RustAgent {
-                binary: Some("my-custom-agent".to_string()),
-            },
+            backend_id: "my-custom-agent".to_string(),
             persona_dir: None,
             workspace_dir: None,
             extra_skills_dirs: vec![],
         }]);
         SessionRegistry::new(
-            EngineConfig::default(),
+            None,
             session_manager,
             String::new(),
             Some(roster),
@@ -1212,6 +1664,7 @@ mod tests {
     fn test_agent_ctx_carries_workspace_dir() {
         let ctx = AgentCtx {
             session_id: uuid::Uuid::new_v4(),
+            session_key: SessionKey::new("ws", "ctx-test"),
             user_text: "hello".to_string(),
             history: vec![],
             system_injection: String::new(),
@@ -1230,27 +1683,21 @@ mod tests {
     }
 
     #[test]
-    fn test_registry_per_session_engine_override() {
+    fn test_registry_default_backend_id_is_cached_in_session() {
+        let (registry, _rx) = make_registry_with_default_backend("native-main");
+        let key = SessionKey::new("ws", "user-backend");
+        let session = registry.get_or_create_session(&key);
+        assert_eq!(session.backend_id.as_deref(), Some("native-main"));
+    }
+
+    #[test]
+    fn test_registry_per_session_backend_override() {
         let (registry, _rx) = make_registry();
         let key = SessionKey::new("ws", "user2");
-        let default_name = registry
-            .get_or_create_session(&key)
-            .engine
-            .name()
-            .to_string();
-        registry.set_session_engine(
-            &key,
-            EngineConfig::RustAgent {
-                binary: Some("my-agent".to_string()),
-            },
-        );
-        let new_name = registry
-            .get_or_create_session(&key)
-            .engine
-            .name()
-            .to_string();
-        assert_ne!(default_name, new_name);
-        assert_eq!(new_name, "my-agent");
+        assert_eq!(registry.get_or_create_session(&key).backend_id, None);
+        registry.set_session_backend(&key, "my-agent-backend");
+        let new_backend = registry.get_or_create_session(&key).backend_id.clone();
+        assert_eq!(new_backend.as_deref(), Some("my-agent-backend"));
     }
 
     #[tokio::test]
@@ -1286,7 +1733,95 @@ mod tests {
             source: qai_protocol::MsgSource::Human,
         };
         let result = registry.handle(inbound).await.unwrap();
-        assert!(result.unwrap().contains("/engine"));
+        assert!(result.unwrap().contains("/backend"));
+    }
+
+    #[tokio::test]
+    async fn test_registry_slash_approve_uses_resolver() {
+        let (registry, _rx) = make_registry();
+        let decisions = Arc::new(std::sync::Mutex::new(Vec::new()));
+        registry.set_approval_resolver(Arc::new(FakeApprovalResolver {
+            decisions: Arc::clone(&decisions),
+            result: true,
+        }));
+        let inbound = InboundMsg {
+            id: "approve-1".to_string(),
+            session_key: SessionKey::new("ws", "user-approve"),
+            content: MsgContent::text("/approve approval-1 allow-once"),
+            sender: "user".to_string(),
+            channel: "ws".to_string(),
+            timestamp: chrono::Utc::now(),
+            thread_ts: None,
+            target_agent: None,
+            source: qai_protocol::MsgSource::Human,
+        };
+
+        let result = registry.handle(inbound).await.unwrap();
+        assert!(result.unwrap().contains("approval-1"));
+        let recorded = decisions.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].0, "approval-1");
+        assert_eq!(recorded[0].1, ApprovalDecision::AllowOnce);
+    }
+
+    #[tokio::test]
+    async fn test_registry_slash_approve_rejects_invalid_decision() {
+        let (registry, _rx) = make_registry();
+        let inbound = InboundMsg {
+            id: "approve-2".to_string(),
+            session_key: SessionKey::new("ws", "user-approve-2"),
+            content: MsgContent::text("/approve approval-2 maybe"),
+            sender: "user".to_string(),
+            channel: "ws".to_string(),
+            timestamp: chrono::Utc::now(),
+            thread_ts: None,
+            target_agent: None,
+            source: qai_protocol::MsgSource::Human,
+        };
+
+        let result = registry.handle(inbound).await.unwrap();
+        assert!(result.unwrap().contains("无效审批决定"));
+    }
+
+    #[tokio::test]
+    async fn test_registry_uses_runtime_dispatch_boundary() {
+        let dir =
+            std::env::temp_dir().join(format!("test-registry-dispatch-{}", uuid::Uuid::new_v4()));
+        let storage = SessionStorage::new(dir);
+        let session_manager = Arc::new(SessionManager::new(storage));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let last_backend = Arc::new(std::sync::Mutex::new(None));
+        let (registry, _rx) = SessionRegistry::with_runtime_dispatch(
+            Some("native-main".to_string()),
+            session_manager,
+            String::new(),
+            None,
+            None,
+            None,
+            None,
+            vec![],
+            Arc::new(FakeRuntimeDispatch {
+                calls: Arc::clone(&calls),
+                last_backend: Arc::clone(&last_backend),
+            }),
+        );
+
+        let inbound = InboundMsg {
+            id: "dispatch-test-1".to_string(),
+            session_key: SessionKey::new("ws", "dispatch-user"),
+            content: MsgContent::text("hello runtime"),
+            sender: "user".to_string(),
+            channel: "ws".to_string(),
+            timestamp: chrono::Utc::now(),
+            thread_ts: None,
+            target_agent: None,
+            source: qai_protocol::MsgSource::Human,
+        };
+
+        let result = registry.handle(inbound).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(last_backend.lock().unwrap().as_deref(), Some("native-main"));
+        assert_eq!(result.as_deref(), Some("fake-dispatch: hello runtime"));
     }
 
     #[test]
@@ -1312,7 +1847,10 @@ mod tests {
     /// use the orchestrator's lead_agent_name to look up the roster by name.
     #[test]
     fn test_lead_fallback_uses_front_bot_roster_entry() {
-        use crate::team::{heartbeat::DispatchFn, orchestrator::TeamOrchestrator, registry::TaskRegistry, session::TeamSession};
+        use crate::team::{
+            heartbeat::DispatchFn, orchestrator::TeamOrchestrator, registry::TaskRegistry,
+            session::TeamSession,
+        };
         use tempfile::tempdir;
 
         let (registry, _rx) = make_registry_with_roster();
@@ -1320,7 +1858,12 @@ mod tests {
         let task_registry = Arc::new(TaskRegistry::new_in_memory().unwrap());
         let session = Arc::new(TeamSession::from_dir("t", tmp.path().to_path_buf()));
         let dispatch_fn: DispatchFn = Arc::new(|_, _| Box::pin(async { Ok(()) }));
-        let orch = TeamOrchestrator::new(task_registry, session, dispatch_fn, std::time::Duration::from_secs(60));
+        let orch = TeamOrchestrator::new(
+            task_registry,
+            session,
+            dispatch_fn,
+            std::time::Duration::from_secs(60),
+        );
 
         // Wire: lead_session_key + lead_agent_name = "mybot"
         let lead_key = qai_protocol::SessionKey::new("lark", "group:123");
@@ -1329,7 +1872,12 @@ mod tests {
         registry.register_team_orchestrator("t".to_string(), orch);
 
         // Confirm roster has "mybot"
-        let entry = registry.roster.as_ref().unwrap().find_by_name("mybot").unwrap();
+        let entry = registry
+            .roster
+            .as_ref()
+            .unwrap()
+            .find_by_name("mybot")
+            .unwrap();
         assert_eq!(entry.name, "mybot");
 
         // Simulate a Lead turn with no @mention: session_key == lead_key, source == Human
@@ -1340,7 +1888,10 @@ mod tests {
             .as_ref()
             .and_then(|o| o.lead_agent_name.get())
             .and_then(|name| registry.roster.as_ref()?.find_by_name(name));
-        assert!(resolved.is_some(), "Lead fallback should resolve front_bot roster entry");
+        assert!(
+            resolved.is_some(),
+            "Lead fallback should resolve front_bot roster entry"
+        );
         assert_eq!(resolved.unwrap().name, "mybot");
     }
 
@@ -1363,7 +1914,7 @@ mod tests {
         );
         let session_manager = Arc::new(SessionManager::new(storage));
         let (reg, _rx) = SessionRegistry::new(
-            EngineConfig::default(),
+            None,
             session_manager,
             String::new(),
             None,
@@ -1385,7 +1936,7 @@ mod tests {
         );
         let session_manager = Arc::new(SessionManager::new(storage));
         let (reg, _rx) = SessionRegistry::new(
-            EngineConfig::default(),
+            None,
             session_manager,
             String::new(),
             None,
@@ -1568,7 +2119,7 @@ mod tests {
         );
         let session_manager = Arc::new(SessionManager::new(storage));
         let (registry, _rx) = SessionRegistry::new(
-            EngineConfig::default(),
+            None,
             session_manager,
             String::new(),
             None,
@@ -1737,6 +2288,154 @@ mod tests {
         };
 
         assert!(prefix_for_fwd.is_none(), "no prefix in no-roster mode");
-        assert_eq!(reply_text, "Hello world", "reply unchanged in no-roster mode");
+        assert_eq!(
+            reply_text, "Hello world",
+            "reply unchanged in no-roster mode"
+        );
+    }
+
+    fn make_registry_with_team_orchestrator() -> (Arc<SessionRegistry>, Arc<TeamOrchestrator>) {
+        use crate::team::{
+            heartbeat::DispatchFn, orchestrator::TeamOrchestrator, registry::TaskRegistry,
+            session::TeamSession,
+        };
+        use tempfile::tempdir;
+
+        let (registry, _rx) = make_registry();
+        let tmp = tempdir().unwrap();
+        let task_registry = Arc::new(TaskRegistry::new_in_memory().unwrap());
+        let session = Arc::new(TeamSession::from_dir("team-test", tmp.path().to_path_buf()));
+        let dispatch_fn: DispatchFn = Arc::new(|_, _| Box::pin(async { Ok(()) }));
+        let orch = TeamOrchestrator::new(
+            task_registry,
+            session,
+            dispatch_fn,
+            std::time::Duration::from_secs(60),
+        );
+        let lead_key = SessionKey::new("lark", "group:team");
+        orch.set_lead_session_key(lead_key.clone());
+        orch.set_scope(lead_key);
+        registry.register_team_orchestrator("team-test".to_string(), Arc::clone(&orch));
+        (registry, orch)
+    }
+
+    #[tokio::test]
+    async fn test_invoke_team_tool_submit_and_accept_updates_registry() {
+        let (registry, orch) = make_registry_with_team_orchestrator();
+        let specialist_key = SessionKey::new("specialist", "team-test:codex");
+
+        orch.registry
+            .create_task(crate::team::registry::CreateTask {
+                id: "T100".into(),
+                title: "Implement auth".into(),
+                assignee_hint: Some("codex".into()),
+                deps: vec![],
+                timeout_secs: 1800,
+                spec: None,
+                success_criteria: None,
+            })
+            .unwrap();
+        orch.registry.try_claim("T100", "codex").unwrap();
+
+        let submit = registry
+            .invoke_team_tool(
+                &specialist_key,
+                TeamToolCall::SubmitTaskResult {
+                    task_id: "T100".into(),
+                    summary: "auth implemented".into(),
+                    agent: Some("codex".into()),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(submit.ok);
+        assert!(submit.message.contains("submitted"));
+
+        let lead_key = SessionKey::new("lark", "group:team");
+        let accept = registry
+            .invoke_team_tool(
+                &lead_key,
+                TeamToolCall::AcceptTask {
+                    task_id: "T100".into(),
+                    by: Some("leader".into()),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(accept.ok);
+        assert!(accept.message.contains("accepted"));
+
+        let task = orch.registry.get_task("T100").unwrap().unwrap();
+        assert!(matches!(
+            task.status_parsed(),
+            crate::team::registry::TaskStatus::Accepted { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_invoke_team_tool_get_status_returns_json_payload() {
+        let (registry, orch) = make_registry_with_team_orchestrator();
+        let lead_key = SessionKey::new("lark", "group:team");
+
+        orch.registry
+            .create_task(crate::team::registry::CreateTask {
+                id: "T200".into(),
+                title: "Write docs".into(),
+                assignee_hint: Some("codex".into()),
+                deps: vec![],
+                timeout_secs: 1800,
+                spec: None,
+                success_criteria: None,
+            })
+            .unwrap();
+
+        let status = registry
+            .invoke_team_tool(&lead_key, TeamToolCall::GetTaskStatus)
+            .await
+            .unwrap();
+        assert!(status.ok);
+        assert!(status.message.contains("\"id\": \"T200\""));
+        assert!(status.payload.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_apply_runtime_events_submits_task_into_existing_registry() {
+        let (registry, orch) = make_registry_with_team_orchestrator();
+        let specialist_key = SessionKey::new("specialist", "team-test:openclaw-main");
+
+        orch.registry
+            .create_task(crate::team::registry::CreateTask {
+                id: "T300".into(),
+                title: "Implement bridge".into(),
+                assignee_hint: Some("openclaw-main".into()),
+                deps: vec![],
+                timeout_secs: 1800,
+                spec: None,
+                success_criteria: None,
+            })
+            .unwrap();
+        orch.registry.try_claim("T300", "openclaw-main").unwrap();
+
+        registry
+            .apply_runtime_events(
+                &specialist_key,
+                &TurnResult {
+                    full_text: "submitted".into(),
+                    events: vec![RuntimeEvent::ToolCallback(TeamCallback::TaskSubmitted {
+                        task_id: "T300".into(),
+                        summary: "bridge implemented".into(),
+                        agent: "openclaw-main".into(),
+                    })],
+                },
+            )
+            .await
+            .unwrap();
+
+        let task = orch.registry.get_task("T300").unwrap().unwrap();
+        assert!(matches!(
+            task.status_parsed(),
+            crate::team::registry::TaskStatus::Submitted { .. }
+        ));
+        assert_eq!(task.completion_note.as_deref(), Some("bridge implemented"));
     }
 }

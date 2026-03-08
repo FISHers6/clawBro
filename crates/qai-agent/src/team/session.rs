@@ -27,7 +27,13 @@ impl TeamSession {
         // 将 group_scope 中的特殊字符替换为连字符，用于目录名
         let safe_scope: String = group_scope
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
 
         let base = dirs::home_dir()
@@ -185,9 +191,11 @@ impl TeamSession {
              {criteria}\n\
              \n\
              ── 必须遵守 ──\n\
-             1. 完成任务时必须调用 MCP 工具 `complete_task(task_id, note)`（agent 参数可选，填自己的名称更准确），系统才会更新任务状态\n\
-             2. 遇到阻塞时必须调用 MCP 工具 `block_task(task_id, reason)`，将任务上报给 Lead\n\
-             3. 重要产出（文件路径、关键发现）写在 complete_task 的 note 参数中\n\
+             1. 阶段性进展可调用 `checkpoint_task(task_id, note)` 向 Lead 发送检查点\n\
+             2. 完成任务后优先调用 `submit_task_result(task_id, summary)`，等待 Lead 验收\n\
+             3. 遇到阻塞时调用 `block_task(task_id, reason)` 释放任务并上报；仅需协助时调用 `request_help(task_id, message)`，保留 claim\n\
+             4. 兼容旧路径时仍可调用 `complete_task(task_id, note)`，但新语义优先使用 submit_task_result\n\
+             5. 重要产出（文件路径、关键发现）写在 summary / note 参数中\n\
              ══════════════════════════════════════════{upstream_section}",
             id = task.id,
             title = task.title,
@@ -255,7 +263,9 @@ mod tests {
     #[test]
     fn test_write_and_read_files() {
         let (session, _tmp) = make_session();
-        session.write_team_md("Claude: Lead\nCodex: Backend").unwrap();
+        session
+            .write_team_md("Claude: Lead\nCodex: Backend")
+            .unwrap();
         session.write_context_md("Task context here").unwrap();
 
         assert_eq!(session.read_team_md(), "Claude: Lead\nCodex: Backend");
@@ -285,28 +295,40 @@ mod tests {
         let registry = TaskRegistry::new_in_memory().unwrap();
 
         // T001 is a dependency with a completion note
-        registry.create_task(CreateTask {
-            id: "T001".into(),
-            title: "Design schema".into(),
-            ..Default::default()
-        }).unwrap();
+        registry
+            .create_task(CreateTask {
+                id: "T001".into(),
+                title: "Design schema".into(),
+                ..Default::default()
+            })
+            .unwrap();
         registry.try_claim("T001", "codex").unwrap();
-        registry.mark_done("T001", "codex", "Created users table with uuid pk").unwrap();
+        registry
+            .mark_done("T001", "codex", "Created users table with uuid pk")
+            .unwrap();
 
         // T002 depends on T001
-        registry.create_task(CreateTask {
-            id: "T002".into(),
-            title: "Implement model".into(),
-            deps: vec!["T001".into()],
-            ..Default::default()
-        }).unwrap();
+        registry
+            .create_task(CreateTask {
+                id: "T002".into(),
+                title: "Implement model".into(),
+                deps: vec!["T001".into()],
+                ..Default::default()
+            })
+            .unwrap();
 
         let task = registry.get_task("T002").unwrap().unwrap();
         let reminder = session.build_task_reminder(&task, &registry);
 
-        assert!(reminder.contains("上游任务结果"), "must have upstream section header");
+        assert!(
+            reminder.contains("上游任务结果"),
+            "must have upstream section header"
+        );
         assert!(reminder.contains("T001"), "must mention T001");
-        assert!(reminder.contains("Created users table"), "must include T001 completion note");
+        assert!(
+            reminder.contains("Created users table"),
+            "must include T001 completion note"
+        );
     }
 
     #[test]
@@ -324,12 +346,24 @@ mod tests {
         let task = registry.get_task("T003").unwrap().unwrap();
         let reminder = session.build_task_reminder(&task, &registry);
 
-        assert!(!reminder.contains("[DONE:"), "must NOT contain legacy [DONE:] text marker");
-        assert!(!reminder.contains("[BLOCKED:"), "must NOT contain legacy [BLOCKED:] text marker");
+        assert!(
+            !reminder.contains("[DONE:"),
+            "must NOT contain legacy [DONE:] text marker"
+        );
+        assert!(
+            !reminder.contains("[BLOCKED:"),
+            "must NOT contain legacy [BLOCKED:] text marker"
+        );
         assert!(reminder.contains("Implement JWT"));
         assert!(reminder.contains("JWT token is generated"));
-        assert!(reminder.contains("complete_task"), "must mention complete_task MCP tool");
-        assert!(reminder.contains("block_task"), "must mention block_task MCP tool");
+        assert!(
+            reminder.contains("complete_task"),
+            "must mention complete_task MCP tool"
+        );
+        assert!(
+            reminder.contains("block_task"),
+            "must mention block_task MCP tool"
+        );
     }
 
     #[test]

@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 qai-protocol  = { path = "../qai-protocol" }
+qai-runtime   = { path = "../qai-runtime" }
 qai-session   = { path = "../qai-session" }
 qai-skills    = { path = "../qai-skills" }
 qai-channels  = { path = "../qai-channels" }

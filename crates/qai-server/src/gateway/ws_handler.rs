@@ -8,6 +8,7 @@ use axum::{
     response::IntoResponse,
 };
 use qai_protocol::{AgentEvent, InboundMsg, SessionKey};
+use qai_runtime::ApprovalDecision;
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
@@ -28,6 +29,11 @@ pub enum WsClientMsg {
     Subscribe { session_key: SessionKey },
     /// 取消订阅
     Unsubscribe { session_key: SessionKey },
+    /// 向 agent 发送消息（现有功能，InboundMsg 格式）
+    ResolveApproval {
+        approval_id: String,
+        decision: String,
+    },
     /// 向 agent 发送消息（现有功能，InboundMsg 格式）
     #[serde(untagged)]
     Message(InboundMsg),
@@ -83,6 +89,28 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                                     vec
                                 });
                                 tracing::debug!("WS client unsubscribed from {:?}", session_key);
+                            }
+                            Ok(WsClientMsg::ResolveApproval {
+                                approval_id,
+                                decision,
+                            }) => {
+                                match ApprovalDecision::parse(&decision) {
+                                    Some(parsed) => {
+                                        if !state.approvals.resolve(&approval_id, parsed) {
+                                            tracing::warn!(
+                                                approval_id = %approval_id,
+                                                "WS approval resolve ignored: unknown or expired id"
+                                            );
+                                        }
+                                    }
+                                    None => {
+                                        tracing::warn!(
+                                            approval_id = %approval_id,
+                                            decision = %decision,
+                                            "WS approval resolve ignored: invalid decision"
+                                        );
+                                    }
+                                }
                             }
                             Ok(WsClientMsg::Message(inbound)) => {
                                 let registry = state.registry.clone();
@@ -154,5 +182,13 @@ mod tests {
         let json = r#"{"id":"1","session_key":{"channel":"ws","scope":"u1"},"content":{"type":"Text","text":"hi"},"sender":"u","channel":"ws","timestamp":"2026-01-01T00:00:00Z","thread_ts":null}"#;
         let msg: WsClientMsg = serde_json::from_str(json).unwrap();
         assert!(matches!(msg, WsClientMsg::Message(_)));
+    }
+
+    #[test]
+    fn test_ws_client_msg_parse_resolve_approval() {
+        let json =
+            r#"{"type":"ResolveApproval","approval_id":"approval-1","decision":"allow-once"}"#;
+        let msg: WsClientMsg = serde_json::from_str(json).unwrap();
+        assert!(matches!(msg, WsClientMsg::ResolveApproval { .. }));
     }
 }

@@ -100,11 +100,7 @@ impl RelayEngine {
     /// - 若 Specialist 失败，用错误提示替换标记
     ///
     /// `source` 必须不是 `BotMention`（Relay 是同步委托，不是 Bot 自发触发）
-    pub async fn process(
-        &self,
-        lead_reply: &str,
-        scope: &SessionKey,
-    ) -> Result<String> {
+    pub async fn process(&self, lead_reply: &str, scope: &SessionKey) -> Result<String> {
         let markers = extract_relay_markers(lead_reply);
         if markers.is_empty() {
             return Ok(lead_reply.to_string());

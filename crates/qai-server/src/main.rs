@@ -1,10 +1,14 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use qai_agent::{OutputSink, SessionRegistry};
+use qai_agent::{ConductorRuntimeDispatch, OutputSink, SessionRegistry};
 use qai_channels::Channel as _;
+use qai_runtime::{
+    acp::AcpBackendAdapter, ApprovalBroker, BackendRegistry, OpenClawBackendAdapter,
+    QuickAiNativeBackendAdapter,
+};
 use qai_server::config;
 use qai_server::gateway;
-use qai_server::state::AppState;
+use qai_server::state::{AppState, BrokerApprovalResolver};
 use qai_session::{SessionManager, SessionStorage};
 use qai_skills::SkillLoader;
 use std::sync::Arc;
@@ -69,7 +73,8 @@ async fn main() -> Result<()> {
         .init();
 
     let cfg = config::GatewayConfig::load()?;
-    tracing::info!("Loaded config: engine={:?}", cfg.agent.engine);
+    cfg.validate_runtime_topology()?;
+    tracing::info!("Loaded config with {} backends", cfg.backends.len());
 
     // 初始化 Session 存储
     let storage = SessionStorage::new(cfg.session.dir.clone());
@@ -83,9 +88,7 @@ async fn main() -> Result<()> {
     let system_injection = skill_loader.build_system_injection(&skills);
     tracing::info!("Loaded {} skills", skills.len());
 
-    // 初始化 Engine
-    let engine_cfg = cfg.agent.engine.clone();
-    tracing::info!("Engine: {:?}", engine_cfg);
+    tracing::info!("Default backend: {}", cfg.agent.backend_id);
 
     // Build AgentRoster from config (None if no agents configured)
     let roster = if cfg.agent_roster.is_empty() {
@@ -108,8 +111,28 @@ async fn main() -> Result<()> {
     let memory_system_ref = memory_system.clone();
 
     // 初始化 SessionRegistry（替换 AgentRunner）
-    let (registry, _event_rx) = SessionRegistry::new(
-        engine_cfg,
+    let approvals = ApprovalBroker::default();
+    let runtime_registry = Arc::new(BackendRegistry::new());
+    runtime_registry
+        .register_adapter("acp", Arc::new(AcpBackendAdapter::new(approvals.clone())))
+        .await;
+    runtime_registry
+        .register_adapter(
+            "openclaw",
+            Arc::new(OpenClawBackendAdapter::new(approvals.clone())),
+        )
+        .await;
+    runtime_registry
+        .register_adapter("native", Arc::new(QuickAiNativeBackendAdapter))
+        .await;
+    for backend in &cfg.backends {
+        runtime_registry
+            .register_backend(backend.to_backend_spec())
+            .await;
+    }
+    let runtime_dispatch = Arc::new(ConductorRuntimeDispatch::new(Arc::clone(&runtime_registry)));
+    let (registry, _event_rx) = SessionRegistry::with_runtime_dispatch(
+        Some(cfg.agent.backend_id.clone()),
         session_manager,
         system_injection,
         roster,
@@ -117,14 +140,18 @@ async fn main() -> Result<()> {
         Some(cfg.memory.shared_dir.clone()),
         cfg.gateway.default_workspace.clone(),
         all_skill_dirs,
+        runtime_dispatch,
     );
     // 使用 registry 内部的 global_tx，确保事件正确广播
     let event_tx = registry.global_sender();
+    registry.set_approval_resolver(Arc::new(BrokerApprovalResolver::new(approvals.clone())));
 
     let state = AppState {
         registry: registry.clone(),
         event_tx: event_tx.clone(),
         cfg: Arc::new(cfg.clone()),
+        runtime_token: Arc::new(uuid::Uuid::new_v4().to_string()),
+        approvals,
     };
 
     // Channel registry for cron output: maps channel name → channel Arc
@@ -284,8 +311,7 @@ async fn main() -> Result<()> {
                             //    cancel_tx / cancel_rx: handle() sends cancel when it returns
                             //    Ok(None) (dedup hit) or Err, since in those cases no TurnComplete
                             //    event will ever arrive and the stream would otherwise leak forever.
-                            let (cancel_tx, cancel_rx) =
-                                tokio::sync::oneshot::channel::<()>();
+                            let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
                             let channel2 = channel_clone.clone();
                             let registry2 = registry_clone.clone();
                             let sk2 = session_key.clone();
@@ -311,11 +337,7 @@ async fn main() -> Result<()> {
                                 };
 
                                 qai_agent::throttled_stream(
-                                    event_rx,
-                                    session_id,
-                                    &sink,
-                                    ph_id2,
-                                    cancel_rx,
+                                    event_rx, session_id, &sink, ph_id2, cancel_rx,
                                 )
                                 .await;
                             });
@@ -386,47 +408,97 @@ async fn main() -> Result<()> {
 
     let cron_channel_map = Arc::new(cron_channel_map);
 
+    // Approval notify loop: surface runtime approval requests back into the originating IM
+    // session so operators can resolve them with `/approve <id> <decision>`.
+    {
+        let mut approval_rx = event_tx.subscribe();
+        let channels_for_approval = cron_channel_map.clone();
+        tokio::spawn(async move {
+            while let Ok(event) = approval_rx.recv().await {
+                let qai_protocol::AgentEvent::ApprovalRequest {
+                    session_key,
+                    approval_id,
+                    prompt,
+                    command,
+                    ..
+                } = event
+                else {
+                    continue;
+                };
+                if session_key.channel == "ws" {
+                    continue;
+                }
+                let Some(ch) = channels_for_approval.get(&session_key.channel) else {
+                    continue;
+                };
+                let header = command
+                    .as_deref()
+                    .map(|cmd| format!("审批请求：`{cmd}`"))
+                    .unwrap_or_else(|| "审批请求".to_string());
+                let body = format!(
+                    "{header}\n{prompt}\n\n审批 ID: `{approval_id}`\n回复命令：`/approve {approval_id} allow-once`\n或：`/approve {approval_id} allow-always`\n或：`/approve {approval_id} deny`"
+                );
+                let outbound = qai_protocol::OutboundMsg {
+                    session_key: session_key.clone(),
+                    content: qai_protocol::MsgContent::text(body),
+                    reply_to: None,
+                    thread_ts: None,
+                };
+                if let Err(e) = ch.send(&outbound).await {
+                    tracing::error!(
+                        channel = %session_key.channel,
+                        scope = %session_key.scope,
+                        approval_id = %approval_id,
+                        "Approval notify send error: {e}"
+                    );
+                }
+            }
+        });
+        tracing::info!("Approval notify task started");
+    }
+
     // ── Swarm Wiring ─────────────────────────────────────────────────────────
     // Wire RelayEngine: synchronous [RELAY: @agent <cmd>] delegation (C1 + I2).
     // MsgSource::Relay is set on the inner InboundMsg so Hook 3 (MentionTrigger)
     // does not recurse into the relay result.
     {
         let registry_for_relay = registry.clone();
-        let relay_dispatch: qai_agent::relay::RelayDispatchFn = Box::new(move |target_agent, content, lead_session_key| {
-            let registry = registry_for_relay.clone();
-            Box::pin(async move {
-                // DEADLOCK FIX (C-2): Relay Specialist MUST NOT reuse the Lead's session_key.
-                //
-                // Lead's handle() holds Semaphore(1) for lead_session_key throughout its entire
-                // execution. Hook 2 (Relay) fires after engine.run() but before the permit drops.
-                // If we called registry.handle() with the same session_key, the inner handle()
-                // would block forever waiting for the same Semaphore(1) → deadlock.
-                //
-                // Fix: give the Relay Specialist a dedicated session_key:
-                //   channel = "relay"
-                //   scope   = "{lead_scope}:{agent_name}"
-                // This ensures an independent Semaphore and independent session history.
-                let agent_bare = target_agent.trim_start_matches('@');
-                let relay_scope = format!("{}:{}", lead_session_key.scope, agent_bare);
-                let relay_session_key = qai_protocol::SessionKey::new("relay", &relay_scope);
+        let relay_dispatch: qai_agent::relay::RelayDispatchFn =
+            Box::new(move |target_agent, content, lead_session_key| {
+                let registry = registry_for_relay.clone();
+                Box::pin(async move {
+                    // DEADLOCK FIX (C-2): Relay Specialist MUST NOT reuse the Lead's session_key.
+                    //
+                    // Lead's handle() holds Semaphore(1) for lead_session_key throughout its entire
+                    // execution. Hook 2 (Relay) fires after engine.run() but before the permit drops.
+                    // If we called registry.handle() with the same session_key, the inner handle()
+                    // would block forever waiting for the same Semaphore(1) → deadlock.
+                    //
+                    // Fix: give the Relay Specialist a dedicated session_key:
+                    //   channel = "relay"
+                    //   scope   = "{lead_scope}:{agent_name}"
+                    // This ensures an independent Semaphore and independent session history.
+                    let agent_bare = target_agent.trim_start_matches('@');
+                    let relay_scope = format!("{}:{}", lead_session_key.scope, agent_bare);
+                    let relay_session_key = qai_protocol::SessionKey::new("relay", &relay_scope);
 
-                let msg = qai_protocol::InboundMsg {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    session_key: relay_session_key,
-                    content,
-                    sender: "relay".to_string(),
-                    channel: "relay".to_string(),
-                    timestamp: chrono::Utc::now(),
-                    thread_ts: None,
-                    target_agent: Some(target_agent),
-                    source: qai_protocol::MsgSource::Relay,
-                };
-                registry.handle(msg).await
-            })
-        });
-        registry.set_relay_engine(std::sync::Arc::new(
-            qai_agent::relay::RelayEngine::new(relay_dispatch),
-        ));
+                    let msg = qai_protocol::InboundMsg {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        session_key: relay_session_key,
+                        content,
+                        sender: "relay".to_string(),
+                        channel: "relay".to_string(),
+                        timestamp: chrono::Utc::now(),
+                        thread_ts: None,
+                        target_agent: Some(target_agent),
+                        source: qai_protocol::MsgSource::Relay,
+                    };
+                    registry.handle(msg).await
+                })
+            });
+        registry.set_relay_engine(std::sync::Arc::new(qai_agent::relay::RelayEngine::new(
+            relay_dispatch,
+        )));
         tracing::info!("RelayEngine wired");
     }
 
@@ -436,166 +508,22 @@ async fn main() -> Result<()> {
     {
         let bot_names: Vec<String> = cfg.agent_roster.iter().map(|e| e.name.clone()).collect();
         if !bot_names.is_empty() {
-            let trigger = std::sync::Arc::new(
-                qai_channels::mention_trigger::MentionTrigger::new(bot_names, redispatch_tx.clone()),
-            );
+            let trigger = std::sync::Arc::new(qai_channels::mention_trigger::MentionTrigger::new(
+                bot_names,
+                redispatch_tx.clone(),
+            ));
             registry.set_mention_trigger(trigger);
             tracing::info!("MentionTrigger wired ({} bots)", cfg.agent_roster.len());
         }
     }
 
-    // TeamNotify redispatch channel — used by TeamOrchestrator to send milestone notifications
-    // back to the Lead's IM channel via the main message loop.
-    let (team_notify_tx, mut team_notify_rx) =
-        tokio::sync::mpsc::channel::<qai_protocol::InboundMsg>(256);
-    let team_notify_tx_for_orch = team_notify_tx.clone();
-
-    // Wire one TeamOrchestrator per Team group: per-group isolation + per-team SQLite (G+H).
-    {
-        use qai_agent::team::{
-            heartbeat::DispatchFn, orchestrator::TeamOrchestrator,
-            registry::TaskRegistry, session::TeamSession,
-        };
-
-        let team_groups: Vec<_> = cfg.groups.iter()
-            .filter(|g| matches!(g.mode.interaction, qai_server::config::InteractionMode::Team))
-            .collect();
-
-        for group in team_groups {
-            // Derive team_id from group scope (sanitized for filesystem use)
-            let team_id: String = group.scope
-                .chars()
-                .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
-                .collect();
-
-            // Per-group session directory and SQLite database (H: file-based, not in-memory)
-            let session = match TeamSession::new(&group.scope, &team_id) {
-                Ok(s) => std::sync::Arc::new(s),
-                Err(e) => {
-                    tracing::error!(scope = %group.scope, "Failed to create TeamSession: {e:#}");
-                    continue;
-                }
-            };
-            let db_path = session.dir.join("tasks.db");
-            let task_registry = match TaskRegistry::new(db_path.to_str().unwrap_or(":memory:")) {
-                Ok(r) => std::sync::Arc::new(r),
-                Err(e) => {
-                    tracing::error!(scope = %group.scope, "Failed to open TaskRegistry: {e:#}");
-                    continue;
-                }
-            };
-
-            let registry_for_dispatch = registry.clone();
-            let task_reg_for_dispatch = std::sync::Arc::clone(&task_registry);
-            let team_session_for_dispatch = std::sync::Arc::clone(&session);
-            let dispatch_fn: DispatchFn = std::sync::Arc::new(
-                move |agent: String, task: qai_agent::team::registry::Task| {
-                    let registry = registry_for_dispatch.clone();
-                    let task_reg = std::sync::Arc::clone(&task_reg_for_dispatch);
-                    let team_session = std::sync::Arc::clone(&team_session_for_dispatch);
-                    Box::pin(async move {
-                        let specialist_key = team_session.specialist_session_key(&agent);
-                        let specialist_channel = specialist_key.channel.clone();
-                        let reminder = team_session.build_task_reminder(&task, &task_reg);
-                        registry.set_task_reminder(specialist_key.clone(), reminder);
-                        let msg = qai_protocol::InboundMsg {
-                            id: uuid::Uuid::new_v4().to_string(),
-                            session_key: specialist_key,
-                            content: qai_protocol::MsgContent::text(
-                                task.spec.as_deref().unwrap_or(&task.title),
-                            ),
-                            sender: "orchestrator".to_string(),
-                            channel: specialist_channel,
-                            timestamp: chrono::Utc::now(),
-                            thread_ts: None,
-                            target_agent: Some(format!("@{}", agent)),
-                            source: qai_protocol::MsgSource::Heartbeat,
-                        };
-                        let result = registry.handle(msg).await;
-                        if let Ok(Some(ref reply_text)) = result {
-                            // Log Specialist reply to events.jsonl for observability.
-                            // Specialist replies are intentionally NOT forwarded to IM —
-                            // Lead learns of completion via TeamNotify.
-                            let _ = team_session.append_specialist_reply(&agent, &task.id, reply_text);
-                        }
-                        result.map(|_| ())
-                    })
-                },
-            );
-
-            let team_orch = TeamOrchestrator::new(
-                task_registry,
-                std::sync::Arc::clone(&session),
-                dispatch_fn,
-                Duration::from_secs(60),
-            );
-
-            // Wire I3: milestone events → IM channel
-            let cron_channels_for_notify = cron_channel_map.clone();
-            team_orch.set_notify_fn(std::sync::Arc::new(
-                move |scope: qai_protocol::SessionKey, msg: String| {
-                    let channels = cron_channels_for_notify.clone();
-                    tokio::spawn(async move {
-                        if let Some(ch) = channels.get(&scope.channel) {
-                            let outbound = qai_protocol::OutboundMsg {
-                                session_key: scope,
-                                content: qai_protocol::MsgContent::text(msg),
-                                reply_to: None,
-                                thread_ts: None,
-                            };
-                            if let Err(e) = ch.send(&outbound).await {
-                                tracing::error!("Milestone notify send error: {e}");
-                            }
-                        }
-                    });
-                },
-            ));
-
-            // Wire lead_session_key from group config
-            let channel_name: &str = if let Some(ref ch) = group.mode.channel {
-                ch.as_str()
-            } else if cfg.channels.dingtalk.as_ref().map(|c| c.enabled).unwrap_or(false) {
-                "dingtalk"
-            } else if cfg.channels.lark.as_ref().map(|c| c.enabled).unwrap_or(false) {
-                "lark"
-            } else {
-                "ws"
-            };
-            let lead_key = qai_protocol::SessionKey::new(channel_name, &group.scope);
-            team_orch.set_lead_session_key(lead_key.clone());
-            team_orch.set_scope(lead_key);
-            if let Some(front_bot) = &group.mode.front_bot {
-                team_orch.set_lead_agent_name(front_bot.clone());
-                tracing::info!(front_bot = %front_bot, scope = %group.scope, "Lead agent wired from front_bot");
-            }
-            if !group.team.roster.is_empty() {
-                team_orch.set_available_specialists(group.team.roster.clone());
-                tracing::info!(specialists = ?group.team.roster, scope = %group.scope, "Available specialists wired");
-            }
-
-            // Wire TeamNotify sender into orchestrator
-            team_orch.set_team_notify_tx(team_notify_tx_for_orch.clone());
-
-            // Eagerly start SharedTeamMcpServer so both Lead and Specialist receive
-            // mcp_server_url from their very first turn (fixes chicken-and-egg issue).
-            match team_orch.start_mcp_server().await {
-                Ok(()) => tracing::info!(scope = %group.scope, team_id = %team_id, "SharedTeamMcpServer started"),
-                Err(e) => tracing::error!(scope = %group.scope, "Failed to start SharedTeamMcpServer: {e:#}"),
-            }
-
-            registry.register_team_orchestrator(team_id.clone(), team_orch);
-            tracing::info!(scope = %group.scope, team_id = %team_id, "TeamOrchestrator registered");
-        }
-
-        tracing::info!("TeamOrchestrators wired");
-
-        // Wire auto_promote scopes: groups with auto_promote = true but no team orchestrator
-        // can still trigger Lead behavior via keyword detection in mode_selector.
-        for group in cfg.groups.iter().filter(|g| g.mode.auto_promote) {
-            registry.add_auto_promote_scope(group.scope.clone());
-            tracing::info!(scope = %group.scope, "auto_promote keyword detection enabled");
-        }
-    }
+    qai_server::team_runtime::wire_team_runtime(
+        registry.clone(),
+        &cfg,
+        cron_channel_map.clone(),
+        Duration::from_secs(60),
+    )
+    .await?;
 
     // Spawn BotMention redispatch task: MentionTrigger → handle() → IM reply (C1).
     {
@@ -629,29 +557,6 @@ async fn main() -> Result<()> {
         tracing::info!("BotMention redispatch task started");
     }
 
-    // Spawn TeamNotify redispatch task: Lead receives [团队通知] and processes it.
-    // F3 fix: Lead's text reply is intentionally dropped here. User-visible output must flow
-    // through Lead's post_update() MCP tool call (notify_fn → ch.send()). Forwarding the
-    // text reply directly would double-send when Lead also calls post_update.
-    {
-        let registry_for_notify = registry.clone();
-        tokio::spawn(async move {
-            while let Some(inbound) = team_notify_rx.recv().await {
-                match registry_for_notify.handle(inbound).await {
-                    Ok(Some(_reply)) => {
-                        // F3 fix: TeamNotify-triggered Lead turns must NOT forward the text
-                        // reply to IM. User-visible output must flow through the Lead's
-                        // `post_update()` MCP tool call (which invokes notify_fn → ch.send()).
-                        // Forwarding _reply here would double-send when Lead also calls post_update.
-                        // Drop _reply silently — post_update() already handled IM delivery.
-                    }
-                    Ok(None) => {}
-                    Err(e) => tracing::error!("TeamNotify handle error: {e}"),
-                }
-            }
-        });
-        tracing::info!("TeamNotify redispatch task started");
-    }
     // ── End Swarm Wiring ─────────────────────────────────────────────────────
 
     // 启动 CronScheduler
@@ -793,7 +698,13 @@ async fn main() -> Result<()> {
     }
 
     // 启动 Gateway HTTP/WS 服务器
-    let addr = gateway::server::start(state, &cfg.gateway.host, cfg.gateway.port).await?;
+    let runtime_token = state.runtime_token.clone();
+    let addr = gateway::server::start(state.clone(), &cfg.gateway.host, cfg.gateway.port).await?;
+    registry.set_team_tool_url(format!(
+        "http://127.0.0.1:{}/runtime/team-tools?token={}",
+        addr.port(),
+        runtime_token
+    ));
 
     // 写端口到 ~/.quickai/gateway.port（供 Tauri 壳读取）
     let port_file = dirs::home_dir()

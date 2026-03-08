@@ -1,0 +1,22 @@
+[package]
+name = "qai-runtime"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+qai-protocol = { path = "../qai-protocol" }
+serde.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+dashmap.workspace = true
+tokio.workspace = true
+futures.workspace = true
+tokio-util = { version = "0.7", features = ["compat"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
+tracing.workspace = true
+agent-client-protocol = "0.9"
+serde_json.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

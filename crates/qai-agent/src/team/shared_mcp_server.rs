@@ -1,11 +1,21 @@
-//! SharedTeamMcpServer — unified MCP SSE server for all team agents.
+//! SharedTeamMcpServer — ACP-family MCP adapter for team tools.
 //!
-//! Exposes 8 tools on a single port:
+//! This is the legacy ACP-family tool surface, not the canonical multi-backend
+//! Team Tool Contract.
+//!
+//! Exposes 8 legacy tools on a single port:
 //!   Lead tools:       create_task, start_execution, request_confirmation, post_update,
 //!                     get_task_status, assign_task
 //!   Specialist tools: complete_task, block_task
 //!
-//! All agents get the same URL. System prompts determine which tools are appropriate per role.
+//! Canonical v1.1 tools are also exposed for ACP-family agents:
+//!   Lead tools:       accept_task, reopen_task
+//!   Specialist tools: checkpoint_task, submit_task_result, request_help
+//!
+//! All ACP agents get the same URL. System prompts determine which tools are appropriate per role.
+//! Future family-agnostic semantics (`checkpoint_task`, `submit_task_result`,
+//! `accept_task`, `reopen_task`, `request_help`) live in `qai-runtime::tool_bridge`
+//! and will be mapped into this adapter as compatibility shims.
 //!
 //! Lifecycle:
 //!   ```text
@@ -18,12 +28,11 @@ use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::Result;
 use rmcp::{
-    ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{ServerCapabilities, ServerInfo},
-    schemars,
-    tool, tool_router,
-    transport::{SseServer, sse_server::SseServerConfig},
+    schemars, tool, tool_handler, tool_router,
+    transport::{sse_server::SseServerConfig, SseServer},
+    ServerHandler,
 };
 use serde::Deserialize;
 use tokio::task::JoinHandle;
@@ -74,6 +83,37 @@ pub struct AssignTaskParams {
     pub new_assignee: String,
 }
 
+/// Parameters for `checkpoint_task`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CheckpointTaskParams {
+    pub task_id: String,
+    pub note: String,
+    pub agent: Option<String>,
+}
+
+/// Parameters for `submit_task_result`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SubmitTaskResultParams {
+    pub task_id: String,
+    pub summary: String,
+    pub agent: Option<String>,
+}
+
+/// Parameters for `accept_task`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AcceptTaskParams {
+    pub task_id: String,
+    pub by: Option<String>,
+}
+
+/// Parameters for `reopen_task`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReopenTaskParams {
+    pub task_id: String,
+    pub reason: String,
+    pub by: Option<String>,
+}
+
 /// Parameters for `complete_task`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CompleteTaskParams {
@@ -96,10 +136,18 @@ pub struct BlockTaskParams {
     pub agent: Option<String>,
 }
 
+/// Parameters for `request_help`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RequestHelpParams {
+    pub task_id: String,
+    pub message: String,
+    pub agent: Option<String>,
+}
+
 // ─── SharedTeamToolServer ────────────────────────────────────────────────────
 
-/// Unified MCP server: exposes all 8 team tools on one port.
-/// Lead agents use the first 6; Specialist agents use the last 2.
+/// ACP-family MCP server exposing the current legacy team tools on one port.
+/// Lead ACP agents use the first 6; Specialist ACP agents use the last 2.
 #[derive(Clone)]
 pub struct SharedTeamToolServer {
     #[allow(dead_code)]
@@ -116,10 +164,47 @@ impl SharedTeamToolServer {
         }
     }
 
+    /// Legacy ACP completion mapping.
+    /// Future canonical semantics are expected to flow through:
+    /// `submit_task_result` -> leader `accept_task` / `reopen_task`.
+    fn complete_task_legacy(&self, task_id: &str, agent: &str, note: &str) -> Result<()> {
+        self.orchestrator
+            .handle_specialist_done(task_id, agent, note)
+    }
+
+    /// Legacy ACP blocked/help mapping.
+    /// Future canonical semantics are expected to flow through:
+    /// `block_task` / `request_help` -> leader triage or reassignment.
+    fn block_task_legacy(&self, task_id: &str, agent: &str, reason: &str) -> Result<()> {
+        self.orchestrator
+            .handle_specialist_blocked(task_id, agent, reason)
+    }
+
+    fn resolve_claimed_agent(&self, task_id: &str, explicit: Option<&str>) -> String {
+        explicit
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                self.orchestrator
+                    .registry
+                    .get_task(task_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|t| {
+                        t.status_raw
+                            .strip_prefix("claimed:")
+                            .and_then(|s| s.splitn(2, ':').next())
+                            .map(|s| s.to_string())
+                    })
+            })
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+
     // ── Lead tools ────────────────────────────────────────────────────────────
 
     /// Register a new task in the team's task graph during the Planning phase.
-    #[tool(description = "Lead only. Register a new task. Provide id, title, and optionally assignee, spec, deps (comma-separated IDs), success_criteria.")]
+    #[tool(
+        description = "Lead only. Register a new task. Provide id, title, and optionally assignee, spec, deps (comma-separated IDs), success_criteria."
+    )]
     async fn create_task(&self, Parameters(p): Parameters<CreateTaskParams>) -> String {
         let deps: Vec<String> = p
             .deps
@@ -148,7 +233,9 @@ impl SharedTeamToolServer {
     }
 
     /// Activate team execution: start the Heartbeat and MCP server becomes live.
-    #[tool(description = "Lead only. Start task execution. Call after all tasks are registered with create_task.")]
+    #[tool(
+        description = "Lead only. Start task execution. Call after all tasks are registered with create_task."
+    )]
     async fn start_execution(&self) -> String {
         match self.orchestrator.activate().await {
             Ok(msg) => msg,
@@ -157,7 +244,9 @@ impl SharedTeamToolServer {
     }
 
     /// Request user confirmation before starting execution.
-    #[tool(description = "Lead only. Request user confirmation. Posts plan_summary to IM and waits for user reply before execution begins.")]
+    #[tool(
+        description = "Lead only. Request user confirmation. Posts plan_summary to IM and waits for user reply before execution begins."
+    )]
     async fn request_confirmation(
         &self,
         Parameters(p): Parameters<RequestConfirmationParams>,
@@ -169,14 +258,18 @@ impl SharedTeamToolServer {
     }
 
     /// Post a status update or message to the IM channel.
-    #[tool(description = "Lead only. Post a message to the IM channel. Use for status updates, progress reports, or questions.")]
+    #[tool(
+        description = "Lead only. Post a message to the IM channel. Use for status updates, progress reports, or questions."
+    )]
     async fn post_update(&self, Parameters(p): Parameters<PostUpdateParams>) -> String {
         self.orchestrator.post_message(&p.message);
         "Posted.".to_string()
     }
 
     /// Get a JSON snapshot of all tasks and their current statuses.
-    #[tool(description = "Lead only. Get current status of all tasks as JSON. Returns an array with id, title, status, assignee, deps.")]
+    #[tool(
+        description = "Lead only. Get current status of all tasks as JSON. Returns an array with id, title, status, assignee, deps."
+    )]
     async fn get_task_status(&self) -> String {
         match self.orchestrator.registry.all_tasks() {
             Ok(tasks) => {
@@ -201,7 +294,9 @@ impl SharedTeamToolServer {
     }
 
     /// Reassign a pending task to a different agent.
-    #[tool(description = "Lead only. Reassign a pending task to a new agent. task_id must be pending. Provide new_assignee agent name.")]
+    #[tool(
+        description = "Lead only. Reassign a pending task to a new agent. task_id must be pending. Provide new_assignee agent name."
+    )]
     async fn assign_task(&self, Parameters(p): Parameters<AssignTaskParams>) -> String {
         match self
             .orchestrator
@@ -213,47 +308,88 @@ impl SharedTeamToolServer {
         }
     }
 
+    /// Accept a submitted task result.
+    #[tool(
+        description = "Lead only. Accept a submitted task result after review. Provide task_id and optionally your leader name in by."
+    )]
+    async fn accept_task(&self, Parameters(p): Parameters<AcceptTaskParams>) -> String {
+        let by = p.by.as_deref().unwrap_or("leader");
+        match self.orchestrator.accept_submitted_task(&p.task_id, by) {
+            Ok(()) => format!("Task {} accepted by {}.", p.task_id, by),
+            Err(e) => format!("Error accepting task {}: {e}", p.task_id),
+        }
+    }
+
+    /// Reopen a submitted/accepted/done task.
+    #[tool(
+        description = "Lead only. Reopen a task back to pending. Provide task_id, reason, and optionally your leader name in by."
+    )]
+    async fn reopen_task(&self, Parameters(p): Parameters<ReopenTaskParams>) -> String {
+        let by = p.by.as_deref().unwrap_or("leader");
+        match self
+            .orchestrator
+            .reopen_submitted_task(&p.task_id, &p.reason, by)
+        {
+            Ok(()) => format!("Task {} reopened by {}.", p.task_id, by),
+            Err(e) => format!("Error reopening task {}: {e}", p.task_id),
+        }
+    }
+
     // ── Specialist tools ───────────────────────────────────────────────────────
 
     /// Mark a task as complete.
-    #[tool(description = "Specialist only. Mark a task as complete. Provide the task_id, a short completion note, and your agent name.")]
+    #[tool(
+        description = "Specialist only. Mark a task as complete. Provide the task_id, a short completion note, and your agent name."
+    )]
     async fn complete_task(&self, Parameters(p): Parameters<CompleteTaskParams>) -> String {
-        // Resolve agent: explicit param first, then extract from claimed status
-        let agent = p.agent.as_deref().map(|s| s.to_string()).unwrap_or_else(|| {
-            self.orchestrator.registry.get_task(&p.task_id)
-                .ok()
-                .flatten()
-                .and_then(|t| {
-                    t.status_raw.strip_prefix("claimed:")
-                        .and_then(|s| s.splitn(2, ':').next())
-                        .map(|s| s.to_string())
-                })
-                .unwrap_or_else(|| "unknown".to_string())
-        });
-        match self.orchestrator.handle_specialist_done(&p.task_id, &agent, &p.note) {
+        let agent = self.resolve_claimed_agent(&p.task_id, p.agent.as_deref());
+        match self.complete_task_legacy(&p.task_id, &agent, &p.note) {
             Ok(()) => format!("Task {} marked done.", p.task_id),
             Err(e) => format!("Error completing task {}: {e}", p.task_id),
         }
     }
 
+    /// Report a progress checkpoint without changing task state.
+    #[tool(
+        description = "Specialist only. Report a checkpoint update for the claimed task. Provide task_id, note, and optionally your agent name."
+    )]
+    async fn checkpoint_task(&self, Parameters(p): Parameters<CheckpointTaskParams>) -> String {
+        let agent = self.resolve_claimed_agent(&p.task_id, p.agent.as_deref());
+        match self
+            .orchestrator
+            .handle_specialist_checkpoint(&p.task_id, &agent, &p.note)
+        {
+            Ok(()) => format!("Checkpoint recorded for task {}.", p.task_id),
+            Err(e) => format!("Error recording checkpoint for task {}: {e}", p.task_id),
+        }
+    }
+
+    /// Submit a completed task result for lead acceptance.
+    #[tool(
+        description = "Specialist only. Submit task results for lead review. Provide task_id, summary, and optionally your agent name."
+    )]
+    async fn submit_task_result(
+        &self,
+        Parameters(p): Parameters<SubmitTaskResultParams>,
+    ) -> String {
+        let agent = self.resolve_claimed_agent(&p.task_id, p.agent.as_deref());
+        match self
+            .orchestrator
+            .handle_specialist_submitted(&p.task_id, &agent, &p.summary)
+        {
+            Ok(()) => format!("Task {} submitted for review.", p.task_id),
+            Err(e) => format!("Error submitting task {}: {e}", p.task_id),
+        }
+    }
+
     /// Report that a task is blocked.
-    #[tool(description = "Specialist only. Report a task as blocked. Provide the task_id, reason, and your agent name.")]
+    #[tool(
+        description = "Specialist only. Report a task as blocked. Provide the task_id, reason, and your agent name."
+    )]
     async fn block_task(&self, Parameters(p): Parameters<BlockTaskParams>) -> String {
-        // Resolve agent: explicit param first, then extract from claimed status (mirrors complete_task).
-        // Default "specialist" would always fail the ownership check when the actual claimer is a named agent.
-        let agent_owned = p.agent.as_deref().map(|s| s.to_string()).unwrap_or_else(|| {
-            self.orchestrator.registry.get_task(&p.task_id)
-                .ok()
-                .flatten()
-                .and_then(|t| {
-                    t.status_raw.strip_prefix("claimed:")
-                        .and_then(|s| s.splitn(2, ':').next())
-                        .map(|s| s.to_string())
-                })
-                .unwrap_or_else(|| "unknown".to_string())
-        });
+        // Legacy hard block: release the claim and escalate.
+        let agent_owned = self.resolve_claimed_agent(&p.task_id, p.agent.as_deref());
         let agent = agent_owned.as_str();
-        // Validate claim ownership before resetting
         let owns_claim = self
             .orchestrator
             .registry
@@ -273,20 +409,50 @@ impl SharedTeamToolServer {
         if let Err(e) = self.orchestrator.registry.reset_claim(&p.task_id) {
             tracing::warn!(task_id = %p.task_id, "reset_claim error: {e:#}");
         }
-        if let Err(e) = self.orchestrator.handle_specialist_blocked(&p.task_id, agent, &p.reason) {
+        if let Err(e) = self.block_task_legacy(&p.task_id, agent, &p.reason) {
             tracing::warn!(task_id = %p.task_id, "handle_specialist_blocked error: {e:#}");
         }
         format!("Task {} reported as blocked: {}", p.task_id, p.reason)
     }
+
+    /// Ask lead for help while keeping the task claimed.
+    #[tool(
+        description = "Specialist only. Request help from the lead without releasing the claim. Provide task_id, message, and optionally your agent name."
+    )]
+    async fn request_help(&self, Parameters(p): Parameters<RequestHelpParams>) -> String {
+        let agent = self.resolve_claimed_agent(&p.task_id, p.agent.as_deref());
+        let owns_claim = self
+            .orchestrator
+            .registry
+            .is_claimed_by(&p.task_id, &agent)
+            .unwrap_or(false);
+        if !owns_claim {
+            return format!(
+                "Cannot request help for task {}: not currently claimed by {}.",
+                p.task_id, agent
+            );
+        }
+        match self
+            .orchestrator
+            .handle_specialist_help_requested(&p.task_id, &agent, &p.message)
+        {
+            Ok(()) => format!("Help request sent for task {}.", p.task_id),
+            Err(e) => format!("Error requesting help for task {}: {e}", p.task_id),
+        }
+    }
 }
 
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for SharedTeamToolServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "Shared team tools. \
+                "ACP-family shared team tools. \
                  Lead agents use: create_task, start_execution, request_confirmation, post_update, get_task_status, assign_task. \
-                 Specialist agents use: complete_task, block_task."
+                 Lead agents may also use: accept_task, reopen_task. \
+                 Specialist agents may also use: checkpoint_task, submit_task_result, request_help. \
+                 Legacy specialist compatibility tools remain: complete_task, block_task. \
+                 Canonical multi-backend semantics are defined in qai-runtime's tool_bridge contract."
                     .to_string(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
@@ -335,11 +501,10 @@ impl SharedTeamToolServer {
 
         let shutdown_ct = server_ct.clone();
         let task = tokio::spawn(async move {
-            let server = axum::serve(listener, sse_router)
-                .with_graceful_shutdown(async move {
-                    shutdown_ct.cancelled().await;
-                    tracing::info!("SharedTeamMcpServer shutting down");
-                });
+            let server = axum::serve(listener, sse_router).with_graceful_shutdown(async move {
+                shutdown_ct.cancelled().await;
+                tracing::info!("SharedTeamMcpServer shutting down");
+            });
             if let Err(e) = server.await {
                 tracing::error!(error = %e, "SharedTeamMcpServer exited with error");
             }
@@ -432,7 +597,10 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-        srv.orchestrator.registry.try_claim("T001", "codex").unwrap();
+        srv.orchestrator
+            .registry
+            .try_claim("T001", "codex")
+            .unwrap();
 
         let result = srv
             .complete_task(Parameters(CompleteTaskParams {
@@ -441,7 +609,10 @@ mod tests {
                 agent: Some("codex".to_string()),
             }))
             .await;
-        assert_eq!(result, "Task T001 marked done.", "unexpected result: {result}");
+        assert_eq!(
+            result, "Task T001 marked done.",
+            "unexpected result: {result}"
+        );
 
         let task = srv.orchestrator.registry.get_task("T001").unwrap().unwrap();
         assert!(
@@ -449,6 +620,134 @@ mod tests {
             "expected Done, got {:?}",
             task.status_parsed()
         );
+    }
+
+    #[tokio::test]
+    async fn test_submit_then_accept_transitions_to_accepted() {
+        let (srv, _tmp) = make_server();
+        srv.orchestrator
+            .registry
+            .create_task(CT {
+                id: "T010".into(),
+                title: "reviewable".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        srv.orchestrator
+            .registry
+            .try_claim("T010", "codex")
+            .unwrap();
+
+        let submitted = srv
+            .submit_task_result(Parameters(SubmitTaskResultParams {
+                task_id: "T010".into(),
+                summary: "ready for review".into(),
+                agent: Some("codex".into()),
+            }))
+            .await;
+        assert!(submitted.contains("submitted"), "result: {submitted}");
+
+        let accepted = srv
+            .accept_task(Parameters(AcceptTaskParams {
+                task_id: "T010".into(),
+                by: Some("claude".into()),
+            }))
+            .await;
+        assert!(accepted.contains("accepted"), "result: {accepted}");
+
+        let task = srv.orchestrator.registry.get_task("T010").unwrap().unwrap();
+        assert!(matches!(task.status_parsed(), TaskStatus::Accepted { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_reopen_task_returns_task_to_pending() {
+        let (srv, _tmp) = make_server();
+        srv.orchestrator
+            .registry
+            .create_task(CT {
+                id: "T011".into(),
+                title: "reopenable".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        srv.orchestrator
+            .registry
+            .try_claim("T011", "codex")
+            .unwrap();
+        srv.orchestrator
+            .handle_specialist_submitted("T011", "codex", "ready")
+            .unwrap();
+
+        let result = srv
+            .reopen_task(Parameters(ReopenTaskParams {
+                task_id: "T011".into(),
+                reason: "needs edge-case fix".into(),
+                by: Some("leader".into()),
+            }))
+            .await;
+        assert!(result.contains("reopened"), "result: {result}");
+
+        let task = srv.orchestrator.registry.get_task("T011").unwrap().unwrap();
+        assert!(matches!(task.status_parsed(), TaskStatus::Pending));
+    }
+
+    #[tokio::test]
+    async fn test_request_help_does_not_release_claim() {
+        let (srv, _tmp) = make_server();
+        srv.orchestrator
+            .registry
+            .create_task(CT {
+                id: "T012".into(),
+                title: "stuck".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        srv.orchestrator
+            .registry
+            .try_claim("T012", "codex")
+            .unwrap();
+
+        let result = srv
+            .request_help(Parameters(RequestHelpParams {
+                task_id: "T012".into(),
+                message: "need schema guidance".into(),
+                agent: Some("codex".into()),
+            }))
+            .await;
+        assert!(result.contains("Help request sent"), "result: {result}");
+        assert!(srv
+            .orchestrator
+            .registry
+            .is_claimed_by("T012", "codex")
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_does_not_change_task_state() {
+        let (srv, _tmp) = make_server();
+        srv.orchestrator
+            .registry
+            .create_task(CT {
+                id: "T013".into(),
+                title: "checkpoint".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        srv.orchestrator
+            .registry
+            .try_claim("T013", "codex")
+            .unwrap();
+
+        let result = srv
+            .checkpoint_task(Parameters(CheckpointTaskParams {
+                task_id: "T013".into(),
+                note: "schema drafted".into(),
+                agent: Some("codex".into()),
+            }))
+            .await;
+        assert!(result.contains("Checkpoint recorded"), "result: {result}");
+        let task = srv.orchestrator.registry.get_task("T013").unwrap().unwrap();
+        assert!(matches!(task.status_parsed(), TaskStatus::Claimed { .. }));
     }
 
     #[tokio::test]
@@ -462,7 +761,10 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-        srv.orchestrator.registry.try_claim("T002", "codex").unwrap();
+        srv.orchestrator
+            .registry
+            .try_claim("T002", "codex")
+            .unwrap();
 
         let result = srv
             .block_task(Parameters(BlockTaskParams {
@@ -501,7 +803,10 @@ mod tests {
             }))
             .await;
         assert_eq!(result, "Confirmation requested. Waiting for user reply.");
-        assert!(matches!(srv.orchestrator.team_state(), TeamState::AwaitingConfirm));
+        assert!(matches!(
+            srv.orchestrator.team_state(),
+            TeamState::AwaitingConfirm
+        ));
     }
 
     #[tokio::test]

@@ -4,32 +4,68 @@
 pub mod config;
 pub mod gateway;
 pub mod state;
+pub mod team_runtime;
 
 pub use config::GatewayConfig;
-pub use state::AppState;
+pub use state::{AppState, BrokerApprovalResolver};
 
 use anyhow::Result;
-use qai_agent::{EngineConfig, SessionRegistry};
+use qai_agent::{ConductorRuntimeDispatch, SessionRegistry};
+use qai_runtime::{
+    acp::AcpBackendAdapter, ApprovalBroker, BackendFamily, BackendRegistry, BackendSpec,
+    LaunchSpec, OpenClawBackendAdapter, QuickAiNativeBackendAdapter,
+};
 use qai_session::{SessionManager, SessionStorage};
 use qai_skills::SkillLoader;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Start a gateway instance for testing.
 /// The server runs until the tokio runtime shuts down (end of `#[tokio::test]`).
 /// `agent_binary`: path to the ACP agent binary (e.g. `quickai-rust-agent`).
 /// Returns the bound SocketAddr (port 0 = OS-assigned).
 pub async fn start_test_gateway(agent_binary: &str) -> Result<SocketAddr> {
-    let engine_config = EngineConfig::RustAgent {
-        binary: Some(agent_binary.to_string()),
-    };
-    start_test_gateway_with_engine(engine_config).await
+    let mut cfg = GatewayConfig::default();
+    cfg.agent.backend_id = "test-default".to_string();
+    cfg.backends.push(backend_catalog_entry(BackendSpec {
+        backend_id: "test-default".to_string(),
+        family: BackendFamily::Acp,
+        adapter_key: "acp".into(),
+        launch: LaunchSpec::Command {
+            command: agent_binary.to_string(),
+            args: vec![],
+            env: vec![],
+        },
+    }));
+    start_test_gateway_with_config(cfg).await
 }
 
-/// Start a gateway instance for testing with an explicit `EngineConfig`.
+/// Start a gateway instance for testing with an explicit runtime backend.
 /// Returns the bound SocketAddr (port 0 = OS-assigned).
-pub async fn start_test_gateway_with_engine(engine_config: EngineConfig) -> Result<SocketAddr> {
-    let cfg = GatewayConfig::default();
+pub async fn start_test_gateway_with_backend(default_backend: BackendSpec) -> Result<SocketAddr> {
+    let mut cfg = GatewayConfig::default();
+    cfg.agent.backend_id = default_backend.backend_id.clone();
+    cfg.backends.push(backend_catalog_entry(default_backend));
+    start_test_gateway_with_config(cfg).await
+}
+
+/// Start a gateway instance for testing with an explicit `GatewayConfig`.
+/// Returns the bound SocketAddr (port 0 = OS-assigned).
+pub async fn start_test_gateway_with_config(cfg: GatewayConfig) -> Result<SocketAddr> {
+    let state = build_test_state_with_config(cfg).await?;
+    let runtime_token = state.runtime_token.clone();
+    let addr = gateway::server::start(state.clone(), "127.0.0.1", 0).await?;
+    state.registry.set_team_tool_url(format!(
+        "http://127.0.0.1:{}/runtime/team-tools?token={}",
+        addr.port(),
+        runtime_token
+    ));
+    Ok(addr)
+}
+
+pub async fn build_test_state_with_config(cfg: GatewayConfig) -> Result<AppState> {
+    cfg.validate_runtime_topology()?;
     let storage = SessionStorage::new(cfg.session.dir.clone());
     let session_manager = Arc::new(SessionManager::new(storage));
 
@@ -37,24 +73,102 @@ pub async fn start_test_gateway_with_engine(engine_config: EngineConfig) -> Resu
     let skills = skill_loader.load_all();
     let system_injection = skill_loader.build_system_injection(&skills);
 
-    // _event_rx dropped: new WS clients subscribe via state.event_tx.subscribe() instead
-    let (registry, _event_rx) = SessionRegistry::new(
-        engine_config,
+    let approvals = ApprovalBroker::default();
+    let runtime_registry = Arc::new(BackendRegistry::new());
+    runtime_registry
+        .register_adapter("acp", Arc::new(AcpBackendAdapter::new(approvals.clone())))
+        .await;
+    runtime_registry
+        .register_adapter(
+            "openclaw",
+            Arc::new(OpenClawBackendAdapter::new(approvals.clone())),
+        )
+        .await;
+    runtime_registry
+        .register_adapter("native", Arc::new(QuickAiNativeBackendAdapter))
+        .await;
+    for backend in &cfg.backends {
+        runtime_registry
+            .register_backend(backend.to_backend_spec())
+            .await;
+    }
+    let runtime_dispatch = Arc::new(ConductorRuntimeDispatch::new(Arc::clone(&runtime_registry)));
+    let (registry, _event_rx) = SessionRegistry::with_runtime_dispatch(
+        Some(cfg.agent.backend_id.clone()),
         session_manager,
         system_injection,
-        None,                         // no roster in test helpers
-        None,                         // no memory system in test helpers
-        None,                         // no default_persona_dir in test helpers
-        None,                         // no default_workspace in test helpers
-        vec![cfg.skills.dir.clone()], // gateway-level skill dirs
+        if cfg.agent_roster.is_empty() {
+            None
+        } else {
+            Some(qai_agent::AgentRoster::new(cfg.agent_roster.clone()))
+        },
+        None,
+        None,
+        None,
+        vec![cfg.skills.dir.clone()],
+        runtime_dispatch,
     );
     let event_tx = registry.global_sender();
+    registry.set_approval_resolver(Arc::new(BrokerApprovalResolver::new(approvals.clone())));
 
     let state = AppState {
         registry,
         event_tx,
         cfg: Arc::new(cfg),
+        runtime_token: Arc::new(uuid::Uuid::new_v4().to_string()),
+        approvals,
     };
-    let addr = gateway::server::start(state, "127.0.0.1", 0).await?;
-    Ok(addr)
+
+    team_runtime::wire_team_runtime(
+        Arc::clone(&state.registry),
+        state.cfg.as_ref(),
+        Arc::new(std::collections::HashMap::new()),
+        Duration::from_millis(50),
+    )
+    .await?;
+
+    Ok(state)
+}
+
+fn backend_catalog_entry(spec: BackendSpec) -> config::BackendCatalogEntry {
+    let family = match spec.family {
+        BackendFamily::Acp => config::BackendFamilyConfig::Acp,
+        BackendFamily::OpenClawGateway => config::BackendFamilyConfig::OpenClawGateway,
+        BackendFamily::QuickAiNative => config::BackendFamilyConfig::QuickAiNative,
+    };
+    let launch = match spec.launch {
+        LaunchSpec::Command { command, args, env } => config::BackendLaunchConfig::Command {
+            command,
+            args,
+            env: env.into_iter().collect(),
+        },
+        LaunchSpec::GatewayWs {
+            endpoint,
+            token,
+            password,
+            role,
+            scopes,
+            agent_id,
+            team_helper_command,
+            team_helper_args,
+            lead_helper_mode,
+        } => config::BackendLaunchConfig::GatewayWs {
+            endpoint,
+            token,
+            password,
+            role,
+            scopes,
+            agent_id,
+            team_helper_command,
+            team_helper_args,
+            lead_helper_mode,
+        },
+        LaunchSpec::Embedded => config::BackendLaunchConfig::Embedded,
+    };
+    config::BackendCatalogEntry {
+        id: spec.backend_id,
+        family,
+        adapter_key: Some(spec.adapter_key),
+        launch,
+    }
 }

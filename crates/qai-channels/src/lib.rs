@@ -1,7 +1,7 @@
 pub mod allowlist;
-pub mod mention_trigger;
 pub mod dingtalk;
 pub mod lark;
+pub mod mention_trigger;
 pub mod traits;
 
 pub use allowlist::AllowlistChecker;

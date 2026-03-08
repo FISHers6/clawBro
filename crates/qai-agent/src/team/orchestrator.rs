@@ -9,7 +9,10 @@
 //!   Heartbeat  = 定期调度（派发 Ready 任务、重置超时任务）
 //!   Orchestrator = 事件响应（处理完成通知、检查里程碑、写文件）
 //!
-//! 注意：[DONE:]/[BLOCKED:] 文本标记已移除。完成通知通过 MCP complete_task 工具实现。
+//! 注意：[DONE:]/[BLOCKED:] 文本标记已移除。当前 ACP-family 完成通知通过
+//! `SharedTeamToolServer` 的 `complete_task` / `block_task` 工具实现；
+//! canonical multi-backend semantics 将在 qai-runtime::tool_bridge 中升级为
+//! submit/accept/reopen 流程。
 
 use anyhow::Result;
 use chrono::Utc;
@@ -315,7 +318,10 @@ impl TeamOrchestrator {
             *state == TeamState::Running || *state == TeamState::Done
         };
         if already_started {
-            anyhow::bail!("TeamOrchestrator::start() called twice for team '{}'", self.session.team_id);
+            anyhow::bail!(
+                "TeamOrchestrator::start() called twice for team '{}'",
+                self.session.team_id
+            );
         }
 
         // 1. Write TEAM.md
@@ -354,12 +360,7 @@ impl TeamOrchestrator {
     /// 3. 导出 TASKS.md 快照
     /// 4. 检查里程碑（all_done 或新任务解锁）
     /// 5. 推 TeamNotify 给 Lead Agent
-    pub fn handle_specialist_done(
-        &self,
-        task_id: &str,
-        agent: &str,
-        note: &str,
-    ) -> Result<()> {
+    pub fn handle_specialist_done(&self, task_id: &str, agent: &str, note: &str) -> Result<()> {
         // 1. 更新状态（校验认领者身份）
         self.registry.mark_done(task_id, agent, note)?;
 
@@ -385,16 +386,85 @@ impl TeamOrchestrator {
             let ready = self.registry.find_ready_tasks()?;
             if !ready.is_empty() {
                 let ids: Vec<_> = ready.iter().map(|t| t.id.as_str()).collect();
-                self.publish_milestone(
-                    "checkpoint",
-                    &format!("新任务已解锁：{}", ids.join(", ")),
-                )?;
+                self.publish_milestone("checkpoint", &format!("新任务已解锁：{}", ids.join(", ")))?;
             }
         }
 
         // 5. 推 TeamNotify 给 Lead
         self.dispatch_team_notify_done(task_id, agent, note, all_done);
 
+        Ok(())
+    }
+
+    /// 处理 Specialist 提交结果（新语义：submitted，等待 Lead 验收）
+    pub fn handle_specialist_submitted(
+        &self,
+        task_id: &str,
+        agent: &str,
+        summary: &str,
+    ) -> Result<()> {
+        self.registry.submit_task_result(task_id, agent, summary)?;
+
+        let event = serde_json::json!({
+            "event": "SUBMITTED",
+            "task": task_id,
+            "agent": agent,
+            "ts": Utc::now().to_rfc3339(),
+        })
+        .to_string();
+        let _ = self.session.append_event(&event);
+        let _ = self.session.sync_tasks_md(&self.registry);
+
+        self.dispatch_team_notify_submitted(task_id, agent, summary);
+        Ok(())
+    }
+
+    /// Lead 验收已提交任务（submitted -> accepted），并复用里程碑检查逻辑。
+    pub fn accept_submitted_task(&self, task_id: &str, by: &str) -> Result<()> {
+        self.registry.accept_task(task_id, by)?;
+
+        let event = serde_json::json!({
+            "event": "ACCEPTED",
+            "task": task_id,
+            "by": by,
+            "ts": Utc::now().to_rfc3339(),
+        })
+        .to_string();
+        let _ = self.session.append_event(&event);
+        let _ = self.session.sync_tasks_md(&self.registry);
+
+        let all_done = self.registry.all_done()?;
+        if all_done {
+            *self.team_state_inner.lock().unwrap() = TeamState::Done;
+            self.publish_milestone("all_done", "所有任务已完成 ✅")?;
+        } else {
+            let ready = self.registry.find_ready_tasks()?;
+            if !ready.is_empty() {
+                let ids: Vec<_> = ready.iter().map(|t| t.id.as_str()).collect();
+                self.publish_milestone("checkpoint", &format!("新任务已解锁：{}", ids.join(", ")))?;
+            }
+        }
+
+        self.dispatch_team_notify_accepted(task_id, by, all_done);
+        Ok(())
+    }
+
+    /// Lead 重新打开已提交/已验收任务，退回 pending 并通知团队。
+    pub fn reopen_submitted_task(&self, task_id: &str, reason: &str, by: &str) -> Result<()> {
+        self.registry.reopen_task(task_id, reason)?;
+
+        let event = serde_json::json!({
+            "event": "REOPENED",
+            "task": task_id,
+            "by": by,
+            "reason": reason,
+            "ts": Utc::now().to_rfc3339(),
+        })
+        .to_string();
+        let _ = self.session.append_event(&event);
+        let _ = self.session.sync_tasks_md(&self.registry);
+
+        self.dispatch_team_notify_reopened(task_id, by, reason);
         Ok(())
     }
 
@@ -410,13 +480,16 @@ impl TeamOrchestrator {
         };
         let tasks = self.registry.all_tasks().unwrap_or_default();
         let notify_content = if all_done {
-            let summary = tasks.iter()
-                .map(|t| format!(
-                    "- {}（{}）：{}",
-                    t.id,
-                    t.assignee_hint.as_deref().unwrap_or("?"),
-                    t.completion_note.as_deref().unwrap_or("完成")
-                ))
+            let summary = tasks
+                .iter()
+                .map(|t| {
+                    format!(
+                        "- {}（{}）：{}",
+                        t.id,
+                        t.assignee_hint.as_deref().unwrap_or("?"),
+                        t.completion_note.as_deref().unwrap_or("完成")
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
             format!(
@@ -449,6 +522,112 @@ impl TeamOrchestrator {
         tokio::spawn(async move {
             if let Err(e) = tx.send(msg).await {
                 tracing::warn!(task_id = %task_id, "TeamNotify dispatch failed: {e}");
+            }
+        });
+    }
+
+    fn dispatch_team_notify_submitted(&self, task_id: &str, agent: &str, summary: &str) {
+        let lead_key = match self.lead_session_key.get().cloned() {
+            Some(k) => k,
+            None => return,
+        };
+        let tx = match self.team_notify_tx.get() {
+            Some(t) => t.clone(),
+            None => return,
+        };
+        let notify_content = format!(
+            "[团队通知] 任务 {} 已提交待验收（执行者：{}）\n\n提交摘要：\n{}\n\n请检查结果，并决定 accept 或 reopen。",
+            task_id, agent, summary
+        );
+        let lead_channel = lead_key.channel.clone();
+        let msg = qai_protocol::InboundMsg {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_key: lead_key,
+            content: qai_protocol::MsgContent::text(notify_content),
+            sender: "gateway".to_string(),
+            channel: lead_channel,
+            timestamp: Utc::now(),
+            thread_ts: None,
+            target_agent: None,
+            source: qai_protocol::MsgSource::TeamNotify,
+        };
+        let task_id = task_id.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = tx.send(msg).await {
+                tracing::warn!(task_id = %task_id, "TeamNotify (submitted) dispatch failed: {e}");
+            }
+        });
+    }
+
+    fn dispatch_team_notify_accepted(&self, task_id: &str, by: &str, all_done: bool) {
+        let lead_key = match self.lead_session_key.get().cloned() {
+            Some(k) => k,
+            None => return,
+        };
+        let tx = match self.team_notify_tx.get() {
+            Some(t) => t.clone(),
+            None => return,
+        };
+        let notify_content = if all_done {
+            format!(
+                "[团队通知] 任务 {} 已验收（验收者：{}）\n\n所有任务现已完成，请生成最终汇总并通过 post_update 发送给用户。",
+                task_id, by
+            )
+        } else {
+            format!(
+                "[团队通知] 任务 {} 已验收（验收者：{}）\n\n如有新解锁任务，Heartbeat 将继续派发。",
+                task_id, by
+            )
+        };
+        let lead_channel = lead_key.channel.clone();
+        let msg = qai_protocol::InboundMsg {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_key: lead_key,
+            content: qai_protocol::MsgContent::text(notify_content),
+            sender: "gateway".to_string(),
+            channel: lead_channel,
+            timestamp: Utc::now(),
+            thread_ts: None,
+            target_agent: None,
+            source: qai_protocol::MsgSource::TeamNotify,
+        };
+        let task_id = task_id.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = tx.send(msg).await {
+                tracing::warn!(task_id = %task_id, "TeamNotify (accepted) dispatch failed: {e}");
+            }
+        });
+    }
+
+    fn dispatch_team_notify_reopened(&self, task_id: &str, by: &str, reason: &str) {
+        let lead_key = match self.lead_session_key.get().cloned() {
+            Some(k) => k,
+            None => return,
+        };
+        let tx = match self.team_notify_tx.get() {
+            Some(t) => t.clone(),
+            None => return,
+        };
+        let notify_content = format!(
+            "[团队通知] 任务 {} 已重新打开（操作者：{}）\n\n原因：{}\n\nHeartbeat 将在依赖满足时重新派发该任务。",
+            task_id, by, reason
+        );
+        let lead_channel = lead_key.channel.clone();
+        let msg = qai_protocol::InboundMsg {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_key: lead_key,
+            content: qai_protocol::MsgContent::text(notify_content),
+            sender: "gateway".to_string(),
+            channel: lead_channel,
+            timestamp: Utc::now(),
+            thread_ts: None,
+            target_agent: None,
+            source: qai_protocol::MsgSource::TeamNotify,
+        };
+        let task_id = task_id.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = tx.send(msg).await {
+                tracing::warn!(task_id = %task_id, "TeamNotify (reopened) dispatch failed: {e}");
             }
         });
     }
@@ -510,6 +689,46 @@ impl TeamOrchestrator {
         Ok(())
     }
 
+    /// 处理 Specialist 中间检查点，不改变任务状态，只通知 Lead 当前进展。
+    pub fn handle_specialist_checkpoint(
+        &self,
+        task_id: &str,
+        agent: &str,
+        note: &str,
+    ) -> Result<()> {
+        let event = serde_json::json!({
+            "event": "CHECKPOINT",
+            "task": task_id,
+            "agent": agent,
+            "note": note,
+            "ts": Utc::now().to_rfc3339(),
+        })
+        .to_string();
+        let _ = self.session.append_event(&event);
+        self.dispatch_team_notify_checkpoint(task_id, agent, note);
+        Ok(())
+    }
+
+    /// 处理 Specialist 请求协助，不改变任务状态，也不释放 claim。
+    pub fn handle_specialist_help_requested(
+        &self,
+        task_id: &str,
+        agent: &str,
+        message: &str,
+    ) -> Result<()> {
+        let event = serde_json::json!({
+            "event": "HELP_REQUESTED",
+            "task": task_id,
+            "agent": agent,
+            "message": message,
+            "ts": Utc::now().to_rfc3339(),
+        })
+        .to_string();
+        let _ = self.session.append_event(&event);
+        self.dispatch_team_notify_help(task_id, agent, message);
+        Ok(())
+    }
+
     /// 构建并发送 TeamNotify InboundMsg 给 Lead（task 阻塞）
     fn dispatch_team_notify_blocked(&self, task_id: &str, agent: &str, reason: &str) {
         let lead_key = match self.lead_session_key.get().cloned() {
@@ -540,6 +759,72 @@ impl TeamOrchestrator {
         tokio::spawn(async move {
             if let Err(e) = tx.send(msg).await {
                 tracing::warn!(task_id = %task_id, "TeamNotify (blocked) dispatch failed: {e}");
+            }
+        });
+    }
+
+    fn dispatch_team_notify_checkpoint(&self, task_id: &str, agent: &str, note: &str) {
+        let lead_key = match self.lead_session_key.get().cloned() {
+            Some(k) => k,
+            None => return,
+        };
+        let tx = match self.team_notify_tx.get() {
+            Some(t) => t.clone(),
+            None => return,
+        };
+        let notify_content = format!(
+            "[团队通知] 任务 {} 已更新检查点（执行者：{}）\n\n进展：{}\n\n如有必要，可调用 post_update() 向用户同步阶段性进展。",
+            task_id, agent, note
+        );
+        let lead_channel = lead_key.channel.clone();
+        let msg = qai_protocol::InboundMsg {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_key: lead_key,
+            content: qai_protocol::MsgContent::text(notify_content),
+            sender: "gateway".to_string(),
+            channel: lead_channel,
+            timestamp: Utc::now(),
+            thread_ts: None,
+            target_agent: None,
+            source: qai_protocol::MsgSource::TeamNotify,
+        };
+        let task_id = task_id.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = tx.send(msg).await {
+                tracing::warn!(task_id = %task_id, "TeamNotify (checkpoint) dispatch failed: {e}");
+            }
+        });
+    }
+
+    fn dispatch_team_notify_help(&self, task_id: &str, agent: &str, message: &str) {
+        let lead_key = match self.lead_session_key.get().cloned() {
+            Some(k) => k,
+            None => return,
+        };
+        let tx = match self.team_notify_tx.get() {
+            Some(t) => t.clone(),
+            None => return,
+        };
+        let notify_content = format!(
+            "[团队通知] 任务 {} 请求协助（执行者：{}）\n\n请求内容：{}\n\n请决定是直接回复思路、重新分配，还是让其继续执行。",
+            task_id, agent, message
+        );
+        let lead_channel = lead_key.channel.clone();
+        let msg = qai_protocol::InboundMsg {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_key: lead_key,
+            content: qai_protocol::MsgContent::text(notify_content),
+            sender: "gateway".to_string(),
+            channel: lead_channel,
+            timestamp: Utc::now(),
+            thread_ts: None,
+            target_agent: None,
+            source: qai_protocol::MsgSource::TeamNotify,
+        };
+        let task_id = task_id.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = tx.send(msg).await {
+                tracing::warn!(task_id = %task_id, "TeamNotify (help) dispatch failed: {e}");
             }
         });
     }
@@ -592,9 +877,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let registry = Arc::new(TaskRegistry::new_in_memory().unwrap());
         let session = Arc::new(TeamSession::from_dir("test-team", tmp.path().to_path_buf()));
-        let dispatch_fn: DispatchFn = Arc::new(|_agent, _task| {
-            Box::pin(async { Ok(()) })
-        });
+        let dispatch_fn: DispatchFn = Arc::new(|_agent, _task| Box::pin(async { Ok(()) }));
         let orch = TeamOrchestrator::new(
             registry,
             session,
@@ -631,7 +914,8 @@ mod tests {
             id: "T001".into(),
             title: "test".into(),
             ..Default::default()
-        }).unwrap();
+        })
+        .unwrap();
         orch.activate().await.unwrap();
         assert!(matches!(orch.team_state(), TeamState::Running));
         assert!(orch.mcp_server_port.get().is_some());
@@ -658,6 +942,68 @@ mod tests {
         assert_eq!(task.completion_note.as_deref(), Some("created jwt.rs"));
     }
 
+    #[test]
+    fn test_handle_specialist_submitted_updates_registry() {
+        let (orch, _tmp) = make_orchestrator();
+        orch.registry
+            .create_task(CreateTask {
+                id: "T004".into(),
+                title: "JWT impl".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        orch.registry.try_claim("T004", "codex").unwrap();
+
+        orch.handle_specialist_submitted("T004", "codex", "ready for review")
+            .unwrap();
+
+        let task = orch.registry.get_task("T004").unwrap().unwrap();
+        use crate::team::registry::TaskStatus;
+        assert!(matches!(
+            task.status_parsed(),
+            TaskStatus::Submitted { ref agent, .. } if agent == "codex"
+        ));
+        assert_eq!(task.completion_note.as_deref(), Some("ready for review"));
+    }
+
+    #[tokio::test]
+    async fn test_accept_submitted_task_triggers_all_done_milestone() {
+        let (orch, _tmp) = make_orchestrator();
+        let received = Arc::new(std::sync::Mutex::new(vec![]));
+        let received_clone = Arc::clone(&received);
+
+        orch.set_notify_fn(Arc::new(move |_scope, msg| {
+            received_clone.lock().unwrap().push(msg);
+        }));
+        orch.set_scope(qai_protocol::SessionKey::new("test", "test-scope"));
+
+        orch.registry
+            .create_task(CreateTask {
+                id: "T005".into(),
+                title: "only task".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        orch.registry.try_claim("T005", "codex").unwrap();
+        orch.handle_specialist_submitted("T005", "codex", "ready")
+            .unwrap();
+        orch.accept_submitted_task("T005", "claude").unwrap();
+
+        let task = orch.registry.get_task("T005").unwrap().unwrap();
+        use crate::team::registry::TaskStatus;
+        assert!(matches!(
+            task.status_parsed(),
+            TaskStatus::Accepted { ref by, .. } if by == "claude"
+        ));
+
+        let msgs = received.lock().unwrap();
+        assert!(
+            !msgs.is_empty(),
+            "notify_fn should be called on acceptance milestone"
+        );
+        assert!(msgs.iter().any(|m| m.contains("所有任务已完成")));
+    }
+
     #[tokio::test]
     async fn test_all_done_triggers_milestone_notify_fn() {
         let (orch, _tmp) = make_orchestrator();
@@ -678,11 +1024,16 @@ mod tests {
             })
             .unwrap();
         orch.registry.try_claim("T001", "codex").unwrap();
-        orch.handle_specialist_done("T001", "codex", "done").unwrap();
+        orch.handle_specialist_done("T001", "codex", "done")
+            .unwrap();
 
         let msgs = received.lock().unwrap();
         assert!(!msgs.is_empty(), "notify_fn should be called on milestone");
-        assert!(msgs[0].contains("所有任务已完成"), "unexpected: {}", msgs[0]);
+        assert!(
+            msgs[0].contains("所有任务已完成"),
+            "unexpected: {}",
+            msgs[0]
+        );
     }
 
     #[tokio::test]

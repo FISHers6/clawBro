@@ -1,9 +1,4 @@
-use anyhow::Result;
-use async_trait::async_trait;
-use qai_protocol::AgentEvent;
 use std::path::PathBuf;
-use std::sync::Arc;
-use tokio::sync::broadcast;
 use uuid::Uuid;
 
 /// Agent 在团队中的角色（决定 SystemPromptBuilder 的行为）
@@ -22,6 +17,8 @@ pub enum AgentRole {
 #[derive(Debug, Clone)]
 pub struct AgentCtx {
     pub session_id: Uuid,
+    pub session_key: qai_protocol::SessionKey,
+    pub participant_name: Option<String>,
     pub user_text: String,
     pub history: Vec<HistoryMsg>,
     pub system_injection: String, // skills 注入文本
@@ -36,12 +33,22 @@ pub struct AgentCtx {
     /// URL of the running TeamMcpServer (e.g. "http://127.0.0.1:54321/sse").
     /// Set only for Specialist turns when TeamOrchestrator is wired and running.
     pub mcp_server_url: Option<String>,
+    /// URL of the family-agnostic Team Tool RPC endpoint.
+    pub team_tool_url: Option<String>,
+    /// Canonical shared memory / contextual summary for this turn.
+    pub shared_memory: Option<String>,
+    /// Canonical long-term memory for solo/lead turns.
+    pub agent_memory: Option<String>,
+    /// Canonical team manifest for lead/specialist turns.
+    pub team_manifest: Option<String>,
 }
 
 impl Default for AgentCtx {
     fn default() -> Self {
         Self {
             session_id: Uuid::nil(),
+            session_key: qai_protocol::SessionKey::new("unknown", "unknown"),
+            participant_name: None,
             user_text: String::new(),
             history: vec![],
             system_injection: String::new(),
@@ -50,6 +57,10 @@ impl Default for AgentCtx {
             team_dir: None,
             task_reminder: None,
             mcp_server_url: None,
+            team_tool_url: None,
+            shared_memory: None,
+            agent_memory: None,
+            team_manifest: None,
         }
     }
 }
@@ -59,14 +70,3 @@ pub struct HistoryMsg {
     pub role: String,
     pub content: String,
 }
-
-/// 统一 AgentEngine trait（所有 engine 实现此 trait）
-#[async_trait]
-pub trait AgentEngine: Send + Sync {
-    fn name(&self) -> &str;
-
-    /// 执行一次 Agent 对话，通过 broadcast channel 流式发出事件
-    async fn run(&self, ctx: AgentCtx, event_tx: broadcast::Sender<AgentEvent>) -> Result<String>; // 返回完整回复文本
-}
-
-pub type BoxEngine = Arc<dyn AgentEngine>;

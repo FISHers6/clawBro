@@ -3,10 +3,14 @@
 //! SQLite 是唯一真相源（single source of truth）。
 //! TASKS.md 是定期从 SQLite 导出的只读快照（由 TeamSession::write_tasks_md 调用）。
 //!
-//! 状态机：Pending → Claimed → Done / Failed
+//! 状态机：Pending → Claimed → Submitted → Accepted
+//! 兼容旧路径：Pending → Claimed → Done / Failed
 //!   - Pending  → Claimed  : try_claim()（乐观锁，原子 UPDATE）
 //!   - Claimed  → Pending  : reset_claim()（超时后由 Heartbeat 重置）
 //!   - Claimed  → Done     : mark_done()
+//!   - Claimed  → Submitted: submit_task_result()
+//!   - Submitted → Accepted: accept_task()
+//!   - Submitted/Accepted/Done → Pending: reopen_task()
 //!   - Claimed  → Failed   : mark_failed()（retry_count >= 3）
 
 use anyhow::{Context, Result};
@@ -20,6 +24,8 @@ use std::sync::{Arc, Mutex};
 pub enum TaskStatus {
     Pending,
     Claimed { agent: String, at: DateTime<Utc> },
+    Submitted { agent: String, at: DateTime<Utc> },
+    Accepted { by: String, at: DateTime<Utc> },
     Done,
     Failed(String),
     Retrying(u32),
@@ -29,7 +35,14 @@ pub enum TaskStatus {
 pub struct Task {
     pub id: String,
     pub title: String,
-    /// 编码为字符串："pending" | "claimed:{agent}:{iso8601}" | "done" | "failed:{msg}" | "retrying:{n}"
+    /// 编码为字符串：
+    /// "pending" |
+    /// "claimed:{agent}:{iso8601}" |
+    /// "submitted:{agent}:{iso8601}" |
+    /// "accepted:{by}:{iso8601}" |
+    /// "done" |
+    /// "failed:{msg}" |
+    /// "retrying:{n}"
     pub status_raw: String,
     /// JSON 数组 ["T001", "T002"]
     pub deps_json: String,
@@ -50,6 +63,22 @@ impl Task {
             TaskStatus::Pending
         } else if s == "done" {
             TaskStatus::Done
+        } else if let Some(rest) = s.strip_prefix("submitted:") {
+            let mut parts = rest.splitn(2, ':');
+            let agent = parts.next().unwrap_or("unknown").to_string();
+            let at = parts
+                .next()
+                .and_then(|ts| ts.parse::<DateTime<Utc>>().ok())
+                .unwrap_or_else(Utc::now);
+            TaskStatus::Submitted { agent, at }
+        } else if let Some(rest) = s.strip_prefix("accepted:") {
+            let mut parts = rest.splitn(2, ':');
+            let by = parts.next().unwrap_or("leader").to_string();
+            let at = parts
+                .next()
+                .and_then(|ts| ts.parse::<DateTime<Utc>>().ok())
+                .unwrap_or_else(Utc::now);
+            TaskStatus::Accepted { by, at }
         } else if let Some(rest) = s.strip_prefix("claimed:") {
             // "claimed:codex:2026-03-05T10:00:00Z"
             let mut parts = rest.splitn(2, ':');
@@ -185,11 +214,13 @@ impl TaskRegistry {
         )?;
         if rows == 0 {
             // Diagnose: task not found, or claimed by another agent
-            let status: Option<String> = conn.query_row(
-                "SELECT status FROM tasks WHERE id = ?1",
-                params![task_id],
-                |r| r.get(0),
-            ).ok();
+            let status: Option<String> = conn
+                .query_row(
+                    "SELECT status FROM tasks WHERE id = ?1",
+                    params![task_id],
+                    |r| r.get(0),
+                )
+                .ok();
             match status {
                 None => anyhow::bail!("mark_done: task '{}' not found", task_id),
                 Some(s) if s.starts_with("claimed:") => {
@@ -200,9 +231,69 @@ impl TaskRegistry {
                 }
                 Some(s) => anyhow::bail!(
                     "mark_done: task '{}' not in claimed state (current: {})",
-                    task_id, s
+                    task_id,
+                    s
                 ),
             }
+        }
+        Ok(())
+    }
+
+    /// 提交任务结果（新语义）：从 claimed -> submitted，等待 Lead 验收。
+    pub fn submit_task_result(&self, task_id: &str, agent: &str, summary: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let claimed_prefix = format!("claimed:{}:", agent);
+        let submitted = format!("submitted:{}:{}", agent, now);
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "UPDATE tasks SET status = ?1, completion_note = ?2 \
+             WHERE id = ?3 AND status LIKE ?4",
+            params![submitted, summary, task_id, format!("{}%", claimed_prefix)],
+        )?;
+        if rows == 0 {
+            anyhow::bail!(
+                "submit_task_result: task '{}' not claimed by '{}'",
+                task_id,
+                agent
+            );
+        }
+        Ok(())
+    }
+
+    /// 验收任务结果（新语义）：从 submitted -> accepted。
+    pub fn accept_task(&self, task_id: &str, by: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let accepted = format!("accepted:{}:{}", by, now);
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "UPDATE tasks SET status = ?1, done_at = ?2 \
+             WHERE id = ?3 AND status LIKE 'submitted:%'",
+            params![accepted, now, task_id],
+        )?;
+        if rows == 0 {
+            anyhow::bail!("accept_task: task '{}' not in submitted state", task_id);
+        }
+        Ok(())
+    }
+
+    /// 重新打开任务（新语义）：将 submitted / accepted / done 退回 pending。
+    pub fn reopen_task(&self, task_id: &str, reason: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "UPDATE tasks
+             SET status = 'pending', done_at = NULL, completion_note = COALESCE(completion_note, '') || ?2
+             WHERE id = ?1 AND (
+                 status LIKE 'submitted:%' OR
+                 status LIKE 'accepted:%' OR
+                 status = 'done'
+             )",
+            params![task_id, format!("\n[REOPEN] {}", reason)],
+        )?;
+        if rows == 0 {
+            anyhow::bail!(
+                "reopen_task: task '{}' not in submitted/accepted/done state",
+                task_id
+            );
         }
         Ok(())
     }
@@ -255,7 +346,9 @@ impl TaskRegistry {
                 |r| r.get(0),
             )
             .optional()?;
-        Ok(status.map(|s| s.starts_with(&expected_prefix)).unwrap_or(false))
+        Ok(status
+            .map(|s| s.starts_with(&expected_prefix))
+            .unwrap_or(false))
     }
 
     /// 重置超时任务（Pending，retry_count 已在 try_claim 时递增）
@@ -289,8 +382,8 @@ impl TaskRegistry {
 
         // 获取所有已完成任务 ID（在同一 conn guard 下，与上面查询等价于单事务）
         let mut done_stmt =
-            conn.prepare("SELECT id FROM tasks WHERE status = 'done'")?;
-        let done_ids: Vec<String> = done_stmt
+            conn.prepare("SELECT id FROM tasks WHERE status = 'done' OR status LIKE 'accepted:%'")?;
+        let terminal_ids: Vec<String> = done_stmt
             .query_map([], |row| row.get(0))?
             .filter_map(|r| r.ok())
             .collect();
@@ -300,7 +393,7 @@ impl TaskRegistry {
             .into_iter()
             .filter(|t| {
                 let deps = t.deps();
-                deps.is_empty() || deps.iter().all(|d| done_ids.contains(d))
+                deps.is_empty() || deps.iter().all(|d| terminal_ids.contains(d))
             })
             .collect();
 
@@ -366,8 +459,10 @@ impl TaskRegistry {
         })?
         .filter_map(|r| r.ok())
         .for_each(|(id, title, status, assignee, retries, done_at)| {
-            let icon = if status == "done" {
+            let icon = if status == "done" || status.starts_with("accepted:") {
                 "✅"
+            } else if status.starts_with("submitted:") {
+                "📨"
             } else if status.starts_with("failed") {
                 "❌"
             } else if status.starts_with("claimed") {
@@ -396,13 +491,12 @@ impl TaskRegistry {
     /// 若任务表为空（尚未注册任何任务），返回 false（防止误广播 all_done 里程碑）。
     pub fn all_done(&self) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
-        let total: i64 =
-            conn.query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))?;
+        let total: i64 = conn.query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))?;
         if total == 0 {
             return Ok(false);
         }
         let not_done: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM tasks WHERE status != 'done'",
+            "SELECT COUNT(*) FROM tasks WHERE status != 'done' AND status NOT LIKE 'accepted:%'",
             [],
             |row| row.get(0),
         )?;
@@ -423,10 +517,11 @@ impl TaskRegistry {
     /// 查找所有被 given_id 阻塞的任务 ID
     pub fn tasks_blocked_by(&self, given_id: &str) -> Vec<String> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = match conn.prepare("SELECT id, deps_json FROM tasks WHERE status = 'pending'") {
-            Ok(s) => s,
-            Err(_) => return vec![],
-        };
+        let mut stmt =
+            match conn.prepare("SELECT id, deps_json FROM tasks WHERE status = 'pending'") {
+                Ok(s) => s,
+                Err(_) => return vec![],
+            };
         stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })
@@ -515,9 +610,87 @@ mod tests {
         assert!(!claimed2, "T001 already claimed, should fail");
 
         // 完成任务（传入认领者 "codex"）
-        registry.mark_done("T001", "codex", "created src/auth/jwt.rs").unwrap();
+        registry
+            .mark_done("T001", "codex", "created src/auth/jwt.rs")
+            .unwrap();
         let task = registry.get_task("T001").unwrap().unwrap();
         assert!(matches!(task.status_parsed(), TaskStatus::Done));
+    }
+
+    #[test]
+    fn test_submit_accept_and_reopen_flow() {
+        let registry = TaskRegistry::new_in_memory().unwrap();
+        registry
+            .create_task(CreateTask {
+                id: "T010".into(),
+                title: "Implement JWT middleware".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        registry.try_claim("T010", "codex").unwrap();
+        registry
+            .submit_task_result("T010", "codex", "added jwt.rs and tests")
+            .unwrap();
+        let submitted = registry.get_task("T010").unwrap().unwrap();
+        assert!(matches!(
+            submitted.status_parsed(),
+            TaskStatus::Submitted { ref agent, .. } if agent == "codex"
+        ));
+        assert_eq!(
+            submitted.completion_note.as_deref(),
+            Some("added jwt.rs and tests")
+        );
+
+        registry.accept_task("T010", "claude").unwrap();
+        let accepted = registry.get_task("T010").unwrap().unwrap();
+        assert!(matches!(
+            accepted.status_parsed(),
+            TaskStatus::Accepted { ref by, .. } if by == "claude"
+        ));
+        assert!(accepted.done_at.is_some());
+        assert!(registry.all_done().unwrap());
+
+        registry.reopen_task("T010", "needs edge-case fix").unwrap();
+        let reopened = registry.get_task("T010").unwrap().unwrap();
+        assert!(matches!(reopened.status_parsed(), TaskStatus::Pending));
+        assert!(reopened.done_at.is_none());
+        assert!(reopened
+            .completion_note
+            .as_deref()
+            .unwrap_or("")
+            .contains("[REOPEN] needs edge-case fix"));
+    }
+
+    #[test]
+    fn test_accepted_dependency_unblocks_downstream_tasks() {
+        let registry = TaskRegistry::new_in_memory().unwrap();
+        registry
+            .create_task(CreateTask {
+                id: "T011".into(),
+                title: "base".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        registry
+            .create_task(CreateTask {
+                id: "T012".into(),
+                title: "dependent".into(),
+                deps: vec!["T011".into()],
+                ..Default::default()
+            })
+            .unwrap();
+
+        registry.try_claim("T011", "codex").unwrap();
+        registry
+            .submit_task_result("T011", "codex", "ready for review")
+            .unwrap();
+        let ready_before_accept = registry.find_ready_tasks().unwrap();
+        assert!(!ready_before_accept.iter().any(|t| t.id == "T012"));
+
+        registry.accept_task("T011", "leader").unwrap();
+        let ready_after_accept = registry.find_ready_tasks().unwrap();
+        assert!(ready_after_accept.iter().any(|t| t.id == "T012"));
     }
 
     #[test]
@@ -563,7 +736,10 @@ mod tests {
 
         // T001 未完成，T002 不可认领
         let ready = registry.find_ready_tasks().unwrap();
-        assert!(!ready.iter().any(|t| t.id == "T002"), "T002 blocked by T001");
+        assert!(
+            !ready.iter().any(|t| t.id == "T002"),
+            "T002 blocked by T001"
+        );
         assert!(ready.iter().any(|t| t.id == "T001"), "T001 should be ready");
 
         // T001 完成后，T002 可认领

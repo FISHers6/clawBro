@@ -11,10 +11,19 @@ path = "src/lib.rs"
 name = "quickai-gateway"
 path = "src/main.rs"
 
+[[bin]]
+name = "qai-team-cli"
+path = "src/bin/qai_team_cli.rs"
+
+[[bin]]
+name = "qai_acp_approval_fixture"
+path = "src/bin/qai_acp_approval_fixture.rs"
+
 [dependencies]
 qai-protocol  = { path = "../qai-protocol" }
 qai-session   = { path = "../qai-session" }
 qai-agent     = { path = "../qai-agent" }
+qai-runtime   = { path = "../qai-runtime" }
 qai-channels  = { path = "../qai-channels" }
 qai-skills    = { path = "../qai-skills" }
 qai-cron      = { path = "../qai-cron" }
@@ -31,6 +40,10 @@ uuid.workspace     = true
 toml.workspace     = true
 dirs.workspace     = true
 async-trait.workspace = true
+reqwest.workspace = true
+agent-client-protocol = "0.9"
+tokio-util = { version = "0.7", features = ["compat"] }
+rmcp = { version = "=0.8.5", features = ["client", "transport-sse-client-reqwest"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -42,5 +55,6 @@ qai-protocol = { path = "../qai-protocol" }
 chrono = { version = "0.4", features = ["serde"] }
 serde_json = "1"
 uuid = { version = "1.6", features = ["v4"] }
+tempfile = "3"
 # Needed to install a default CryptoProvider for rustls 0.23 used by tokio-tungstenite 0.26
 rustls = { version = "0.23", features = ["ring"] }

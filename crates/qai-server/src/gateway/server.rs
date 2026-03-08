@@ -1,5 +1,8 @@
 use crate::state::AppState;
-use axum::{routing::get, Router};
+use axum::{
+    routing::{get, post},
+    Router,
+};
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
 
@@ -7,6 +10,10 @@ pub async fn start(state: AppState, host: &str, port: u16) -> anyhow::Result<Soc
     let app = Router::new()
         .route("/health", get(health))
         .route("/ws", get(super::ws_handler::ws_upgrade))
+        .route(
+            "/runtime/team-tools",
+            post(super::team_tools_handler::invoke_team_tool),
+        )
         .with_state(state);
 
     let addr: SocketAddr = format!("{}:{}", host, port).parse()?;

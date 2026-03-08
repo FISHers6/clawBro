@@ -67,11 +67,7 @@ impl MentionTrigger {
             if let Some(pos) = output.find(&pattern) {
                 // 提取 @bot 之后到句末的指令（到换行符或字符串结束）
                 let rest = &output[pos + pattern.len()..];
-                let instruction = rest
-                    .split_once('\n')
-                    .map(|(s, _)| s)
-                    .unwrap_or(rest)
-                    .trim();
+                let instruction = rest.split_once('\n').map(|(s, _)| s).unwrap_or(rest).trim();
 
                 if instruction.is_empty() {
                     continue;
@@ -109,10 +105,7 @@ mod tests {
 
     fn make_trigger(bots: &[&str]) -> (MentionTrigger, mpsc::Receiver<InboundMsg>) {
         let (tx, rx) = mpsc::channel(16);
-        let trigger = MentionTrigger::new(
-            bots.iter().map(|s| s.to_string()).collect(),
-            tx,
-        );
+        let trigger = MentionTrigger::new(bots.iter().map(|s| s.to_string()).collect(), tx);
         (trigger, rx)
     }
 
@@ -198,7 +191,12 @@ mod tests {
     fn test_unknown_bot_not_triggered() {
         let (trigger, mut rx) = make_trigger(&["claude"]);
         // @unknown 不在 roster 中
-        trigger.scan_and_dispatch("@unknown do something", "claude", &scope(), &MsgSource::Human);
+        trigger.scan_and_dispatch(
+            "@unknown do something",
+            "claude",
+            &scope(),
+            &MsgSource::Human,
+        );
         assert!(rx.try_recv().is_err());
     }
 
@@ -212,7 +210,10 @@ mod tests {
             &scope(),
             &MsgSource::TeamNotify,
         );
-        assert!(rx.try_recv().is_err(), "TeamNotify source must not trigger BotMention");
+        assert!(
+            rx.try_recv().is_err(),
+            "TeamNotify source must not trigger BotMention"
+        );
     }
 
     #[test]
@@ -225,6 +226,9 @@ mod tests {
             &scope(),
             &MsgSource::Heartbeat,
         );
-        assert!(rx.try_recv().is_err(), "Heartbeat source must not trigger BotMention");
+        assert!(
+            rx.try_recv().is_err(),
+            "Heartbeat source must not trigger BotMention"
+        );
     }
 }

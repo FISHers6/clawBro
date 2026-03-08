@@ -21,6 +21,15 @@ const TEAM_NOTIFY_PROTOCOL: &str = "\
 - 如果显示「所有任务已完成」：调用 `post_update` 工具生成最终汇总，向用户报告成果
 - 如果显示部分完成：无需立即响应，等待所有任务完成
 
+**收到任务提交待验收通知时：**
+- 检查结果后调用 `accept_task(task_id)` 验收，或
+- 调用 `reopen_task(task_id, reason)` 退回给 Specialist 修正
+
+**收到检查点或求助通知时：**
+- 可直接继续观察，不一定要立即发给用户
+- 如对用户可见，调用 `post_update`
+- 如需要调整执行，调用 `assign_task`
+
 **收到任务阻塞通知时：**
 - 调用 `assign_task(task_id, new_assignee)` 重新分配，或
 - 调用 `post_update` 向用户说明情况
@@ -144,7 +153,8 @@ impl<'a> SystemPromptBuilder<'a> {
         }
 
         // ── Layer 5b: Agent memory（仅 Solo/Lead；Specialist 跳过 ← Ralph Loop 核心）──
-        if !matches!(self.agent_role, AgentRole::Specialist) && !self.agent_memory.trim().is_empty() {
+        if !matches!(self.agent_role, AgentRole::Specialist) && !self.agent_memory.trim().is_empty()
+        {
             let capped = cap_to_words(self.agent_memory, self.agent_max_words);
             parts.push(format!("## 长期记忆\n\n{capped}"));
         }
@@ -456,7 +466,10 @@ mod tests {
             !result.contains("secret project memory"),
             "Specialist should NOT see MEMORY.md"
         );
-        assert!(result.contains("soul content"), "Specialist always sees SOUL.md");
+        assert!(
+            result.contains("soul content"),
+            "Specialist always sees SOUL.md"
+        );
     }
 
     #[test]
@@ -476,8 +489,14 @@ mod tests {
         }
         .build();
 
-        assert!(result.contains("任务背景"), "Specialist shared_memory label should be 任务背景");
-        assert!(!result.contains("群组共享记忆"), "Specialist must NOT see 群组共享记忆");
+        assert!(
+            result.contains("任务背景"),
+            "Specialist shared_memory label should be 任务背景"
+        );
+        assert!(
+            !result.contains("群组共享记忆"),
+            "Specialist must NOT see 群组共享记忆"
+        );
     }
 
     #[test]
@@ -499,7 +518,10 @@ mod tests {
 
         let reminder_pos = result.find("URGENT: T003").unwrap();
         let soul_pos = result.find("soul content").unwrap();
-        assert!(reminder_pos < soul_pos, "task_reminder must appear before SOUL.md");
+        assert!(
+            reminder_pos < soul_pos,
+            "task_reminder must appear before SOUL.md"
+        );
     }
 
     #[test]
@@ -519,7 +541,10 @@ mod tests {
         }
         .build();
 
-        assert!(result.contains("long term memory"), "Solo MUST see MEMORY.md");
+        assert!(
+            result.contains("long term memory"),
+            "Solo MUST see MEMORY.md"
+        );
         assert!(result.contains("长期记忆"));
     }
 

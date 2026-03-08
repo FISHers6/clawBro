@@ -104,10 +104,7 @@ impl SessionStorage {
             return Ok(vec![]);
         }
         let content = tokio::fs::read_to_string(&path).await?;
-        let lines: Vec<&str> = content
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .collect();
+        let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
         let start = lines.len().saturating_sub(limit);
         lines[start..]
             .iter()
@@ -240,19 +237,13 @@ mod tests {
         }
 
         // load_recent_messages(5) should return only the last 5
-        let recent = storage
-            .load_recent_messages(session_id, 5)
-            .await
-            .unwrap();
+        let recent = storage.load_recent_messages(session_id, 5).await.unwrap();
         assert_eq!(recent.len(), 5);
         assert_eq!(recent[0].content, "msg-5");
         assert_eq!(recent[4].content, "msg-9");
 
         // limit > total: should return all
-        let all = storage
-            .load_recent_messages(session_id, 100)
-            .await
-            .unwrap();
+        let all = storage.load_recent_messages(session_id, 100).await.unwrap();
         assert_eq!(all.len(), 10);
     }
 

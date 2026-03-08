@@ -176,10 +176,7 @@ mod tests {
         let dispatch_fn: DispatchFn = Arc::new(move |agent, task| {
             let dispatched = Arc::clone(&dispatched);
             Box::pin(async move {
-                dispatched
-                    .lock()
-                    .unwrap()
-                    .push((agent, task.id.clone()));
+                dispatched.lock().unwrap().push((agent, task.id.clone()));
                 Ok(())
             })
         });
@@ -220,6 +217,51 @@ mod tests {
         assert_eq!(d.len(), 1, "should dispatch exactly once");
         assert_eq!(d[0].0, "codex");
         assert_eq!(d[0].1, "T003");
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_dispatches_tasks_unblocked_by_accepted_dependency() {
+        let registry = Arc::new(TaskRegistry::new_in_memory().unwrap());
+        registry
+            .create_task(CreateTask {
+                id: "T_BASE".into(),
+                title: "base".into(),
+                assignee_hint: Some("codex".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        registry
+            .create_task(CreateTask {
+                id: "T_NEXT".into(),
+                title: "next".into(),
+                assignee_hint: Some("claude".to_string()),
+                deps: vec!["T_BASE".into()],
+                ..Default::default()
+            })
+            .unwrap();
+
+        registry.try_claim("T_BASE", "codex").unwrap();
+        registry
+            .submit_task_result("T_BASE", "codex", "ready")
+            .unwrap();
+        registry.accept_task("T_BASE", "leader").unwrap();
+
+        let dispatched = Arc::new(Mutex::new(vec![]));
+        let hb = make_heartbeat(
+            Arc::clone(&registry),
+            Arc::clone(&dispatched),
+            Duration::from_millis(50),
+        );
+
+        let hb_clone = Arc::clone(&hb);
+        let handle = tokio::spawn(async move { hb_clone.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        handle.abort();
+
+        let d = dispatched.lock().unwrap();
+        assert!(d
+            .iter()
+            .any(|(agent, task_id)| agent == "claude" && task_id == "T_NEXT"));
     }
 
     #[tokio::test]
@@ -274,7 +316,7 @@ mod tests {
         registry.try_claim("T001", "codex").unwrap(); // retry_count = 2
         registry.reset_claim("T001").unwrap();
         registry.try_claim("T001", "codex").unwrap(); // retry_count = 3
-        // 此时 retry_count = 3，下一次 heartbeat 应该标记 Failed
+                                                      // 此时 retry_count = 3，下一次 heartbeat 应该标记 Failed
 
         let dispatched = Arc::new(Mutex::new(vec![]));
         let hb = make_heartbeat(

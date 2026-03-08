@@ -2,9 +2,8 @@
 /// Parsed slash command from user input.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SlashCommand {
-    /// /engine <name> — 切换当前 session 的 Agent 引擎
-    /// Valid names: "rust", "claude", "codex", or any custom ACP binary path
-    SetEngine(String),
+    /// /backend <id-or-agent-name> — 切换当前 session 的 runtime backend
+    SetBackend(String),
     /// /reset — 清除当前 session 的对话历史
     Reset,
     /// /help — 显示可用命令列表
@@ -20,6 +19,11 @@ pub enum SlashCommand {
     /// /workspace — 查看当前 session 工作区目录
     /// /workspace <path> — 设置当前 session 工作区目录
     Workspace(Option<String>),
+    /// /approve <id> <allow-once|allow-always|deny> — 响应待处理审批
+    Approve {
+        approval_id: String,
+        decision: String,
+    },
 }
 
 impl SlashCommand {
@@ -33,9 +37,9 @@ impl SlashCommand {
         let cmd = parts.next()?; // safe: trimmed non-empty string starting with '/'
         let arg = parts.next();
         match cmd {
-            "/engine" => {
+            "/backend" => {
                 let name = arg.map(|s| s.trim()).filter(|s| !s.is_empty())?;
-                Some(Self::SetEngine(name.to_string()))
+                Some(Self::SetBackend(name.to_string()))
             }
             "/reset" => Some(Self::Reset),
             "/help" => Some(Self::Help),
@@ -62,6 +66,19 @@ impl SlashCommand {
                 let path = arg.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
                 Some(Self::Workspace(path))
             }
+            "/approve" => {
+                let arg = arg.map(str::trim).filter(|s| !s.is_empty())?;
+                let mut parts = arg.split_whitespace();
+                let approval_id = parts.next()?.trim();
+                let decision = parts.next()?.trim();
+                if approval_id.is_empty() || decision.is_empty() || parts.next().is_some() {
+                    return None;
+                }
+                Some(Self::Approve {
+                    approval_id: approval_id.to_string(),
+                    decision: decision.to_string(),
+                })
+            }
             _ => None,
         }
     }
@@ -69,9 +86,11 @@ impl SlashCommand {
     /// 命令执行后返回给用户的确认文本
     pub fn confirmation_text(&self) -> String {
         match self {
-            Self::SetEngine(name) => format!("✅ 引擎已切换到 {name}\n下次消息将使用新引擎处理"),
+            Self::SetBackend(name) => {
+                format!("✅ Backend 已切换到 {name}\n下次消息将使用新 backend 处理")
+            }
             Self::Reset => "✅ 对话历史已清除".to_string(),
-            Self::Help => "可用命令：\n/engine <rust|claude|codex> — 切换引擎\n/reset — 清除历史\n/help — 显示帮助\n/remember <内容> — 写入记忆\n/memory — 查看共享记忆\n/memory @agent — 查看指定 agent 记忆\n/memory reset — 清空记忆\n/forget <关键词> — 删除记忆条目\n/workspace — 查看当前 session 工作区目录\n/workspace /path — 设置 session 工作区目录".to_string(),
+            Self::Help => "可用命令：\n/backend <backend-id|agent-name> — 切换 backend\n/reset — 清除历史\n/help — 显示帮助\n/remember <内容> — 写入记忆\n/memory — 查看共享记忆\n/memory @agent — 查看指定 agent 记忆\n/memory reset — 清空记忆\n/forget <关键词> — 删除记忆条目\n/workspace — 查看当前 session 工作区目录\n/workspace /path — 设置 session 工作区目录\n/approve <id> <allow-once|allow-always|deny> — 响应待处理审批".to_string(),
             Self::Remember(content) => format!("✅ 已记录：{content}"),
             // Unreachable in practice: registry's handle_slash returns early with real content.
             Self::Memory(_) => unreachable!(
@@ -84,6 +103,9 @@ impl SlashCommand {
             Self::Workspace(_) => unreachable!(
                 "Workspace must be handled by handle_slash (returns early with real content), not confirmation_text"
             ),
+            Self::Approve { .. } => unreachable!(
+                "Approve must be handled by handle_slash (returns early with real content), not confirmation_text"
+            ),
         }
     }
 }
@@ -93,15 +115,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_engine_claude() {
-        let cmd = SlashCommand::parse("/engine claude").unwrap();
-        assert!(matches!(cmd, SlashCommand::SetEngine(ref s) if s == "claude"));
+    fn test_parse_backend_name() {
+        let cmd = SlashCommand::parse("/backend claude-main").unwrap();
+        assert!(matches!(cmd, SlashCommand::SetBackend(ref s) if s == "claude-main"));
     }
 
     #[test]
-    fn test_parse_engine_rust() {
-        let cmd = SlashCommand::parse("/engine rust").unwrap();
-        assert!(matches!(cmd, SlashCommand::SetEngine(ref s) if s == "rust"));
+    fn test_parse_backend_agent_name() {
+        let cmd = SlashCommand::parse("/backend reviewer").unwrap();
+        assert!(matches!(cmd, SlashCommand::SetBackend(ref s) if s == "reviewer"));
     }
 
     #[test]
@@ -128,16 +150,15 @@ mod tests {
     }
 
     #[test]
-    fn test_confirmation_text_engine() {
-        let cmd = SlashCommand::SetEngine("claude".to_string());
-        assert!(cmd.confirmation_text().contains("claude"));
+    fn test_confirmation_text_backend() {
+        let cmd = SlashCommand::SetBackend("claude-main".to_string());
+        assert!(cmd.confirmation_text().contains("claude-main"));
     }
 
     #[test]
-    fn test_parse_engine_whitespace_only() {
-        // /engine with only whitespace should return None (no engine name)
-        assert!(SlashCommand::parse("/engine ").is_none());
-        assert!(SlashCommand::parse("/engine   ").is_none());
+    fn test_parse_backend_whitespace_only() {
+        assert!(SlashCommand::parse("/backend ").is_none());
+        assert!(SlashCommand::parse("/backend   ").is_none());
     }
 
     #[test]
@@ -204,6 +225,17 @@ mod tests {
             Some(SlashCommand::Workspace(Some(
                 "/projects/my-app".to_string()
             )))
+        );
+    }
+
+    #[test]
+    fn test_parse_approve() {
+        assert_eq!(
+            SlashCommand::parse("/approve approval-1 allow-once"),
+            Some(SlashCommand::Approve {
+                approval_id: "approval-1".into(),
+                decision: "allow-once".into(),
+            })
         );
     }
 }

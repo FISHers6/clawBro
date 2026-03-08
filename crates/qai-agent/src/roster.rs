@@ -1,9 +1,7 @@
-// quickai-gateway/crates/qai-agent/src/roster.rs
-//! AgentRoster: user-configured @mention → Engine mapping.
+//! AgentRoster: user-configured @mention -> backend mapping.
 //! @mention names are 100% user-defined (e.g. "@mybot", "@dev-agent").
-//! Channels extract the mention from platform messages; roster resolves it to an engine.
+//! Channels extract the mention from platform messages; roster resolves it to a backend.
 
-use crate::selector::EngineConfig;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -15,8 +13,8 @@ pub struct AgentEntry {
     pub name: String,
     /// User-configured @mention strings that route to this agent
     pub mentions: Vec<String>,
-    /// Engine to invoke when this agent is mentioned
-    pub engine: EngineConfig,
+    /// Runtime backend id from the backend catalog.
+    pub backend_id: String,
     /// Optional directory with SOUL.md / IDENTITY.md / MEMORY.md persona files
     #[serde(default)]
     pub persona_dir: Option<PathBuf>,
@@ -29,7 +27,7 @@ pub struct AgentEntry {
 }
 
 /// User-configured roster of agents for a gateway instance.
-/// Each entry maps user-defined @mentions to an engine.
+/// Each entry maps user-defined @mentions to a backend.
 pub struct AgentRoster {
     agents: Vec<AgentEntry>,
 }
@@ -52,7 +50,7 @@ impl AgentRoster {
         })
     }
 
-    /// Find agent by name (case-insensitive). Useful for slash commands like `/engine mybot`.
+    /// Find agent by name (case-insensitive). Useful for slash commands like `/backend mybot`.
     pub fn find_by_name<'a>(&'a self, name: &str) -> Option<&'a AgentEntry> {
         let name_lower = name.to_lowercase();
         self.agents
@@ -76,6 +74,12 @@ impl AgentRoster {
     }
 }
 
+impl AgentEntry {
+    pub fn runtime_backend_id(&self) -> &str {
+        self.backend_id.as_str()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,9 +88,8 @@ mod tests {
         AgentRoster::new(vec![
             AgentEntry {
                 name: "mybot".to_string(),
-                // User-configured: these are NOT hardcoded agent names
                 mentions: vec!["@mybot".to_string(), "@dev-assistant".to_string()],
-                engine: EngineConfig::ClaudeAgent { binary: None },
+                backend_id: "claude-main".to_string(),
                 persona_dir: None,
                 workspace_dir: None,
                 extra_skills_dirs: vec![],
@@ -94,7 +97,7 @@ mod tests {
             AgentEntry {
                 name: "reviewer".to_string(),
                 mentions: vec!["@reviewer".to_string()],
-                engine: EngineConfig::CodexAcp { binary: None },
+                backend_id: "codex-main".to_string(),
                 persona_dir: None,
                 workspace_dir: None,
                 extra_skills_dirs: vec![],
@@ -184,9 +187,8 @@ mod tests {
         let toml = r#"
 name = "claude"
 mentions = ["@claude"]
+backend_id = "claude-main"
 workspace_dir = "/projects/my-app"
-[engine]
-type = "claude_agent"
     "#;
         let entry: AgentEntry = toml::from_str(toml).unwrap();
         assert_eq!(
@@ -200,8 +202,7 @@ type = "claude_agent"
         let toml = r#"
 name = "claude"
 mentions = ["@claude"]
-[engine]
-type = "claude_agent"
+backend_id = "claude-main"
     "#;
         let entry: AgentEntry = toml::from_str(toml).unwrap();
         assert!(entry.workspace_dir.is_none());
@@ -212,9 +213,8 @@ type = "claude_agent"
         let toml = r#"
 name = "claude"
 mentions = ["@claude"]
+backend_id = "claude-main"
 extra_skills_dirs = ["/custom/skills"]
-[engine]
-type = "claude_agent"
         "#;
         let entry: AgentEntry = toml::from_str(toml).unwrap();
         assert_eq!(entry.extra_skills_dirs.len(), 1);
@@ -225,12 +225,23 @@ type = "claude_agent"
     }
 
     #[test]
+    fn test_agent_entry_backend_id_deserialises() {
+        let toml = r#"
+name = "claude"
+mentions = ["@claude"]
+backend_id = "claude-main"
+        "#;
+        let entry: AgentEntry = toml::from_str(toml).unwrap();
+        assert_eq!(entry.backend_id, "claude-main");
+        assert_eq!(entry.runtime_backend_id(), "claude-main");
+    }
+
+    #[test]
     fn test_agent_entry_extra_skills_dirs_defaults_empty() {
         let toml = r#"
 name = "claude"
 mentions = ["@claude"]
-[engine]
-type = "claude_agent"
+backend_id = "claude-main"
         "#;
         let entry: AgentEntry = toml::from_str(toml).unwrap();
         assert!(entry.extra_skills_dirs.is_empty());

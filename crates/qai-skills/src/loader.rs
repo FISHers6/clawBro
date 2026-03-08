@@ -809,7 +809,8 @@ mod tests {
             "soul_injection should identify Rex by name"
         );
         assert!(
-            rex.soul_injection.contains("chess grandmaster") || rex.soul_injection.contains("systems"),
+            rex.soul_injection.contains("chess grandmaster")
+                || rex.soul_injection.contains("systems"),
             "soul_injection should contain persona-specific content"
         );
         assert!(

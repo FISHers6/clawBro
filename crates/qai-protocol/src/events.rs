@@ -9,6 +9,22 @@ pub enum AgentEvent {
         session_id: Uuid,
         delta: String,
     },
+    ApprovalRequest {
+        session_id: Uuid,
+        session_key: crate::SessionKey,
+        approval_id: String,
+        prompt: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_at_ms: Option<u64>,
+    },
     ToolCallStart {
         session_id: Uuid,
         tool_name: String,
@@ -38,6 +54,7 @@ impl AgentEvent {
     pub fn session_id(&self) -> Uuid {
         match self {
             Self::TextDelta { session_id, .. } => *session_id,
+            Self::ApprovalRequest { session_id, .. } => *session_id,
             Self::ToolCallStart { session_id, .. } => *session_id,
             Self::ToolCallResult { session_id, .. } => *session_id,
             Self::Thinking { session_id } => *session_id,
@@ -63,6 +80,39 @@ mod tests {
             );
         } else {
             panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn test_approval_request_round_trip() {
+        let event = AgentEvent::ApprovalRequest {
+            session_id: Uuid::nil(),
+            session_key: crate::SessionKey::new("ws", "approval"),
+            approval_id: "approval-1".into(),
+            prompt: "Allow `git status`?".into(),
+            command: Some("git status".into()),
+            cwd: Some("/tmp".into()),
+            host: Some("gateway".into()),
+            agent_id: Some("main".into()),
+            expires_at_ms: Some(123),
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        let decoded: AgentEvent = serde_json::from_str(&json).unwrap();
+        match decoded {
+            AgentEvent::ApprovalRequest {
+                approval_id,
+                session_key,
+                command,
+                expires_at_ms,
+                ..
+            } => {
+                assert_eq!(approval_id, "approval-1");
+                assert_eq!(session_key, crate::SessionKey::new("ws", "approval"));
+                assert_eq!(command.as_deref(), Some("git status"));
+                assert_eq!(expires_at_ms, Some(123));
+            }
+            other => panic!("wrong variant: {other:?}"),
         }
     }
 }

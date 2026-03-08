@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/qai-protocol",
+    "crates/qai-runtime",
     "crates/qai-session",
     "crates/qai-agent",
     "crates/qai-channels",
