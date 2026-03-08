@@ -303,6 +303,7 @@ mod tests {
     use crate::{SEND_INITIAL_DELAY_MS, SEND_MAX_RETRIES};
     use std::sync::Mutex;
 
+    #[allow(clippy::assertions_on_constants)]
     #[test]
     fn retry_constants_are_reasonable() {
         assert_eq!(SEND_MAX_RETRIES, 3);
