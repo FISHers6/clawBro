@@ -24,6 +24,8 @@ pub enum SlashCommand {
         approval_id: String,
         decision: String,
     },
+    /// /team [status] — 查看当前 Team 任务状态（仅 Team mode 下有效）
+    TeamStatus,
 }
 
 impl SlashCommand {
@@ -66,6 +68,13 @@ impl SlashCommand {
                 let path = arg.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
                 Some(Self::Workspace(path))
             }
+            "/team" => {
+                let sub = arg.map(|s| s.trim()).unwrap_or("status");
+                match sub {
+                    "status" | "" => Some(Self::TeamStatus),
+                    _ => None,
+                }
+            }
             "/approve" => {
                 let arg = arg.map(str::trim).filter(|s| !s.is_empty())?;
                 let mut parts = arg.split_whitespace();
@@ -90,7 +99,7 @@ impl SlashCommand {
                 format!("✅ Backend 已切换到 {name}\n下次消息将使用新 backend 处理")
             }
             Self::Reset => "✅ 对话历史已清除".to_string(),
-            Self::Help => "可用命令：\n/backend <backend-id|agent-name> — 切换 backend\n/reset — 清除历史\n/help — 显示帮助\n/remember <内容> — 写入记忆\n/memory — 查看共享记忆\n/memory @agent — 查看指定 agent 记忆\n/memory reset — 清空记忆\n/forget <关键词> — 删除记忆条目\n/workspace — 查看当前 session 工作区目录\n/workspace /path — 设置 session 工作区目录\n/approve <id> <allow-once|allow-always|deny> — 响应待处理审批".to_string(),
+            Self::Help => "可用命令：\n/backend <backend-id|agent-name> — 切换 backend\n/reset — 清除历史\n/help — 显示帮助\n/remember <内容> — 写入记忆\n/memory — 查看共享记忆\n/memory @agent — 查看指定 agent 记忆\n/memory reset — 清空记忆\n/forget <关键词> — 删除记忆条目\n/workspace — 查看当前 session 工作区目录\n/workspace /path — 设置 session 工作区目录\n/approve <id> <allow-once|allow-always|deny> — 响应待处理审批\n/team status — 查看 Team 任务状态（Team mode）".to_string(),
             Self::Remember(content) => format!("✅ 已记录：{content}"),
             // Unreachable in practice: registry's handle_slash returns early with real content.
             Self::Memory(_) => unreachable!(
@@ -105,6 +114,9 @@ impl SlashCommand {
             ),
             Self::Approve { .. } => unreachable!(
                 "Approve must be handled by handle_slash (returns early with real content), not confirmation_text"
+            ),
+            Self::TeamStatus => unreachable!(
+                "TeamStatus must be handled by handle_slash (returns early with real content)"
             ),
         }
     }
@@ -236,6 +248,22 @@ mod tests {
                 approval_id: "approval-1".into(),
                 decision: "allow-once".into(),
             })
+        );
+    }
+
+    #[test]
+    fn test_parse_team_status() {
+        assert_eq!(
+            SlashCommand::parse("/team status"),
+            Some(SlashCommand::TeamStatus)
+        );
+    }
+
+    #[test]
+    fn test_parse_team_no_subcommand() {
+        assert_eq!(
+            SlashCommand::parse("/team"),
+            Some(SlashCommand::TeamStatus)
         );
     }
 }

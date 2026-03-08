@@ -1517,6 +1517,45 @@ impl SessionRegistry {
                     approval_id
                 )));
             }
+            SlashCommand::TeamStatus => {
+                // Look up the team orchestrator for this session (Lead or Specialist).
+                let orch_arc = self.get_orchestrator_for_session(session_key);
+
+                if let Some(orch) = orch_arc {
+                    let team_manifest = orch.session.read_team_md();
+                    let tasks_snapshot = orch.session.read_tasks_md();
+                    let task_count = orch
+                        .registry
+                        .all_tasks()
+                        .map(|tasks| {
+                            let total = tasks.len();
+                            let done = tasks.iter().filter(|t| t.status_raw == "done").count();
+                            let claimed = tasks
+                                .iter()
+                                .filter(|t| t.status_raw.starts_with("claimed:"))
+                                .count();
+                            let pending = total - done - claimed;
+                            format!("{done}/{total} 完成，{claimed} 执行中，{pending} 待处理")
+                        })
+                        .unwrap_or_else(|_| "无法读取任务数据".to_string());
+
+                    let response = if team_manifest.trim().is_empty()
+                        && tasks_snapshot.trim().is_empty()
+                    {
+                        "ℹ️ Team 已初始化但尚无任务。Lead 正在规划中...".to_string()
+                    } else {
+                        format!(
+                            "🏢 **Team 状态** — {task_count}\n\n{team_manifest}\n\n---\n\n{tasks_snapshot}"
+                        )
+                    };
+                    return Ok(Some(response));
+                } else {
+                    return Ok(Some(
+                        "ℹ️ 当前 session 没有活跃的 Team。输入 /team plan 开始规划。"
+                            .to_string(),
+                    ));
+                }
+            }
         }
         Ok(Some(cmd.confirmation_text()))
     }
