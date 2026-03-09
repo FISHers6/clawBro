@@ -38,8 +38,10 @@ use serde::Deserialize;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use super::orchestrator::{TeamOrchestrator, TeamState};
+use super::orchestrator::TeamOrchestrator;
 use super::registry::CreateTask;
+use super::tool_executor::{execute_team_tool_call, resolve_claimed_agent};
+use qai_runtime::{RuntimeRole, TeamToolCall};
 
 // ─── Parameter structs ──────────────────────────────────────────────────────
 
@@ -164,39 +166,9 @@ impl SharedTeamToolServer {
         }
     }
 
-    /// Legacy ACP completion mapping.
-    /// Future canonical semantics are expected to flow through:
-    /// `submit_task_result` -> leader `accept_task` / `reopen_task`.
-    fn complete_task_legacy(&self, task_id: &str, agent: &str, note: &str) -> Result<()> {
-        self.orchestrator
-            .handle_specialist_done(task_id, agent, note)
-    }
-
-    /// Legacy ACP blocked/help mapping.
-    /// Future canonical semantics are expected to flow through:
-    /// `block_task` / `request_help` -> leader triage or reassignment.
-    fn block_task_legacy(&self, task_id: &str, agent: &str, reason: &str) -> Result<()> {
-        self.orchestrator
-            .handle_specialist_blocked(task_id, agent, reason)
-    }
-
-    fn resolve_claimed_agent(&self, task_id: &str, explicit: Option<&str>) -> String {
-        explicit
-            .map(ToOwned::to_owned)
-            .or_else(|| {
-                self.orchestrator
-                    .registry
-                    .get_task(task_id)
-                    .ok()
-                    .flatten()
-                    .and_then(|t| {
-                        t.status_raw
-                            .strip_prefix("claimed:")
-                            .and_then(|s| s.split(':').next())
-                            .map(|s| s.to_string())
-                    })
-            })
-            .unwrap_or_else(|| "unknown".to_string())
+    async fn invoke_canonical(&self, role: RuntimeRole, call: TeamToolCall) -> Result<String> {
+        let response = execute_team_tool_call(Arc::clone(&self.orchestrator), role, call).await?;
+        Ok(response.message)
     }
 
     // ── Lead tools ────────────────────────────────────────────────────────────
@@ -226,7 +198,20 @@ impl SharedTeamToolServer {
             success_criteria: p.success_criteria,
         };
 
-        match self.orchestrator.register_task(task) {
+        match self
+            .invoke_canonical(
+                RuntimeRole::Leader,
+                TeamToolCall::CreateTask {
+                    id: task.id,
+                    title: task.title,
+                    assignee: task.assignee_hint,
+                    spec: task.spec,
+                    deps: task.deps,
+                    success_criteria: task.success_criteria,
+                },
+            )
+            .await
+        {
             Ok(msg) => msg,
             Err(e) => format!("Error registering task {}: {e}", p.id),
         }
@@ -237,7 +222,10 @@ impl SharedTeamToolServer {
         description = "Lead only. Start task execution. Call after all tasks are registered with create_task."
     )]
     async fn start_execution(&self) -> String {
-        match self.orchestrator.activate().await {
+        match self
+            .invoke_canonical(RuntimeRole::Leader, TeamToolCall::StartExecution)
+            .await
+        {
             Ok(msg) => msg,
             Err(e) => format!("Error starting execution: {e}"),
         }
@@ -251,10 +239,18 @@ impl SharedTeamToolServer {
         &self,
         Parameters(p): Parameters<RequestConfirmationParams>,
     ) -> String {
-        let formatted = format!("**Plan for confirmation:**\n\n{}", p.plan_summary);
-        self.orchestrator.post_message(&formatted);
-        *self.orchestrator.team_state_inner.lock().unwrap() = TeamState::AwaitingConfirm;
-        "Confirmation requested. Waiting for user reply.".to_string()
+        match self
+            .invoke_canonical(
+                RuntimeRole::Leader,
+                TeamToolCall::RequestConfirmation {
+                    plan_summary: p.plan_summary,
+                },
+            )
+            .await
+        {
+            Ok(msg) => msg,
+            Err(e) => format!("Error requesting confirmation: {e}"),
+        }
     }
 
     /// Post a status update or message to the IM channel.
@@ -262,8 +258,16 @@ impl SharedTeamToolServer {
         description = "Lead only. Post a message to the IM channel. Use for status updates, progress reports, or questions."
     )]
     async fn post_update(&self, Parameters(p): Parameters<PostUpdateParams>) -> String {
-        self.orchestrator.post_message(&p.message);
-        "Posted.".to_string()
+        match self
+            .invoke_canonical(
+                RuntimeRole::Leader,
+                TeamToolCall::PostUpdate { message: p.message },
+            )
+            .await
+        {
+            Ok(msg) => msg,
+            Err(e) => format!("Error posting update: {e}"),
+        }
     }
 
     /// Get a JSON snapshot of all tasks and their current statuses.
@@ -271,24 +275,11 @@ impl SharedTeamToolServer {
         description = "Lead only. Get current status of all tasks as JSON. Returns an array with id, title, status, assignee, deps."
     )]
     async fn get_task_status(&self) -> String {
-        match self.orchestrator.registry.all_tasks() {
-            Ok(tasks) => {
-                let arr: Vec<serde_json::Value> = tasks
-                    .iter()
-                    .map(|t| {
-                        serde_json::json!({
-                            "id": t.id,
-                            "title": t.title,
-                            "status": t.status_raw,
-                            "assignee": t.assignee_hint,
-                            "deps": t.deps(),
-                            "retry_count": t.retry_count,
-                            "completion_note": t.completion_note,
-                        })
-                    })
-                    .collect();
-                serde_json::to_string_pretty(&arr).unwrap_or_else(|e| format!("Error: {e}"))
-            }
+        match self
+            .invoke_canonical(RuntimeRole::Leader, TeamToolCall::GetTaskStatus)
+            .await
+        {
+            Ok(msg) => msg,
             Err(e) => format!("Error fetching tasks: {e}"),
         }
     }
@@ -299,11 +290,16 @@ impl SharedTeamToolServer {
     )]
     async fn assign_task(&self, Parameters(p): Parameters<AssignTaskParams>) -> String {
         match self
-            .orchestrator
-            .registry
-            .reassign_task(&p.task_id, &p.new_assignee)
+            .invoke_canonical(
+                RuntimeRole::Leader,
+                TeamToolCall::AssignTask {
+                    task_id: p.task_id.clone(),
+                    new_assignee: p.new_assignee.clone(),
+                },
+            )
+            .await
         {
-            Ok(()) => format!("Task {} reassigned to {}.", p.task_id, p.new_assignee),
+            Ok(msg) => msg,
             Err(e) => format!("Error reassigning task {}: {e}", p.task_id),
         }
     }
@@ -313,9 +309,17 @@ impl SharedTeamToolServer {
         description = "Lead only. Accept a submitted task result after review. Provide task_id and optionally your leader name in by."
     )]
     async fn accept_task(&self, Parameters(p): Parameters<AcceptTaskParams>) -> String {
-        let by = p.by.as_deref().unwrap_or("leader");
-        match self.orchestrator.accept_submitted_task(&p.task_id, by) {
-            Ok(()) => format!("Task {} accepted by {}.", p.task_id, by),
+        match self
+            .invoke_canonical(
+                RuntimeRole::Leader,
+                TeamToolCall::AcceptTask {
+                    task_id: p.task_id.clone(),
+                    by: p.by,
+                },
+            )
+            .await
+        {
+            Ok(msg) => msg,
             Err(e) => format!("Error accepting task {}: {e}", p.task_id),
         }
     }
@@ -325,12 +329,18 @@ impl SharedTeamToolServer {
         description = "Lead only. Reopen a task back to pending. Provide task_id, reason, and optionally your leader name in by."
     )]
     async fn reopen_task(&self, Parameters(p): Parameters<ReopenTaskParams>) -> String {
-        let by = p.by.as_deref().unwrap_or("leader");
         match self
-            .orchestrator
-            .reopen_submitted_task(&p.task_id, &p.reason, by)
+            .invoke_canonical(
+                RuntimeRole::Leader,
+                TeamToolCall::ReopenTask {
+                    task_id: p.task_id.clone(),
+                    reason: p.reason.clone(),
+                    by: p.by,
+                },
+            )
+            .await
         {
-            Ok(()) => format!("Task {} reopened by {}.", p.task_id, by),
+            Ok(msg) => msg,
             Err(e) => format!("Error reopening task {}: {e}", p.task_id),
         }
     }
@@ -342,8 +352,11 @@ impl SharedTeamToolServer {
         description = "Specialist only. Mark a task as complete. Provide the task_id, a short completion note, and your agent name."
     )]
     async fn complete_task(&self, Parameters(p): Parameters<CompleteTaskParams>) -> String {
-        let agent = self.resolve_claimed_agent(&p.task_id, p.agent.as_deref());
-        match self.complete_task_legacy(&p.task_id, &agent, &p.note) {
+        let agent = resolve_claimed_agent(&self.orchestrator, &p.task_id, p.agent.as_deref());
+        match self
+            .orchestrator
+            .handle_specialist_done(&p.task_id, &agent, &p.note)
+        {
             Ok(()) => format!("Task {} marked done.", p.task_id),
             Err(e) => format!("Error completing task {}: {e}", p.task_id),
         }
@@ -354,12 +367,18 @@ impl SharedTeamToolServer {
         description = "Specialist only. Report a checkpoint update for the claimed task. Provide task_id, note, and optionally your agent name."
     )]
     async fn checkpoint_task(&self, Parameters(p): Parameters<CheckpointTaskParams>) -> String {
-        let agent = self.resolve_claimed_agent(&p.task_id, p.agent.as_deref());
         match self
-            .orchestrator
-            .handle_specialist_checkpoint(&p.task_id, &agent, &p.note)
+            .invoke_canonical(
+                RuntimeRole::Specialist,
+                TeamToolCall::CheckpointTask {
+                    task_id: p.task_id.clone(),
+                    note: p.note.clone(),
+                    agent: p.agent,
+                },
+            )
+            .await
         {
-            Ok(()) => format!("Checkpoint recorded for task {}.", p.task_id),
+            Ok(msg) => msg,
             Err(e) => format!("Error recording checkpoint for task {}: {e}", p.task_id),
         }
     }
@@ -372,12 +391,18 @@ impl SharedTeamToolServer {
         &self,
         Parameters(p): Parameters<SubmitTaskResultParams>,
     ) -> String {
-        let agent = self.resolve_claimed_agent(&p.task_id, p.agent.as_deref());
         match self
-            .orchestrator
-            .handle_specialist_submitted(&p.task_id, &agent, &p.summary)
+            .invoke_canonical(
+                RuntimeRole::Specialist,
+                TeamToolCall::SubmitTaskResult {
+                    task_id: p.task_id.clone(),
+                    summary: p.summary.clone(),
+                    agent: p.agent,
+                },
+            )
+            .await
         {
-            Ok(()) => format!("Task {} submitted for review.", p.task_id),
+            Ok(msg) => msg,
             Err(e) => format!("Error submitting task {}: {e}", p.task_id),
         }
     }
@@ -387,32 +412,22 @@ impl SharedTeamToolServer {
         description = "Specialist only. Report a task as blocked. Provide the task_id, reason, and your agent name."
     )]
     async fn block_task(&self, Parameters(p): Parameters<BlockTaskParams>) -> String {
-        // Legacy hard block: release the claim and escalate.
-        let agent_owned = self.resolve_claimed_agent(&p.task_id, p.agent.as_deref());
-        let agent = agent_owned.as_str();
-        let owns_claim = self
-            .orchestrator
-            .registry
-            .is_claimed_by(&p.task_id, agent)
-            .unwrap_or(false);
-        if !owns_claim {
-            tracing::warn!(
-                task_id = %p.task_id,
-                agent = %agent,
-                "block_task rejected: agent does not hold claim"
-            );
-            return format!(
-                "Cannot block task {}: not currently claimed by {}.",
-                p.task_id, agent
-            );
+        match self
+            .invoke_canonical(
+                RuntimeRole::Specialist,
+                TeamToolCall::BlockTask {
+                    task_id: p.task_id.clone(),
+                    reason: p.reason.clone(),
+                    agent: p.agent,
+                },
+            )
+            .await
+        {
+            Ok(msg) => msg,
+            Err(e) => {
+                format!("Error blocking task {}: {e}", p.task_id)
+            }
         }
-        if let Err(e) = self.orchestrator.registry.reset_claim(&p.task_id) {
-            tracing::warn!(task_id = %p.task_id, "reset_claim error: {e:#}");
-        }
-        if let Err(e) = self.block_task_legacy(&p.task_id, agent, &p.reason) {
-            tracing::warn!(task_id = %p.task_id, "handle_specialist_blocked error: {e:#}");
-        }
-        format!("Task {} reported as blocked: {}", p.task_id, p.reason)
     }
 
     /// Ask lead for help while keeping the task claimed.
@@ -420,23 +435,18 @@ impl SharedTeamToolServer {
         description = "Specialist only. Request help from the lead without releasing the claim. Provide task_id, message, and optionally your agent name."
     )]
     async fn request_help(&self, Parameters(p): Parameters<RequestHelpParams>) -> String {
-        let agent = self.resolve_claimed_agent(&p.task_id, p.agent.as_deref());
-        let owns_claim = self
-            .orchestrator
-            .registry
-            .is_claimed_by(&p.task_id, &agent)
-            .unwrap_or(false);
-        if !owns_claim {
-            return format!(
-                "Cannot request help for task {}: not currently claimed by {}.",
-                p.task_id, agent
-            );
-        }
         match self
-            .orchestrator
-            .handle_specialist_help_requested(&p.task_id, &agent, &p.message)
+            .invoke_canonical(
+                RuntimeRole::Specialist,
+                TeamToolCall::RequestHelp {
+                    task_id: p.task_id.clone(),
+                    message: p.message.clone(),
+                    agent: p.agent,
+                },
+            )
+            .await
         {
-            Ok(()) => format!("Help request sent for task {}.", p.task_id),
+            Ok(msg) => msg,
             Err(e) => format!("Error requesting help for task {}: {e}", p.task_id),
         }
     }
@@ -784,6 +794,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_block_task_returns_error_for_non_owner() {
+        let (srv, _tmp) = make_server();
+        srv.orchestrator
+            .registry
+            .create_task(CT {
+                id: "T402".into(),
+                title: "api".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        srv.orchestrator
+            .registry
+            .try_claim("T402", "codex")
+            .unwrap();
+
+        let result = srv
+            .block_task(Parameters(BlockTaskParams {
+                task_id: "T402".to_string(),
+                reason: "stuck".to_string(),
+                agent: Some("gemini".to_string()),
+            }))
+            .await;
+
+        assert!(
+            result.contains("Error blocking task T402"),
+            "legacy block_task should report error instead of pretending success: {result}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_post_update_without_notify_fn_does_not_panic() {
         let (srv, _tmp) = make_server();
         let result = srv
@@ -805,7 +845,7 @@ mod tests {
         assert_eq!(result, "Confirmation requested. Waiting for user reply.");
         assert!(matches!(
             srv.orchestrator.team_state(),
-            TeamState::AwaitingConfirm
+            crate::team::orchestrator::TeamState::AwaitingConfirm
         ));
     }
 

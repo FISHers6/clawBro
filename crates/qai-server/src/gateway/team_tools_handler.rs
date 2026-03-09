@@ -101,6 +101,7 @@ mod tests {
 
         let state = AppState {
             registry: Arc::clone(&registry),
+            runtime_registry: Arc::new(qai_runtime::BackendRegistry::new()),
             event_tx: registry.global_sender(),
             cfg: Arc::new(cfg),
             runtime_token: Arc::new("test-token".to_string()),

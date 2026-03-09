@@ -1516,6 +1516,7 @@ dependencies = [
  "tokio-tungstenite 0.26.2",
  "tokio-util",
  "toml 0.9.12+spec-1.1.0",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "uuid",

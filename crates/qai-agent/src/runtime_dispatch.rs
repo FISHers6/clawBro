@@ -260,26 +260,60 @@ fn runtime_context_from_ctx(ctx: &AgentCtx) -> RuntimeContext {
 }
 
 fn collect_workspace_native_files(ctx: &AgentCtx) -> Vec<String> {
-    const CANDIDATES: &[&str] = &[
-        "AGENTS.md",
-        "CLAUDE.md",
-        "TEAM.md",
-        "CONTEXT.md",
-        "TASKS.md",
-    ];
+    let mut files = Vec::new();
+    let mut seen = BTreeSet::new();
 
-    let mut files = BTreeSet::new();
-    for dir in [ctx.workspace_dir.as_ref(), ctx.team_dir.as_ref()]
-        .into_iter()
-        .flatten()
-    {
-        for name in CANDIDATES {
-            if dir.join(name).is_file() {
-                files.insert((*name).to_string());
-            }
+    if let Some(persona_dir) = ctx.persona_dir.as_ref() {
+        for name in ["SOUL.md", "IDENTITY.md"] {
+            push_visible_file(&mut files, &mut seen, persona_dir, name);
+        }
+        push_visible_file(&mut files, &mut seen, persona_dir, "USER.md");
+        if !matches!(ctx.agent_role, crate::traits::AgentRole::Specialist) {
+            push_visible_file(&mut files, &mut seen, persona_dir, "MEMORY.md");
+        }
+        let scoped_memory_name = format!("memory/{}.md", scoped_memory_file_stem(&ctx.session_key));
+        push_visible_relative_file(&mut files, &mut seen, persona_dir, &scoped_memory_name);
+    }
+
+    if let Some(workspace_root) = ctx.workspace_root.as_ref() {
+        for name in ["AGENTS.md", "CLAUDE.md", "USER.md", "HEARTBEAT.md"] {
+            push_visible_file(&mut files, &mut seen, workspace_root, name);
         }
     }
-    files.into_iter().collect()
+
+    if let Some(team_dir) = ctx.team_dir.as_ref() {
+        for name in ["TEAM.md", "CONTEXT.md", "TASKS.md", "HEARTBEAT.md"] {
+            push_visible_file(&mut files, &mut seen, team_dir, name);
+        }
+    }
+
+    files
+}
+
+fn push_visible_file(
+    files: &mut Vec<String>,
+    seen: &mut BTreeSet<String>,
+    dir: &std::path::Path,
+    name: &str,
+) {
+    if dir.join(name).is_file() && seen.insert(name.to_string()) {
+        files.push(name.to_string());
+    }
+}
+
+fn push_visible_relative_file(
+    files: &mut Vec<String>,
+    seen: &mut BTreeSet<String>,
+    dir: &std::path::Path,
+    relative_name: &str,
+) {
+    if dir.join(relative_name).is_file() && seen.insert(relative_name.to_string()) {
+        files.push(relative_name.to_string());
+    }
+}
+
+fn scoped_memory_file_stem(session_key: &qai_protocol::SessionKey) -> String {
+    format!("{}_{}", session_key.channel, session_key.scope)
 }
 
 fn forward_runtime_event(
@@ -337,6 +371,7 @@ mod tests {
         BackendAdapter, LaunchSpec, RuntimeEventSink,
     };
     use std::sync::Arc;
+    use tempfile::tempdir;
 
     struct FakeBackendAdapter;
 
@@ -464,5 +499,106 @@ mod tests {
         assert_eq!(spec.family, BackendFamily::Acp);
         assert_eq!(spec.adapter_key, "acp");
         assert!(matches!(spec.launch, LaunchSpec::Command { .. }));
+    }
+
+    #[test]
+    fn collect_workspace_native_files_includes_heartbeat_when_present() {
+        let tmp = tempdir().unwrap();
+        let persona = tempdir().unwrap();
+        std::fs::write(persona.path().join("SOUL.md"), "soul").unwrap();
+        std::fs::write(tmp.path().join("AGENTS.md"), "agents").unwrap();
+        std::fs::write(tmp.path().join("HEARTBEAT.md"), "heartbeat").unwrap();
+
+        let mut ctx = AgentCtx::default();
+        ctx.session_key = qai_protocol::SessionKey::new("lark", "group:test");
+        ctx.persona_dir = Some(persona.path().to_path_buf());
+        ctx.workspace_root = Some(tmp.path().to_path_buf());
+        ctx.workspace_dir = Some(tmp.path().to_path_buf());
+
+        let files = collect_workspace_native_files(&ctx);
+        assert!(files.contains(&"SOUL.md".to_string()));
+        assert!(files.contains(&"AGENTS.md".to_string()));
+        assert!(files.contains(&"HEARTBEAT.md".to_string()));
+    }
+
+    #[test]
+    fn collect_workspace_native_files_dedupes_workspace_and_team_entries() {
+        let persona = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let team = tempdir().unwrap();
+        std::fs::write(persona.path().join("SOUL.md"), "workspace soul").unwrap();
+        std::fs::write(persona.path().join("MEMORY.md"), "long term").unwrap();
+        std::fs::create_dir_all(persona.path().join("memory")).unwrap();
+        std::fs::write(
+            persona.path().join("memory").join("lark_group:test.md"),
+            "scoped",
+        )
+        .unwrap();
+        std::fs::write(workspace.path().join("AGENTS.md"), "agents").unwrap();
+        std::fs::write(workspace.path().join("USER.md"), "user").unwrap();
+        std::fs::write(workspace.path().join("HEARTBEAT.md"), "workspace heartbeat").unwrap();
+        std::fs::write(team.path().join("HEARTBEAT.md"), "team heartbeat").unwrap();
+        std::fs::write(team.path().join("TEAM.md"), "team").unwrap();
+        std::fs::write(team.path().join("TASKS.md"), "tasks").unwrap();
+
+        let mut ctx = AgentCtx::default();
+        ctx.session_key = qai_protocol::SessionKey::new("lark", "group:test");
+        ctx.persona_dir = Some(persona.path().to_path_buf());
+        ctx.workspace_root = Some(workspace.path().to_path_buf());
+        ctx.workspace_dir = Some(workspace.path().to_path_buf());
+        ctx.team_dir = Some(team.path().to_path_buf());
+
+        let files = collect_workspace_native_files(&ctx);
+        assert_eq!(
+            files,
+            vec![
+                "SOUL.md".to_string(),
+                "MEMORY.md".to_string(),
+                "memory/lark_group:test.md".to_string(),
+                "AGENTS.md".to_string(),
+                "USER.md".to_string(),
+                "HEARTBEAT.md".to_string(),
+                "TEAM.md".to_string(),
+                "TASKS.md".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_workspace_native_files_hides_long_term_memory_for_specialists() {
+        let persona = tempdir().unwrap();
+        let team = tempdir().unwrap();
+        std::fs::write(persona.path().join("SOUL.md"), "soul").unwrap();
+        std::fs::write(persona.path().join("IDENTITY.md"), "identity").unwrap();
+        std::fs::write(persona.path().join("MEMORY.md"), "long term").unwrap();
+        std::fs::create_dir_all(persona.path().join("memory")).unwrap();
+        std::fs::write(
+            persona.path().join("memory").join("specialist_team-1:coder.md"),
+            "specialist scoped",
+        )
+        .unwrap();
+        std::fs::write(team.path().join("TEAM.md"), "team").unwrap();
+        std::fs::write(team.path().join("CONTEXT.md"), "context").unwrap();
+
+        let mut ctx = AgentCtx::default();
+        ctx.session_key = qai_protocol::SessionKey::new("specialist", "team-1:coder");
+        ctx.agent_role = crate::traits::AgentRole::Specialist;
+        ctx.persona_dir = Some(persona.path().to_path_buf());
+        ctx.team_dir = Some(team.path().to_path_buf());
+
+        let files = collect_workspace_native_files(&ctx);
+        assert!(files.contains(&"SOUL.md".to_string()));
+        assert!(files.contains(&"IDENTITY.md".to_string()));
+        assert!(files.contains(&"memory/specialist_team-1:coder.md".to_string()));
+        assert!(!files.contains(&"MEMORY.md".to_string()));
+        assert_eq!(
+            files
+                .iter()
+                .filter(|name| name.as_str() == "HEARTBEAT.md")
+                .count(),
+            0
+        );
+        assert!(files.contains(&"TEAM.md".to_string()));
+        assert!(files.contains(&"CONTEXT.md".to_string()));
     }
 }

@@ -22,6 +22,10 @@ pub struct AgentCtx {
     pub user_text: String,
     pub history: Vec<HistoryMsg>,
     pub system_injection: String, // skills 注入文本
+    /// Resolved persona root for this turn.
+    pub persona_dir: Option<PathBuf>,
+    /// Resolved workspace root before any team-role-specific effective workspace rewrite.
+    pub workspace_root: Option<PathBuf>,
     /// Resolved workspace for this turn.
     pub workspace_dir: Option<PathBuf>,
     /// Agent 在团队中的角色（默认 Solo）
@@ -52,6 +56,8 @@ impl Default for AgentCtx {
             user_text: String::new(),
             history: vec![],
             system_injection: String::new(),
+            persona_dir: None,
+            workspace_root: None,
             workspace_dir: None,
             agent_role: AgentRole::Solo,
             team_dir: None,

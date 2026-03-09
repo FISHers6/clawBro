@@ -58,3 +58,4 @@ uuid = { version = "1.6", features = ["v4"] }
 tempfile = "3"
 # Needed to install a default CryptoProvider for rustls 0.23 used by tokio-tungstenite 0.26
 rustls = { version = "0.23", features = ["ring"] }
+tower = { version = "0.5", features = ["util"] }

@@ -5,13 +5,77 @@
 //!     TEAM.md        — 团队职责宣言（Lead 在 /team start 时写入）
 //!     CONTEXT.md     — 任务背景（Lead 维护，注入 Specialist 的 shared_memory）
 //!     TASKS.md       — 任务快照（由 TaskRegistry::export_tasks_md 导出，只读）
+//!     HEARTBEAT.md   — 可选的团队心跳检查清单（统一 context contract）
 //!     events.jsonl   — 事件日志（调试用）
 
 use anyhow::{Context, Result};
 use qai_protocol::SessionKey;
+use serde::Serialize;
 use std::path::PathBuf;
 
-use super::registry::{Task, TaskRegistry};
+use super::registry::{Task, TaskRegistry, TaskStatus};
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskArtifactMeta {
+    pub id: String,
+    pub title: String,
+    pub assignee_hint: Option<String>,
+    pub status: String,
+    pub deps: Vec<String>,
+    pub success_criteria: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub done_at: Option<String>,
+    pub claimed_by: Option<String>,
+    pub submitted_by: Option<String>,
+    pub accepted_by: Option<String>,
+}
+
+impl TaskArtifactMeta {
+    pub fn from_task(task: &Task) -> Self {
+        let (claimed_by, submitted_by, accepted_by, updated_at) = match task.status_parsed() {
+            TaskStatus::Claimed { agent, at } => {
+                (Some(agent), None, None, at.to_rfc3339())
+            }
+            TaskStatus::Submitted { agent, at } => {
+                (None, Some(agent), None, at.to_rfc3339())
+            }
+            TaskStatus::Accepted { by, at } => {
+                (None, None, Some(by), at.to_rfc3339())
+            }
+            TaskStatus::Done => (
+                None,
+                None,
+                None,
+                task.done_at
+                    .as_ref()
+                    .map(chrono::DateTime::to_rfc3339)
+                    .unwrap_or_else(|| task.created_at.to_rfc3339()),
+            ),
+            _ => (
+                None,
+                None,
+                None,
+                task.created_at.to_rfc3339(),
+            ),
+        };
+
+        Self {
+            id: task.id.clone(),
+            title: task.title.clone(),
+            assignee_hint: task.assignee_hint.clone(),
+            status: task.status_raw.clone(),
+            deps: task.deps(),
+            success_criteria: task.success_criteria.clone(),
+            created_at: task.created_at.to_rfc3339(),
+            updated_at,
+            done_at: task.done_at.as_ref().map(chrono::DateTime::to_rfc3339),
+            claimed_by,
+            submitted_by,
+            accepted_by,
+        }
+    }
+}
 
 pub struct TeamSession {
     pub team_id: String,
@@ -87,6 +151,39 @@ impl TeamSession {
         self.write_file("AGENTS.md", content)
     }
 
+    pub fn write_heartbeat_md(&self, content: &str) -> Result<()> {
+        self.write_file("HEARTBEAT.md", content)
+    }
+
+    pub fn tasks_dir(&self) -> PathBuf {
+        self.dir.join("tasks")
+    }
+
+    pub fn task_dir(&self, task_id: &str) -> PathBuf {
+        self.tasks_dir().join(task_id)
+    }
+
+    pub fn write_task_meta(&self, task_id: &str, meta: &TaskArtifactMeta) -> Result<()> {
+        self.ensure_task_dir(task_id)?;
+        let body = serde_json::to_string_pretty(meta)?;
+        self.write_task_file(task_id, "meta.json", &body)
+    }
+
+    pub fn write_task_spec(&self, task_id: &str, content: &str) -> Result<()> {
+        self.ensure_task_dir(task_id)?;
+        self.write_task_file(task_id, "spec.md", content)
+    }
+
+    pub fn append_task_progress(&self, task_id: &str, content: &str) -> Result<()> {
+        self.ensure_task_dir(task_id)?;
+        self.append_task_file(task_id, "progress.md", content)
+    }
+
+    pub fn write_task_result(&self, task_id: &str, content: &str) -> Result<()> {
+        self.ensure_task_dir(task_id)?;
+        self.write_task_file(task_id, "result.md", content)
+    }
+
     /// 从 TaskRegistry 导出任务快照到 TASKS.md
     pub fn sync_tasks_md(&self, registry: &TaskRegistry) -> Result<()> {
         let md = registry.export_tasks_md()?;
@@ -104,6 +201,10 @@ impl TeamSession {
 
     pub fn read_tasks_md(&self) -> String {
         self.read_file("TASKS.md")
+    }
+
+    pub fn read_heartbeat_md(&self) -> String {
+        self.read_file("HEARTBEAT.md")
     }
 
     /// 追加事件日志（JSONL 格式，调试用）
@@ -233,6 +334,30 @@ impl TeamSession {
             .with_context(|| format!("Failed to write {}", path.display()))
     }
 
+    fn ensure_task_dir(&self, task_id: &str) -> Result<()> {
+        let dir = self.task_dir(task_id);
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("Failed to create task artifact dir: {}", dir.display()))
+    }
+
+    fn write_task_file(&self, task_id: &str, name: &str, content: &str) -> Result<()> {
+        let path = self.task_dir(task_id).join(name);
+        std::fs::write(&path, content)
+            .with_context(|| format!("Failed to write {}", path.display()))
+    }
+
+    fn append_task_file(&self, task_id: &str, name: &str, content: &str) -> Result<()> {
+        use std::io::Write;
+        let path = self.task_dir(task_id).join(name);
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("Failed to open {}", path.display()))?;
+        writeln!(file, "{content}")?;
+        Ok(())
+    }
+
     fn read_file(&self, name: &str) -> String {
         std::fs::read_to_string(self.dir.join(name)).unwrap_or_default()
     }
@@ -267,9 +392,11 @@ mod tests {
             .write_team_md("Claude: Lead\nCodex: Backend")
             .unwrap();
         session.write_context_md("Task context here").unwrap();
+        session.write_heartbeat_md("Check stale tasks").unwrap();
 
         assert_eq!(session.read_team_md(), "Claude: Lead\nCodex: Backend");
         assert_eq!(session.read_context_md(), "Task context here");
+        assert_eq!(session.read_heartbeat_md(), "Check stale tasks");
     }
 
     #[test]
@@ -394,5 +521,92 @@ mod tests {
         // Text content must not introduce extra lines
         assert_eq!(contents.lines().count(), 1);
         assert!(contents.contains("\\n"));
+    }
+
+    #[test]
+    fn test_task_artifact_helpers_write_expected_layout() {
+        let (session, _tmp) = make_session();
+        let meta = TaskArtifactMeta {
+            id: "T010".into(),
+            title: "Ship auth".into(),
+            assignee_hint: Some("codex".into()),
+            status: "pending".into(),
+            deps: vec!["T001".into()],
+            success_criteria: Some("Auth flow passes".into()),
+            created_at: "2026-03-09T00:00:00Z".into(),
+            updated_at: "2026-03-09T00:00:00Z".into(),
+            done_at: None,
+            claimed_by: None,
+            submitted_by: None,
+            accepted_by: None,
+        };
+
+        session.write_task_meta("T010", &meta).unwrap();
+        session.write_task_spec("T010", "# Spec\nImplement auth").unwrap();
+        session
+            .append_task_progress("T010", "[checkpoint] schema drafted")
+            .unwrap();
+        session
+            .write_task_result("T010", "# Result\nReady for review")
+            .unwrap();
+
+        let task_dir = _tmp.path().join("tasks").join("T010");
+        assert!(task_dir.is_dir());
+        assert!(task_dir.join("meta.json").is_file());
+        assert!(task_dir.join("spec.md").is_file());
+        assert!(task_dir.join("progress.md").is_file());
+        assert!(task_dir.join("result.md").is_file());
+
+        let meta_text = std::fs::read_to_string(task_dir.join("meta.json")).unwrap();
+        assert!(meta_text.contains("\"id\": \"T010\""));
+        assert!(meta_text.contains("\"status\": \"pending\""));
+        let spec_text = std::fs::read_to_string(task_dir.join("spec.md")).unwrap();
+        assert!(spec_text.contains("Implement auth"));
+        let progress_text = std::fs::read_to_string(task_dir.join("progress.md")).unwrap();
+        assert!(progress_text.contains("schema drafted"));
+        let result_text = std::fs::read_to_string(task_dir.join("result.md")).unwrap();
+        assert!(result_text.contains("Ready for review"));
+    }
+
+    #[test]
+    fn test_append_task_progress_appends_instead_of_overwriting() {
+        let (session, _tmp) = make_session();
+        session.append_task_progress("T011", "checkpoint one").unwrap();
+        session.append_task_progress("T011", "checkpoint two").unwrap();
+
+        let progress = std::fs::read_to_string(_tmp.path().join("tasks").join("T011").join("progress.md"))
+            .unwrap();
+        assert!(progress.contains("checkpoint one"));
+        assert!(progress.contains("checkpoint two"));
+        assert_eq!(progress.lines().count(), 2);
+    }
+
+    #[test]
+    fn test_task_artifact_meta_projects_registry_task_fields() {
+        let registry = TaskRegistry::new_in_memory().unwrap();
+        registry
+            .create_task(CreateTask {
+                id: "T012".into(),
+                title: "Implement billing".into(),
+                assignee_hint: Some("worker".into()),
+                deps: vec!["T001".into(), "T002".into()],
+                success_criteria: Some("Billing succeeds".into()),
+                spec: Some("Implement billing workflow".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        registry.try_claim("T012", "worker").unwrap();
+        let task = registry.get_task("T012").unwrap().unwrap();
+
+        let meta = TaskArtifactMeta::from_task(&task);
+        assert_eq!(meta.id, "T012");
+        assert_eq!(meta.title, "Implement billing");
+        assert_eq!(meta.assignee_hint.as_deref(), Some("worker"));
+        assert_eq!(meta.status, task.status_raw);
+        assert_eq!(meta.deps, vec!["T001".to_string(), "T002".to_string()]);
+        assert_eq!(meta.success_criteria.as_deref(), Some("Billing succeeds"));
+        assert_eq!(meta.claimed_by.as_deref(), Some("worker"));
+        assert!(meta.submitted_by.is_none());
+        assert!(meta.accepted_by.is_none());
     }
 }

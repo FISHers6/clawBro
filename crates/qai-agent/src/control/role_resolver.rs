@@ -11,7 +11,7 @@ use std::sync::Arc;
 pub(crate) fn is_front_bot_turn(
     inbound: &InboundMsg,
     orch: &Option<Arc<TeamOrchestrator>>,
-    roster: &Option<AgentRoster>,
+    roster: Option<&AgentRoster>,
 ) -> bool {
     let orch = match orch {
         Some(o) => o,
@@ -28,7 +28,6 @@ pub(crate) fn is_front_bot_turn(
             let mention_bare = mention.trim_start_matches('@');
             mention_bare.eq_ignore_ascii_case(front_bot)
                 || roster
-                    .as_ref()
                     .and_then(|r| r.find_by_mention(mention))
                     .map(|e| e.name.eq_ignore_ascii_case(front_bot))
                     .unwrap_or(false)
@@ -79,7 +78,7 @@ mod tests {
     #[test]
     fn non_front_bot_mention_in_team_scope_is_not_lead() {
         let orch = Some(make_orchestrator());
-        let roster = Some(AgentRoster::new(vec![
+        let roster = AgentRoster::new(vec![
             AgentEntry {
                 name: "claude".to_string(),
                 mentions: vec!["@claude".to_string()],
@@ -96,9 +95,9 @@ mod tests {
                 workspace_dir: None,
                 extra_skills_dirs: vec![],
             },
-        ]));
+        ]);
 
         let inbound = make_inbound(Some("@codex"));
-        assert!(!is_front_bot_turn(&inbound, &orch, &roster));
+        assert!(!is_front_bot_turn(&inbound, &orch, Some(&roster)));
     }
 }

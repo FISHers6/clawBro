@@ -71,6 +71,10 @@ impl ApprovalBroker {
         self.pending.contains_key(approval_id)
     }
 
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+
     fn clear_if_pending(&self, approval_id: &str) {
         self.pending.remove(approval_id);
     }

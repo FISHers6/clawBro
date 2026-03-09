@@ -16,17 +16,18 @@
 
 use anyhow::Result;
 use chrono::Utc;
+use serde::Serialize;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 
 use super::heartbeat::DispatchFn;
-use super::registry::TaskRegistry;
-use super::session::TeamSession;
+use super::registry::{Task, TaskRegistry};
+use super::session::{TaskArtifactMeta, TeamSession};
 
 // ─── TeamState ────────────────────────────────────────────────────────────────
 
 /// Team Mode 执行状态机
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum TeamState {
     /// Lead 正在通过 create_task() 建立任务图
     Planning,
@@ -36,6 +37,39 @@ pub enum TeamState {
     Running,
     /// 所有任务已完成
     Done,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct TeamTaskCounts {
+    pub total: usize,
+    pub pending: usize,
+    pub claimed: usize,
+    pub submitted: usize,
+    pub accepted: usize,
+    pub done: usize,
+    pub failed: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct TeamArtifactHealthSummary {
+    pub root_present: bool,
+    pub team_md_present: bool,
+    pub context_md_present: bool,
+    pub tasks_md_present: bool,
+    pub task_artifacts_present: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TeamRuntimeSummary {
+    pub team_id: String,
+    pub state: TeamState,
+    pub lead_session_key: Option<qai_protocol::SessionKey>,
+    pub lead_agent_name: Option<String>,
+    pub specialists: Vec<String>,
+    pub tool_surface_ready: bool,
+    pub mcp_port: Option<u16>,
+    pub task_counts: TeamTaskCounts,
+    pub artifact_health: TeamArtifactHealthSummary,
 }
 
 // ─── TeamPlan ─────────────────────────────────────────────────────────────────
@@ -90,6 +124,8 @@ pub struct TeamOrchestrator {
     pub available_specialists: std::sync::OnceLock<Vec<String>>,
     /// TeamNotify MPSC sender — wired from main.rs after registry is ready.
     team_notify_tx: std::sync::OnceLock<tokio::sync::mpsc::Sender<qai_protocol::InboundMsg>>,
+    #[cfg(test)]
+    test_mcp_start_result: std::sync::Mutex<Option<std::result::Result<u16, String>>>,
 }
 
 impl TeamOrchestrator {
@@ -114,6 +150,8 @@ impl TeamOrchestrator {
             lead_agent_name: std::sync::OnceLock::new(),
             available_specialists: std::sync::OnceLock::new(),
             team_notify_tx: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            test_mcp_start_result: std::sync::Mutex::new(None),
         })
     }
 
@@ -159,10 +197,62 @@ impl TeamOrchestrator {
         let _ = self.available_specialists.set(agents);
     }
 
+    #[cfg(test)]
+    pub fn set_test_mcp_start_result(&self, result: std::result::Result<u16, String>) {
+        *self.test_mcp_start_result.lock().unwrap() = Some(result);
+    }
+
     /// 向 IM 频道发布一条消息（Lead 调用 post_update 时使用）
     pub fn post_message(&self, message: &str) {
         if let (Some(f), Some(scope)) = (self.notify_fn.get(), self.scope.get()) {
             (f)(scope.clone(), message.to_string());
+        }
+    }
+
+    pub fn status_snapshot(&self) -> TeamRuntimeSummary {
+        let tasks = self.registry.all_tasks().unwrap_or_default();
+        let mut counts = TeamTaskCounts {
+            total: tasks.len(),
+            ..TeamTaskCounts::default()
+        };
+        for task in &tasks {
+            let status = task.status_raw.as_str();
+            if status == "pending" {
+                counts.pending += 1;
+            } else if status.starts_with("claimed:") {
+                counts.claimed += 1;
+            } else if status.starts_with("submitted:") {
+                counts.submitted += 1;
+            } else if status.starts_with("accepted:") {
+                counts.accepted += 1;
+            } else if status == "done" {
+                counts.done += 1;
+            } else if status.starts_with("failed") {
+                counts.failed += 1;
+            }
+        }
+        let artifact_health = TeamArtifactHealthSummary {
+            root_present: self.session.dir.is_dir(),
+            team_md_present: self.session.dir.join("TEAM.md").is_file(),
+            context_md_present: self.session.dir.join("CONTEXT.md").is_file(),
+            tasks_md_present: self.session.dir.join("TASKS.md").is_file(),
+            task_artifacts_present: self.session.dir.join("tasks").is_dir(),
+        };
+
+        TeamRuntimeSummary {
+            team_id: self.session.team_id.clone(),
+            state: self.team_state(),
+            lead_session_key: self.lead_session_key.get().cloned(),
+            lead_agent_name: self.lead_agent_name.get().cloned(),
+            specialists: self
+                .available_specialists
+                .get()
+                .cloned()
+                .unwrap_or_default(),
+            tool_surface_ready: self.mcp_server_port.get().is_some(),
+            mcp_port: self.mcp_server_port.get().copied(),
+            task_counts: counts,
+            artifact_health,
         }
     }
 
@@ -176,6 +266,7 @@ impl TeamOrchestrator {
         }
         let id = task.id.clone();
         self.registry.create_task(task)?;
+        self.sync_task_artifacts(&id)?;
         Ok(format!("Task {} registered.", id))
     }
 
@@ -190,6 +281,21 @@ impl TeamOrchestrator {
     pub async fn start_mcp_server(self: &Arc<Self>) -> Result<()> {
         if self.mcp_server_port.get().is_some() {
             return Ok(()); // already started
+        }
+        #[cfg(test)]
+        if let Some(result) = self.test_mcp_start_result.lock().unwrap().take() {
+            match result {
+                Ok(port) => {
+                    let _ = self.mcp_server_port.set(port);
+                    tracing::info!(
+                        team_id = %self.session.team_id,
+                        mcp_port = ?self.mcp_server_port.get(),
+                        "SharedTeamMcpServer test port injected"
+                    );
+                    return Ok(());
+                }
+                Err(message) => anyhow::bail!(message),
+            }
         }
         let mcp_srv = super::shared_mcp_server::SharedTeamToolServer::new(Arc::clone(self));
         let mcp_handle = mcp_srv.spawn().await?;
@@ -215,8 +321,11 @@ impl TeamOrchestrator {
         if already_activated {
             anyhow::bail!("TeamOrchestrator::activate() called twice");
         }
-        // Transition state
-        *self.team_state_inner.lock().unwrap() = TeamState::Running;
+
+        // Team execution must not transition to Running until the tool surface is reachable.
+        if self.mcp_server_port.get().is_none() {
+            self.start_mcp_server().await?;
+        }
 
         // Write TEAM.md if not yet written
         let manifest = self.session.read_team_md();
@@ -290,15 +399,7 @@ impl TeamOrchestrator {
             async move { hb.run().await }
         });
         *self.heartbeat_handle.lock().unwrap() = Some(handle);
-
-        // MCP server was already started eagerly by start_mcp_server() in main.rs.
-        // If somehow not started yet (e.g. in tests that call activate() directly),
-        // start it now as a fallback.
-        if self.mcp_server_port.get().is_none() {
-            if let Err(e) = self.start_mcp_server().await {
-                tracing::error!(team_id = %self.session.team_id, "MCP server start failed: {e:#}");
-            }
-        }
+        *self.team_state_inner.lock().unwrap() = TeamState::Running;
 
         tracing::info!(
             team_id = %self.session.team_id,
@@ -338,6 +439,7 @@ impl TeamOrchestrator {
                 spec: task.spec.clone(),
                 success_criteria: task.success_criteria.clone(),
             })?;
+            self.sync_task_artifacts(&task.id)?;
         }
 
         // 3. Activate (syncs TASKS.md, starts Heartbeat + MCP)
@@ -363,6 +465,13 @@ impl TeamOrchestrator {
     pub fn handle_specialist_done(&self, task_id: &str, agent: &str, note: &str) -> Result<()> {
         // 1. 更新状态（校验认领者身份）
         self.registry.mark_done(task_id, agent, note)?;
+        self.sync_task_artifacts(task_id)?;
+        let _ = self.session.write_task_result(
+            task_id,
+            &format!(
+                "# Result\n\nSubmitted by: {agent}\n\nFinal note:\n{note}\n"
+            ),
+        );
 
         // 2. 事件日志
         let event = serde_json::json!({
@@ -404,6 +513,13 @@ impl TeamOrchestrator {
         summary: &str,
     ) -> Result<()> {
         self.registry.submit_task_result(task_id, agent, summary)?;
+        self.sync_task_artifacts(task_id)?;
+        let _ = self.session.write_task_result(
+            task_id,
+            &format!(
+                "# Result\n\nSubmitted by: {agent}\n\nSummary:\n{summary}\n"
+            ),
+        );
 
         let event = serde_json::json!({
             "event": "SUBMITTED",
@@ -422,6 +538,31 @@ impl TeamOrchestrator {
     /// Lead 验收已提交任务（submitted -> accepted），并复用里程碑检查逻辑。
     pub fn accept_submitted_task(&self, task_id: &str, by: &str) -> Result<()> {
         self.registry.accept_task(task_id, by)?;
+        self.sync_task_artifacts(task_id)?;
+        let _ = self.session.append_task_progress(
+            task_id,
+            &format!(
+                "[{}] {} accepted submission",
+                Utc::now().to_rfc3339(),
+                by
+            ),
+        );
+        let previous = self
+            .session
+            .task_dir(task_id)
+            .join("result.md");
+        let acceptance_note = format!(
+            "\n\n## Acceptance\n\nAccepted by: {by}\nTimestamp: {}\n",
+            Utc::now().to_rfc3339()
+        );
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(previous)
+            .and_then(|mut file| {
+                use std::io::Write;
+                file.write_all(acceptance_note.as_bytes())
+            });
 
         let event = serde_json::json!({
             "event": "ACCEPTED",
@@ -452,6 +593,16 @@ impl TeamOrchestrator {
     /// Lead 重新打开已提交/已验收任务，退回 pending 并通知团队。
     pub fn reopen_submitted_task(&self, task_id: &str, reason: &str, by: &str) -> Result<()> {
         self.registry.reopen_task(task_id, reason)?;
+        self.sync_task_artifacts(task_id)?;
+        let _ = self.session.append_task_progress(
+            task_id,
+            &format!(
+                "[{}] {} reopened task: {}",
+                Utc::now().to_rfc3339(),
+                by,
+                reason
+            ),
+        );
 
         let event = serde_json::json!({
             "event": "REOPENED",
@@ -691,6 +842,17 @@ impl TeamOrchestrator {
         })
         .to_string();
         let _ = self.session.append_event(&event);
+        self.registry.reset_claim(task_id)?;
+        self.sync_task_artifacts(task_id)?;
+        let _ = self.session.append_task_progress(
+            task_id,
+            &format!(
+                "[{}] {} blocked task: {}",
+                Utc::now().to_rfc3339(),
+                agent,
+                reason
+            ),
+        );
 
         // Escalation → Lead via team_notify_tx (same path as task completion)
         self.dispatch_team_notify_blocked(task_id, agent, reason);
@@ -714,6 +876,15 @@ impl TeamOrchestrator {
         })
         .to_string();
         let _ = self.session.append_event(&event);
+        let _ = self.session.append_task_progress(
+            task_id,
+            &format!(
+                "[{}] {} checkpoint: {}",
+                Utc::now().to_rfc3339(),
+                agent,
+                note
+            ),
+        );
         self.dispatch_team_notify_checkpoint(task_id, agent, note);
         Ok(())
     }
@@ -734,6 +905,15 @@ impl TeamOrchestrator {
         })
         .to_string();
         let _ = self.session.append_event(&event);
+        let _ = self.session.append_task_progress(
+            task_id,
+            &format!(
+                "[{}] {} requested help: {}",
+                Utc::now().to_rfc3339(),
+                agent,
+                message
+            ),
+        );
         self.dispatch_team_notify_help(task_id, agent, message);
         Ok(())
     }
@@ -872,6 +1052,41 @@ impl TeamOrchestrator {
         );
         Ok(())
     }
+
+    fn sync_task_artifacts(&self, task_id: &str) -> Result<()> {
+        let Some(task) = self.registry.get_task(task_id)? else {
+            anyhow::bail!("task '{}' not found while syncing artifacts", task_id);
+        };
+        self.write_task_artifacts(&task)
+    }
+
+    fn write_task_artifacts(&self, task: &Task) -> Result<()> {
+        self.session
+            .write_task_meta(&task.id, &TaskArtifactMeta::from_task(task))?;
+        self.session
+            .write_task_spec(&task.id, &render_task_spec(task))?;
+        Ok(())
+    }
+}
+
+fn render_task_spec(task: &Task) -> String {
+    let deps = task.deps();
+    let deps_section = if deps.is_empty() {
+        "None".to_string()
+    } else {
+        deps.join(", ")
+    };
+    format!(
+        "# {title}\n\n## Task ID\n\n{id}\n\n## Description\n\n{spec}\n\n## Success Criteria\n\n{criteria}\n\n## Dependencies\n\n{deps}\n",
+        title = task.title,
+        id = task.id,
+        spec = task.spec.as_deref().unwrap_or("No detailed spec provided."),
+        criteria = task
+            .success_criteria
+            .as_deref()
+            .unwrap_or("Complete the requested work."),
+        deps = deps_section,
+    )
 }
 
 // ─── 测试 ────────────────────────────────────────────────────────────────────
@@ -898,16 +1113,24 @@ mod tests {
 
     #[test]
     fn test_register_task_increments_registry() {
-        let (orch, _tmp) = make_orchestrator();
+        let (orch, tmp) = make_orchestrator();
         let result = orch.register_task(CreateTask {
             id: "T001".into(),
             title: "Write DB schema".into(),
+            spec: Some("Design the schema".into()),
+            success_criteria: Some("Schema covers auth and billing".into()),
             ..Default::default()
         });
         assert!(result.is_ok());
         assert!(result.unwrap().contains("T001"));
         let task = orch.registry.get_task("T001").unwrap().unwrap();
         assert_eq!(task.title, "Write DB schema");
+        let task_dir = tmp.path().join("tasks").join("T001");
+        assert!(task_dir.join("meta.json").is_file());
+        assert!(task_dir.join("spec.md").is_file());
+        let spec = std::fs::read_to_string(task_dir.join("spec.md")).unwrap();
+        assert!(spec.contains("Design the schema"));
+        assert!(spec.contains("Schema covers auth and billing"));
     }
 
     #[test]
@@ -919,6 +1142,7 @@ mod tests {
     #[tokio::test]
     async fn test_activate_starts_mcp_and_sets_running() {
         let (orch, _tmp) = make_orchestrator();
+        orch.set_test_mcp_start_result(Ok(32123));
         orch.register_task(CreateTask {
             id: "T001".into(),
             title: "test".into(),
@@ -927,12 +1151,29 @@ mod tests {
         .unwrap();
         orch.activate().await.unwrap();
         assert!(matches!(orch.team_state(), TeamState::Running));
-        assert!(orch.mcp_server_port.get().is_some());
+        assert_eq!(orch.mcp_server_port.get().copied(), Some(32123));
+    }
+
+    #[tokio::test]
+    async fn test_activate_fails_when_mcp_start_fails() {
+        let (orch, _tmp) = make_orchestrator();
+        orch.set_test_mcp_start_result(Err("synthetic mcp failure".to_string()));
+        orch.register_task(CreateTask {
+            id: "TFAIL".into(),
+            title: "test".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let err = orch.activate().await.unwrap_err().to_string();
+        assert!(err.contains("synthetic mcp failure"));
+        assert!(matches!(orch.team_state(), TeamState::Planning));
+        assert!(orch.mcp_server_port.get().is_none());
     }
 
     #[test]
     fn test_handle_specialist_done_updates_registry() {
-        let (orch, _tmp) = make_orchestrator();
+        let (orch, tmp) = make_orchestrator();
         orch.registry
             .create_task(CreateTask {
                 id: "T003".into(),
@@ -949,11 +1190,17 @@ mod tests {
         use crate::team::registry::TaskStatus;
         assert!(matches!(task.status_parsed(), TaskStatus::Done));
         assert_eq!(task.completion_note.as_deref(), Some("created jwt.rs"));
+        let result = std::fs::read_to_string(tmp.path().join("tasks").join("T003").join("result.md"))
+            .unwrap();
+        assert!(result.contains("created jwt.rs"));
+        let meta = std::fs::read_to_string(tmp.path().join("tasks").join("T003").join("meta.json"))
+            .unwrap();
+        assert!(meta.contains("\"status\": \"done\""));
     }
 
     #[test]
     fn test_handle_specialist_submitted_updates_registry() {
-        let (orch, _tmp) = make_orchestrator();
+        let (orch, tmp) = make_orchestrator();
         orch.registry
             .create_task(CreateTask {
                 id: "T004".into(),
@@ -973,11 +1220,17 @@ mod tests {
             TaskStatus::Submitted { ref agent, .. } if agent == "codex"
         ));
         assert_eq!(task.completion_note.as_deref(), Some("ready for review"));
+        let result = std::fs::read_to_string(tmp.path().join("tasks").join("T004").join("result.md"))
+            .unwrap();
+        assert!(result.contains("ready for review"));
+        let meta = std::fs::read_to_string(tmp.path().join("tasks").join("T004").join("meta.json"))
+            .unwrap();
+        assert!(meta.contains("submitted:codex:"));
     }
 
     #[tokio::test]
     async fn test_accept_submitted_task_triggers_all_done_milestone() {
-        let (orch, _tmp) = make_orchestrator();
+        let (orch, tmp) = make_orchestrator();
         let received = Arc::new(std::sync::Mutex::new(vec![]));
         let received_clone = Arc::clone(&received);
 
@@ -1011,6 +1264,13 @@ mod tests {
             "notify_fn should be called on acceptance milestone"
         );
         assert!(msgs.iter().any(|m| m.contains("所有任务已完成")));
+        let result = std::fs::read_to_string(tmp.path().join("tasks").join("T005").join("result.md"))
+            .unwrap();
+        assert!(result.contains("Accepted by: claude"));
+        let progress =
+            std::fs::read_to_string(tmp.path().join("tasks").join("T005").join("progress.md"))
+                .unwrap();
+        assert!(progress.contains("claude accepted submission"));
     }
 
     #[tokio::test]
@@ -1047,7 +1307,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_start_registers_tasks_and_writes_team_md() {
-        let (orch, _tmp) = make_orchestrator();
+        let (orch, tmp) = make_orchestrator();
+        orch.set_test_mcp_start_result(Ok(32124));
 
         let plan = TeamPlan {
             team_id: "test-team".into(),
@@ -1069,6 +1330,9 @@ mod tests {
 
         let task = orch.registry.get_task("T001").unwrap().unwrap();
         assert_eq!(task.title, "Setup");
+        let task_dir = tmp.path().join("tasks").join("T001");
+        assert!(task_dir.join("meta.json").is_file());
+        assert!(task_dir.join("spec.md").is_file());
     }
 
     #[test]
@@ -1099,7 +1363,7 @@ mod tests {
     fn block_task_accepts_owner() {
         use crate::team::registry::CreateTask;
 
-        let (orch, _tmp) = make_orchestrator();
+        let (orch, tmp) = make_orchestrator();
 
         orch.register_task(CreateTask {
             id: "T002".into(),
@@ -1115,5 +1379,44 @@ mod tests {
             "block_task should accept owner: {:?}",
             result.err()
         );
+        let task = orch.registry.get_task("T002").unwrap().unwrap();
+        assert!(
+            matches!(
+                task.status_parsed(),
+                crate::team::registry::TaskStatus::Pending
+            ),
+            "blocked task should release claim back to Pending, got {:?}",
+            task.status_parsed()
+        );
+        let progress =
+            std::fs::read_to_string(tmp.path().join("tasks").join("T002").join("progress.md"))
+                .unwrap();
+        assert!(progress.contains("blocked task"));
+        assert!(progress.contains("stuck on auth"));
+    }
+
+    #[test]
+    fn checkpoint_and_help_append_progress_artifacts() {
+        let (orch, tmp) = make_orchestrator();
+
+        orch.register_task(CreateTask {
+            id: "T020".into(),
+            title: "Need coordination".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        orch.handle_specialist_checkpoint("T020", "codex", "halfway there")
+            .unwrap();
+        orch.handle_specialist_help_requested("T020", "codex", "need API guidance")
+            .unwrap();
+
+        let progress =
+            std::fs::read_to_string(tmp.path().join("tasks").join("T020").join("progress.md"))
+                .unwrap();
+        assert!(progress.contains("checkpoint"));
+        assert!(progress.contains("halfway there"));
+        assert!(progress.contains("requested help"));
+        assert!(progress.contains("need API guidance"));
     }
 }

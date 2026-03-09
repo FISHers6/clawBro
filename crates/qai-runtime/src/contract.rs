@@ -17,11 +17,19 @@ pub enum RuntimeRole {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct RuntimeContext {
+    /// Derived system guidance for runtimes that need structured prompt text.
+    /// This is a projection layer, not the durable source of persona identity.
     pub system_prompt: Option<String>,
+    /// Canonical visible file contract for this turn.
+    /// Entries are deterministic and role-aware projections of persona/workspace/team files.
     pub workspace_native_files: Vec<String>,
+    /// Shared contextual memory projection for this turn.
     pub memory_summary: Option<String>,
+    /// Private role-allowed memory projection for this turn.
     pub agent_memory: Option<String>,
+    /// Projection of TEAM.md when team context is active.
     pub team_manifest: Option<String>,
+    /// Derived task-local execution helper, not a durable context source.
     pub task_reminder: Option<String>,
     pub history_lines: Vec<String>,
     pub user_input: Option<String>,

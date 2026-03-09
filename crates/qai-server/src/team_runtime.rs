@@ -150,14 +150,14 @@ pub async fn wire_team_runtime(
 
         team_orch.set_team_notify_tx(team_notify_tx_for_orch.clone());
 
-        match team_orch.start_mcp_server().await {
-            Ok(()) => {
-                tracing::info!(scope = %group.scope, team_id = %team_id, "SharedTeamMcpServer started")
-            }
-            Err(e) => {
-                tracing::error!(scope = %group.scope, "Failed to start SharedTeamMcpServer: {e:#}")
-            }
-        }
+        team_orch.start_mcp_server().await.map_err(|e| {
+            anyhow::anyhow!(
+                "failed to start SharedTeamMcpServer for scope '{}' (team '{}'): {e:#}",
+                group.scope,
+                team_id
+            )
+        })?;
+        tracing::info!(scope = %group.scope, team_id = %team_id, "SharedTeamMcpServer started");
 
         registry.register_team_orchestrator(team_id.clone(), team_orch);
         tracing::info!(scope = %group.scope, team_id = %team_id, "TeamOrchestrator registered");
@@ -166,6 +166,18 @@ pub async fn wire_team_runtime(
     for group in cfg.groups.iter().filter(|g| g.mode.auto_promote) {
         registry.add_auto_promote_scope(group.scope.clone());
         tracing::info!(scope = %group.scope, "auto_promote keyword detection enabled");
+    }
+
+    for group in cfg.groups.iter() {
+        if let Some(front_bot) = &group.mode.front_bot {
+            registry.register_scope_binding(group.scope.clone(), front_bot.clone());
+            tracing::info!(scope = %group.scope, front_bot = %front_bot, "scope binding registered");
+        }
+    }
+
+    for binding in &cfg.bindings {
+        registry.register_binding(binding.to_binding_rule());
+        tracing::info!(agent = %binding.agent_name(), kind = ?binding, "routing binding registered");
     }
 
     {

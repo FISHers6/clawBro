@@ -2,6 +2,7 @@
 //! Exposes modules and test helpers for integration tests.
 
 pub mod config;
+pub mod diagnostics;
 pub mod gateway;
 pub mod state;
 pub mod team_runtime;
@@ -93,8 +94,9 @@ pub async fn build_test_state_with_config(cfg: GatewayConfig) -> Result<AppState
             .await;
     }
     let runtime_dispatch = Arc::new(ConductorRuntimeDispatch::new(Arc::clone(&runtime_registry)));
+    let default_backend_id = cfg.resolved_default_backend_id();
     let (registry, _event_rx) = SessionRegistry::with_runtime_dispatch(
-        Some(cfg.agent.backend_id.clone()),
+        default_backend_id,
         session_manager,
         system_injection,
         if cfg.agent_roster.is_empty() {
@@ -113,6 +115,7 @@ pub async fn build_test_state_with_config(cfg: GatewayConfig) -> Result<AppState
 
     let state = AppState {
         registry,
+        runtime_registry,
         event_tx,
         cfg: Arc::new(cfg),
         runtime_token: Arc::new(uuid::Uuid::new_v4().to_string()),

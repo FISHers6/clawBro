@@ -1,4 +1,5 @@
 use anyhow::Result;
+use qai_agent::bindings::{BindingPeerKind, BindingRule};
 use qai_agent::roster::AgentEntry;
 use qai_runtime::{BackendFamily, BackendSpec, LaunchSpec};
 use serde::{Deserialize, Serialize};
@@ -100,6 +101,9 @@ pub struct GatewayConfig {
     /// 群组专项配置列表（`[[group]]` 段，可配置交互模式和 Team Mode 参数）
     #[serde(default, rename = "group")]
     pub groups: Vec<GroupConfig>,
+    /// Deterministic routing bindings (`[[binding]]`).
+    #[serde(default, rename = "binding")]
+    pub bindings: Vec<BindingConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,6 +131,11 @@ impl Default for GatewaySection {
 }
 
 impl GatewayConfig {
+    pub fn resolved_default_backend_id(&self) -> Option<String> {
+        let backend_id = self.agent.backend_id.trim();
+        (!backend_id.is_empty()).then(|| backend_id.to_string())
+    }
+
     pub fn validate_runtime_topology(&self) -> Result<()> {
         if self.backends.is_empty() {
             anyhow::bail!("at least one [[backend]] entry is required");
@@ -156,6 +165,46 @@ impl GatewayConfig {
                     "agent_roster `{}` resolves to backend `{}` which is not present in [[backend]] catalog",
                     entry.name,
                     backend_id
+                );
+            }
+        }
+
+        let roster_names: BTreeSet<&str> = self
+            .agent_roster
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        if !self.bindings.is_empty() && roster_names.is_empty() {
+            anyhow::bail!("[[binding]] requires [[agent_roster]] so bindings can resolve to named agents");
+        }
+        for group in &self.groups {
+            if let Some(front_bot) = group.mode.front_bot.as_deref() {
+                if !roster_names.contains(front_bot) {
+                    anyhow::bail!(
+                        "group `{}` references front_bot `{}` which is not present in [[agent_roster]]",
+                        group.scope,
+                        front_bot
+                    );
+                }
+            }
+
+            for specialist in &group.team.roster {
+                if !roster_names.contains(specialist.as_str()) {
+                    anyhow::bail!(
+                        "group `{}` references team agent `{}` which is not present in [[agent_roster]]",
+                        group.scope,
+                        specialist
+                    );
+                }
+            }
+        }
+
+        for binding in &self.bindings {
+            let agent_name = binding.agent_name();
+            if !roster_names.contains(agent_name) {
+                anyhow::bail!(
+                    "binding references agent `{}` which is not present in [[agent_roster]]",
+                    agent_name
                 );
             }
         }
@@ -424,6 +473,118 @@ pub struct GroupConfig {
     pub team: GroupTeamConfig,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BindingPeerKindConfig {
+    User,
+    Group,
+}
+
+impl BindingPeerKindConfig {
+    fn into_agent_kind(self) -> BindingPeerKind {
+        match self {
+            Self::User => BindingPeerKind::User,
+            Self::Group => BindingPeerKind::Group,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BindingConfig {
+    Thread {
+        agent: String,
+        scope: String,
+        thread_id: String,
+        #[serde(default)]
+        channel: Option<String>,
+    },
+    Scope {
+        agent: String,
+        scope: String,
+        #[serde(default)]
+        channel: Option<String>,
+    },
+    Peer {
+        agent: String,
+        peer_kind: BindingPeerKindConfig,
+        peer_id: String,
+        #[serde(default)]
+        channel: Option<String>,
+    },
+    Team {
+        agent: String,
+        team_id: String,
+    },
+    Channel {
+        agent: String,
+        channel: String,
+    },
+    Default {
+        agent: String,
+    },
+}
+
+impl BindingConfig {
+    pub fn agent_name(&self) -> &str {
+        match self {
+            Self::Thread { agent, .. }
+            | Self::Scope { agent, .. }
+            | Self::Peer { agent, .. }
+            | Self::Team { agent, .. }
+            | Self::Channel { agent, .. }
+            | Self::Default { agent } => agent,
+        }
+    }
+
+    pub fn to_binding_rule(&self) -> BindingRule {
+        match self {
+            Self::Thread {
+                agent,
+                scope,
+                thread_id,
+                channel,
+            } => BindingRule::Thread {
+                channel: channel.clone(),
+                scope: scope.clone(),
+                thread_id: thread_id.clone(),
+                agent_name: agent.clone(),
+            },
+            Self::Scope {
+                agent,
+                scope,
+                channel,
+            } => BindingRule::Scope {
+                channel: channel.clone(),
+                scope: scope.clone(),
+                agent_name: agent.clone(),
+            },
+            Self::Peer {
+                agent,
+                peer_kind,
+                peer_id,
+                channel,
+            } => BindingRule::Peer {
+                channel: channel.clone(),
+                kind: peer_kind.clone().into_agent_kind(),
+                id: peer_id.clone(),
+                agent_name: agent.clone(),
+            },
+            Self::Team { agent, team_id } => BindingRule::Team {
+                team_id: team_id.clone(),
+                agent_name: agent.clone(),
+            },
+            Self::Channel { agent, channel } => BindingRule::Channel {
+                channel: channel.clone(),
+                agent_name: agent.clone(),
+            },
+            Self::Default { agent } => BindingRule::Default {
+                agent_name: agent.clone(),
+            },
+        }
+    }
+}
+
 impl GatewayConfig {
     /// 从 ~/.quickai/config.toml 加载，不存在则用默认值
     pub fn load() -> Result<Self> {
@@ -641,6 +802,163 @@ type = "embedded"
     }
 
     #[test]
+    fn test_validate_runtime_topology_accepts_group_front_bot_and_team_roster() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+[[backend]]
+id = "native-main"
+family = "quick_ai_native"
+
+[backend.launch]
+type = "embedded"
+
+[agent]
+backend_id = "native-main"
+
+[[agent_roster]]
+name = "claude"
+mentions = ["@claude"]
+backend_id = "native-main"
+
+[[agent_roster]]
+name = "codex"
+mentions = ["@codex"]
+backend_id = "native-main"
+
+[[group]]
+scope = "group:lark:abc"
+
+[group.mode]
+interaction = "team"
+front_bot = "claude"
+
+[group.team]
+roster = ["codex"]
+"#,
+        )
+        .unwrap();
+
+        cfg.validate_runtime_topology().unwrap();
+    }
+
+    #[test]
+    fn test_validate_runtime_topology_rejects_unknown_group_front_bot() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+[[backend]]
+id = "native-main"
+family = "quick_ai_native"
+
+[backend.launch]
+type = "embedded"
+
+[agent]
+backend_id = "native-main"
+
+[[agent_roster]]
+name = "codex"
+mentions = ["@codex"]
+backend_id = "native-main"
+
+[[group]]
+scope = "group:lark:abc"
+
+[group.mode]
+interaction = "team"
+front_bot = "claude"
+"#,
+        )
+        .unwrap();
+
+        let err = cfg.validate_runtime_topology().unwrap_err();
+        assert!(err.to_string().contains("front_bot `claude`"));
+    }
+
+    #[test]
+    fn test_validate_runtime_topology_rejects_unknown_group_team_agent() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+[[backend]]
+id = "native-main"
+family = "quick_ai_native"
+
+[backend.launch]
+type = "embedded"
+
+[agent]
+backend_id = "native-main"
+
+[[agent_roster]]
+name = "claude"
+mentions = ["@claude"]
+backend_id = "native-main"
+
+[[group]]
+scope = "group:lark:abc"
+
+[group.mode]
+interaction = "team"
+front_bot = "claude"
+
+[group.team]
+roster = ["codex"]
+"#,
+        )
+        .unwrap();
+
+        let err = cfg.validate_runtime_topology().unwrap_err();
+        assert!(err.to_string().contains("team agent `codex`"));
+    }
+
+    #[test]
+    fn test_resolved_default_backend_id_treats_blank_as_none() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+[[backend]]
+id = "native-main"
+family = "quick_ai_native"
+
+[backend.launch]
+type = "embedded"
+
+[agent]
+backend_id = "   "
+
+[[agent_roster]]
+name = "claude"
+mentions = ["@claude"]
+backend_id = "native-main"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.resolved_default_backend_id(), None);
+    }
+
+    #[test]
+    fn test_resolved_default_backend_id_returns_trimmed_value() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+[[backend]]
+id = "native-main"
+family = "quick_ai_native"
+
+[backend.launch]
+type = "embedded"
+
+[agent]
+backend_id = " native-main "
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            cfg.resolved_default_backend_id().as_deref(),
+            Some("native-main")
+        );
+    }
+
+    #[test]
     fn test_memory_config_deserializes_with_defaults() {
         let toml_str = "[memory]\ndistill_every_n = 5";
         let cfg: GatewayConfig = toml::from_str(toml_str).unwrap();
@@ -836,6 +1154,12 @@ scope = "group:lark:xyz"
     }
 
     #[test]
+    fn test_bindings_empty_by_default() {
+        let cfg = GatewayConfig::default();
+        assert!(cfg.bindings.is_empty());
+    }
+
+    #[test]
     fn test_group_mode_channel_field_deserializes() {
         let toml_str = r#"
 [[group]]
@@ -856,5 +1180,106 @@ channel = "lark"
         let toml_str = "[[group]]\nscope = \"group:lark:xyz\"";
         let cfg: GatewayConfig = toml::from_str(toml_str).unwrap();
         assert!(cfg.groups[0].mode.channel.is_none());
+    }
+
+    #[test]
+    fn test_binding_config_deserializes_multiple_kinds() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+[[backend]]
+id = "native-main"
+family = "quick_ai_native"
+
+[backend.launch]
+type = "embedded"
+
+[[agent_roster]]
+name = "claude"
+mentions = ["@claude"]
+backend_id = "native-main"
+
+[[agent_roster]]
+name = "codex"
+mentions = ["@codex"]
+backend_id = "native-main"
+
+[[binding]]
+kind = "thread"
+agent = "claude"
+channel = "dingtalk"
+scope = "group:cid_1"
+thread_id = "webhook-1"
+
+[[binding]]
+kind = "peer"
+agent = "codex"
+channel = "lark"
+peer_kind = "user"
+peer_id = "ou_123"
+
+[[binding]]
+kind = "default"
+agent = "claude"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.bindings.len(), 3);
+        assert!(matches!(cfg.bindings[0], BindingConfig::Thread { .. }));
+        assert!(matches!(cfg.bindings[1], BindingConfig::Peer { .. }));
+        assert!(matches!(cfg.bindings[2], BindingConfig::Default { .. }));
+    }
+
+    #[test]
+    fn test_validate_runtime_topology_rejects_unknown_binding_agent() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+[[backend]]
+id = "native-main"
+family = "quick_ai_native"
+
+[backend.launch]
+type = "embedded"
+
+[[agent_roster]]
+name = "claude"
+mentions = ["@claude"]
+backend_id = "native-main"
+
+[[binding]]
+kind = "channel"
+agent = "codex"
+channel = "lark"
+"#,
+        )
+        .unwrap();
+
+        let err = cfg.validate_runtime_topology().unwrap_err();
+        assert!(err.to_string().contains("binding references agent `codex`"));
+    }
+
+    #[test]
+    fn test_validate_runtime_topology_rejects_bindings_without_roster() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+[[backend]]
+id = "native-main"
+family = "quick_ai_native"
+
+[backend.launch]
+type = "embedded"
+
+[agent]
+backend_id = "native-main"
+
+[[binding]]
+kind = "default"
+agent = "claude"
+"#,
+        )
+        .unwrap();
+
+        let err = cfg.validate_runtime_topology().unwrap_err();
+        assert!(err.to_string().contains("[[binding]] requires [[agent_roster]]"));
     }
 }

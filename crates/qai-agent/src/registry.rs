@@ -5,40 +5,32 @@
 //! - Registry resolves target_agent via AgentRoster (generic name lookup)
 //! - No platform-specific text parsing here
 
-use crate::control::role_resolver::is_front_bot_turn;
 use crate::control::session_router::get_orchestrator_for_session as route_orchestrator_for_session;
-use crate::control::turn_intent::build_turn_intent;
+use crate::context_assembly::{assemble_context, ContextAssemblyRequest};
 use crate::dedup::DedupStore;
-use crate::memory::cap_to_words;
+use crate::bindings::BindingRule;
 use crate::memory::{MemoryEvent, MemorySystem, MemoryTarget};
-use crate::persona::AgentPersona;
-use crate::prompt_builder::SystemPromptBuilder;
+use crate::post_turn::{process_post_turn, PostTurnInput, PostTurnProcessor};
 use crate::relay::RelayEngine;
 use crate::roster::AgentRoster;
+use crate::routing::resolve_turn_routing;
 use crate::runtime_dispatch::{default_runtime_dispatch, RuntimeDispatch, RuntimeDispatchRequest};
 use crate::slash::SlashCommand;
+use crate::slash_service::{execute_slash_request, SlashRequest};
 use crate::team::orchestrator::TeamOrchestrator;
-use crate::traits::{AgentCtx, AgentRole, HistoryMsg};
-use crate::{ApprovalDecision, ApprovalResolver};
+use crate::team::orchestrator::TeamRuntimeSummary;
+use crate::team::tool_executor::{execute_team_tool_call, resolve_team_tool_role};
+use crate::ApprovalResolver;
 use anyhow::Result;
 use dashmap::DashMap;
 use qai_channels::mention_trigger::MentionTrigger;
-use qai_protocol::{AgentEvent, InboundMsg, MsgSource, SessionKey};
-use qai_runtime::contract::{TeamCallback, TurnMode, TurnResult};
+use qai_protocol::{AgentEvent, InboundMsg, SessionKey};
+use qai_runtime::contract::{TeamCallback, TurnResult};
 use qai_runtime::{RuntimeEvent, TeamToolCall, TeamToolResponse};
 use qai_session::{SessionManager, StoredMessage};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
 use uuid::Uuid;
-
-/// Cloned data extracted from a roster match to avoid holding a borrow across await points.
-struct RosterMatchData {
-    agent_name: String,
-    backend_id: String,
-    persona_dir: Option<std::path::PathBuf>,
-    workspace_dir: Option<std::path::PathBuf>,
-    extra_skills_dirs: Vec<std::path::PathBuf>,
-}
 
 /// Single session state: holds per-session runtime backend selection.
 pub struct Session {
@@ -46,10 +38,190 @@ pub struct Session {
     pub backend_id: Option<String>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct MemoryControlContext<'a> {
+    registry: &'a SessionRegistry,
+}
+
+impl<'a> MemoryControlContext<'a> {
+    pub(crate) fn is_enabled(self) -> bool {
+        self.registry.memory_system.is_some()
+    }
+
+    pub(crate) fn memory_system(self) -> Option<Arc<MemorySystem>> {
+        self.registry.memory_system.clone()
+    }
+
+    pub(crate) fn resolve_memory_target(self, target_agent: Option<&str>) -> MemoryTarget {
+        target_agent
+            .and_then(|mention| {
+                self.registry
+                    .roster
+                    .as_ref()?
+                    .find_by_mention(mention)?
+                    .persona_dir
+                    .clone()
+            })
+            .map(|dir| MemoryTarget::Agent { persona_dir: dir })
+            .unwrap_or(MemoryTarget::Shared)
+    }
+
+    pub(crate) async fn read_agent_memory(
+        self,
+        agent_name: &str,
+        session_key: &SessionKey,
+    ) -> Result<Option<String>> {
+        let persona_dir = self
+            .registry
+            .roster
+            .as_ref()
+            .and_then(|r| r.find_by_name(agent_name))
+            .and_then(|entry| entry.persona_dir.clone());
+        let Some(persona_dir) = persona_dir else {
+            return Ok(None);
+        };
+
+        let Some(ms) = self.memory_system() else {
+            return Ok(None);
+        };
+
+        let scoped = ms
+            .store()
+            .load_agent_memory(&persona_dir, session_key)
+            .await
+            .unwrap_or_default();
+        Ok((!scoped.trim().is_empty()).then_some(scoped))
+    }
+
+    pub(crate) fn consume_pending_reset_confirmation(
+        self,
+        session_key: &SessionKey,
+        now: std::time::Instant,
+    ) -> bool {
+        let confirmed = self
+            .registry
+            .pending_resets
+            .get(session_key)
+            .map(|t| now.duration_since(*t).as_secs() < 60)
+            .unwrap_or(false);
+        if confirmed {
+            self.registry.pending_resets.remove(session_key);
+        }
+        confirmed
+    }
+
+    pub(crate) fn arm_pending_reset(self, session_key: &SessionKey, now: std::time::Instant) {
+        self.registry.pending_resets.insert(session_key.clone(), now);
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SlashControlContext<'a> {
+    registry: &'a SessionRegistry,
+}
+
+impl<'a> SlashControlContext<'a> {
+    pub(crate) fn memory(self) -> MemoryControlContext<'a> {
+        MemoryControlContext {
+            registry: self.registry,
+        }
+    }
+
+    pub(crate) fn resolve_backend_id(self, name: &str) -> String {
+        self.registry
+            .roster
+            .as_ref()
+            .and_then(|r| r.find_by_name(name))
+            .map(|entry| entry.runtime_backend_id().to_string())
+            .unwrap_or_else(|| name.to_string())
+    }
+
+    pub(crate) fn set_session_backend(self, key: &SessionKey, backend_id: String) {
+        self.registry.set_session_backend(key, backend_id);
+    }
+
+    pub(crate) async fn clear_session_history(self, session_key: &SessionKey) {
+        if let Ok(session_id) = self.registry.session_manager.get_or_create(session_key).await {
+            self.registry
+                .session_manager
+                .storage()
+                .clear_messages(session_id)
+                .await
+                .ok();
+        }
+    }
+
+    pub(crate) fn approval_resolver(self) -> Option<Arc<dyn ApprovalResolver>> {
+        self.registry.approval_resolver.get().cloned()
+    }
+
+    pub(crate) fn render_workspace_summary(
+        self,
+        session_key: &SessionKey,
+        target_agent: Option<&str>,
+    ) -> String {
+        let roster_workspace: Option<std::path::PathBuf> = target_agent.and_then(|mention| {
+            self.registry
+                .roster
+                .as_ref()
+                .and_then(|r| r.find_by_mention(mention))
+                .and_then(|entry| entry.workspace_dir.clone())
+        });
+        let resolved = self
+            .registry
+            .session_workspace(session_key)
+            .or(roster_workspace)
+            .or_else(|| self.registry.default_workspace.clone());
+        let display = resolved
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(none — running in gateway process directory)".to_string());
+        format!("Current workspace: `{display}`")
+    }
+
+    pub(crate) fn set_session_workspace(self, key: &SessionKey, path: std::path::PathBuf) {
+        self.registry.session_workspaces.insert(key.clone(), path);
+    }
+
+    pub(crate) fn render_team_status(self, session_key: &SessionKey) -> String {
+        let orch_arc = route_orchestrator_for_session(&self.registry.team_orchestrators, session_key);
+        if let Some(orch) = orch_arc {
+            let team_manifest = orch.session.read_team_md();
+            let tasks_snapshot = orch.session.read_tasks_md();
+            let task_count = orch
+                .registry
+                .all_tasks()
+                .map(|tasks| {
+                    let total = tasks.len();
+                    let done = tasks.iter().filter(|t| t.status_raw == "done").count();
+                    let claimed = tasks
+                        .iter()
+                        .filter(|t| t.status_raw.starts_with("claimed:"))
+                        .count();
+                    let pending = total - done - claimed;
+                    format!("{done}/{total} 完成，{claimed} 执行中，{pending} 待处理")
+                })
+                .unwrap_or_else(|_| "无法读取任务数据".to_string());
+
+            if team_manifest.trim().is_empty() && tasks_snapshot.trim().is_empty() {
+                "ℹ️ Team 已初始化但尚无任务。Lead 正在规划中...".to_string()
+            } else {
+                format!(
+                    "🏢 **Team 状态** — {task_count}\n\n{team_manifest}\n\n---\n\n{tasks_snapshot}"
+                )
+            }
+        } else {
+            "ℹ️ 当前 session 没有活跃的 Team。".to_string()
+        }
+    }
+}
+
 /// SessionRegistry: manages all per-session state with DashMap
 pub struct SessionRegistry {
     sessions: DashMap<SessionKey, Arc<Session>>,
     default_backend_id: Option<String>,
+    /// Deterministic routing bindings registered from gateway config.
+    /// Evaluated only when there is no explicit @mention and no manual session override.
+    bindings: std::sync::RwLock<Vec<BindingRule>>,
     session_manager: Arc<SessionManager>,
     dedup: DedupStore,
     /// WS subscriptions: session_key → list of WS client senders
@@ -67,7 +239,7 @@ pub struct SessionRegistry {
     last_activity: DashMap<SessionKey, std::time::Instant>,
     /// Pending /memory reset confirmations: session_key → timestamp of first reset request
     pending_resets: DashMap<SessionKey, std::time::Instant>,
-    /// Fallback persona_dir for single-engine mode (no roster match).
+    /// Default persona_dir for turns that do not resolve through roster routing.
     /// When set, TurnCompleted events fire even without a roster agent.
     default_persona_dir: Option<std::path::PathBuf>,
     /// Global default workspace directory. Used when no per-agent workspace_dir is set.
@@ -146,6 +318,7 @@ impl SessionRegistry {
         let registry = Arc::new(Self {
             sessions: DashMap::new(),
             default_backend_id,
+            bindings: std::sync::RwLock::new(Vec::new()),
             session_manager,
             dedup: DedupStore::new(),
             ws_subs: Arc::new(DashMap::new()),
@@ -224,6 +397,15 @@ impl SessionRegistry {
         self.team_orchestrators.insert(team_id, orch);
     }
 
+    #[cfg(test)]
+    pub(crate) fn memory_control(&self) -> MemoryControlContext<'_> {
+        MemoryControlContext { registry: self }
+    }
+
+    pub(crate) fn slash_control(&self) -> SlashControlContext<'_> {
+        SlashControlContext { registry: self }
+    }
+
     /// Find the TeamOrchestrator responsible for this session.
     ///
     /// - Specialist sessions: channel == "specialist", scope == "{team_id}:{agent}" → look up by team_id prefix.
@@ -278,41 +460,9 @@ impl SessionRegistry {
     pub fn session_workspace(&self, key: &SessionKey) -> Option<std::path::PathBuf> {
         self.session_workspaces.get(key).map(|v| v.clone())
     }
-
-    /// Set per-session workspace override (called from /workspace slash command handler).
-    fn set_session_workspace(&self, key: &SessionKey, path: std::path::PathBuf) {
-        self.session_workspaces.insert(key.clone(), path);
-    }
-
     /// All session scopes that have had activity (used by nightly consolidation scheduler).
     pub fn all_active_scopes(&self) -> Vec<SessionKey> {
         self.last_activity.iter().map(|e| e.key().clone()).collect()
-    }
-
-    /// Resolve the persona directory for the current turn.
-    /// Priority: roster agent's explicit dir > session-level default > auto-derived ~/.quickai/agents/{name}/
-    fn resolve_persona_dir(
-        &self,
-        roster_match: &Option<RosterMatchData>,
-    ) -> Option<std::path::PathBuf> {
-        roster_match
-            .as_ref()
-            .and_then(|rm| rm.persona_dir.clone())
-            .or_else(|| self.default_persona_dir.clone())
-            .or_else(|| {
-                roster_match.as_ref().map(|rm| {
-                    let name = &rm.agent_name;
-                    let dir = AgentPersona::default_dir_for(name);
-                    if !self.initialized_persona_dirs.contains(&dir) {
-                        if let Err(e) = AgentPersona::ensure_default_dir(&dir, name) {
-                            tracing::warn!(agent = %name, error = %e, "Failed to create default persona dir");
-                        } else {
-                            self.initialized_persona_dirs.insert(dir.clone());
-                        }
-                    }
-                    dir
-                })
-            })
     }
 
     /// Return how many seconds the given session has been idle (no `handle()` activity).
@@ -345,32 +495,41 @@ impl SessionRegistry {
         let _ = self.approval_resolver.set(resolver);
     }
 
+    /// Register a deterministic scope -> agent binding from gateway config.
+    pub fn register_scope_binding(&self, scope: String, agent_name: String) {
+        self.register_binding(BindingRule::scope(scope, agent_name));
+    }
+
+    pub fn register_binding(&self, binding: BindingRule) {
+        let agent_name = binding.agent_name().to_string();
+        if self
+            .roster
+            .as_ref()
+            .is_some_and(|roster| {
+                crate::routing::resolve_roster_match_by_name(Some(roster), &agent_name).is_none()
+            })
+        {
+            tracing::warn!(
+                agent = %agent_name,
+                "ignoring routing binding for unknown roster agent"
+            );
+            return;
+        }
+        self.bindings.write().unwrap().push(binding);
+    }
+
     pub fn session_manager_ref(&self) -> &SessionManager {
         &self.session_manager
     }
 
-    fn resolve_claimed_agent_for_tool(
-        &self,
-        team_orch: &TeamOrchestrator,
-        task_id: &str,
-        explicit: Option<&str>,
-    ) -> String {
-        explicit
-            .map(ToOwned::to_owned)
-            .or_else(|| {
-                team_orch
-                    .registry
-                    .get_task(task_id)
-                    .ok()
-                    .flatten()
-                    .and_then(|t| {
-                        t.status_raw
-                            .strip_prefix("claimed:")
-                            .and_then(|s| s.split(':').next())
-                            .map(|s| s.to_string())
-                    })
-            })
-            .unwrap_or_else(|| "unknown".to_string())
+    pub fn team_summaries(&self) -> Vec<TeamRuntimeSummary> {
+        let mut summaries: Vec<_> = self
+            .team_orchestrators
+            .iter()
+            .map(|entry| entry.value().status_snapshot())
+            .collect();
+        summaries.sort_by(|a, b| a.team_id.cmp(&b.team_id));
+        summaries
     }
 
     pub async fn invoke_team_tool(
@@ -381,182 +540,8 @@ impl SessionRegistry {
         let team_orch = self
             .get_orchestrator_for_session(session_key)
             .ok_or_else(|| anyhow::anyhow!("no TeamOrchestrator found for session"))?;
-
-        let response = match call {
-            TeamToolCall::CreateTask {
-                id,
-                title,
-                assignee,
-                spec,
-                deps,
-                success_criteria,
-            } => TeamToolResponse {
-                ok: true,
-                message: team_orch.register_task(crate::team::registry::CreateTask {
-                    id,
-                    title,
-                    assignee_hint: assignee,
-                    deps,
-                    timeout_secs: 1800,
-                    spec,
-                    success_criteria,
-                })?,
-                payload: None,
-            },
-            TeamToolCall::StartExecution => TeamToolResponse {
-                ok: true,
-                message: team_orch.activate().await?,
-                payload: None,
-            },
-            TeamToolCall::RequestConfirmation { plan_summary } => {
-                let formatted = format!("**Plan for confirmation:**\n\n{}", plan_summary);
-                team_orch.post_message(&formatted);
-                *team_orch.team_state_inner.lock().unwrap() =
-                    crate::team::orchestrator::TeamState::AwaitingConfirm;
-                TeamToolResponse {
-                    ok: true,
-                    message: "Confirmation requested. Waiting for user reply.".to_string(),
-                    payload: None,
-                }
-            }
-            TeamToolCall::PostUpdate { message } => {
-                team_orch.post_message(&message);
-                TeamToolResponse {
-                    ok: true,
-                    message: "Posted.".to_string(),
-                    payload: None,
-                }
-            }
-            TeamToolCall::GetTaskStatus => {
-                let tasks = team_orch.registry.all_tasks()?;
-                let arr: Vec<serde_json::Value> = tasks
-                    .iter()
-                    .map(|t| {
-                        serde_json::json!({
-                            "id": t.id,
-                            "title": t.title,
-                            "status": t.status_raw,
-                            "assignee": t.assignee_hint,
-                            "deps": t.deps(),
-                            "retry_count": t.retry_count,
-                            "completion_note": t.completion_note,
-                        })
-                    })
-                    .collect();
-                let payload = serde_json::Value::Array(arr.clone());
-                TeamToolResponse {
-                    ok: true,
-                    message: serde_json::to_string_pretty(&arr)?,
-                    payload: Some(payload),
-                }
-            }
-            TeamToolCall::AssignTask {
-                task_id,
-                new_assignee,
-            } => {
-                team_orch.registry.reassign_task(&task_id, &new_assignee)?;
-                TeamToolResponse {
-                    ok: true,
-                    message: format!("Task {} reassigned to {}.", task_id, new_assignee),
-                    payload: None,
-                }
-            }
-            TeamToolCall::CheckpointTask {
-                task_id,
-                note,
-                agent,
-            } => {
-                let agent =
-                    self.resolve_claimed_agent_for_tool(&team_orch, &task_id, agent.as_deref());
-                team_orch.handle_specialist_checkpoint(&task_id, &agent, &note)?;
-                TeamToolResponse {
-                    ok: true,
-                    message: format!("Checkpoint recorded for task {}.", task_id),
-                    payload: None,
-                }
-            }
-            TeamToolCall::SubmitTaskResult {
-                task_id,
-                summary,
-                agent,
-            } => {
-                let agent =
-                    self.resolve_claimed_agent_for_tool(&team_orch, &task_id, agent.as_deref());
-                team_orch.handle_specialist_submitted(&task_id, &agent, &summary)?;
-                TeamToolResponse {
-                    ok: true,
-                    message: format!("Task {} submitted for review.", task_id),
-                    payload: None,
-                }
-            }
-            TeamToolCall::AcceptTask { task_id, by } => {
-                let by = by.as_deref().unwrap_or("leader");
-                team_orch.accept_submitted_task(&task_id, by)?;
-                TeamToolResponse {
-                    ok: true,
-                    message: format!("Task {} accepted by {}.", task_id, by),
-                    payload: None,
-                }
-            }
-            TeamToolCall::ReopenTask {
-                task_id,
-                reason,
-                by,
-            } => {
-                let by = by.as_deref().unwrap_or("leader");
-                team_orch.reopen_submitted_task(&task_id, &reason, by)?;
-                TeamToolResponse {
-                    ok: true,
-                    message: format!("Task {} reopened by {}.", task_id, by),
-                    payload: None,
-                }
-            }
-            TeamToolCall::BlockTask {
-                task_id,
-                reason,
-                agent,
-            } => {
-                let agent =
-                    self.resolve_claimed_agent_for_tool(&team_orch, &task_id, agent.as_deref());
-                if !team_orch
-                    .registry
-                    .is_claimed_by(&task_id, &agent)
-                    .unwrap_or(false)
-                {
-                    anyhow::bail!("task '{}' is not currently claimed by '{}'", task_id, agent);
-                }
-                let _ = team_orch.registry.reset_claim(&task_id);
-                team_orch.handle_specialist_blocked(&task_id, &agent, &reason)?;
-                TeamToolResponse {
-                    ok: true,
-                    message: format!("Task {} reported as blocked: {}", task_id, reason),
-                    payload: None,
-                }
-            }
-            TeamToolCall::RequestHelp {
-                task_id,
-                message,
-                agent,
-            } => {
-                let agent =
-                    self.resolve_claimed_agent_for_tool(&team_orch, &task_id, agent.as_deref());
-                if !team_orch
-                    .registry
-                    .is_claimed_by(&task_id, &agent)
-                    .unwrap_or(false)
-                {
-                    anyhow::bail!("task '{}' is not currently claimed by '{}'", task_id, agent);
-                }
-                team_orch.handle_specialist_help_requested(&task_id, &agent, &message)?;
-                TeamToolResponse {
-                    ok: true,
-                    message: format!("Help request sent for task {}.", task_id),
-                    payload: None,
-                }
-            }
-        };
-
-        Ok(response)
+        let role = resolve_team_tool_role(session_key, &team_orch)?;
+        execute_team_tool_call(team_orch, role, call).await
     }
 
     async fn apply_team_callback(
@@ -728,170 +713,36 @@ impl SessionRegistry {
             }
         }
 
-        // Early Specialist/Lead detection — must run before roster_match so Lead turns
-        // without an explicit @mention can fall back to the configured front_bot engine.
-        let early_is_specialist = inbound.source == MsgSource::Heartbeat;
-        // Auto-promote check: scope has auto_promote=true AND message contains team trigger keywords.
-        // We then try to find an unclaimed orchestrator (lead_session_key not yet set) to attach.
-        // If no orchestrator is found, fall back to Solo to avoid injecting Lead tools with no MCP URL.
-        let is_auto_promote_candidate = !early_is_specialist
-            && session_team_orch.is_none()
-            && inbound.source == MsgSource::Human
-            && self.auto_promote_scopes.contains(&session_key.scope)
-            && crate::mode_selector::is_team_trigger(inbound.content.as_text().unwrap_or(""));
-        // For auto_promote candidates, find the orchestrator bound to this exact scope.
-        // We match by lead_session_key.scope rather than "unclaimed" (is_none()), because:
-        //   - All Team orchestrators have lead_session_key preset at startup in main.rs.
-        //   - Matching by scope prevents cross-group binding in multi-group deployments.
-        //   - A group with both Team mode AND auto_promote=true can trigger Lead behavior
-        //     dynamically via keyword detection (e.g. before user types /team start).
-        let auto_promote_orch: Option<Arc<TeamOrchestrator>> = if is_auto_promote_candidate {
-            let found = self
-                .team_orchestrators
-                .iter()
-                .find(|e| {
-                    e.value()
-                        .lead_session_key
-                        .get()
-                        .map(|k| k.scope == session_key.scope)
-                        .unwrap_or(false)
-                })
-                .map(|e| Arc::clone(e.value()));
-            if found.is_none() {
-                tracing::warn!(
-                    scope = %session_key.scope,
-                    "auto_promote triggered but no orchestrator found for this scope — falling back to Solo"
-                );
-            }
-            found
-        } else {
-            None
-        };
-        // Merge: for auto_promote, use the found orchestrator for all subsequent Lead logic.
-        let session_team_orch = session_team_orch.or(auto_promote_orch);
-        // Lead turn: must have an orchestrator AND the message must target front_bot
-        // (either no @mention → default to front_bot, or explicit @front_bot mention).
-        // Without the is_front_bot_turn() guard, @codex in a Team group would incorrectly
-        // receive Lead role and Lead system prompt (F2 fix).
-        let early_is_lead = !early_is_specialist
-            && session_team_orch.is_some()
-            && is_front_bot_turn(&inbound, &session_team_orch, &self.roster);
-
-        // ── Generic routing via target_agent (set by Channel) ──
-        // Clone needed data from roster match to avoid holding borrow across await.
-        // For Lead turns without an explicit @mention, fall back to the configured
-        // front_bot agent (set via `front_bot` in [[group]] config).
-        let roster_match: Option<RosterMatchData> = inbound
-            .target_agent
-            .as_deref()
-            .and_then(|mention| {
-                self.roster
-                    .as_ref()
-                    .and_then(|r| r.find_by_mention(mention))
-                    .map(|entry| RosterMatchData {
-                        agent_name: entry.name.clone(),
-                        backend_id: entry.runtime_backend_id().to_string(),
-                        persona_dir: entry.persona_dir.clone(),
-                        workspace_dir: entry.workspace_dir.clone(),
-                        extra_skills_dirs: entry.extra_skills_dirs.clone(),
-                    })
-            })
-            .or_else(|| {
-                // Lead fallback: no @mention but this is a Lead turn → use front_bot engine
-                if early_is_lead {
-                    session_team_orch
-                        .as_ref()
-                        .and_then(|o| o.lead_agent_name.get())
-                        .and_then(|name| {
-                            self.roster
-                                .as_ref()?
-                                .find_by_name(name)
-                                .map(|entry| RosterMatchData {
-                                    agent_name: entry.name.clone(),
-                                    backend_id: entry.runtime_backend_id().to_string(),
-                                    persona_dir: entry.persona_dir.clone(),
-                                    workspace_dir: entry.workspace_dir.clone(),
-                                    extra_skills_dirs: entry.extra_skills_dirs.clone(),
-                                })
-                        })
-                } else {
-                    None
-                }
-            });
-
-        let turn_mode = if early_is_specialist || early_is_lead {
-            TurnMode::Team
-        } else if inbound.source == MsgSource::Relay {
-            TurnMode::Relay
-        } else {
-            TurnMode::Solo
-        };
-        let session_backend_id = if roster_match.is_none() {
-            self.get_or_create_session(&session_key).backend_id.clone()
-        } else {
-            None
-        };
-        let turn_intent = build_turn_intent(
+        let specialist_task_reminder = self.team_task_reminders.get(&session_key).map(|v| v.clone());
+        let session_backend_id = self.get_or_create_session(&session_key).backend_id.clone();
+        let bindings = self.bindings.read().unwrap().clone();
+        let routing = resolve_turn_routing(
             &inbound,
-            turn_mode,
-            session_team_orch
-                .as_ref()
-                .and_then(|o| o.lead_agent_name.get())
-                .and_then(|name| {
-                    self.roster
-                        .as_ref()
-                        .and_then(|r| r.find_by_name(name))
-                        .map(|entry| entry.runtime_backend_id().to_string())
-                        .or_else(|| Some(name.clone()))
-                })
-                .as_deref(),
-            roster_match
-                .as_ref()
-                .map(|rm| rm.backend_id.as_str())
-                .or(session_backend_id.as_deref()),
+            self.roster.as_ref(),
+            &bindings,
+            &self.team_orchestrators,
+            &self.auto_promote_scopes,
+            session_backend_id,
+            specialist_task_reminder,
         );
+        if !routing.is_lead {
+            self.team_task_reminders.remove(&session_key);
+        }
         tracing::debug!(
-            session = ?turn_intent.session_key,
-            mode = ?turn_intent.mode,
-            leader_candidate = ?turn_intent.leader_candidate,
-            target_backend = ?turn_intent.target_backend,
+            session = ?routing.intent.session_key,
+            mode = ?routing.intent.mode,
+            leader_candidate = ?routing.intent.leader_candidate,
+            target_backend = ?routing.intent.target_backend,
             "built turn intent"
         );
-
-        // Resolve runtime selection: roster match overrides the per-session backend selection.
-        let (fallback_backend_id, sender_name): (Option<String>, Option<String>) =
-            if let Some(rm) = &roster_match {
-                (
-                    Some(rm.backend_id.clone()),
-                    Some(format!("@{}", rm.agent_name)),
-                )
-            } else {
-                // No @mention or no roster: use the session's persistent backend selection.
-                let session = self.get_or_create_session(&session_key);
-                (session.backend_id.clone(), None)
-            };
 
         // Get-or-create persistent session record
         let session_id = self.session_manager.get_or_create(&session_key).await?;
         let storage = self.session_manager.storage();
 
-        // ── History: 50-message sliding window + sender prefix for LLM context ──
         // load_recent_messages avoids deserializing the entire JSONL for long sessions.
         let recent = storage.load_recent_messages(session_id, 50).await?;
         let recent = &recent[..];
-        let history: Vec<HistoryMsg> = recent
-            .iter()
-            .map(|m| {
-                let content = match m.sender.as_deref() {
-                    Some(s) if !s.is_empty() => format!("[{}]: {}", s, m.content),
-                    _ => m.content.clone(),
-                };
-                HistoryMsg {
-                    role: m.role.clone(),
-                    content,
-                }
-            })
-            .collect();
 
         // Save user message with sender annotation
         let user_msg = StoredMessage {
@@ -904,254 +755,44 @@ impl SessionRegistry {
         };
         storage.append_message(session_id, &user_msg).await?;
 
-        // Resolve workspace: per-session override (/workspace cmd) > per-roster-agent entry > global default
-        let workspace_dir_resolved: Option<std::path::PathBuf> = self
-            .session_workspace(&session_key) // per-session override from /workspace command
-            .or_else(|| {
-                roster_match
-                    .as_ref()
-                    .and_then(|rm| rm.workspace_dir.clone())
-            })
-            .or_else(|| self.default_workspace.clone());
-
-        // Build workspace-aware skill injection:
-        //   1. {workspace}/.agents/skills/ (canonical npx-skills install dir) ← primary
-        //   2. Agent's explicit extra_skills_dirs
-        //   3. Gateway-level skill_loader_dirs (fallback)
-        let (skill_injection, first_persona) = {
-            let mut agent_skill_dirs: Vec<std::path::PathBuf> = Vec::new();
-            // 1. Canonical workspace dir
-            if let Some(ref ws) = workspace_dir_resolved {
-                let canonical = ws.join(".agents").join("skills");
-                if canonical.exists() {
-                    agent_skill_dirs.push(canonical);
-                }
-            }
-            // 2. Agent's explicit extra dirs
-            if let Some(rm) = &roster_match {
-                agent_skill_dirs.extend(rm.extra_skills_dirs.iter().cloned());
-            }
-            if agent_skill_dirs.is_empty() && self.skill_loader_dirs.is_empty() {
-                // No workspace-specific dirs — use pre-built gateway-level injection
-                (String::new(), None)
-            } else {
-                // Merge: workspace dirs first, then gateway fallback dirs
-                let mut all_dirs = agent_skill_dirs;
-                all_dirs.extend(self.skill_loader_dirs.iter().cloned());
-                let loader = qai_skills::SkillLoader::with_dirs(all_dirs);
-                let skills = loader.load_all();
-                let personas = loader.load_personas();
-                let injection = loader.build_system_injection(&skills);
-                let persona = personas.into_iter().next();
-                (injection, persona)
-            }
-        };
-
-        // Override agent_role for Lead
-        let early_agent_role = if early_is_specialist {
-            AgentRole::Specialist
-        } else if early_is_lead {
-            AgentRole::Lead
-        } else {
-            AgentRole::Solo
-        };
-
         // When a TeamNotify arrives, lazily set lead_session_key + scope if not yet set.
         // TeamNotify session_key IS the lead's session_key — find the orchestrator by scanning all.
         if inbound.source == qai_protocol::MsgSource::TeamNotify {
-            if let Some(team_orch) = session_team_orch.as_ref() {
+            if let Some(team_orch) = routing.team_orchestrator.as_ref() {
                 team_orch.set_lead_session_key(session_key.clone());
                 team_orch.set_scope(session_key.clone());
             }
         }
-
-        // Build Lead Layer 0 (task_reminder for Lead turns based on TeamState)
-        let lead_layer_0: Option<String> = if early_is_lead {
-            let state = session_team_orch
-                .as_ref()
-                .map(|o| o.team_state())
-                .unwrap_or(crate::team::orchestrator::TeamState::Planning);
-            {
-                let specialists_list = session_team_orch
-                    .as_ref()
-                    .and_then(|o| o.available_specialists.get())
-                    .map(|v| v.join(", "))
-                    .unwrap_or_else(|| "（未配置）".to_string());
-                Some(match state {
-                    crate::team::orchestrator::TeamState::Planning
-                    | crate::team::orchestrator::TeamState::AwaitingConfirm => {
-                        format!(
-                            "你是团队协调者。用户的请求需要多个 Agent 协作完成。\n\n\
-                             可分配的 Specialist：{specialists_list}\n\n\
-                             步骤：\n\
-                             1. 分析任务，调用 create_task() 定义所有子任务和依赖关系（assignee 填 Specialist 名称）\n\
-                             2. 简单任务（≤3个、无复杂依赖）直接调用 start_execution()\n\
-                             3. 复杂任务先调用 request_confirmation(plan_summary)，等用户确认后再执行\n\
-                             4. Specialist 完成后通常会先提交结果；你收到待验收通知后，用 accept_task() 验收或 reopen_task() 打回\n\
-                             5. 任务执行中你会收到 [团队通知] 消息，用 post_update() 向用户播报关键进度\n\
-                             6. 收到\"所有任务已完成\"通知后，合成最终结果并调用 post_update() 发给用户\n\n\
-                             可用工具：create_task, start_execution, request_confirmation, post_update, get_task_status, assign_task, accept_task, reopen_task",
-                            specialists_list = specialists_list,
-                        )
-                    }
-                    crate::team::orchestrator::TeamState::Running
-                    | crate::team::orchestrator::TeamState::Done => {
-                        format!(
-                            "团队任务执行中。可分配的 Specialist：{specialists_list}\n\n\
-                             你会收到 [团队通知] 消息：\n\
-                             - 用 post_update(message) 向用户播报进度\n\
-                             - 用 get_task_status() 查看全局状态\n\
-                             - 用 assign_task(task_id, agent) 重新分配卡住的任务（agent 填 Specialist 名称）\n\
-                             - 对 submitted 结果用 accept_task(task_id) 验收，或用 reopen_task(task_id, reason) 打回\n\
-                             - 收到\"所有任务已完成\"通知后，合成最终汇总并 post_update",
-                            specialists_list = specialists_list,
-                        )
-                    }
-                })
-            }
-        } else {
-            None
-        };
-
-        // Lead turns use lead_layer_0 as task_reminder; Specialist turns use pre-registered reminder.
-        // Use a single .remove() (not .get()) to consume the DashMap entry exactly once.
-        let early_task_reminder: Option<String> = if early_is_lead {
-            lead_layer_0.clone()
-        } else {
-            self.team_task_reminders
-                .remove(&session_key)
-                .map(|(_, v)| v)
-        };
-
-        let canonical_shared_memory = if early_is_specialist {
-            session_team_orch
-                .as_ref()
-                .map(|o| o.session.read_context_md())
-                .filter(|content| !content.trim().is_empty())
-        } else if let Some(ms) = &self.memory_system {
-            ms.store()
-                .load_shared_memory(&session_key)
-                .await
-                .ok()
-                .filter(|content| !content.trim().is_empty())
-        } else {
-            None
-        };
-        let canonical_team_manifest = if matches!(
-            early_agent_role,
-            crate::traits::AgentRole::Lead | crate::traits::AgentRole::Specialist
-        ) {
-            session_team_orch
-                .as_ref()
-                .map(|o| o.session.read_team_md())
-                .filter(|manifest| !manifest.trim().is_empty())
-        } else {
-            None
-        };
-
-        let mut canonical_agent_memory: Option<String> = None;
-        // Build the full system prompt via SystemPromptBuilder (6-layer persona-aware).
-        let system_injection = {
-            if roster_match.is_some() {
-                // Roster match: build fresh with all persona layers.
-                let resolved_dir = self.resolve_persona_dir(&roster_match);
-                let (soul_md, identity_raw, agent_memory) = if let Some(ref dir) = resolved_dir {
-                    let ap = AgentPersona::load_from_dir_scoped(dir, &session_key);
-                    (ap.soul, ap.identity, ap.memory)
-                } else {
-                    (String::new(), String::new(), String::new())
-                };
-                canonical_agent_memory = (!agent_memory.trim().is_empty()).then_some(agent_memory);
-
-                // Persona capability body prepended to regular skill injection.
-                let combined_skills = match &first_persona {
-                    Some(p) if !p.capability_body.trim().is_empty() => {
-                        if skill_injection.is_empty() {
-                            p.capability_body.clone()
-                        } else {
-                            format!("{}\n\n{}", p.capability_body, skill_injection)
-                        }
-                    }
-                    _ => skill_injection,
-                };
-
-                SystemPromptBuilder {
-                    persona: first_persona.as_ref(),
-                    soul_md: &soul_md,
-                    identity_raw: &identity_raw,
-                    skills_injection: &combined_skills,
-                    shared_memory: "",
-                    agent_memory: "",
-                    shared_max_words: 300,
-                    agent_max_words: 500,
-                    agent_role: early_agent_role,
-                    task_reminder: None,
-                    team_manifest: None,
-                }
-                .build()
-            } else {
-                // No roster match: use cached gateway-level injection; fold in workspace skills if any.
-                // If a persona skill was found in a workspace skill dir, its capability_body and identity
-                // layers are intentionally NOT injected here — persona layers require a roster-matched agent
-                // so that the correct persona_dir (SOUL.md + IDENTITY.md) is resolved.
-                if let Some(ref p) = first_persona {
-                    tracing::debug!(
-                        persona = %p.identity.name,
-                        "persona found in skill dirs but no roster match — \
-                         persona layers not injected in single-engine mode"
-                    );
-                }
-                if skill_injection.is_empty() {
-                    self.system_injection.clone()
-                } else if self.system_injection.is_empty() {
-                    skill_injection
-                } else {
-                    format!("{}\n\n{}", self.system_injection, skill_injection)
-                }
-            }
-        };
-
-        // Pass the already-consumed reminder into AgentCtx (same value used by SystemPromptBuilder).
-        let task_reminder = early_task_reminder.clone();
-        // session_team_orch was resolved once at top of handle() — reuse here.
-        let team_dir = if early_is_specialist {
-            session_team_orch.as_ref().map(|o| o.session.dir.clone())
-        } else {
-            None
-        };
-
-        // For Specialist turns, override workspace_dir with team_dir so the engine sees
-        // TEAM.md/TASKS.md/CONTEXT.md in its working directory (fixes I1).
-        let effective_workspace = team_dir.clone().or(workspace_dir_resolved);
-
-        // Both Lead and Specialist get the same unified MCP server URL (SharedTeamToolServer).
-        // System prompts guide which of the 8 tools are relevant per role.
-        let mcp_server_url: Option<String> = session_team_orch
-            .as_ref()
-            .and_then(|o| o.mcp_server_port.get().copied())
-            .map(|port| format!("http://127.0.0.1:{port}/sse"));
-        let team_tool_url = session_team_orch
-            .as_ref()
-            .and_then(|_| self.team_tool_url.get().cloned());
-
-        // Build AgentCtx for the engine
-        let ctx = AgentCtx {
+        let assembled = assemble_context(ContextAssemblyRequest {
             session_id,
-            session_key: session_key.clone(),
-            participant_name: roster_match.as_ref().map(|rm| rm.agent_name.clone()),
-            user_text,
-            history,
-            system_injection,
-            workspace_dir: effective_workspace,
-            agent_role: early_agent_role,
-            task_reminder,
-            team_dir,
-            mcp_server_url,
-            team_tool_url,
-            shared_memory: canonical_shared_memory,
-            agent_memory: canonical_agent_memory,
-            team_manifest: canonical_team_manifest,
-        };
+            session_key: &session_key,
+            inbound: &inbound,
+            recent_messages: recent,
+            roster_match: routing.roster_match.as_ref(),
+            agent_role: routing.agent_role,
+            task_reminder: routing.task_reminder.clone(),
+            session_team_orch: routing.team_orchestrator.as_ref(),
+            system_injection: &self.system_injection,
+            memory_system: self.memory_system.as_ref(),
+            default_persona_dir: self.default_persona_dir.clone(),
+            default_workspace: self.default_workspace.clone(),
+            session_workspace: self.session_workspace(&session_key),
+            skill_loader_dirs: &self.skill_loader_dirs,
+            initialized_persona_dirs: &self.initialized_persona_dirs,
+            team_tool_url: self.team_tool_url.get().cloned(),
+        })
+        .await;
+        let ctx = assembled.ctx;
+        let persona_prefix = assembled.persona_prefix;
+        let resolved_persona_dir = assembled.resolved_persona_dir;
+        let crate::routing::RoutingDecision {
+            intent,
+            fallback_backend_id,
+            sender_name,
+            roster_match,
+            is_lead,
+            ..
+        } = routing;
 
         // Per-call event channel: forward to global_tx + ws_subs
         // TurnComplete is enriched with sender_name here (engine itself doesn't know roster)
@@ -1160,18 +801,7 @@ impl SessionRegistry {
         let ws_subs_clone = Arc::clone(&self.ws_subs);
         let sk_for_fwd = session_key.clone();
         let sender_for_fwd = sender_name.clone();
-        // Only apply persona prefix when a roster agent was resolved (persona injected into prompt).
-        // Without a roster match the persona system prompt is not built, so prefix would be misleading.
-        //
-        // Design note: The prefix is applied in TWO independent places intentionally:
-        //   1. Here (prefix_for_fwd): for WebSocket subscribers that receive TurnComplete events.
-        //   2. reply_text below: for IM channel callers (DingTalk/Lark) that use handle()'s return.
-        // These are different consumers of the same turn output, not the same consumer seeing it twice.
-        let prefix_for_fwd: Option<String> = if roster_match.is_some() {
-            first_persona.as_ref().map(|p| p.display_prefix())
-        } else {
-            None
-        };
+        let prefix_for_fwd = persona_prefix.clone();
         {
             let mut fwd_rx = session_tx.subscribe();
             tokio::spawn(async move {
@@ -1206,129 +836,36 @@ impl SessionRegistry {
         let turn = self
             .runtime_dispatch
             .dispatch(RuntimeDispatchRequest {
-                intent: turn_intent,
+                intent,
                 ctx,
                 fallback_backend_id,
                 event_tx: session_tx,
             })
             .await?;
         self.apply_runtime_events(&session_key, &turn).await?;
-        let full_text = turn.full_text;
-
-        // ── Post-run hooks ─────────────────────────────────────────────────────
-
-        // Hook 2: [RELAY: @agent <指令>] marker expansion (Relay Mode)
-        // Guard: Lead turns in Team mode must NOT use [RELAY:] syntax — Lead communicates
-        // with Specialists via MCP tools (assign_task, etc.), not relay markers.
-        // If a Lead outputs [RELAY:] accidentally, warn and skip processing to prevent
-        // bypassing the TaskRegistry state machine.
-        let full_text = if early_is_lead {
-            if full_text.contains("[RELAY:") {
-                tracing::warn!(
-                    session = ?session_key,
-                    "Lead turn output contains [RELAY:] syntax — relay hook skipped. \
-                     Use assign_task MCP tool to communicate with Specialists."
-                );
-            }
-            full_text
-        } else if let Some(relay) = self.relay_engine.get() {
-            if full_text.contains("[RELAY:") {
-                match relay.process(&full_text, &session_key).await {
-                    Ok(processed) => processed,
-                    Err(e) => {
-                        tracing::warn!("relay engine error: {:#}", e);
-                        full_text
-                    }
-                }
-            } else {
-                full_text
-            }
-        } else {
-            full_text
-        };
-
-        // Hook 3: @botname scan → BotMention dispatch
-        // Anti-recursion guard: do not scan replies that came from automated internal sources.
-        // - BotMention: would create direct recursion (Bot A → Bot B → Bot A)
-        // - Relay: Relay Specialist's reply is substituted into Lead's text; no further dispatch
-        // - TeamNotify: Lead's progress summary may mention other bots (e.g. "@codex has finished
-        //   task X"), which should not trigger new Specialist turns
-        // - Heartbeat: Specialist replies should not spawn additional bot calls
-        if !matches!(
-            inbound.source,
-            MsgSource::BotMention | MsgSource::Relay | MsgSource::TeamNotify | MsgSource::Heartbeat
-        ) {
-            if let Some(trigger) = self.mention_trigger.get() {
-                let sender = roster_match
-                    .as_ref()
-                    .map(|r| r.agent_name.as_str())
-                    .unwrap_or("agent");
-                trigger.scan_and_dispatch(&full_text, sender, &session_key, &inbound.source);
-            }
-        }
-
-        // Save assistant reply with sender annotation
-        let assistant_msg = StoredMessage {
-            id: Uuid::new_v4(),
-            role: "assistant".to_string(),
-            content: full_text.clone(),
-            timestamp: chrono::Utc::now(),
-            sender: sender_name,
-            tool_calls: None,
-        };
-        storage.append_message(session_id, &assistant_msg).await?;
-
-        // After engine completes, update idle tracking unconditionally
-        self.last_activity
-            .insert(session_key.clone(), std::time::Instant::now());
-
-        // ── Memory events (non-blocking) ──
-        if let Some(ms) = &self.memory_system {
-            // persona_dir: unified resolution chain (roster explicit > session default > auto-derived)
-            let persona_dir_opt = self.resolve_persona_dir(&roster_match);
-
-            let agent_name_raw: String = roster_match
-                .as_ref()
-                .map(|rm| rm.agent_name.clone())
-                .unwrap_or_else(|| "default".to_string());
-
-            if let Some(persona_dir) = persona_dir_opt {
-                let agent_name = agent_name_raw.trim_start_matches('@').to_string();
-                let pd = persona_dir.clone();
-                let sk = session_key.clone();
-                let log_entry = format!(
-                    "**[{}]**: {}\n\n**[@{}]**: {}",
-                    inbound.sender, user_text_for_log, agent_name, full_text
-                );
-                let store = ms.store();
-                tokio::spawn(async move {
-                    store.append_daily_log(&pd, &sk, &log_entry).await.ok();
-                });
-
-                let count_key = (session_key.clone(), agent_name.clone());
-                let new_count = {
-                    let mut c = self.turn_counts.entry(count_key).or_insert(0);
-                    *c += 1;
-                    *c
-                };
-                ms.emit(MemoryEvent::TurnCompleted {
-                    scope: session_key.clone(),
-                    agent: agent_name,
-                    persona_dir,
-                    turn_count: new_count,
-                });
-            }
-        }
-
-        // Apply persona IM prefix only when a roster agent was resolved (persona was injected).
-        let reply_text = if roster_match.is_some() {
-            match &first_persona {
-                Some(p) => format!("{}{full_text}", p.display_prefix()),
-                None => full_text,
-            }
-        } else {
-            full_text
-        };
+        let reply_text = process_post_turn(
+            PostTurnProcessor {
+                relay_engine: self.relay_engine.get(),
+                mention_trigger: self.mention_trigger.get(),
+                memory_system: self.memory_system.as_ref(),
+                last_activity: &self.last_activity,
+                turn_counts: &self.turn_counts,
+            },
+            PostTurnInput {
+                inbound: &inbound,
+                session_key: &session_key,
+                session_id,
+                storage,
+                sender_name,
+                persona_prefix,
+                roster_match: roster_match.as_ref(),
+                persona_dir: resolved_persona_dir,
+                user_text_for_log: &user_text_for_log,
+                full_text: turn.full_text,
+                is_lead,
+            },
+        )
+        .await?;
         Ok(Some(reply_text))
     }
 
@@ -1339,240 +876,14 @@ impl SessionRegistry {
         session_key: &SessionKey,
         target_agent: Option<&str>,
     ) -> Result<Option<String>> {
-        match &cmd {
-            SlashCommand::SetBackend(name) => {
-                let backend_id = self
-                    .roster
-                    .as_ref()
-                    .and_then(|r| r.find_by_name(name))
-                    .map(|entry| entry.runtime_backend_id().to_string())
-                    .unwrap_or_else(|| name.clone());
-                self.set_session_backend(session_key, backend_id);
-            }
-            SlashCommand::Reset => {
-                if let Ok(session_id) = self.session_manager.get_or_create(session_key).await {
-                    self.session_manager
-                        .storage()
-                        .clear_messages(session_id)
-                        .await
-                        .ok();
-                }
-            }
-            SlashCommand::Help => {}
-            SlashCommand::Remember(content) => {
-                let memory_target = target_agent
-                    .and_then(|mention| {
-                        self.roster
-                            .as_ref()?
-                            .find_by_mention(mention)?
-                            .persona_dir
-                            .clone()
-                    })
-                    .map(|dir| MemoryTarget::Agent { persona_dir: dir })
-                    .unwrap_or(MemoryTarget::Shared);
-                if let Some(ms) = &self.memory_system {
-                    ms.emit(MemoryEvent::UserRemember {
-                        scope: session_key.clone(),
-                        target: memory_target,
-                        content: content.clone(),
-                    });
-                }
-            }
-            SlashCommand::Memory(agent_opt) => {
-                match agent_opt {
-                    Some(agent_name) => {
-                        // Per-agent memory lookup: <persona_dir>/<agent_name>/memory.md
-                        let content = self
-                            .read_agent_memory(agent_name)
-                            .unwrap_or_else(|| format!("No memory found for agent @{agent_name}"));
-                        return Ok(Some(content));
-                    }
-                    None => {
-                        // Shared memory (original behaviour)
-                        if let Some(ms) = &self.memory_system {
-                            let store = ms.store();
-                            let shared = store
-                                .load_shared_memory(session_key)
-                                .await
-                                .unwrap_or_default();
-                            let scope_display = &session_key.scope;
-                            let response = if shared.is_empty() {
-                                format!(
-                                    "📭 当前还没有关于「{scope_display}」的记忆。\n\n可以告诉我一些背景，比如：\n- 团队用什么技术栈？\n- 有哪些编码规范？\n- 当前在做什么项目？\n\n或者直接 /remember <内容> 手动添加。"
-                                )
-                            } else {
-                                let ts = store
-                                    .shared_last_modified(session_key)
-                                    .await
-                                    .ok()
-                                    .flatten()
-                                    .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
-                                    .unwrap_or_else(|| "未知".to_string());
-                                format!(
-                                    "📚 当前记忆（{scope_display}）\n最后更新：{ts}\n\n{}\n\n输入 /remember <内容> 添加新记忆，/forget <关键词> 删除。",
-                                    cap_to_words(&shared, 500)
-                                )
-                            };
-                            return Ok(Some(response));
-                        }
-                    }
-                }
-            }
-            SlashCommand::Forget(keyword) => {
-                if let Some(ms) = &self.memory_system {
-                    let store = ms.store();
-                    let shared = store
-                        .load_shared_memory(session_key)
-                        .await
-                        .unwrap_or_default();
-                    let filtered: String = shared
-                        .lines()
-                        .filter(|line| !line.to_lowercase().contains(&keyword.to_lowercase()))
-                        .map(|l| format!("{l}\n"))
-                        .collect();
-                    store.overwrite_shared(session_key, &filtered).await.ok();
-                }
-            }
-            SlashCommand::MemoryReset => {
-                let now = std::time::Instant::now();
-                let confirmed = self
-                    .pending_resets
-                    .get(session_key)
-                    .map(|t| now.duration_since(*t).as_secs() < 60)
-                    .unwrap_or(false);
-                if confirmed {
-                    self.pending_resets.remove(session_key);
-                    if let Some(ms) = &self.memory_system {
-                        ms.store().overwrite_shared(session_key, "").await.ok();
-                    }
-                    return Ok(Some("✅ 记忆已清空。".to_string()));
-                } else {
-                    self.pending_resets.insert(session_key.clone(), now);
-                    return Ok(Some(
-                        "⚠️ 你确定要清空当前记忆吗？此操作不可撤销。\n再次发送 /memory reset 以确认（60 秒内有效）。".to_string()
-                    ));
-                }
-            }
-            SlashCommand::Workspace(path_opt) => {
-                match path_opt {
-                    None => {
-                        // Show current workspace using the full three-tier resolution:
-                        //   per-session override > roster entry workspace_dir > global default
-                        let roster_workspace: Option<std::path::PathBuf> =
-                            target_agent.and_then(|mention| {
-                                self.roster
-                                    .as_ref()
-                                    .and_then(|r| r.find_by_mention(mention))
-                                    .and_then(|entry| entry.workspace_dir.clone())
-                            });
-                        let resolved = self
-                            .session_workspace(session_key)
-                            .or(roster_workspace)
-                            .or_else(|| self.default_workspace.clone());
-                        let display =
-                            resolved
-                                .map(|p| p.display().to_string())
-                                .unwrap_or_else(|| {
-                                    "(none — running in gateway process directory)".to_string()
-                                });
-                        return Ok(Some(format!("Current workspace: `{display}`")));
-                    }
-                    Some(path_str) => {
-                        let new_path = std::path::PathBuf::from(path_str);
-                        if !new_path.exists() {
-                            return Ok(Some(format!("Directory does not exist: `{path_str}`")));
-                        }
-                        if !new_path.is_dir() {
-                            return Ok(Some(format!("Path is not a directory: `{path_str}`")));
-                        }
-                        self.set_session_workspace(session_key, new_path);
-                        return Ok(Some(format!(
-                            "Workspace set to: `{path_str}`\nNew agent turns will run in this directory."
-                        )));
-                    }
-                }
-            }
-            SlashCommand::Approve {
-                approval_id,
-                decision,
-            } => {
-                let Some(parsed) = ApprovalDecision::parse(decision) else {
-                    return Ok(Some(
-                        "❌ 无效审批决定。使用：allow-once / allow-always / deny".to_string(),
-                    ));
-                };
-                let Some(resolver) = self.approval_resolver.get() else {
-                    return Ok(Some("❌ 当前运行实例未启用审批解析器。".to_string()));
-                };
-                let resolved = resolver.resolve(approval_id, parsed).await?;
-                if resolved {
-                    return Ok(Some(format!(
-                        "✅ 已处理审批 `{}` -> `{}`",
-                        approval_id,
-                        parsed.as_str()
-                    )));
-                }
-                return Ok(Some(format!(
-                    "⚠️ 审批 `{}` 不存在、已过期，或已被处理。",
-                    approval_id
-                )));
-            }
-            SlashCommand::TeamStatus => {
-                // Look up the team orchestrator for this session (Lead or Specialist).
-                let orch_arc = self.get_orchestrator_for_session(session_key);
-
-                if let Some(orch) = orch_arc {
-                    let team_manifest = orch.session.read_team_md();
-                    let tasks_snapshot = orch.session.read_tasks_md();
-                    let task_count = orch
-                        .registry
-                        .all_tasks()
-                        .map(|tasks| {
-                            let total = tasks.len();
-                            let done = tasks.iter().filter(|t| t.status_raw == "done").count();
-                            let claimed = tasks
-                                .iter()
-                                .filter(|t| t.status_raw.starts_with("claimed:"))
-                                .count();
-                            let pending = total - done - claimed;
-                            format!("{done}/{total} 完成，{claimed} 执行中，{pending} 待处理")
-                        })
-                        .unwrap_or_else(|_| "无法读取任务数据".to_string());
-
-                    let response = if team_manifest.trim().is_empty()
-                        && tasks_snapshot.trim().is_empty()
-                    {
-                        "ℹ️ Team 已初始化但尚无任务。Lead 正在规划中...".to_string()
-                    } else {
-                        format!(
-                            "🏢 **Team 状态** — {task_count}\n\n{team_manifest}\n\n---\n\n{tasks_snapshot}"
-                        )
-                    };
-                    return Ok(Some(response));
-                } else {
-                    return Ok(Some(
-                        "ℹ️ 当前 session 没有活跃的 Team。输入 /team plan 开始规划。".to_string(),
-                    ));
-                }
-            }
-        }
-        Ok(Some(cmd.confirmation_text()))
-    }
-
-    /// Read the memory file for a named agent persona.
-    /// Prefers the per-entry `persona_dir` from the roster if available.
-    /// Convention: `<persona_dir>/<agent_name>/memory.md` — matches AgentPersona path structure.
-    /// Falls back to `default_persona_dir` (single-engine mode).
-    /// Returns None if no persona_dir is configured, or if the file doesn't exist / can't be read.
-    pub fn read_agent_memory(&self, agent_name: &str) -> Option<String> {
-        let persona_dir: std::path::PathBuf = self
-            .roster
-            .as_ref()
-            .and_then(|r| r.find_by_name(agent_name))
-            .and_then(|entry| entry.persona_dir.clone())
-            .or_else(|| self.default_persona_dir.clone())?;
-        let mem_path = persona_dir.join(agent_name).join("memory.md");
-        std::fs::read_to_string(&mem_path).ok()
+        let reply = execute_slash_request(SlashRequest {
+            session_key,
+            command: &cmd,
+            target_agent,
+            control: self.slash_control(),
+        })
+        .await?;
+        Ok(reply.final_text().map(str::to_string))
     }
 
     /// Test helper: inject an instant into pending_resets directly (bypasses 60s window).
@@ -1585,6 +896,7 @@ impl SessionRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ApprovalDecision;
     use crate::memory::{distiller::NoopDistiller, store::FileMemoryStore, MemorySystem};
     use crate::roster::{AgentEntry, AgentRoster};
     use crate::runtime_dispatch::{RuntimeDispatch, RuntimeDispatchRequest};
@@ -1711,16 +1023,38 @@ mod tests {
         )
     }
 
+    fn make_registry_with_runtime_dispatch_and_roster(
+        default_backend_id: Option<&str>,
+        roster_entries: Vec<AgentEntry>,
+        runtime_dispatch: Arc<dyn RuntimeDispatch>,
+    ) -> (Arc<SessionRegistry>, broadcast::Receiver<AgentEvent>) {
+        let dir =
+            std::env::temp_dir().join(format!("test-registry-routing-{}", uuid::Uuid::new_v4()));
+        let storage = SessionStorage::new(dir);
+        let session_manager = Arc::new(SessionManager::new(storage));
+        SessionRegistry::with_runtime_dispatch(
+            default_backend_id.map(str::to_string),
+            session_manager,
+            String::new(),
+            Some(AgentRoster::new(roster_entries)),
+            None,
+            None,
+            None,
+            vec![],
+            runtime_dispatch,
+        )
+    }
+
     #[test]
     fn test_agent_ctx_carries_workspace_dir() {
-        let ctx = AgentCtx {
+        let ctx = crate::traits::AgentCtx {
             session_id: uuid::Uuid::new_v4(),
             session_key: SessionKey::new("ws", "ctx-test"),
             user_text: "hello".to_string(),
             history: vec![],
             system_injection: String::new(),
             workspace_dir: Some(std::path::PathBuf::from("/projects/test")),
-            ..AgentCtx::default()
+            ..crate::traits::AgentCtx::default()
         };
         assert!(ctx.workspace_dir.is_some());
     }
@@ -1875,6 +1209,359 @@ mod tests {
         assert_eq!(result.as_deref(), Some("fake-dispatch: hello runtime"));
     }
 
+    #[tokio::test]
+    async fn test_scope_binding_routes_no_mention_to_bound_agent() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let last_backend = Arc::new(std::sync::Mutex::new(None));
+        let (registry, _rx) = make_registry_with_runtime_dispatch_and_roster(
+            None,
+            vec![
+                AgentEntry {
+                    name: "claude".to_string(),
+                    mentions: vec!["@claude".to_string()],
+                    backend_id: "claude-main".to_string(),
+                    persona_dir: None,
+                    workspace_dir: None,
+                    extra_skills_dirs: vec![],
+                },
+                AgentEntry {
+                    name: "codex".to_string(),
+                    mentions: vec!["@codex".to_string()],
+                    backend_id: "codex-main".to_string(),
+                    persona_dir: None,
+                    workspace_dir: None,
+                    extra_skills_dirs: vec![],
+                },
+            ],
+            Arc::new(FakeRuntimeDispatch {
+                calls: Arc::clone(&calls),
+                last_backend: Arc::clone(&last_backend),
+            }),
+        );
+        registry.register_scope_binding("group:lark:bound".to_string(), "claude".to_string());
+
+        let result = registry
+            .handle(InboundMsg {
+                id: "routing-bound-1".to_string(),
+                session_key: SessionKey::new("lark", "group:lark:bound"),
+                content: MsgContent::text("hello bound route"),
+                sender: "user".to_string(),
+                channel: "lark".to_string(),
+                timestamp: chrono::Utc::now(),
+                thread_ts: None,
+                target_agent: None,
+                source: qai_protocol::MsgSource::Human,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(last_backend.lock().unwrap().as_deref(), Some("claude-main"));
+        assert_eq!(result.as_deref(), Some("fake-dispatch: hello bound route"));
+    }
+
+    #[tokio::test]
+    async fn test_explicit_mention_overrides_scope_binding() {
+        let last_backend = Arc::new(std::sync::Mutex::new(None));
+        let (registry, _rx) = make_registry_with_runtime_dispatch_and_roster(
+            None,
+            vec![
+                AgentEntry {
+                    name: "claude".to_string(),
+                    mentions: vec!["@claude".to_string()],
+                    backend_id: "claude-main".to_string(),
+                    persona_dir: None,
+                    workspace_dir: None,
+                    extra_skills_dirs: vec![],
+                },
+                AgentEntry {
+                    name: "codex".to_string(),
+                    mentions: vec!["@codex".to_string()],
+                    backend_id: "codex-main".to_string(),
+                    persona_dir: None,
+                    workspace_dir: None,
+                    extra_skills_dirs: vec![],
+                },
+            ],
+            Arc::new(FakeRuntimeDispatch {
+                calls: Arc::new(AtomicUsize::new(0)),
+                last_backend: Arc::clone(&last_backend),
+            }),
+        );
+        registry.register_scope_binding("group:lark:bound".to_string(), "claude".to_string());
+
+        registry
+            .handle(InboundMsg {
+                id: "routing-bound-2".to_string(),
+                session_key: SessionKey::new("lark", "group:lark:bound"),
+                content: MsgContent::text("hello explicit mention"),
+                sender: "user".to_string(),
+                channel: "lark".to_string(),
+                timestamp: chrono::Utc::now(),
+                thread_ts: None,
+                target_agent: Some("@codex".to_string()),
+                source: qai_protocol::MsgSource::Human,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(last_backend.lock().unwrap().as_deref(), Some("codex-main"));
+    }
+
+    #[tokio::test]
+    async fn test_session_backend_override_beats_scope_binding() {
+        let last_backend = Arc::new(std::sync::Mutex::new(None));
+        let (registry, _rx) = make_registry_with_runtime_dispatch_and_roster(
+            None,
+            vec![AgentEntry {
+                name: "claude".to_string(),
+                mentions: vec!["@claude".to_string()],
+                backend_id: "claude-main".to_string(),
+                persona_dir: None,
+                workspace_dir: None,
+                extra_skills_dirs: vec![],
+            }],
+            Arc::new(FakeRuntimeDispatch {
+                calls: Arc::new(AtomicUsize::new(0)),
+                last_backend: Arc::clone(&last_backend),
+            }),
+        );
+        let key = SessionKey::new("lark", "group:lark:bound");
+        registry.register_scope_binding(key.scope.clone(), "claude".to_string());
+        registry.set_session_backend(&key, "manual-backend");
+
+        registry
+            .handle(InboundMsg {
+                id: "routing-bound-3".to_string(),
+                session_key: key,
+                content: MsgContent::text("hello session override"),
+                sender: "user".to_string(),
+                channel: "lark".to_string(),
+                timestamp: chrono::Utc::now(),
+                thread_ts: None,
+                target_agent: None,
+                source: qai_protocol::MsgSource::Human,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            last_backend.lock().unwrap().as_deref(),
+            Some("manual-backend")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_thread_binding_overrides_scope_binding() {
+        let last_backend = Arc::new(std::sync::Mutex::new(None));
+        let (registry, _rx) = make_registry_with_runtime_dispatch_and_roster(
+            None,
+            vec![
+                AgentEntry {
+                    name: "claude".to_string(),
+                    mentions: vec!["@claude".to_string()],
+                    backend_id: "claude-main".to_string(),
+                    persona_dir: None,
+                    workspace_dir: None,
+                    extra_skills_dirs: vec![],
+                },
+                AgentEntry {
+                    name: "codex".to_string(),
+                    mentions: vec!["@codex".to_string()],
+                    backend_id: "codex-main".to_string(),
+                    persona_dir: None,
+                    workspace_dir: None,
+                    extra_skills_dirs: vec![],
+                },
+            ],
+            Arc::new(FakeRuntimeDispatch {
+                calls: Arc::new(AtomicUsize::new(0)),
+                last_backend: Arc::clone(&last_backend),
+            }),
+        );
+        registry.register_binding(crate::bindings::BindingRule::scope(
+            "group:lark:bound",
+            "claude",
+        ));
+        registry.register_binding(crate::bindings::BindingRule::Thread {
+            channel: Some("lark".to_string()),
+            scope: "group:lark:bound".to_string(),
+            thread_id: "thread-1".to_string(),
+            agent_name: "codex".to_string(),
+        });
+
+        registry
+            .handle(InboundMsg {
+                id: "routing-thread-1".to_string(),
+                session_key: SessionKey::new("lark", "group:lark:bound"),
+                content: MsgContent::text("hello thread binding"),
+                sender: "user".to_string(),
+                channel: "lark".to_string(),
+                timestamp: chrono::Utc::now(),
+                thread_ts: Some("thread-1".to_string()),
+                target_agent: None,
+                source: qai_protocol::MsgSource::Human,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(last_backend.lock().unwrap().as_deref(), Some("codex-main"));
+    }
+
+    #[tokio::test]
+    async fn test_later_explicit_scope_binding_overrides_earlier_scope_binding() {
+        let last_backend = Arc::new(std::sync::Mutex::new(None));
+        let (registry, _rx) = make_registry_with_runtime_dispatch_and_roster(
+            None,
+            vec![
+                AgentEntry {
+                    name: "claude".to_string(),
+                    mentions: vec!["@claude".to_string()],
+                    backend_id: "claude-main".to_string(),
+                    persona_dir: None,
+                    workspace_dir: None,
+                    extra_skills_dirs: vec![],
+                },
+                AgentEntry {
+                    name: "codex".to_string(),
+                    mentions: vec!["@codex".to_string()],
+                    backend_id: "codex-main".to_string(),
+                    persona_dir: None,
+                    workspace_dir: None,
+                    extra_skills_dirs: vec![],
+                },
+            ],
+            Arc::new(FakeRuntimeDispatch {
+                calls: Arc::new(AtomicUsize::new(0)),
+                last_backend: Arc::clone(&last_backend),
+            }),
+        );
+        registry.register_scope_binding("group:lark:bound".to_string(), "claude".to_string());
+        registry.register_binding(crate::bindings::BindingRule::Scope {
+            channel: Some("lark".to_string()),
+            scope: "group:lark:bound".to_string(),
+            agent_name: "codex".to_string(),
+        });
+
+        registry
+            .handle(InboundMsg {
+                id: "routing-bound-override-1".to_string(),
+                session_key: SessionKey::new("lark", "group:lark:bound"),
+                content: MsgContent::text("hello explicit override"),
+                sender: "user".to_string(),
+                channel: "lark".to_string(),
+                timestamp: chrono::Utc::now(),
+                thread_ts: None,
+                target_agent: None,
+                source: qai_protocol::MsgSource::Human,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(last_backend.lock().unwrap().as_deref(), Some("codex-main"));
+    }
+
+    #[tokio::test]
+    async fn test_explicit_default_binding_overrides_default_roster_agent() {
+        let last_backend = Arc::new(std::sync::Mutex::new(None));
+        let (registry, _rx) = make_registry_with_runtime_dispatch_and_roster(
+            None,
+            vec![
+                AgentEntry {
+                    name: "claude".to_string(),
+                    mentions: vec!["@claude".to_string()],
+                    backend_id: "claude-main".to_string(),
+                    persona_dir: None,
+                    workspace_dir: None,
+                    extra_skills_dirs: vec![],
+                },
+                AgentEntry {
+                    name: "codex".to_string(),
+                    mentions: vec!["@codex".to_string()],
+                    backend_id: "codex-main".to_string(),
+                    persona_dir: None,
+                    workspace_dir: None,
+                    extra_skills_dirs: vec![],
+                },
+            ],
+            Arc::new(FakeRuntimeDispatch {
+                calls: Arc::new(AtomicUsize::new(0)),
+                last_backend: Arc::clone(&last_backend),
+            }),
+        );
+        registry.register_binding(crate::bindings::BindingRule::Default {
+            agent_name: "codex".to_string(),
+        });
+
+        registry
+            .handle(InboundMsg {
+                id: "routing-default-binding-1".to_string(),
+                session_key: SessionKey::new("ws", "no-binding-match"),
+                content: MsgContent::text("hello explicit default"),
+                sender: "user".to_string(),
+                channel: "ws".to_string(),
+                timestamp: chrono::Utc::now(),
+                thread_ts: None,
+                target_agent: None,
+                source: qai_protocol::MsgSource::Human,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(last_backend.lock().unwrap().as_deref(), Some("codex-main"));
+    }
+
+    #[tokio::test]
+    async fn test_roster_only_mode_falls_back_to_default_roster_agent() {
+        let last_backend = Arc::new(std::sync::Mutex::new(None));
+        let (registry, _rx) = make_registry_with_runtime_dispatch_and_roster(
+            None,
+            vec![
+                AgentEntry {
+                    name: "mybot".to_string(),
+                    mentions: vec!["@mybot".to_string()],
+                    backend_id: "mybot-main".to_string(),
+                    persona_dir: None,
+                    workspace_dir: None,
+                    extra_skills_dirs: vec![],
+                },
+                AgentEntry {
+                    name: "reviewer".to_string(),
+                    mentions: vec!["@reviewer".to_string()],
+                    backend_id: "reviewer-main".to_string(),
+                    persona_dir: None,
+                    workspace_dir: None,
+                    extra_skills_dirs: vec![],
+                },
+            ],
+            Arc::new(FakeRuntimeDispatch {
+                calls: Arc::new(AtomicUsize::new(0)),
+                last_backend: Arc::clone(&last_backend),
+            }),
+        );
+
+        let result = registry
+            .handle(InboundMsg {
+                id: "routing-default-roster-1".to_string(),
+                session_key: SessionKey::new("ws", "roster-only"),
+                content: MsgContent::text("hello default roster"),
+                sender: "user".to_string(),
+                channel: "ws".to_string(),
+                timestamp: chrono::Utc::now(),
+                thread_ts: None,
+                target_agent: None,
+                source: qai_protocol::MsgSource::Human,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(last_backend.lock().unwrap().as_deref(), Some("mybot-main"));
+        assert_eq!(
+            result.as_deref(),
+            Some("fake-dispatch: hello default roster")
+        );
+    }
+
     #[test]
     fn test_registry_roster_resolves_target_agent() {
         let (registry, _rx) = make_registry_with_roster();
@@ -1946,62 +1633,9 @@ mod tests {
         assert_eq!(resolved.unwrap().name, "mybot");
     }
 
-    #[test]
-    fn test_read_agent_memory_no_persona_dir() {
-        // make_registry() passes None for default_persona_dir
-        let (reg, _rx) = make_registry();
-        assert!(reg.read_agent_memory("reviewer").is_none());
-    }
-
-    #[test]
-    fn test_read_agent_memory_file_exists() {
-        let tmp = tempdir().unwrap();
-        let agent_dir = tmp.path().join("reviewer");
-        std::fs::create_dir_all(&agent_dir).unwrap();
-        std::fs::write(agent_dir.join("memory.md"), "reviewer memory content").unwrap();
-
-        let storage = SessionStorage::new(
-            std::env::temp_dir().join(format!("test-agent-mem-{}", uuid::Uuid::new_v4())),
-        );
-        let session_manager = Arc::new(SessionManager::new(storage));
-        let (reg, _rx) = SessionRegistry::new(
-            None,
-            session_manager,
-            String::new(),
-            None,
-            None,
-            Some(tmp.path().to_path_buf()),
-            None,
-            vec![],
-        );
-        let content = reg.read_agent_memory("reviewer").unwrap();
-        assert_eq!(content, "reviewer memory content");
-    }
-
-    #[test]
-    fn test_read_agent_memory_file_missing() {
-        let tmp = tempdir().unwrap();
-        // persona_dir exists but no subdirectory for "reviewer"
-        let storage = SessionStorage::new(
-            std::env::temp_dir().join(format!("test-agent-missing-{}", uuid::Uuid::new_v4())),
-        );
-        let session_manager = Arc::new(SessionManager::new(storage));
-        let (reg, _rx) = SessionRegistry::new(
-            None,
-            session_manager,
-            String::new(),
-            None,
-            None,
-            Some(tmp.path().to_path_buf()),
-            None,
-            vec![],
-        );
-        assert!(reg.read_agent_memory("reviewer").is_none());
-    }
-
     #[tokio::test]
-    async fn test_slash_memory_at_agent_no_persona_dir_returns_not_found() {
-        // make_registry has no persona_dir; /memory @reviewer should return "No memory found"
+    async fn test_slash_memory_at_agent_without_memory_system_reports_disabled() {
+        // make_registry has no memory system; /memory now reports memory disabled.
         let (registry, _rx) = make_registry();
         let inbound = InboundMsg {
             id: "mem-agent-1".to_string(),
@@ -2017,8 +1651,8 @@ mod tests {
         let result = registry.handle(inbound).await.unwrap();
         let text = result.unwrap();
         assert!(
-            text.contains("No memory found for agent @reviewer"),
-            "expected 'No memory found' message, got: {text}"
+            text.contains("未启用记忆系统"),
+            "expected memory disabled message, got: {text}"
         );
     }
 
@@ -2447,6 +2081,101 @@ mod tests {
         assert!(status.ok);
         assert!(status.message.contains("\"id\": \"T200\""));
         assert!(status.payload.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_invoke_team_tool_block_task_notifies_lead_and_resets_claim() {
+        let (registry, orch) = make_registry_with_team_orchestrator();
+        let specialist_key = SessionKey::new("specialist", "team-test:codex");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        orch.set_team_notify_tx(tx);
+
+        orch.registry
+            .create_task(crate::team::registry::CreateTask {
+                id: "T210".into(),
+                title: "Investigate auth".into(),
+                assignee_hint: Some("codex".into()),
+                deps: vec![],
+                timeout_secs: 1800,
+                spec: None,
+                success_criteria: None,
+            })
+            .unwrap();
+        orch.registry.try_claim("T210", "codex").unwrap();
+
+        let response = registry
+            .invoke_team_tool(
+                &specialist_key,
+                TeamToolCall::BlockTask {
+                    task_id: "T210".into(),
+                    reason: "missing credential".into(),
+                    agent: Some("codex".into()),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(response.ok);
+
+        let task = orch.registry.get_task("T210").unwrap().unwrap();
+        assert!(matches!(
+            task.status_parsed(),
+            crate::team::registry::TaskStatus::Pending
+        ));
+
+        let notify = rx
+            .recv()
+            .await
+            .expect("lead should receive blocked notification");
+        let text = notify.content.as_text().unwrap_or("");
+        assert!(text.contains("T210"));
+        assert!(text.contains("missing credential"));
+    }
+
+    #[tokio::test]
+    async fn test_invoke_team_tool_rejects_lead_only_tool_from_specialist_session() {
+        let (registry, _orch) = make_registry_with_team_orchestrator();
+        let specialist_key = SessionKey::new("specialist", "team-test:codex");
+
+        let err = registry
+            .invoke_team_tool(
+                &specialist_key,
+                TeamToolCall::CreateTask {
+                    id: "T401".into(),
+                    title: "illegal".into(),
+                    assignee: Some("codex".into()),
+                    spec: None,
+                    deps: vec![],
+                    success_criteria: None,
+                },
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("CreateTask"));
+        assert!(err.contains("Specialist"));
+    }
+
+    #[tokio::test]
+    async fn test_invoke_team_tool_rejects_specialist_only_tool_from_lead_session() {
+        let (registry, _orch) = make_registry_with_team_orchestrator();
+        let lead_key = SessionKey::new("lark", "group:team");
+
+        let err = registry
+            .invoke_team_tool(
+                &lead_key,
+                TeamToolCall::SubmitTaskResult {
+                    task_id: "T402".into(),
+                    summary: "illegal".into(),
+                    agent: Some("codex".into()),
+                },
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("SubmitTaskResult"));
+        assert!(err.contains("Leader"));
     }
 
     #[tokio::test]

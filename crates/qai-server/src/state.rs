@@ -2,13 +2,14 @@ use crate::config::GatewayConfig;
 use async_trait::async_trait;
 use qai_agent::{ApprovalDecision as AgentApprovalDecision, ApprovalResolver, SessionRegistry};
 use qai_protocol::AgentEvent;
-use qai_runtime::{ApprovalBroker, ApprovalDecision as RuntimeApprovalDecision};
+use qai_runtime::{ApprovalBroker, ApprovalDecision as RuntimeApprovalDecision, BackendRegistry};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
 #[derive(Clone)]
 pub struct AppState {
     pub registry: Arc<SessionRegistry>,
+    pub runtime_registry: Arc<BackendRegistry>,
     pub event_tx: broadcast::Sender<AgentEvent>,
     pub cfg: Arc<GatewayConfig>,
     pub runtime_token: Arc<String>,

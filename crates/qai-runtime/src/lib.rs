@@ -10,6 +10,7 @@ pub mod native;
 pub mod observability;
 pub mod openclaw;
 pub mod registry;
+pub mod testing;
 pub mod tool_bridge;
 
 pub use adapter::{BackendAdapter, LaunchSpec};
@@ -33,6 +34,7 @@ pub use observability::{
 };
 pub use openclaw::OpenClawBackendAdapter;
 pub use registry::{BackendRegistry, BackendSpec};
+pub use testing::{CapturedTurn, ScriptedAdapter, ScriptedTurn};
 pub use tool_bridge::{
     visible_team_tools_for_role, TeamTool, TeamToolCall, TeamToolRequest, TeamToolResponse,
     TeamToolVisibility,

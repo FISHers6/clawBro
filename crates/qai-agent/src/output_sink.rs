@@ -16,25 +16,35 @@ pub trait OutputSink: Send + Sync {
     async fn send_final(&self, text: &str, placeholder_id: Option<&str>);
 }
 
+/// Explicit stream completion signal from the caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamControl {
+    Stop,
+    Final(String),
+}
+
 /// Consume events from `event_rx`, calling `sink` at 500ms intervals for TextDelta,
 /// and `send_final` on TurnComplete or Error.
 ///
-/// The `cancel` receiver allows the caller to signal early termination — e.g. when
-/// `handle()` returns `Ok(None)` (dedup hit) and no `TurnComplete` event will ever arrive.
-/// Dropping the paired `Sender` also cancels the stream.
+/// The `control` receiver allows the caller to signal explicit completion semantics:
+/// - `Stop` for no-op / dedup turns
+/// - `Final(text)` for synchronous control-plane replies
+/// - dropped sender for generic early cancellation
 ///
 /// Usage:
 /// ```ignore
-/// let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+/// let (control_tx, control_rx) =
+///     tokio::sync::oneshot::channel::<StreamControl>();
 /// let placeholder_id = sink.send_thinking().await;
-/// throttled_stream(event_rx, session_id, sink, placeholder_id, cancel_rx).await;
+/// let _ = control_tx.send(StreamControl::Final("done".to_string()));
+/// throttled_stream(event_rx, session_id, sink, placeholder_id, control_rx).await;
 /// ```
 pub async fn throttled_stream(
     mut event_rx: broadcast::Receiver<AgentEvent>,
     target_session_id: uuid::Uuid,
     sink: &dyn OutputSink,
     placeholder_id: Option<String>,
-    mut cancel: tokio::sync::oneshot::Receiver<()>,
+    mut control: tokio::sync::oneshot::Receiver<StreamControl>,
 ) {
     let throttle = Duration::from_millis(500);
     let mut accumulated = String::new();
@@ -42,8 +52,16 @@ pub async fn throttled_stream(
 
     loop {
         tokio::select! {
-            biased; // check cancel first to avoid processing stale events after cancellation
-            _ = &mut cancel => break,
+            biased; // check explicit control first to avoid stale placeholder updates
+            signal = &mut control => {
+                match signal {
+                    Ok(StreamControl::Stop) | Err(_) => break,
+                    Ok(StreamControl::Final(text)) => {
+                        sink.send_final(&text, placeholder).await;
+                        break;
+                    }
+                }
+            },
             event = event_rx.recv() => {
                 match event {
                     Ok(e) => match e {
@@ -113,10 +131,10 @@ mod tests {
     /// Returns a live cancel channel. The returned Sender must be kept alive for the
     /// duration of the stream (dropping it resolves the receiver, triggering cancel).
     fn make_cancel() -> (
-        tokio::sync::oneshot::Sender<()>,
-        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<StreamControl>,
+        tokio::sync::oneshot::Receiver<StreamControl>,
     ) {
-        tokio::sync::oneshot::channel::<()>()
+        tokio::sync::oneshot::channel::<StreamControl>()
     }
 
     #[tokio::test]
@@ -187,13 +205,35 @@ mod tests {
 
         // Send cancel immediately — stream should exit without calling send_final
         let (cancel_tx, cancel_rx) = make_cancel();
-        cancel_tx.send(()).unwrap();
+        cancel_tx.send(StreamControl::Stop).unwrap();
         throttled_stream(rx, session_id, &sink, None, cancel_rx).await;
 
         let recorded = calls.lock().unwrap().clone();
         assert!(
             !recorded.iter().any(|s| s.starts_with("final:")),
             "cancelled stream must not call send_final"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_throttled_stream_control_final_sends_sync_reply() {
+        let (_tx, rx) = broadcast::channel::<AgentEvent>(16);
+        let session_id = Uuid::new_v4();
+        let calls = Arc::new(Mutex::new(vec![]));
+        let sink = MockSink {
+            calls: calls.clone(),
+        };
+
+        let (control_tx, control_rx) = make_cancel();
+        control_tx
+            .send(StreamControl::Final("sync control reply".to_string()))
+            .unwrap();
+        throttled_stream(rx, session_id, &sink, None, control_rx).await;
+
+        let recorded = calls.lock().unwrap().clone();
+        assert!(
+            recorded.iter().any(|s| s == "final:sync control reply"),
+            "explicit final control signal must send final reply"
         );
     }
 }

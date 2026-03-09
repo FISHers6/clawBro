@@ -75,6 +75,22 @@ impl BackendRegistry {
         self.backends.read().await.get(backend_id).cloned()
     }
 
+    pub async fn all_backend_specs(&self) -> Vec<BackendSpec> {
+        let mut specs: Vec<_> = self.backends.read().await.values().cloned().collect();
+        specs.sort_by(|a, b| a.backend_id.cmp(&b.backend_id));
+        specs
+    }
+
+    pub async fn has_adapter(&self, adapter_key: &str) -> bool {
+        self.adapters.read().await.contains_key(adapter_key)
+    }
+
+    pub fn cached_capability_profile(&self, backend_id: &str) -> Option<CapabilityProfile> {
+        self.capability_cache
+            .get(backend_id)
+            .map(|entry| entry.profile.clone())
+    }
+
     pub async fn adapter_for(&self, spec: &BackendSpec) -> anyhow::Result<Arc<dyn BackendAdapter>> {
         self.adapters
             .read()

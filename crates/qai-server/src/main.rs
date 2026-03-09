@@ -88,7 +88,11 @@ async fn main() -> Result<()> {
     let system_injection = skill_loader.build_system_injection(&skills);
     tracing::info!("Loaded {} skills", skills.len());
 
-    tracing::info!("Default backend: {}", cfg.agent.backend_id);
+    let default_backend_id = cfg.resolved_default_backend_id();
+    tracing::info!(
+        default_backend = default_backend_id.as_deref().unwrap_or("<none>"),
+        "Resolved default backend"
+    );
 
     // Build AgentRoster from config (None if no agents configured)
     let roster = if cfg.agent_roster.is_empty() {
@@ -132,7 +136,7 @@ async fn main() -> Result<()> {
     }
     let runtime_dispatch = Arc::new(ConductorRuntimeDispatch::new(Arc::clone(&runtime_registry)));
     let (registry, _event_rx) = SessionRegistry::with_runtime_dispatch(
-        Some(cfg.agent.backend_id.clone()),
+        default_backend_id,
         session_manager,
         system_injection,
         roster,
@@ -148,6 +152,7 @@ async fn main() -> Result<()> {
 
     let state = AppState {
         registry: registry.clone(),
+        runtime_registry: Arc::clone(&runtime_registry),
         event_tx: event_tx.clone(),
         cfg: Arc::new(cfg.clone()),
         runtime_token: Arc::new(uuid::Uuid::new_v4().to_string()),
@@ -308,10 +313,11 @@ async fn main() -> Result<()> {
                             //    It will get session_id itself and then consume events at 500ms
                             //    intervals, editing the placeholder message in-place.
                             //
-                            //    cancel_tx / cancel_rx: handle() sends cancel when it returns
-                            //    Ok(None) (dedup hit) or Err, since in those cases no TurnComplete
-                            //    event will ever arrive and the stream would otherwise leak forever.
-                            let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+                            //    control_tx / control_rx: handle() sends an explicit completion
+                            //    signal when the turn ends without a runtime TurnComplete event
+                            //    (e.g. sync slash replies, dedup hit, or early errors).
+                            let (control_tx, control_rx) =
+                                tokio::sync::oneshot::channel::<qai_agent::StreamControl>();
                             let channel2 = channel_clone.clone();
                             let registry2 = registry_clone.clone();
                             let sk2 = session_key.clone();
@@ -337,7 +343,7 @@ async fn main() -> Result<()> {
                                 };
 
                                 qai_agent::throttled_stream(
-                                    event_rx, session_id, &sink, ph_id2, cancel_rx,
+                                    event_rx, session_id, &sink, ph_id2, control_rx,
                                 )
                                 .await;
                             });
@@ -348,18 +354,21 @@ async fn main() -> Result<()> {
                             let registry3 = registry_clone.clone();
                             tokio::spawn(async move {
                                 match registry3.handle(inbound).await {
-                                    Ok(Some(_)) => {
-                                        // Engine ran and emitted TurnComplete — stream exits naturally.
-                                        // cancel_tx dropped here; stream already broke out of loop.
+                                    Ok(Some(reply)) => {
+                                        // Runtime turns usually exit on TurnComplete.
+                                        // Sync control-plane replies need an explicit final result.
+                                        let _ =
+                                            control_tx.send(qai_agent::StreamControl::Final(reply));
                                     }
                                     Ok(None) => {
                                         // Dedup hit or no-op: no TurnComplete event will fire.
-                                        let _ = cancel_tx.send(());
+                                        let _ = control_tx.send(qai_agent::StreamControl::Stop);
                                     }
                                     Err(e) => {
                                         tracing::error!("Lark registry handle error: {e}");
-                                        // Error event may not have been emitted; cancel as safety net.
-                                        let _ = cancel_tx.send(());
+                                        let _ = control_tx.send(qai_agent::StreamControl::Final(
+                                            format!("❌ 错误: {e}"),
+                                        ));
                                     }
                                 }
                             });

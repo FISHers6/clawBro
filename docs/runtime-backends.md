@@ -9,6 +9,18 @@
 
 This document describes the runtime side only: backend families, their adapters, and their current status.
 
+Routing precedence is documented separately in [`routing-contract.md`](/Users/fishers/Desktop/repo/quickai-openclaw/quickai-gateway/docs/routing-contract.md).
+
+Current control-plane decomposition in `qai-agent`:
+
+- `routing.rs` resolves turn destination and backend hints
+- `context_assembly.rs` builds workspace/persona/shared context
+- `slash_service.rs` handles synchronous control commands
+- `memory_service.rs` owns `/memory` and related memory control behavior
+- `post_turn.rs` applies relay, mention, memory side effects after runtime completion
+
+`SessionRegistry` remains the ingress orchestrator, not the place where slash and memory business logic should accumulate again.
+
 ## Canonical Model
 
 All backends are normalized through the same runtime contract:
@@ -93,6 +105,12 @@ Important:
 - Native family is no longer limited to `solo/relay`.
 - `quickai-rust-agent` now receives `RuntimeSessionSpec`, dynamically registers team tools by role, and calls back into the gateway through the canonical `/runtime/team-tools` endpoint.
 - This keeps native family on the same business contract as ACP family without forcing it through ACP MCP.
+
+Team contract note:
+
+- canonical team business semantics now live behind one shared executor in `qai-agent`
+- legacy ACP `SharedTeamMcpServer` remains a compatibility adapter only
+- adapter methods translate MCP parameters into canonical team tool execution, rather than carrying a second business logic branch
 
 ## Config Model
 
