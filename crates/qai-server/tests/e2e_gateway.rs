@@ -220,6 +220,53 @@ async fn test_gateway_e2e_claude_agent() {
     }
 }
 
+#[tokio::test]
+async fn test_gateway_ws_inbound_auto_subscribes_socket_to_session() {
+    let fixture = native_echo_fixture_bin();
+    let addr = start_test_gateway_with_backend(BackendSpec {
+        backend_id: "native-echo".to_string(),
+        family: BackendFamily::QuickAiNative,
+        adapter_key: "native".into(),
+        launch: LaunchSpec::Command {
+            command: fixture,
+            args: vec![],
+            env: vec![],
+        },
+    })
+    .await
+    .expect("Failed to start gateway with native echo fixture");
+
+    let (mut ws_write, mut ws_read) = connect_ws(addr).await;
+    let session_key = SessionKey::new("ws", "auto-subscribe");
+    let inbound = InboundMsg {
+        id: uuid::Uuid::new_v4().to_string(),
+        session_key: session_key.clone(),
+        content: MsgContent::text("hello-auto-subscribe"),
+        sender: "auto-subscribe".to_string(),
+        channel: "ws".to_string(),
+        timestamp: chrono::Utc::now(),
+        thread_ts: None,
+        target_agent: None,
+        source: qai_protocol::MsgSource::Human,
+    };
+    send_inbound(&mut ws_write, &inbound).await;
+
+    loop {
+        match next_event(&mut ws_read, 20).await {
+            AgentEvent::TurnComplete {
+                session_id: _,
+                sender: _,
+                full_text,
+            } => {
+                assert_eq!(full_text, "native:hello-auto-subscribe");
+                break;
+            }
+            AgentEvent::TextDelta { .. } | AgentEvent::Thinking { .. } => {}
+            other => panic!("unexpected event without explicit subscribe: {other:?}"),
+        }
+    }
+}
+
 async fn connect_ws(
     addr: std::net::SocketAddr,
 ) -> (

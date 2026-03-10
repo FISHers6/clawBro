@@ -90,8 +90,10 @@ impl MemoryDistiller for AcpDistiller {
                             agent_memory: None,
                             team_manifest: None,
                             task_reminder: None,
+                            history_messages: Vec::new(),
                             history_lines: Vec::new(),
                             user_input: Some(user_text.clone()),
+                            ..RuntimeContext::default()
                         },
                     },
                     qai_runtime::RuntimeEventSink::new(tx),

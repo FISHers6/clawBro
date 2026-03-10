@@ -20,8 +20,11 @@ pub struct StoredMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
     pub name: String,
     pub input: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
 }
 
@@ -81,7 +84,11 @@ impl SessionStorage {
         if !path.exists() {
             return Ok(vec![]);
         }
-        let content = tokio::fs::read_to_string(&path).await?;
+        let content = match tokio::fs::read_to_string(&path).await {
+            Ok(content) => content,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+            Err(err) => return Err(err.into()),
+        };
         let msgs = content
             .lines()
             .filter(|l| !l.trim().is_empty())
@@ -103,7 +110,11 @@ impl SessionStorage {
         if !path.exists() {
             return Ok(vec![]);
         }
-        let content = tokio::fs::read_to_string(&path).await?;
+        let content = match tokio::fs::read_to_string(&path).await {
+            Ok(content) => content,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+            Err(err) => return Err(err.into()),
+        };
         let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
         let start = lines.len().saturating_sub(limit);
         lines[start..]
@@ -200,6 +211,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_load_recent_messages_when_session_dir_exists_but_jsonl_missing() {
+        let dir = tempdir().unwrap();
+        let storage = SessionStorage::new(dir.path().to_path_buf());
+        let session_id = Uuid::new_v4();
+        tokio::fs::create_dir_all(dir.path().join(session_id.to_string()))
+            .await
+            .unwrap();
+
+        let recent = storage.load_recent_messages(session_id, 50).await.unwrap();
+        assert!(recent.is_empty());
+    }
+
+    #[tokio::test]
     async fn test_stored_message_sender_roundtrip() {
         let dir = tempdir().unwrap();
         let storage = SessionStorage::new(dir.path().to_path_buf());
@@ -263,5 +287,23 @@ mod tests {
             !json.contains("sender"),
             "sender=None should not appear in JSON"
         );
+    }
+
+    #[test]
+    fn tool_call_record_roundtrips_optional_identity_fields() {
+        let record = ToolCallRecord {
+            tool_call_id: Some("call-1".into()),
+            name: "read_file".into(),
+            input: serde_json::json!({"path":"README.md"}),
+            output: Some("ok".into()),
+        };
+
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(json.contains("\"tool_call_id\":\"call-1\""));
+
+        let roundtrip: ToolCallRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtrip.tool_call_id.as_deref(), Some("call-1"));
+        assert_eq!(roundtrip.name, "read_file");
+        assert_eq!(roundtrip.output.as_deref(), Some("ok"));
     }
 }

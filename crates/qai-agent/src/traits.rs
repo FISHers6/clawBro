@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use qai_session::ToolCallRecord;
 use uuid::Uuid;
 
 /// Agent 在团队中的角色（决定 SystemPromptBuilder 的行为）
@@ -75,4 +76,6 @@ impl Default for AgentCtx {
 pub struct HistoryMsg {
     pub role: String,
     pub content: String,
+    pub sender: Option<String>,
+    pub tool_calls: Option<Vec<ToolCallRecord>>,
 }

@@ -10,6 +10,7 @@ use axum::{
 use qai_protocol::{AgentEvent, InboundMsg, SessionKey};
 use qai_runtime::ApprovalDecision;
 use serde::Deserialize;
+use std::collections::HashSet;
 use tokio::sync::mpsc;
 
 fn extract_bearer(header: &str) -> Option<&str> {
@@ -63,8 +64,26 @@ pub async fn ws_upgrade(
         .into_response()
 }
 
+fn ensure_subscription(
+    state: &AppState,
+    private_tx: &mpsc::UnboundedSender<AgentEvent>,
+    local_subscriptions: &mut HashSet<SessionKey>,
+    session_key: &SessionKey,
+) {
+    if local_subscriptions.insert(session_key.clone()) {
+        state
+            .registry
+            .ws_subs
+            .entry(session_key.clone())
+            .or_default()
+            .push(private_tx.clone());
+        tracing::debug!(?session_key, "WS client subscribed to session");
+    }
+}
+
 async fn handle_socket(mut socket: WebSocket, state: AppState) {
     let (private_tx, mut private_rx) = mpsc::unbounded_channel::<AgentEvent>();
+    let mut local_subscriptions = HashSet::<SessionKey>::new();
 
     loop {
         tokio::select! {
@@ -74,15 +93,17 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                     Some(Ok(Message::Text(text))) => {
                         match serde_json::from_str::<WsClientMsg>(&text) {
                             Ok(WsClientMsg::Subscribe { session_key }) => {
-                                state.registry.ws_subs
-                                    .entry(session_key)
-                                    .or_default()
-                                    .push(private_tx.clone());
-                                tracing::debug!("WS client subscribed to session");
+                                ensure_subscription(
+                                    &state,
+                                    &private_tx,
+                                    &mut local_subscriptions,
+                                    &session_key,
+                                );
                             }
                             Ok(WsClientMsg::Unsubscribe { session_key }) => {
                                 // Best-effort: prune dead/closed senders from this session's subscriber list.
                                 // Full unsubscribe by sender ID requires a subscription token (future work).
+                                local_subscriptions.remove(&session_key);
                                 state.registry.ws_subs.alter(&session_key, |_, mut vec| {
                                     // A sender is "alive" if it can receive (closed channel = dead)
                                     vec.retain(|tx| !tx.is_closed());
@@ -113,6 +134,15 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                                 }
                             }
                             Ok(WsClientMsg::Message(inbound)) => {
+                                // A socket sending a turn should also receive the resulting runtime
+                                // events for that same session without requiring a separate explicit
+                                // Subscribe round-trip first.
+                                ensure_subscription(
+                                    &state,
+                                    &private_tx,
+                                    &mut local_subscriptions,
+                                    &inbound.session_key,
+                                );
                                 let registry = state.registry.clone();
                                 tokio::spawn(async move {
                                     if let Err(e) = registry.handle(inbound).await {

@@ -299,15 +299,9 @@ async fn main() -> Result<()> {
                             // so no events are missed.
                             let event_rx = registry_clone.global_sender().subscribe();
 
-                            // 1. Send placeholder "thinking..." message and capture its ID.
-                            let placeholder_msg = qai_protocol::OutboundMsg {
-                                session_key: session_key.clone(),
-                                content: qai_protocol::MsgContent::text("⏳ 思考中..."),
-                                reply_to: reply_to.clone(),
-                                thread_ts: thread_ts.clone(),
-                            };
-                            let placeholder_id =
-                                channel_clone.send_and_get_id(&placeholder_msg).await.ok();
+                            // Feishu text replies cannot be edited like cards reliably.
+                            // Keep the IM path simple: send only the final reply.
+                            let placeholder_id = None;
 
                             // 2. Start throttled streaming consumer in a separate task.
                             //    It will get session_id itself and then consume events at 500ms

@@ -65,9 +65,16 @@ impl MentionTrigger {
 
             let pattern = format!("@{}", bot_name);
             if let Some(pos) = output.find(&pattern) {
-                // 提取 @bot 之后到句末的指令（到换行符或字符串结束）
+                // 提取 @bot 之后的指令。
+                // 支持两种格式：
+                //   同行格式: "@codex 实现JWT"   → instruction = "实现JWT"
+                //   换行格式: "@codex\n实现JWT"  → instruction = "实现JWT"
                 let rest = &output[pos + pattern.len()..];
-                let instruction = rest.split_once('\n').map(|(s, _)| s).unwrap_or(rest).trim();
+                let instruction = rest
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty())
+                    .unwrap_or("");
 
                 if instruction.is_empty() {
                     continue;
@@ -185,6 +192,21 @@ mod tests {
             .collect();
         assert!(targets.contains(&"@codex"));
         assert!(targets.contains(&"@gemini"));
+    }
+
+    #[test]
+    fn test_newline_separated_mention_triggers() {
+        let (trigger, mut rx) = make_trigger(&["claude", "codex"]);
+        // 换行格式：@mention 后紧接换行，指令在下一行
+        trigger.scan_and_dispatch(
+            "@codex\n帮我实现 JWT 验证",
+            "claude",
+            &scope(),
+            &MsgSource::Human,
+        );
+        let msg = rx.try_recv().expect("newline-separated @mention should trigger");
+        assert_eq!(msg.target_agent, Some("@codex".to_string()));
+        assert_eq!(msg.content.as_text().unwrap(), "帮我实现 JWT 验证");
     }
 
     #[test]

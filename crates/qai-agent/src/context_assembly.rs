@@ -167,15 +167,11 @@ pub(crate) async fn assemble_context(
 pub(crate) fn build_history(recent_messages: &[StoredMessage]) -> Vec<HistoryMsg> {
     recent_messages
         .iter()
-        .map(|message| {
-            let content = match message.sender.as_deref() {
-                Some(sender) if !sender.is_empty() => format!("[{sender}]: {}", message.content),
-                _ => message.content.clone(),
-            };
-            HistoryMsg {
-                role: message.role.clone(),
-                content,
-            }
+        .map(|message| HistoryMsg {
+            role: message.role.clone(),
+            content: message.content.clone(),
+            sender: message.sender.clone(),
+            tool_calls: message.tool_calls.clone(),
         })
         .collect()
 }
@@ -298,7 +294,7 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
-    fn history_messages_keep_sender_prefixes() {
+    fn history_messages_preserve_sender_metadata_without_mutating_content() {
         let history = build_history(&[StoredMessage {
             id: Uuid::new_v4(),
             role: "assistant".to_string(),
@@ -309,7 +305,8 @@ mod tests {
         }]);
 
         assert_eq!(history.len(), 1);
-        assert_eq!(history[0].content, "[@codex]: done");
+        assert_eq!(history[0].content, "done");
+        assert_eq!(history[0].sender.as_deref(), Some("@codex"));
     }
 
     #[test]

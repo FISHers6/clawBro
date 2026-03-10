@@ -19,6 +19,14 @@ pub async fn run_command_turn(
     session: RuntimeSessionSpec,
     sink: RuntimeEventSink,
 ) -> anyhow::Result<TurnResult> {
+    tracing::info!(
+        backend_id = %session.backend_id,
+        session = ?session.session_key,
+        history_messages = session.context.history_messages.len(),
+        history_lines = session.context.history_lines.len(),
+        user_input = session.context.user_input.as_deref().unwrap_or_default(),
+        "spawning native runtime turn"
+    );
     let mut child = spawn_command(config, session.workspace_dir.as_deref())?;
     let mut stdin = child.stdin.take().expect("stdin available");
     let stdout = child.stdout.take().expect("stdout available");

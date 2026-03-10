@@ -166,9 +166,7 @@ pub async fn run_command_turn(
     let prompt_result = conn
         .prompt(acp::PromptRequest::new(
             sess.session_id,
-            vec![acp::ContentBlock::Text(acp::TextContent::new(
-                render_runtime_prompt(&session),
-            ))],
+            prompt_blocks_from_session(&session),
         ))
         .await
         .map_err(|e| anyhow::anyhow!("ACP prompt failed: {e:?}"));
@@ -263,6 +261,12 @@ pub fn build_mcp_servers(supports_sse: bool, url: Option<&str>) -> Vec<acp::McpS
     vec![]
 }
 
+fn prompt_blocks_from_session(session: &RuntimeSessionSpec) -> Vec<acp::ContentBlock> {
+    vec![acp::ContentBlock::Text(acp::TextContent::new(
+        render_runtime_prompt(session),
+    ))]
+}
+
 fn spawn_command(
     config: &AcpCommandConfig,
     workspace_dir: Option<&std::path::Path>,
@@ -310,5 +314,41 @@ mod tests {
             }
             other => panic!("unexpected mcp server: {other:?}"),
         }
+    }
+
+    #[test]
+    fn acp_prompt_blocks_preserve_rendered_recent_history() {
+        let session = RuntimeSessionSpec {
+            backend_id: "acp-main".into(),
+            participant_name: Some("worker".into()),
+            session_key: qai_protocol::SessionKey::new("ws", "history:test"),
+            role: crate::contract::RuntimeRole::Solo,
+            workspace_dir: None,
+            prompt_text: String::new(),
+            tool_surface: crate::contract::ToolSurfaceSpec::default(),
+            tool_bridge_url: None,
+            team_tool_url: None,
+            context: crate::contract::RuntimeContext {
+                history_lines: vec![
+                    "[user]: [alice]: 第一条".into(),
+                    "[assistant]: [@codex]: 第二条".into(),
+                    "[tool_call:read#call-1]: {\"path\":\"README.md\"}".into(),
+                    "[tool_result:read#call-1]: ok".into(),
+                ],
+                user_input: Some("第三条".into()),
+                ..crate::contract::RuntimeContext::default()
+            },
+        };
+
+        let blocks = prompt_blocks_from_session(&session);
+        assert_eq!(blocks.len(), 1);
+        let acp::ContentBlock::Text(text) = &blocks[0] else {
+            panic!("expected text content block");
+        };
+        assert!(text.text.contains("[user]: [alice]: 第一条"));
+        assert!(text.text.contains("[assistant]: [@codex]: 第二条"));
+        assert!(text.text.contains("[tool_call:read#call-1]: {\"path\":\"README.md\"}"));
+        assert!(text.text.contains("[tool_result:read#call-1]: ok"));
+        assert!(text.text.contains("第三条"));
     }
 }

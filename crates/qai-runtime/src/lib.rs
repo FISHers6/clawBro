@@ -20,8 +20,10 @@ pub use backend::{
 };
 pub use conductor::RuntimeConductor;
 pub use contract::{
-    render_runtime_prompt, PermissionRequest, RuntimeContext, RuntimeEvent, RuntimeRole,
-    RuntimeSessionSpec, TeamCallback, ToolSurfaceSpec, TurnIntent, TurnMode, TurnResult,
+    render_history_lines, render_runtime_prompt, PermissionRequest, RuntimeContext,
+    RuntimeEvent, RuntimeHistoryMessage, RuntimePruningPolicy, RuntimeRole,
+    RuntimeSessionSpec, TeamCallback, ToolSurfaceSpec, TranscriptCompactionMode,
+    TranscriptPruningMode, RuntimeTranscriptSemantics, TurnIntent, TurnMode, TurnResult,
 };
 pub use event_sink::RuntimeEventSink;
 pub use helper_contract::{

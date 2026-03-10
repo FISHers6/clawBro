@@ -947,6 +947,7 @@ mod tests {
     struct FakeRuntimeDispatch {
         calls: Arc<AtomicUsize>,
         last_backend: Arc<std::sync::Mutex<Option<String>>>,
+        history_snapshots: Arc<std::sync::Mutex<Vec<Vec<(String, String)>>>>,
     }
 
     #[async_trait::async_trait]
@@ -954,6 +955,14 @@ mod tests {
         async fn dispatch(&self, request: RuntimeDispatchRequest) -> Result<TurnResult> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             *self.last_backend.lock().unwrap() = request.intent.target_backend.clone();
+            self.history_snapshots.lock().unwrap().push(
+                request
+                    .ctx
+                    .history
+                    .iter()
+                    .map(|msg| (msg.role.clone(), msg.content.clone()))
+                    .collect(),
+            );
             Ok(TurnResult {
                 full_text: format!("fake-dispatch: {}", request.intent.user_text),
                 events: vec![],
@@ -1176,6 +1185,7 @@ mod tests {
         let session_manager = Arc::new(SessionManager::new(storage));
         let calls = Arc::new(AtomicUsize::new(0));
         let last_backend = Arc::new(std::sync::Mutex::new(None));
+        let history_snapshots = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (registry, _rx) = SessionRegistry::with_runtime_dispatch(
             Some("native-main".to_string()),
             session_manager,
@@ -1188,6 +1198,7 @@ mod tests {
             Arc::new(FakeRuntimeDispatch {
                 calls: Arc::clone(&calls),
                 last_backend: Arc::clone(&last_backend),
+                history_snapshots,
             }),
         );
 
@@ -1207,6 +1218,76 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(last_backend.lock().unwrap().as_deref(), Some("native-main"));
         assert_eq!(result.as_deref(), Some("fake-dispatch: hello runtime"));
+    }
+
+    #[tokio::test]
+    async fn test_registry_second_turn_includes_prior_user_and_assistant_history() {
+        let dir =
+            std::env::temp_dir().join(format!("test-registry-history-{}", uuid::Uuid::new_v4()));
+        let storage = SessionStorage::new(dir);
+        let session_manager = Arc::new(SessionManager::new(storage));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let last_backend = Arc::new(std::sync::Mutex::new(None));
+        let history_snapshots = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (registry, _rx) = SessionRegistry::with_runtime_dispatch(
+            Some("native-main".to_string()),
+            session_manager,
+            String::new(),
+            None,
+            None,
+            None,
+            None,
+            vec![],
+            Arc::new(FakeRuntimeDispatch {
+                calls,
+                last_backend,
+                history_snapshots: Arc::clone(&history_snapshots),
+            }),
+        );
+
+        registry
+            .handle(InboundMsg {
+                id: "history-1".to_string(),
+                session_key: SessionKey::new("ws", "history-user"),
+                content: MsgContent::text("苹果香蕉西瓜"),
+                sender: "user".to_string(),
+                channel: "ws".to_string(),
+                timestamp: chrono::Utc::now(),
+                thread_ts: None,
+                target_agent: None,
+                source: qai_protocol::MsgSource::Human,
+            })
+            .await
+            .unwrap();
+
+        registry
+            .handle(InboundMsg {
+                id: "history-2".to_string(),
+                session_key: SessionKey::new("ws", "history-user"),
+                content: MsgContent::text("我刚才说了什么"),
+                sender: "user".to_string(),
+                channel: "ws".to_string(),
+                timestamp: chrono::Utc::now(),
+                thread_ts: None,
+                target_agent: None,
+                source: qai_protocol::MsgSource::Human,
+            })
+            .await
+            .unwrap();
+
+        let snapshots = history_snapshots.lock().unwrap();
+        assert_eq!(snapshots.len(), 2);
+        assert!(snapshots[0].is_empty());
+        assert_eq!(
+            snapshots[1],
+            vec![
+                ("user".to_string(), "苹果香蕉西瓜".to_string()),
+                (
+                    "assistant".to_string(),
+                    "fake-dispatch: 苹果香蕉西瓜".to_string(),
+                ),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -1236,6 +1317,7 @@ mod tests {
             Arc::new(FakeRuntimeDispatch {
                 calls: Arc::clone(&calls),
                 last_backend: Arc::clone(&last_backend),
+                history_snapshots: Arc::new(std::sync::Mutex::new(Vec::new())),
             }),
         );
         registry.register_scope_binding("group:lark:bound".to_string(), "claude".to_string());
@@ -1286,6 +1368,7 @@ mod tests {
             Arc::new(FakeRuntimeDispatch {
                 calls: Arc::new(AtomicUsize::new(0)),
                 last_backend: Arc::clone(&last_backend),
+                history_snapshots: Arc::new(std::sync::Mutex::new(Vec::new())),
             }),
         );
         registry.register_scope_binding("group:lark:bound".to_string(), "claude".to_string());
@@ -1324,6 +1407,7 @@ mod tests {
             Arc::new(FakeRuntimeDispatch {
                 calls: Arc::new(AtomicUsize::new(0)),
                 last_backend: Arc::clone(&last_backend),
+                history_snapshots: Arc::new(std::sync::Mutex::new(Vec::new())),
             }),
         );
         let key = SessionKey::new("lark", "group:lark:bound");
@@ -1377,6 +1461,7 @@ mod tests {
             Arc::new(FakeRuntimeDispatch {
                 calls: Arc::new(AtomicUsize::new(0)),
                 last_backend: Arc::clone(&last_backend),
+                history_snapshots: Arc::new(std::sync::Mutex::new(Vec::new())),
             }),
         );
         registry.register_binding(crate::bindings::BindingRule::scope(
@@ -1434,6 +1519,7 @@ mod tests {
             Arc::new(FakeRuntimeDispatch {
                 calls: Arc::new(AtomicUsize::new(0)),
                 last_backend: Arc::clone(&last_backend),
+                history_snapshots: Arc::new(std::sync::Mutex::new(Vec::new())),
             }),
         );
         registry.register_scope_binding("group:lark:bound".to_string(), "claude".to_string());
@@ -1487,6 +1573,7 @@ mod tests {
             Arc::new(FakeRuntimeDispatch {
                 calls: Arc::new(AtomicUsize::new(0)),
                 last_backend: Arc::clone(&last_backend),
+                history_snapshots: Arc::new(std::sync::Mutex::new(Vec::new())),
             }),
         );
         registry.register_binding(crate::bindings::BindingRule::Default {
@@ -1537,6 +1624,7 @@ mod tests {
             Arc::new(FakeRuntimeDispatch {
                 calls: Arc::new(AtomicUsize::new(0)),
                 last_backend: Arc::clone(&last_backend),
+                history_snapshots: Arc::new(std::sync::Mutex::new(Vec::new())),
             }),
         );
 

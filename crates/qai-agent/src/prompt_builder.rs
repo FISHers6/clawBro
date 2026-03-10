@@ -39,6 +39,18 @@ const TEAM_NOTIFY_PROTOCOL: &str = "\
 
 **不要**将 `[团队通知]` 内容直接转发给用户——总结后再通过 `post_update` 发送。";
 
+/// Conversation continuity contract injected for all runtime-backed turns.
+/// Makes session continuity an explicit system invariant instead of relying on
+/// model defaults.
+const CONVERSATION_CONTINUITY_PROTOCOL: &str = "\
+## 会话连续性协议（系统保证）
+
+你正在一个持久会话中工作。系统已经把最近的真实对话历史提供给你。
+
+- 当用户询问“我刚才说了什么”“上一条消息是什么”“延续刚才的话题”时，必须基于已提供的历史回答。
+- 只要上下文里存在先前消息，就不要声称“无法查看历史”“只能看到当前消息”。
+- 如果历史里存在多个候选消息，应优先回答离当前用户消息最近的一条相关用户输入。";
+
 /// Assembles the full system prompt for a single agent turn.
 ///
 /// Layer order (persona present):
@@ -169,6 +181,9 @@ impl<'a> SystemPromptBuilder<'a> {
             parts.push(TEAM_NOTIFY_PROTOCOL.to_string());
         }
 
+        // ── Layer 8: conversation continuity contract（所有模式）──
+        parts.push(CONVERSATION_CONTINUITY_PROTOCOL.to_string());
+
         parts.join("\n\n")
     }
 }
@@ -218,6 +233,7 @@ mod tests {
         assert!(result.contains("SOUL content"));
         assert!(result.contains("IDENTITY content"));
         assert!(result.contains("SKILLS content"));
+        assert!(result.contains("会话连续性协议"));
         // No persona blocks expected
         assert!(!result.contains("Cognitive Architecture"));
     }
@@ -387,7 +403,7 @@ mod tests {
         }
         .build();
 
-        assert!(result.is_empty());
+        assert!(result.contains("会话连续性协议"));
     }
 
     #[test]
@@ -409,8 +425,8 @@ mod tests {
         .build();
 
         assert!(
-            result.is_empty(),
-            "whitespace-only inputs should produce an empty prompt"
+            result.contains("会话连续性协议"),
+            "whitespace-only inputs should still include the continuity contract"
         );
     }
 

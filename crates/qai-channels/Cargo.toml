@@ -17,6 +17,7 @@ uuid.workspace     = true
 chrono.workspace   = true
 tokio-tungstenite  = { version = "0.26", features = ["rustls-tls-native-roots"] }
 dirs.workspace     = true
+prost.workspace    = true
 
 [dev-dependencies]
 tempfile = "3"

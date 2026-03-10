@@ -7,8 +7,10 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
 use futures::{SinkExt, StreamExt};
+use prost::Message as ProstMessage;
 use qai_protocol::{InboundMsg, MsgContent, OutboundMsg, SessionKey};
 use serde::Deserialize;
+use std::collections::HashMap;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMsg;
 
@@ -40,6 +42,7 @@ pub struct LarkChannel {
     /// Feishu app_access_token is valid for 7200s; we treat it as valid for 7000s
     /// to provide a safety margin against clock skew and network latency.
     token_cache: tokio::sync::Mutex<Option<(String, std::time::Instant)>>,
+    seen_message_ids: tokio::sync::Mutex<HashMap<String, std::time::Instant>>,
 }
 
 impl LarkChannel {
@@ -50,7 +53,21 @@ impl LarkChannel {
             client: reqwest::Client::new(),
             require_mention_in_groups,
             token_cache: tokio::sync::Mutex::new(None),
+            seen_message_ids: tokio::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    async fn should_accept_message(&self, message_id: &str) -> bool {
+        const DEDUP_TTL_SECS: u64 = 600;
+
+        let now = std::time::Instant::now();
+        let mut seen = self.seen_message_ids.lock().await;
+        seen.retain(|_, ts| now.duration_since(*ts).as_secs() < DEDUP_TTL_SECS);
+        if seen.contains_key(message_id) {
+            return false;
+        }
+        seen.insert(message_id.to_string(), now);
+        true
     }
 
     /// Deprecated: use `LarkChannel::new()` with explicit config for full feature support.
@@ -260,6 +277,39 @@ struct LarkWsFrame {
     data: Option<serde_json::Value>,
 }
 
+#[derive(Clone, PartialEq, prost::Message)]
+struct PbHeader {
+    #[prost(string, tag = "1")]
+    key: String,
+    #[prost(string, tag = "2")]
+    value: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct PbFrame {
+    #[prost(uint64, tag = "1")]
+    seq_id: u64,
+    #[prost(uint64, tag = "2")]
+    log_id: u64,
+    #[prost(int32, tag = "3")]
+    service: i32,
+    #[prost(int32, tag = "4")]
+    method: i32,
+    #[prost(message, repeated, tag = "5")]
+    headers: Vec<PbHeader>,
+    #[prost(bytes = "vec", optional, tag = "8")]
+    payload: Option<Vec<u8>>,
+}
+
+impl PbFrame {
+    fn header_value(&self, key: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|header| header.key == key)
+            .map(|header| header.value.as_str())
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct LarkMsgEvent {
     event: LarkMsgEventBody,
@@ -295,6 +345,37 @@ struct LarkMessage {
 #[derive(Deserialize)]
 struct LarkTextContent {
     text: String,
+}
+
+fn decode_binary_frame(raw: &[u8]) -> Option<PbFrame> {
+    PbFrame::decode(raw).ok()
+}
+
+fn decode_binary_event_payload(frame: &PbFrame) -> Option<serde_json::Value> {
+    if frame.method != 1 {
+        return None;
+    }
+
+    if frame.header_value("type")? != "event" {
+        return None;
+    }
+
+    let payload = frame.payload.as_ref()?;
+    serde_json::from_slice(payload).ok()
+}
+
+fn binary_ack_frame(frame: &PbFrame) -> Option<PbFrame> {
+    if frame.method != 1 {
+        return None;
+    }
+
+    let mut ack = frame.clone();
+    ack.payload = Some(br#"{"code":200,"headers":{},"data":[]}"#.to_vec());
+    ack.headers.push(PbHeader {
+            key: "biz_rt".to_string(),
+            value: "0".to_string(),
+    });
+    Some(ack)
 }
 
 #[async_trait]
@@ -388,11 +469,28 @@ impl Channel for LarkChannel {
                         }
                         "event" => {
                             if let Some(data) = frame.data {
-                                handle_event(data, &tx, &checker, self.require_mention_in_groups)
+                                handle_event(self, data, &tx, &checker, self.require_mention_in_groups)
                                     .await;
                             }
                         }
                         _ => {}
+                    }
+                }
+                Ok(WsMsg::Binary(raw)) => {
+                    let Some(frame) = decode_binary_frame(&raw) else {
+                        continue;
+                    };
+
+                    if let Some(ack) = binary_ack_frame(&frame) {
+                        if let Err(e) = ws.send(WsMsg::Binary(ack.encode_to_vec().into())).await {
+                            tracing::error!("Feishu WS binary ack send failed: {e}");
+                            break;
+                        }
+                    }
+
+                    if let Some(data) = decode_binary_event_payload(&frame) {
+                        handle_event(self, data, &tx, &checker, self.require_mention_in_groups)
+                            .await;
                     }
                 }
                 Ok(WsMsg::Close(_)) => {
@@ -423,6 +521,7 @@ fn derive_scope(chat_type: &str, chat_id: &str, open_id: &str) -> String {
 }
 
 async fn handle_event(
+    channel: &LarkChannel,
     data: serde_json::Value,
     tx: &mpsc::Sender<InboundMsg>,
     checker: &crate::allowlist::AllowlistChecker,
@@ -457,6 +556,17 @@ async fn handle_event(
     else {
         return;
     };
+
+    if !channel
+        .should_accept_message(&event.event.message.message_id)
+        .await
+    {
+        tracing::info!(
+            message_id = %event.event.message.message_id,
+            "Skipping duplicate Feishu inbound message"
+        );
+        return;
+    }
 
     let text = text_content.text.trim().to_string();
     if text.is_empty() {
@@ -595,6 +705,14 @@ mod tests {
         assert_eq!(scope, "group:oc_test_group");
     }
 
+    #[tokio::test]
+    async fn test_lark_message_dedup_accepts_first_and_rejects_duplicate() {
+        let channel = LarkChannel::new("app".into(), "secret".into(), false);
+        assert!(channel.should_accept_message("om_1").await);
+        assert!(!channel.should_accept_message("om_1").await);
+        assert!(channel.should_accept_message("om_2").await);
+    }
+
     #[test]
     fn test_lark_p2p_scope_from_event() {
         let scope = derive_scope("p2p", "", "ou_sender");
@@ -700,5 +818,111 @@ mod tests {
         assert!(ch.require_mention_in_groups);
         let ch2 = LarkChannel::new("id".to_string(), "secret".to_string(), false);
         assert!(!ch2.require_mention_in_groups);
+    }
+
+    #[test]
+    fn test_lark_binary_event_payload_decodes() {
+        let payload = serde_json::json!({
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "sender": { "sender_id": { "open_id": "ou_binary" } },
+                "message": {
+                    "message_id": "om_binary_1",
+                    "message_type": "text",
+                    "content": "{\"text\":\"hello from binary\"}",
+                    "chat_type": "p2p",
+                    "chat_id": ""
+                }
+            }
+        });
+        let frame = PbFrame {
+            seq_id: 7,
+            log_id: 8,
+            service: 9,
+            method: 1,
+            headers: vec![PbHeader {
+                key: "type".to_string(),
+                value: "event".to_string(),
+            }],
+            payload: Some(payload.to_string().into_bytes()),
+        };
+
+        let raw = frame.encode_to_vec();
+        let decoded = decode_binary_frame(&raw).expect("binary frame should decode");
+        let event = decode_binary_event_payload(&decoded).expect("event payload should decode");
+        assert_eq!(
+            event["event"]["sender"]["sender_id"]["open_id"],
+            serde_json::json!("ou_binary")
+        );
+        assert_eq!(
+            event["event"]["message"]["message_id"],
+            serde_json::json!("om_binary_1")
+        );
+    }
+
+    #[test]
+    fn test_lark_binary_ack_frame_preserves_identity_fields() {
+        let frame = PbFrame {
+            seq_id: 11,
+            log_id: 12,
+            service: 13,
+            method: 1,
+            headers: vec![PbHeader {
+                key: "type".to_string(),
+                value: "event".to_string(),
+            }],
+            payload: Some(br#"{"header":{"event_type":"im.message.receive_v1"}}"#.to_vec()),
+        };
+
+        let ack = binary_ack_frame(&frame).expect("ack should be generated");
+        assert_eq!(ack.seq_id, 11);
+        assert_eq!(ack.log_id, 12);
+        assert_eq!(ack.service, 13);
+        assert_eq!(ack.method, 1);
+        assert_eq!(
+            ack.headers
+                .iter()
+                .find(|header| header.key == "biz_rt")
+                .map(|header| header.value.as_str()),
+            Some("0")
+        );
+        assert_eq!(
+            ack.payload.as_deref(),
+            Some(br#"{"code":200,"headers":{},"data":[]}"#.as_slice())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lark_binary_event_dispatches_inbound_message() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let checker =
+            crate::allowlist::AllowlistChecker::from_path(None::<std::path::PathBuf>);
+        let channel = LarkChannel::new("app".into(), "secret".into(), false);
+        let payload = serde_json::json!({
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "sender": { "sender_id": { "open_id": "ou_binary_dispatch" } },
+                "message": {
+                    "message_id": "om_binary_dispatch",
+                    "message_type": "text",
+                    "content": "{\"text\":\"ping from binary\"}",
+                    "chat_type": "p2p",
+                    "chat_id": ""
+                }
+            }
+        });
+
+        handle_event(&channel, payload, &tx, &checker, false).await;
+
+        let inbound = rx.recv().await.expect("inbound message should dispatch");
+        assert_eq!(inbound.id, "om_binary_dispatch");
+        assert_eq!(inbound.session_key.channel, "lark");
+        assert_eq!(inbound.session_key.scope, "user:ou_binary_dispatch");
+        assert_eq!(inbound.sender, "ou_binary_dispatch");
+        assert_eq!(inbound.target_agent, None);
+        match inbound.content {
+            MsgContent::Text { text } => assert_eq!(text, "ping from binary"),
+            other => panic!("unexpected content: {other:?}"),
+        }
     }
 }

@@ -4,9 +4,12 @@ use async_trait::async_trait;
 use qai_protocol::AgentEvent;
 use qai_runtime::{
     acp::AcpBackendAdapter, ApprovalBroker, BackendRegistry, OpenClawBackendAdapter,
-    QuickAiNativeBackendAdapter, RuntimeConductor, RuntimeContext, RuntimeEvent, RuntimeRole,
+    QuickAiNativeBackendAdapter, RuntimeConductor, RuntimeContext, RuntimeEvent,
+    RuntimeHistoryMessage, RuntimePruningPolicy, RuntimeRole, TranscriptCompactionMode,
+    TranscriptPruningMode, RuntimeTranscriptSemantics,
     RuntimeSessionSpec, ToolSurfaceSpec, TurnIntent, TurnResult,
 };
+use qai_runtime::contract::RuntimeToolCall;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -167,7 +170,7 @@ async fn run_dispatch_job(
         .or_else(|| request.intent.leader_candidate.clone())
         .or(request.fallback_backend_id.clone())
         .ok_or_else(|| anyhow::anyhow!("no backend selected for turn"))?;
-    registry
+    let spec = registry
         .backend_spec(&backend_id)
         .await
         .ok_or_else(|| anyhow::anyhow!("backend `{backend_id}` is not registered"))?;
@@ -213,7 +216,7 @@ async fn run_dispatch_job(
                 },
                 tool_bridge_url: ctx.mcp_server_url.clone(),
                 team_tool_url: ctx.team_tool_url.clone(),
-                context: runtime_context_from_ctx(&ctx),
+                context: runtime_context_from_ctx(&ctx, spec.family),
             },
             runtime_sink,
         )
@@ -241,7 +244,33 @@ fn runtime_role_from_agent_role(role: crate::traits::AgentRole) -> RuntimeRole {
     }
 }
 
-fn runtime_context_from_ctx(ctx: &AgentCtx) -> RuntimeContext {
+fn runtime_context_from_ctx(
+    ctx: &AgentCtx,
+    family: qai_runtime::backend::BackendFamily,
+) -> RuntimeContext {
+    let history_messages: Vec<RuntimeHistoryMessage> = ctx
+        .history
+        .iter()
+        .map(|msg| RuntimeHistoryMessage {
+            role: msg.role.clone(),
+            content: msg.content.clone(),
+            sender: msg.sender.clone(),
+            tool_calls: msg
+                .tool_calls
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|call| RuntimeToolCall {
+                    tool_call_id: call.tool_call_id,
+                    name: call.name,
+                    input_json: call.input.to_string(),
+                    output: call.output,
+                })
+                .collect(),
+        })
+        .collect();
+    let transcript_semantics = transcript_semantics_for_family(family);
+
     RuntimeContext {
         system_prompt: (!ctx.system_injection.trim().is_empty())
             .then(|| ctx.system_injection.clone()),
@@ -250,12 +279,43 @@ fn runtime_context_from_ctx(ctx: &AgentCtx) -> RuntimeContext {
         agent_memory: ctx.agent_memory.clone(),
         team_manifest: ctx.team_manifest.clone(),
         task_reminder: ctx.task_reminder.clone(),
-        history_lines: ctx
-            .history
-            .iter()
-            .map(|msg| format!("[{}]: {}", msg.role, msg.content))
-            .collect(),
+        history_lines: qai_runtime::render_history_lines(&history_messages, &transcript_semantics),
+        history_messages,
+        transcript_semantics,
         user_input: Some(ctx.user_text.clone()),
+        ..RuntimeContext::default()
+    }
+}
+
+fn transcript_semantics_for_family(
+    family: qai_runtime::backend::BackendFamily,
+) -> RuntimeTranscriptSemantics {
+    let pruning = match family {
+        qai_runtime::backend::BackendFamily::QuickAiNative => TranscriptPruningMode::Off,
+        qai_runtime::backend::BackendFamily::Acp
+        | qai_runtime::backend::BackendFamily::OpenClawGateway => {
+            TranscriptPruningMode::RequestLocal
+        }
+    };
+    RuntimeTranscriptSemantics {
+        pruning,
+        pruning_policy: default_pruning_policy_for_family(family),
+        compaction: TranscriptCompactionMode::RawTranscriptOnly,
+    }
+}
+
+fn default_pruning_policy_for_family(
+    family: qai_runtime::backend::BackendFamily,
+) -> RuntimePruningPolicy {
+    match family {
+        qai_runtime::backend::BackendFamily::QuickAiNative => RuntimePruningPolicy::default(),
+        qai_runtime::backend::BackendFamily::Acp
+        | qai_runtime::backend::BackendFamily::OpenClawGateway => RuntimePruningPolicy {
+            keep_last_assistants: 3,
+            min_prunable_tool_chars: 4_000,
+            soft_trim_head_chars: 800,
+            soft_trim_tail_chars: 800,
+        },
     }
 }
 
@@ -600,5 +660,154 @@ mod tests {
         );
         assert!(files.contains(&"TEAM.md".to_string()));
         assert!(files.contains(&"CONTEXT.md".to_string()));
+    }
+
+    #[test]
+    fn runtime_context_projection_preserves_structured_history() {
+        let mut ctx = AgentCtx::default();
+        ctx.user_text = "current turn".into();
+        ctx.history = vec![
+            crate::traits::HistoryMsg {
+                role: "user".into(),
+                content: "hello".into(),
+                sender: Some("alice".into()),
+                tool_calls: None,
+            },
+            crate::traits::HistoryMsg {
+                role: "assistant".into(),
+                content: "hi there".into(),
+                sender: Some("@codex".into()),
+                tool_calls: Some(vec![qai_session::ToolCallRecord {
+                    tool_call_id: Some("call-1".into()),
+                    name: "read".into(),
+                    input: serde_json::json!({"path":"README.md"}),
+                    output: Some("ok".into()),
+                }]),
+            },
+        ];
+
+        let projected = runtime_context_from_ctx(&ctx, qai_runtime::BackendFamily::Acp);
+        assert_eq!(projected.history_messages.len(), 2);
+        assert_eq!(projected.history_messages[0].role, "user");
+        assert_eq!(projected.history_messages[0].content, "hello");
+        assert_eq!(projected.history_messages[0].sender.as_deref(), Some("alice"));
+        assert_eq!(projected.history_messages[1].role, "assistant");
+        assert_eq!(projected.history_messages[1].content, "hi there");
+        assert_eq!(
+            projected.history_messages[1].sender.as_deref(),
+            Some("@codex")
+        );
+        assert_eq!(projected.history_messages[1].tool_calls.len(), 1);
+        assert_eq!(projected.history_messages[1].tool_calls[0].name, "read");
+        assert_eq!(
+            projected.history_messages[1].tool_calls[0].tool_call_id.as_deref(),
+            Some("call-1")
+        );
+        assert_eq!(
+            projected.transcript_semantics.pruning,
+            TranscriptPruningMode::RequestLocal
+        );
+        assert_eq!(
+            projected.history_lines,
+            vec![
+                "[user]: [alice]: hello".to_string(),
+                "[assistant]: [@codex]: hi there".to_string(),
+                "[tool_call:read#call-1]: {\"path\":\"README.md\"}".to_string(),
+                "[tool_result:read#call-1]: ok".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_context_projection_only_prunes_compatibility_lines_not_structured_history() {
+        let long_output = "y".repeat(5000);
+        let mut ctx = AgentCtx::default();
+        ctx.history = vec![
+            crate::traits::HistoryMsg {
+                role: "assistant".into(),
+                content: "older".into(),
+                sender: None,
+                tool_calls: Some(vec![qai_session::ToolCallRecord {
+                    tool_call_id: Some("call-99".into()),
+                    name: "read".into(),
+                    input: serde_json::json!({"path":"big.txt"}),
+                    output: Some(long_output.clone()),
+                }]),
+            },
+            crate::traits::HistoryMsg {
+                role: "assistant".into(),
+                content: "recent-1".into(),
+                sender: None,
+                tool_calls: None,
+            },
+            crate::traits::HistoryMsg {
+                role: "assistant".into(),
+                content: "recent-2".into(),
+                sender: None,
+                tool_calls: None,
+            },
+            crate::traits::HistoryMsg {
+                role: "assistant".into(),
+                content: "recent-3".into(),
+                sender: None,
+                tool_calls: None,
+            },
+        ];
+
+        let projected = runtime_context_from_ctx(&ctx, qai_runtime::BackendFamily::Acp);
+        assert_eq!(
+            projected.history_messages[0].tool_calls[0].output.as_deref(),
+            Some(long_output.as_str())
+        );
+        let rendered = projected
+            .history_lines
+            .iter()
+            .find(|line| line.starts_with("[tool_result:read#call-99]: "))
+            .unwrap();
+        assert!(rendered.contains("[tool result pruned; omitted"));
+    }
+
+    #[test]
+    fn native_family_defaults_to_no_request_local_pruning() {
+        let long_output = "n".repeat(5000);
+        let mut ctx = AgentCtx::default();
+        ctx.history = vec![crate::traits::HistoryMsg {
+            role: "assistant".into(),
+            content: "older".into(),
+            sender: None,
+            tool_calls: Some(vec![qai_session::ToolCallRecord {
+                tool_call_id: Some("native-1".into()),
+                name: "read".into(),
+                input: serde_json::json!({"path":"big.txt"}),
+                output: Some(long_output.clone()),
+            }]),
+        }];
+
+        let projected = runtime_context_from_ctx(&ctx, qai_runtime::BackendFamily::QuickAiNative);
+        assert_eq!(projected.transcript_semantics.pruning, TranscriptPruningMode::Off);
+        assert_eq!(
+            projected.transcript_semantics.pruning_policy.keep_last_assistants,
+            3
+        );
+        let rendered = projected
+            .history_lines
+            .iter()
+            .find(|line| line.starts_with("[tool_result:read#native-1]: "))
+            .unwrap();
+        assert!(!rendered.contains("[tool result pruned; omitted"));
+        assert!(rendered.ends_with(&long_output));
+    }
+
+    #[test]
+    fn compatibility_families_default_to_request_local_pruning_policy() {
+        let acp = transcript_semantics_for_family(qai_runtime::BackendFamily::Acp);
+        let openclaw = transcript_semantics_for_family(qai_runtime::BackendFamily::OpenClawGateway);
+
+        assert_eq!(acp.pruning, TranscriptPruningMode::RequestLocal);
+        assert_eq!(openclaw.pruning, TranscriptPruningMode::RequestLocal);
+        assert_eq!(acp.pruning_policy.keep_last_assistants, 3);
+        assert_eq!(acp.pruning_policy.min_prunable_tool_chars, 4_000);
+        assert_eq!(openclaw.pruning_policy.soft_trim_head_chars, 800);
+        assert_eq!(openclaw.pruning_policy.soft_trim_tail_chars, 800);
     }
 }

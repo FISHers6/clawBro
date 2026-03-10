@@ -694,6 +694,51 @@ mod tests {
     }
 
     #[test]
+    fn openclaw_prompt_keeps_rendered_recent_history_when_helper_is_enabled() {
+        let helper = TeamHelperConfig {
+            command: "/opt/qai-team-cli".into(),
+            args: vec![],
+            session_channel: "specialist".into(),
+            session_scope: "team:codex".into(),
+            team_tool_url: "http://127.0.0.1:3000/runtime/team-tools?token=t".into(),
+        };
+        let session = RuntimeSessionSpec {
+            backend_id: "openclaw-main".into(),
+            participant_name: Some("worker".into()),
+            session_key: qai_protocol::SessionKey::new("specialist", "team:codex"),
+            role: RuntimeRole::Specialist,
+            workspace_dir: None,
+            prompt_text: String::new(),
+            tool_surface: ToolSurfaceSpec {
+                team_tools: true,
+                local_skills: false,
+                external_mcp: false,
+                backend_native_tools: true,
+            },
+            tool_bridge_url: None,
+            team_tool_url: Some(helper.team_tool_url.clone()),
+            context: RuntimeContext {
+                history_lines: vec![
+                    "[user]: [alice]: 第一条".into(),
+                    "[assistant]: [@codex]: 第二条".into(),
+                    "[tool_call:read#call-1]: {\"path\":\"README.md\"}".into(),
+                    "[tool_result:read#call-1]: ok".into(),
+                ],
+                user_input: Some("第三条".into()),
+                ..RuntimeContext::default()
+            },
+        };
+
+        let prompt = augment_prompt_for_openclaw(&session, Some(&helper));
+        assert!(prompt.contains("[user]: [alice]: 第一条"));
+        assert!(prompt.contains("[assistant]: [@codex]: 第二条"));
+        assert!(prompt.contains("[tool_call:read#call-1]: {\"path\":\"README.md\"}"));
+        assert!(prompt.contains("[tool_result:read#call-1]: ok"));
+        assert!(prompt.contains("第三条"));
+        assert!(prompt.contains("submit-task-result"));
+    }
+
+    #[test]
     fn openclaw_prompt_includes_helper_commands_for_leaders() {
         let helper = TeamHelperConfig {
             command: "/opt/qai-team-cli".into(),
