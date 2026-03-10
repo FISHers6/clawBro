@@ -1,13 +1,12 @@
 use anyhow::Result;
-use async_trait::async_trait;
-use qai_agent::{ConductorRuntimeDispatch, OutputSink, SessionRegistry};
-use qai_channels::Channel as _;
+use qai_agent::{ConductorRuntimeDispatch, SessionRegistry};
 use qai_runtime::{
     acp::AcpBackendAdapter, ApprovalBroker, BackendRegistry, OpenClawBackendAdapter,
     QuickAiNativeBackendAdapter,
 };
 use qai_server::config;
 use qai_server::gateway;
+use qai_server::im_sink::spawn_im_turn;
 use qai_server::state::{AppState, BrokerApprovalResolver};
 use qai_session::{SessionManager, SessionStorage};
 use qai_skills::SkillLoader;
@@ -18,53 +17,10 @@ fn next_delay(current: Duration) -> Duration {
     (current * 2).min(Duration::from_secs(300))
 }
 
-/// OutputSink implementation for Feishu/Lark IM streaming.
-/// Edits the placeholder message at 500ms intervals with accumulated text,
-/// and sends (or edits) the final message when the turn completes.
-struct LarkImSink {
-    channel: Arc<qai_channels::LarkChannel>,
-    reply_to: Option<String>,
-    thread_ts: Option<String>,
-    session_key: qai_protocol::SessionKey,
-}
-
-#[async_trait]
-impl OutputSink for LarkImSink {
-    async fn send_thinking(&self) -> Option<String> {
-        // The placeholder is sent externally before throttled_stream is called;
-        // this method is a no-op for LarkImSink.
-        None
-    }
-
-    async fn send_delta(&self, accumulated: &str, placeholder_id: Option<&str>) {
-        if let Some(msg_id) = placeholder_id {
-            if let Err(e) = self.channel.edit_message(msg_id, accumulated).await {
-                tracing::warn!("Lark edit_message (delta) failed: {e}");
-            }
-        }
-    }
-
-    async fn send_final(&self, text: &str, placeholder_id: Option<&str>) {
-        if let Some(msg_id) = placeholder_id {
-            if let Err(e) = self.channel.edit_message(msg_id, text).await {
-                tracing::error!("Lark edit_message (final) failed: {e}");
-            }
-        } else {
-            let msg = qai_protocol::OutboundMsg {
-                session_key: self.session_key.clone(),
-                content: qai_protocol::MsgContent::text(text),
-                reply_to: self.reply_to.clone(),
-                thread_ts: self.thread_ts.clone(),
-            };
-            if let Err(e) = self.channel.send(&msg).await {
-                tracing::error!("Lark send_final failed: {e}");
-            }
-        }
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -166,6 +122,7 @@ async fn main() -> Result<()> {
     // 启动 Channel 监听（DingTalk）
     if let Some(dt_cfg) = &cfg.channels.dingtalk {
         if dt_cfg.enabled {
+            let dt_presentation = dt_cfg.presentation;
             if let Ok(dt_config) = qai_channels::dingtalk::DingTalkConfig::from_env() {
                 let channel = Arc::new(qai_channels::DingTalkChannel::new(
                     dt_config,
@@ -206,29 +163,12 @@ async fn main() -> Result<()> {
                 // 派发线程：处理消息 → 回复到 DingTalk
                 tokio::spawn(async move {
                     while let Some(inbound) = rx.recv().await {
-                        let session_key = inbound.session_key.clone();
-                        let thread_ts = inbound.thread_ts.clone();
-                        let reply_to = Some(inbound.id.clone());
-
-                        match registry_clone.handle(inbound).await {
-                            Ok(Some(full_text)) => {
-                                let reply = qai_protocol::OutboundMsg {
-                                    session_key,
-                                    content: qai_protocol::MsgContent::text(full_text),
-                                    reply_to,
-                                    thread_ts,
-                                };
-                                if let Err(e) = channel_clone.send(&reply).await {
-                                    tracing::error!("DingTalk send error: {e}");
-                                }
-                            }
-                            Ok(None) => {
-                                tracing::debug!("Dedup: skipped duplicate message");
-                            }
-                            Err(e) => {
-                                tracing::error!("Registry handle error: {e}");
-                            }
-                        }
+                        spawn_im_turn(
+                            registry_clone.clone(),
+                            channel_clone.clone() as Arc<dyn qai_channels::Channel>,
+                            inbound,
+                            dt_presentation,
+                        );
                     }
                 });
 
@@ -242,6 +182,7 @@ async fn main() -> Result<()> {
     // 启动 Channel 监听（Lark/飞书）
     if let Some(lark_cfg) = &cfg.channels.lark {
         if lark_cfg.enabled {
+            let lark_presentation = lark_cfg.presentation;
             let lark_channel_result = {
                 let app_id = std::env::var("LARK_APP_ID");
                 let app_secret = std::env::var("LARK_APP_SECRET");
@@ -291,81 +232,12 @@ async fn main() -> Result<()> {
 
                     tokio::spawn(async move {
                         while let Some(inbound) = rx.recv().await {
-                            let session_key = inbound.session_key.clone();
-                            let thread_ts = inbound.thread_ts.clone();
-                            let reply_to = Some(inbound.id.clone()); // Feishu message_id for reply threading
-
-                            // Subscribe to global event stream BEFORE handle() fires events,
-                            // so no events are missed.
-                            let event_rx = registry_clone.global_sender().subscribe();
-
-                            // Feishu text replies cannot be edited like cards reliably.
-                            // Keep the IM path simple: send only the final reply.
-                            let placeholder_id = None;
-
-                            // 2. Start throttled streaming consumer in a separate task.
-                            //    It will get session_id itself and then consume events at 500ms
-                            //    intervals, editing the placeholder message in-place.
-                            //
-                            //    control_tx / control_rx: handle() sends an explicit completion
-                            //    signal when the turn ends without a runtime TurnComplete event
-                            //    (e.g. sync slash replies, dedup hit, or early errors).
-                            let (control_tx, control_rx) =
-                                tokio::sync::oneshot::channel::<qai_agent::StreamControl>();
-                            let channel2 = channel_clone.clone();
-                            let registry2 = registry_clone.clone();
-                            let sk2 = session_key.clone();
-                            let reply_to2 = reply_to.clone();
-                            let thread_ts2 = thread_ts.clone();
-                            let ph_id2 = placeholder_id.clone();
-                            tokio::spawn(async move {
-                                let session_id =
-                                    match registry2.session_manager_ref().get_or_create(&sk2).await
-                                    {
-                                        Ok(id) => id,
-                                        Err(e) => {
-                                            tracing::error!("Lark: get session_id failed: {e}");
-                                            return;
-                                        }
-                                    };
-
-                                let sink = LarkImSink {
-                                    channel: channel2,
-                                    reply_to: reply_to2,
-                                    thread_ts: thread_ts2,
-                                    session_key: sk2,
-                                };
-
-                                qai_agent::throttled_stream(
-                                    event_rx, session_id, &sink, ph_id2, control_rx,
-                                )
-                                .await;
-                            });
-
-                            // 3. Run handle() in its own task — emits events to broadcast channel.
-                            //    On Ok(None) or Err, signal the stream task to stop (no TurnComplete
-                            //    will ever fire in those cases).
-                            let registry3 = registry_clone.clone();
-                            tokio::spawn(async move {
-                                match registry3.handle(inbound).await {
-                                    Ok(Some(reply)) => {
-                                        // Runtime turns usually exit on TurnComplete.
-                                        // Sync control-plane replies need an explicit final result.
-                                        let _ =
-                                            control_tx.send(qai_agent::StreamControl::Final(reply));
-                                    }
-                                    Ok(None) => {
-                                        // Dedup hit or no-op: no TurnComplete event will fire.
-                                        let _ = control_tx.send(qai_agent::StreamControl::Stop);
-                                    }
-                                    Err(e) => {
-                                        tracing::error!("Lark registry handle error: {e}");
-                                        let _ = control_tx.send(qai_agent::StreamControl::Final(
-                                            format!("❌ 错误: {e}"),
-                                        ));
-                                    }
-                                }
-                            });
+                            spawn_im_turn(
+                                registry_clone.clone(),
+                                channel_clone.clone() as Arc<dyn qai_channels::Channel>,
+                                inbound,
+                                lark_presentation,
+                            );
                         }
                     });
 

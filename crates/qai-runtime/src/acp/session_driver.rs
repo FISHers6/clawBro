@@ -4,6 +4,7 @@ use crate::{
     event_sink::RuntimeEventSink,
 };
 use agent_client_protocol as acp;
+use std::collections::HashMap;
 use tokio::process::Command;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
@@ -99,6 +100,7 @@ pub async fn run_command_turn(
         sink: RuntimeEventSink,
         accumulated: Rc<RefCell<String>>,
         approvals: ApprovalBroker,
+        tool_titles: Rc<RefCell<HashMap<String, String>>>,
     }
 
     #[async_trait::async_trait(?Send)]
@@ -119,11 +121,86 @@ pub async fn run_command_turn(
             &self,
             notification: acp::SessionNotification,
         ) -> acp::Result<()> {
-            if let acp::SessionUpdate::AgentMessageChunk(chunk) = notification.update {
-                if let acp::ContentBlock::Text(t) = chunk.content {
-                    self.accumulated.borrow_mut().push_str(&t.text);
-                    let _ = self.sink.emit(RuntimeEvent::TextDelta { text: t.text });
+            match notification.update {
+                acp::SessionUpdate::AgentMessageChunk(chunk) => {
+                    if let acp::ContentBlock::Text(t) = chunk.content {
+                        self.accumulated.borrow_mut().push_str(&t.text);
+                        let _ = self.sink.emit(RuntimeEvent::TextDelta { text: t.text });
+                    }
                 }
+                acp::SessionUpdate::ToolCall(tool_call) => {
+                    let call_id = tool_call.tool_call_id.to_string();
+                    self.tool_titles
+                        .borrow_mut()
+                        .insert(call_id.clone(), tool_call.title.clone());
+                    let _ = self.sink.emit(RuntimeEvent::ToolCallStarted {
+                        tool_name: tool_call.title,
+                        call_id,
+                        input_summary: tool_call.raw_input.map(|value| truncate_json(&value)),
+                    });
+                }
+                acp::SessionUpdate::ToolCallUpdate(update) => {
+                    let call_id = update.tool_call_id.to_string();
+                    let seen_before = self.tool_titles.borrow().contains_key(&call_id);
+                    if let Some(title) = update.fields.title.clone() {
+                        self.tool_titles.borrow_mut().insert(call_id.clone(), title);
+                    }
+                    let tool_name = self
+                        .tool_titles
+                        .borrow()
+                        .get(&call_id)
+                        .cloned()
+                        .or(update.fields.title.clone())
+                        .unwrap_or_else(|| "acp_tool".to_string());
+                    match update.fields.status {
+                        Some(acp::ToolCallStatus::Pending | acp::ToolCallStatus::InProgress) => {
+                            if !seen_before {
+                                self.tool_titles
+                                    .borrow_mut()
+                                    .insert(call_id.clone(), tool_name.clone());
+                                let _ = self.sink.emit(RuntimeEvent::ToolCallStarted {
+                                    tool_name,
+                                    call_id,
+                                    input_summary: update
+                                        .fields
+                                        .raw_input
+                                        .as_ref()
+                                        .map(truncate_json),
+                                });
+                            }
+                        }
+                        Some(acp::ToolCallStatus::Completed) => {
+                            let result = update
+                                .fields
+                                .raw_output
+                                .as_ref()
+                                .map(truncate_json)
+                                .unwrap_or_else(|| "\"<acp tool completed>\"".to_string());
+                            self.tool_titles.borrow_mut().remove(&call_id);
+                            let _ = self.sink.emit(RuntimeEvent::ToolCallCompleted {
+                                tool_name,
+                                call_id,
+                                result,
+                            });
+                        }
+                        Some(acp::ToolCallStatus::Failed) => {
+                            let error = update
+                                .fields
+                                .raw_output
+                                .as_ref()
+                                .map(truncate_json)
+                                .unwrap_or_else(|| "ACP tool failed".to_string());
+                            self.tool_titles.borrow_mut().remove(&call_id);
+                            let _ = self.sink.emit(RuntimeEvent::ToolCallFailed {
+                                tool_name,
+                                call_id,
+                                error,
+                            });
+                        }
+                        None | Some(_) => {}
+                    }
+                }
+                _ => {}
             }
             Ok(())
         }
@@ -134,6 +211,7 @@ pub async fn run_command_turn(
         sink: sink.clone(),
         accumulated: accumulated.clone(),
         approvals,
+        tool_titles: Rc::new(RefCell::new(HashMap::new())),
     };
     let (conn, handle_io) = acp::ClientSideConnection::new(client, outgoing, incoming, |fut| {
         tokio::task::spawn_local(fut);
@@ -220,6 +298,15 @@ fn permission_request_from_acp(args: &acp::RequestPermissionRequest) -> crate::P
         host: Some("acp".into()),
         agent_id: None,
         expires_at_ms: None,
+    }
+}
+
+fn truncate_json(value: &serde_json::Value) -> String {
+    let compact = value.to_string();
+    if compact.len() > 400 {
+        format!("{}...", &compact[..400])
+    } else {
+        compact
     }
 }
 
@@ -350,5 +437,13 @@ mod tests {
         assert!(text.text.contains("[tool_call:read#call-1]: {\"path\":\"README.md\"}"));
         assert!(text.text.contains("[tool_result:read#call-1]: ok"));
         assert!(text.text.contains("第三条"));
+    }
+
+    #[test]
+    fn truncate_json_caps_large_payloads() {
+        let value = serde_json::json!({ "output": "x".repeat(512) });
+        let rendered = truncate_json(&value);
+        assert!(rendered.ends_with("..."));
+        assert!(rendered.len() < 450);
     }
 }

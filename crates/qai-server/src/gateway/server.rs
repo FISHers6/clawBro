@@ -114,8 +114,14 @@ mod tests {
                 launch: config::BackendLaunchConfig::Embedded,
             }],
             channels: config::ChannelsSection {
-                lark: Some(config::LarkSection { enabled: true }),
-                dingtalk: Some(config::DingTalkSection { enabled: false }),
+                lark: Some(config::LarkSection {
+                    enabled: true,
+                    presentation: config::ProgressPresentationMode::FinalOnly,
+                }),
+                dingtalk: Some(config::DingTalkSection {
+                    enabled: false,
+                    presentation: config::ProgressPresentationMode::FinalOnly,
+                }),
             },
             agent_roster: vec![AgentEntry {
                 name: "claude".to_string(),

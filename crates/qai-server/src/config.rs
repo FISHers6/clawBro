@@ -342,11 +342,23 @@ pub struct ChannelsSection {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DingTalkSection {
     pub enabled: bool,
+    #[serde(default)]
+    pub presentation: ProgressPresentationMode,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressPresentationMode {
+    #[default]
+    FinalOnly,
+    ProgressCompact,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LarkSection {
     pub enabled: bool,
+    #[serde(default)]
+    pub presentation: ProgressPresentationMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -747,6 +759,20 @@ type = "embedded"
         assert_eq!(spec.family, BackendFamily::QuickAiNative);
         assert_eq!(spec.adapter_key, "native");
         assert!(matches!(spec.launch, LaunchSpec::Embedded));
+    }
+
+    #[test]
+    fn test_dingtalk_presentation_deserializes() {
+        let toml = r#"
+[channels.dingtalk]
+enabled = true
+presentation = "progress_compact"
+        "#;
+        let cfg: GatewayConfig = toml::from_str(toml).unwrap();
+        assert_eq!(
+            cfg.channels.dingtalk.unwrap().presentation,
+            ProgressPresentationMode::ProgressCompact
+        );
     }
 
     #[test]

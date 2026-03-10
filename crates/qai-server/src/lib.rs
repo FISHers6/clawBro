@@ -4,6 +4,8 @@
 pub mod config;
 pub mod diagnostics;
 pub mod gateway;
+pub mod im_sink;
+pub mod progress_presentation;
 pub mod state;
 pub mod team_runtime;
 

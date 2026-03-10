@@ -44,6 +44,7 @@ reqwest.workspace = true
 agent-client-protocol = "0.9"
 tokio-util = { version = "0.7", features = ["compat"] }
 rmcp = { version = "=0.8.5", features = ["client", "transport-sse-client-reqwest"] }
+rustls = { version = "0.23", features = ["ring"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -56,6 +57,4 @@ chrono = { version = "0.4", features = ["serde"] }
 serde_json = "1"
 uuid = { version = "1.6", features = ["v4"] }
 tempfile = "3"
-# Needed to install a default CryptoProvider for rustls 0.23 used by tokio-tungstenite 0.26
-rustls = { version = "0.23", features = ["ring"] }
 tower = { version = "0.5", features = ["util"] }

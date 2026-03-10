@@ -551,7 +551,11 @@ async fn test_gateway_e2e_custom_acp_approval_via_ws_resolution() {
                 );
                 break;
             }
-            AgentEvent::TextDelta { .. } | AgentEvent::Thinking { .. } => {}
+            AgentEvent::TextDelta { .. }
+            | AgentEvent::Thinking { .. }
+            | AgentEvent::ToolCallStart { .. }
+            | AgentEvent::ToolCallResult { .. }
+            | AgentEvent::ToolCallFailed { .. } => {}
             other => panic!("unexpected event after approval resolve: {other:?}"),
         }
     }
@@ -629,7 +633,11 @@ async fn test_gateway_e2e_custom_acp_approval_via_slash_command() {
                     "unexpected turn complete after slash approval: {full_text}"
                 );
             }
-            AgentEvent::TextDelta { .. } | AgentEvent::Thinking { .. } => {}
+            AgentEvent::TextDelta { .. }
+            | AgentEvent::Thinking { .. }
+            | AgentEvent::ToolCallStart { .. }
+            | AgentEvent::ToolCallResult { .. }
+            | AgentEvent::ToolCallFailed { .. } => {}
             other => panic!("unexpected event after slash approval: {other:?}"),
         }
     }

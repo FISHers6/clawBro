@@ -272,6 +272,9 @@ impl OpenClawGatewayClient {
                     if let Some(helper_result) = parse_helper_result_event(&payload)? {
                         return Ok(Some(GatewayInbound::HelperResult(helper_result)));
                     }
+                    if let Some(event) = parse_generic_tool_event(&payload)? {
+                        return Ok(Some(GatewayInbound::Runtime(event)));
+                    }
                 }
                 GatewayFrame::Event { event, payload, .. }
                     if event == "exec.approval.requested" =>
@@ -573,6 +576,77 @@ fn parse_helper_result_event(payload: &Value) -> Result<Option<Value>> {
     Ok(Some(json))
 }
 
+fn parse_generic_tool_event(payload: &Value) -> Result<Option<RuntimeEvent>> {
+    if payload.get("stream").and_then(Value::as_str) != Some("tool") {
+        return Ok(None);
+    }
+    let Some(data) = payload.get("data") else {
+        return Ok(None);
+    };
+
+    let phase = data.get("phase").and_then(Value::as_str).unwrap_or_default();
+    let tool_name = data
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("tool")
+        .to_string();
+    let Some(call_id) = data
+        .get("toolCallId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(ToOwned::to_owned)
+    else {
+        return Ok(None);
+    };
+
+    let event = match phase {
+        "start" => RuntimeEvent::ToolCallStarted {
+            tool_name,
+            call_id,
+            input_summary: summarize_tool_args(data.get("args")),
+        },
+        "result" => {
+            let rendered = data
+                .get("result")
+                .or_else(|| data.get("partialResult"))
+                .or_else(|| data.get("details"))
+                .map(render_tool_value)
+                .transpose()?
+                .unwrap_or_else(|| {
+                    data.get("error")
+                        .and_then(Value::as_str)
+                        .or_else(|| data.get("errorMessage").and_then(Value::as_str))
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string()
+                });
+            if data.get("isError").and_then(Value::as_bool).unwrap_or(false) {
+                RuntimeEvent::ToolCallFailed {
+                    tool_name,
+                    call_id,
+                    error: if rendered.is_empty() {
+                        "OpenClaw tool call failed".into()
+                    } else {
+                        rendered
+                    },
+                }
+            } else {
+                RuntimeEvent::ToolCallCompleted {
+                    tool_name,
+                    call_id,
+                    result: rendered,
+                }
+            }
+        }
+        _ => return Ok(None),
+    };
+
+    Ok(Some(event))
+}
+
 fn render_exec_approval_prompt(requested: &ExecApprovalRequested) -> String {
     let mut parts = vec![format!(
         "OpenClaw exec approval required: `{}`",
@@ -654,6 +728,29 @@ fn extract_tool_result_text(result: &Value) -> Option<String> {
         }
         _ => None,
     }
+}
+
+fn summarize_tool_args(args: Option<&Value>) -> Option<String> {
+    let value = args?;
+    let rendered = render_tool_value(value).ok()?;
+    let rendered = rendered.trim();
+    (!rendered.is_empty()).then(|| truncate_chars(rendered, 240))
+}
+
+fn render_tool_value(value: &Value) -> Result<String> {
+    if let Some(text) = extract_tool_result_text(value) {
+        return Ok(text);
+    }
+    Ok(truncate_chars(&serde_json::to_string(value)?, 2_000))
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(max_chars).collect();
+    format!("{head}…")
 }
 
 pub fn canonical_openclaw_session_key(session_key: &qai_protocol::SessionKey) -> String {
@@ -778,5 +875,124 @@ mod tests {
         });
 
         assert!(parse_helper_result_event(&payload).unwrap().is_none());
+    }
+
+    #[test]
+    fn parses_generic_tool_start_event() {
+        let payload = serde_json::json!({
+            "sessionKey": "ws:user",
+            "runId": "run-1",
+            "stream": "tool",
+            "data": {
+                "phase": "start",
+                "name": "read",
+                "toolCallId": "tool-1",
+                "args": { "path": "/tmp/file.txt" }
+            }
+        });
+
+        let event = parse_generic_tool_event(&payload)
+            .unwrap()
+            .expect("generic tool start should parse");
+        assert_eq!(
+            event,
+            RuntimeEvent::ToolCallStarted {
+                tool_name: "read".into(),
+                call_id: "tool-1".into(),
+                input_summary: Some("{\"path\":\"/tmp/file.txt\"}".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_generic_tool_result_event() {
+        let payload = serde_json::json!({
+            "sessionKey": "ws:user",
+            "runId": "run-1",
+            "stream": "tool",
+            "data": {
+                "phase": "result",
+                "name": "search",
+                "toolCallId": "tool-2",
+                "result": {
+                    "content": [{ "type": "text", "text": "match one\nmatch two" }]
+                }
+            }
+        });
+
+        let event = parse_generic_tool_event(&payload)
+            .unwrap()
+            .expect("generic tool result should parse");
+        assert_eq!(
+            event,
+            RuntimeEvent::ToolCallCompleted {
+                tool_name: "search".into(),
+                call_id: "tool-2".into(),
+                result: "match one\nmatch two".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_generic_tool_failure_event() {
+        let payload = serde_json::json!({
+            "sessionKey": "ws:user",
+            "runId": "run-1",
+            "stream": "tool",
+            "data": {
+                "phase": "result",
+                "name": "exec",
+                "toolCallId": "tool-3",
+                "isError": true,
+                "result": {
+                    "content": [{ "type": "text", "text": "permission denied" }]
+                }
+            }
+        });
+
+        let event = parse_generic_tool_event(&payload)
+            .unwrap()
+            .expect("generic tool failure should parse");
+        assert_eq!(
+            event,
+            RuntimeEvent::ToolCallFailed {
+                tool_name: "exec".into(),
+                call_id: "tool-3".into(),
+                error: "permission denied".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn helper_result_parse_still_takes_priority_over_generic_result() {
+        let payload = serde_json::json!({
+            "sessionKey": "specialist:team-1:openclaw",
+            "runId": "run-1",
+            "stream": "tool",
+            "data": {
+                "phase": "result",
+                "name": "exec",
+                "toolCallId": "tool-1",
+                "result": {
+                    "content": [{
+                        "type": "text",
+                        "text": "{\"ok\":true,\"action\":\"submit_task_result\",\"task_id\":\"T1\"}"
+                    }]
+                }
+            }
+        });
+
+        assert!(parse_helper_result_event(&payload).unwrap().is_some());
+        let event = parse_generic_tool_event(&payload)
+            .unwrap()
+            .expect("generic tool result should still parse");
+        assert_eq!(
+            event,
+            RuntimeEvent::ToolCallCompleted {
+                tool_name: "exec".into(),
+                call_id: "tool-1".into(),
+                result: "{\"ok\":true,\"action\":\"submit_task_result\",\"task_id\":\"T1\"}".into(),
+            }
+        );
     }
 }

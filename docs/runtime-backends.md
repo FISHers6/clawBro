@@ -10,6 +10,7 @@
 This document describes the runtime side only: backend families, their adapters, and their current status.
 
 Routing precedence is documented separately in [`routing-contract.md`](/Users/fishers/Desktop/repo/quickai-openclaw/quickai-gateway/docs/routing-contract.md).
+Validated backend capability levels and current product-facing boundaries are documented separately in [`backend-support-matrix.md`](/Users/fishers/Desktop/repo/quickai-openclaw/quickai-gateway/docs/backend-support-matrix.md).
 
 Current control-plane decomposition in `qai-agent`:
 

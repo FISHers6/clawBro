@@ -214,6 +214,22 @@ pub enum TeamCallback {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RuntimeEvent {
     TextDelta { text: String },
+    ToolCallStarted {
+        tool_name: String,
+        call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_summary: Option<String>,
+    },
+    ToolCallCompleted {
+        tool_name: String,
+        call_id: String,
+        result: String,
+    },
+    ToolCallFailed {
+        tool_name: String,
+        call_id: String,
+        error: String,
+    },
     ApprovalRequest(PermissionRequest),
     ToolCallback(TeamCallback),
     TurnComplete { full_text: String },

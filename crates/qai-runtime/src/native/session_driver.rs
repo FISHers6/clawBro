@@ -49,6 +49,9 @@ pub async fn run_command_turn(
         let event: RuntimeEvent = serde_json::from_str(&line)?;
         match &event {
             RuntimeEvent::TextDelta { .. }
+            | RuntimeEvent::ToolCallStarted { .. }
+            | RuntimeEvent::ToolCallCompleted { .. }
+            | RuntimeEvent::ToolCallFailed { .. }
             | RuntimeEvent::ApprovalRequest(_)
             | RuntimeEvent::ToolCallback(_) => {
                 sink.emit(event.clone())?;

@@ -3,6 +3,7 @@
 
 use async_trait::async_trait;
 use qai_protocol::AgentEvent;
+use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::broadcast;
 
@@ -12,8 +13,22 @@ pub trait OutputSink: Send + Sync {
     async fn send_thinking(&self) -> Option<String>;
     /// Update with accumulated text (called at 500ms intervals during streaming)
     async fn send_delta(&self, accumulated: &str, placeholder_id: Option<&str>);
+    /// Send compact progress updates for channels that choose to expose them.
+    async fn send_progress(&self, _progress: &str, _placeholder_id: Option<&str>) {}
     /// Send final complete reply (replaces placeholder or sends new message)
     async fn send_final(&self, text: &str, placeholder_id: Option<&str>);
+    /// Map a tool start event into a channel-specific compact progress label.
+    fn progress_for_tool_start(&self, _tool_name: &str) -> Option<String> {
+        None
+    }
+    /// Map a tool completion event into a channel-specific compact progress label.
+    fn progress_for_tool_result(&self, _tool_name: Option<&str>) -> Option<String> {
+        None
+    }
+    /// Map a tool failure event into a channel-specific compact progress label.
+    fn progress_for_tool_failure(&self, _tool_name: &str) -> Option<String> {
+        None
+    }
 }
 
 /// Explicit stream completion signal from the caller.
@@ -49,6 +64,8 @@ pub async fn throttled_stream(
     let throttle = Duration::from_millis(500);
     let mut accumulated = String::new();
     let placeholder = placeholder_id.as_deref();
+    let mut active_tools = HashMap::<String, String>::new();
+    let mut last_progress: Option<String> = None;
 
     loop {
         tokio::select! {
@@ -69,6 +86,48 @@ pub async fn throttled_stream(
                             if session_id == target_session_id =>
                         {
                             accumulated.push_str(&delta);
+                        }
+                        AgentEvent::ToolCallStart {
+                            session_id,
+                            tool_name,
+                            call_id,
+                        } if session_id == target_session_id => {
+                            active_tools.insert(call_id, tool_name.clone());
+                            if let Some(progress) = sink.progress_for_tool_start(&tool_name) {
+                                if last_progress.as_deref() != Some(progress.as_str()) {
+                                    sink.send_progress(&progress, placeholder).await;
+                                    last_progress = Some(progress);
+                                }
+                            }
+                        }
+                        AgentEvent::ToolCallResult {
+                            session_id,
+                            call_id,
+                            ..
+                        } if session_id == target_session_id => {
+                            let tool_name = active_tools.remove(&call_id);
+                            if let Some(progress) =
+                                sink.progress_for_tool_result(tool_name.as_deref())
+                            {
+                                if last_progress.as_deref() != Some(progress.as_str()) {
+                                    sink.send_progress(&progress, placeholder).await;
+                                    last_progress = Some(progress);
+                                }
+                            }
+                        }
+                        AgentEvent::ToolCallFailed {
+                            session_id,
+                            tool_name,
+                            call_id,
+                            ..
+                        } if session_id == target_session_id => {
+                            active_tools.remove(&call_id);
+                            if let Some(progress) = sink.progress_for_tool_failure(&tool_name) {
+                                if last_progress.as_deref() != Some(progress.as_str()) {
+                                    sink.send_progress(&progress, placeholder).await;
+                                    last_progress = Some(progress);
+                                }
+                            }
                         }
                         AgentEvent::TurnComplete {
                             session_id,
@@ -123,8 +182,23 @@ mod tests {
                 .unwrap()
                 .push(format!("delta:{accumulated}"));
         }
+        async fn send_progress(&self, progress: &str, _placeholder: Option<&str>) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("progress:{progress}"));
+        }
         async fn send_final(&self, text: &str, _placeholder: Option<&str>) {
             self.calls.lock().unwrap().push(format!("final:{text}"));
+        }
+        fn progress_for_tool_start(&self, tool_name: &str) -> Option<String> {
+            Some(format!("start:{tool_name}"))
+        }
+        fn progress_for_tool_result(&self, tool_name: Option<&str>) -> Option<String> {
+            Some(format!("result:{}", tool_name.unwrap_or("unknown")))
+        }
+        fn progress_for_tool_failure(&self, tool_name: &str) -> Option<String> {
+            Some(format!("failed:{tool_name}"))
         }
     }
 
@@ -235,5 +309,75 @@ mod tests {
             recorded.iter().any(|s| s == "final:sync control reply"),
             "explicit final control signal must send final reply"
         );
+    }
+
+    #[tokio::test]
+    async fn test_throttled_stream_emits_compact_progress_events() {
+        let (tx, rx) = broadcast::channel(16);
+        let session_id = Uuid::new_v4();
+        let calls = Arc::new(Mutex::new(vec![]));
+        let sink = MockSink {
+            calls: calls.clone(),
+        };
+
+        let _ = tx.send(AgentEvent::ToolCallStart {
+            session_id,
+            tool_name: "View".to_string(),
+            call_id: "call-1".to_string(),
+        });
+        let _ = tx.send(AgentEvent::ToolCallResult {
+            session_id,
+            call_id: "call-1".to_string(),
+            result: "ok".to_string(),
+        });
+        let _ = tx.send(AgentEvent::TurnComplete {
+            session_id,
+            full_text: "done".to_string(),
+            sender: None,
+        });
+
+        let (_keep, cancel_rx) = make_cancel();
+        throttled_stream(rx, session_id, &sink, None, cancel_rx).await;
+
+        let recorded = calls.lock().unwrap().clone();
+        assert!(recorded.iter().any(|s| s == "progress:start:View"));
+        assert!(recorded.iter().any(|s| s == "progress:result:View"));
+        assert!(recorded.iter().any(|s| s == "final:done"));
+    }
+
+    #[tokio::test]
+    async fn test_throttled_stream_dedupes_repeated_progress_labels() {
+        let (tx, rx) = broadcast::channel(16);
+        let session_id = Uuid::new_v4();
+        let calls = Arc::new(Mutex::new(vec![]));
+        let sink = MockSink {
+            calls: calls.clone(),
+        };
+
+        let _ = tx.send(AgentEvent::ToolCallStart {
+            session_id,
+            tool_name: "View".to_string(),
+            call_id: "call-1".to_string(),
+        });
+        let _ = tx.send(AgentEvent::ToolCallStart {
+            session_id,
+            tool_name: "View".to_string(),
+            call_id: "call-2".to_string(),
+        });
+        let _ = tx.send(AgentEvent::TurnComplete {
+            session_id,
+            full_text: "done".to_string(),
+            sender: None,
+        });
+
+        let (_keep, cancel_rx) = make_cancel();
+        throttled_stream(rx, session_id, &sink, None, cancel_rx).await;
+
+        let recorded = calls.lock().unwrap().clone();
+        let progress_count = recorded
+            .iter()
+            .filter(|s| *s == "progress:start:View")
+            .count();
+        assert_eq!(progress_count, 1, "duplicate compact progress should be coalesced");
     }
 }

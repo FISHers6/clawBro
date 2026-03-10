@@ -35,6 +35,12 @@ pub enum AgentEvent {
         call_id: String,
         result: String,
     },
+    ToolCallFailed {
+        session_id: Uuid,
+        tool_name: String,
+        call_id: String,
+        error: String,
+    },
     Thinking {
         session_id: Uuid,
     },
@@ -57,6 +63,7 @@ impl AgentEvent {
             Self::ApprovalRequest { session_id, .. } => *session_id,
             Self::ToolCallStart { session_id, .. } => *session_id,
             Self::ToolCallResult { session_id, .. } => *session_id,
+            Self::ToolCallFailed { session_id, .. } => *session_id,
             Self::Thinking { session_id } => *session_id,
             Self::TurnComplete { session_id, .. } => *session_id,
             Self::Error { session_id, .. } => *session_id,

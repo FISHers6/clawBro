@@ -402,6 +402,38 @@ fn forward_runtime_event(
                 expires_at_ms: request.expires_at_ms,
             });
         }
+        RuntimeEvent::ToolCallStarted {
+            tool_name,
+            call_id,
+            ..
+        } => {
+            let _ = event_tx.send(AgentEvent::ToolCallStart {
+                session_id,
+                tool_name: tool_name.clone(),
+                call_id: call_id.clone(),
+            });
+        }
+        RuntimeEvent::ToolCallCompleted {
+            call_id, result, ..
+        } => {
+            let _ = event_tx.send(AgentEvent::ToolCallResult {
+                session_id,
+                call_id: call_id.clone(),
+                result: result.clone(),
+            });
+        }
+        RuntimeEvent::ToolCallFailed {
+            tool_name,
+            call_id,
+            error,
+        } => {
+            let _ = event_tx.send(AgentEvent::ToolCallFailed {
+                session_id,
+                tool_name: tool_name.clone(),
+                call_id: call_id.clone(),
+                error: error.clone(),
+            });
+        }
         RuntimeEvent::TurnComplete { full_text } => {
             let _ = event_tx.send(AgentEvent::TurnComplete {
                 session_id,

@@ -651,9 +651,16 @@ export LARK_APP_SECRET=xxx
 ### Lark 运行行为
 
 - 使用长连接 WebSocket 模式
-- 收到消息后会先发一个“思考中”占位
-- 运行中用流式编辑更新占位消息
-- 最终回写最终结果
+- 默认 `presentation = "final_only"`，只发送最终结果
+- 可选 `presentation = "progress_compact"`，先发送简化进度，再发送最终结果
+
+例如：
+
+```toml
+[channels.lark]
+enabled = true
+presentation = "progress_compact"
+```
 
 ### Lark 群聊 scope
 
@@ -672,6 +679,7 @@ group:lark:<chat_id>
 ```toml
 [channels.dingtalk]
 enabled = true
+presentation = "progress_compact"
 ```
 
 同时环境变量必须有：
@@ -684,6 +692,8 @@ export DINGTALK_APP_SECRET=xxx
 ### DingTalk 运行行为
 
 - 使用 Stream Mode
+- 默认 `presentation = "final_only"`
+- 可选 `presentation = "progress_compact"`，会先发紧凑进度，再发最终结果
 - 群聊 scope 形如 `group:<conversationId>`
 - 私聊 scope 形如 `user:<senderId>`
 
