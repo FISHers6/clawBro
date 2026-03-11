@@ -55,13 +55,41 @@ pub async fn wire_team_runtime(
             }
         };
 
+        // ── Compute lead_key before dispatch_fn so it can be captured ────────────
+        let channel_name: String = if let Some(ref ch) = group.mode.channel {
+            ch.clone()
+        } else if cfg
+            .channels
+            .dingtalk
+            .as_ref()
+            .map(|c| c.enabled)
+            .unwrap_or(false)
+        {
+            "dingtalk".to_string()
+        } else if cfg
+            .channels
+            .lark
+            .as_ref()
+            .map(|c| c.enabled)
+            .unwrap_or(false)
+        {
+            "lark".to_string()
+        } else {
+            "ws".to_string()
+        };
+        let lead_key = qai_protocol::SessionKey::new(&channel_name, &group.scope);
+
         let registry_for_dispatch = Arc::clone(&registry);
         let task_reg_for_dispatch = Arc::clone(&task_registry);
         let team_session_for_dispatch = Arc::clone(&session);
+        let channels_for_dispatch = Arc::clone(&channel_map);
+        let dispatch_notify_key = lead_key.clone();
         let dispatch_fn: DispatchFn = Arc::new(move |agent: String, task| {
             let registry = Arc::clone(&registry_for_dispatch);
             let task_reg = Arc::clone(&task_reg_for_dispatch);
             let team_session = Arc::clone(&team_session_for_dispatch);
+            let ch_map = Arc::clone(&channels_for_dispatch);
+            let notify_key = dispatch_notify_key.clone();
             Box::pin(async move {
                 let specialist_key = team_session.specialist_session_key(&agent);
                 let specialist_channel = specialist_key.channel.clone();
@@ -83,6 +111,26 @@ pub async fn wire_team_runtime(
                 let result = registry.handle(msg).await;
                 if let Ok(Some(ref reply_text)) = result {
                     let _ = team_session.append_specialist_reply(&agent, &task.id, reply_text);
+                }
+                // ── 任务派发通知 → IM 群 ─────────────────────────────────────────
+                {
+                    let notify_msg = format!(
+                        "🚀 任务 **{}**「{}」已派发给 @{}",
+                        task.id, task.title, agent
+                    );
+                    tokio::spawn(async move {
+                        if let Some(ch) = ch_map.get(&notify_key.channel) {
+                            let outbound = qai_protocol::OutboundMsg {
+                                session_key: notify_key,
+                                content: qai_protocol::MsgContent::text(notify_msg),
+                                reply_to: None,
+                                thread_ts: None,
+                            };
+                            if let Err(e) = ch.send(&outbound).await {
+                                tracing::warn!("dispatch IM notify error: {e}");
+                            }
+                        }
+                    });
                 }
                 result.map(|_| ())
             })
@@ -115,28 +163,6 @@ pub async fn wire_team_runtime(
             },
         ));
 
-        let channel_name: &str = if let Some(ref ch) = group.mode.channel {
-            ch.as_str()
-        } else if cfg
-            .channels
-            .dingtalk
-            .as_ref()
-            .map(|c| c.enabled)
-            .unwrap_or(false)
-        {
-            "dingtalk"
-        } else if cfg
-            .channels
-            .lark
-            .as_ref()
-            .map(|c| c.enabled)
-            .unwrap_or(false)
-        {
-            "lark"
-        } else {
-            "ws"
-        };
-        let lead_key = qai_protocol::SessionKey::new(channel_name, &group.scope);
         team_orch.set_lead_session_key(lead_key.clone());
         team_orch.set_scope(lead_key);
         if let Some(front_bot) = &group.mode.front_bot {
@@ -147,6 +173,12 @@ pub async fn wire_team_runtime(
             team_orch.set_available_specialists(group.team.roster.clone());
             tracing::info!(specialists = ?group.team.roster, scope = %group.scope, "Available specialists wired");
         }
+        team_orch.set_max_parallel(group.team.max_parallel);
+        tracing::info!(
+            scope = %group.scope,
+            max_parallel = group.team.max_parallel,
+            "team dispatch limit wired"
+        );
 
         team_orch.set_team_notify_tx(team_notify_tx_for_orch.clone());
 
