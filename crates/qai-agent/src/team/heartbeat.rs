@@ -47,6 +47,7 @@ impl OrchestratorHeartbeat {
         session: Arc<TeamSession>,
         dispatch_fn: DispatchFn,
         interval: Duration,
+        max_parallel: usize,
     ) -> Self {
         Self {
             registry,
@@ -55,7 +56,7 @@ impl OrchestratorHeartbeat {
             interval,
             max_retries: 3,
             on_permanent_failure: None,
-            dispatch_semaphore: Arc::new(Semaphore::new(4)),
+            dispatch_semaphore: Arc::new(Semaphore::new(max_parallel.max(1))),
         }
     }
 
@@ -162,6 +163,7 @@ impl OrchestratorHeartbeat {
 mod tests {
     use super::*;
     use crate::team::registry::CreateTask;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use tempfile::tempdir;
 
@@ -186,6 +188,7 @@ mod tests {
             session,
             dispatch_fn,
             interval,
+            4,
         ))
     }
 
@@ -217,6 +220,22 @@ mod tests {
         assert_eq!(d.len(), 1, "should dispatch exactly once");
         assert_eq!(d[0].0, "codex");
         assert_eq!(d[0].1, "T003");
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_honors_configured_dispatch_limit() {
+        let registry = Arc::new(TaskRegistry::new_in_memory().unwrap());
+        let tmp = tempdir().unwrap();
+        let session = Arc::new(TeamSession::from_dir("test-team", tmp.path().to_path_buf()));
+        let dispatch_fn: DispatchFn = Arc::new(move |_agent, _task| Box::pin(async move { Ok(()) }));
+        let hb = OrchestratorHeartbeat::new(
+            registry,
+            session,
+            dispatch_fn,
+            Duration::from_secs(1),
+            1,
+        );
+        assert_eq!(hb.dispatch_semaphore.available_permits(), 1);
     }
 
     #[tokio::test]
@@ -338,6 +357,73 @@ mod tests {
         );
     }
 
+    /// 验证信号量确实限制并发派发数量：max_parallel=2 时，同时在飞行的 dispatch 不超过 2
+    #[tokio::test]
+    async fn test_heartbeat_semaphore_limits_concurrent_dispatches() {
+        let registry = Arc::new(TaskRegistry::new_in_memory().unwrap());
+        // 创建 5 个任务，确保有足够的任务同时触发
+        for i in 0..5u8 {
+            registry
+                .create_task(CreateTask {
+                    id: format!("TC{:02}", i),
+                    title: format!("concurrent task {}", i),
+                    assignee_hint: Some("codex".into()),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let max_inflight = Arc::new(AtomicUsize::new(0));
+        let inflight_c = Arc::clone(&inflight);
+        let max_c = Arc::clone(&max_inflight);
+
+        let tmp = tempdir().unwrap();
+        let session = Arc::new(TeamSession::from_dir("test-concurrent", tmp.path().to_path_buf()));
+
+        let dispatch_fn: DispatchFn = Arc::new(move |_agent, _task| {
+            let inflight = Arc::clone(&inflight_c);
+            let max = Arc::clone(&max_c);
+            Box::pin(async move {
+                let current = inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                // 原子更新最大并发数
+                let mut prev = max.load(Ordering::SeqCst);
+                while current > prev {
+                    match max.compare_exchange(prev, current, Ordering::SeqCst, Ordering::SeqCst) {
+                        Ok(_) => break,
+                        Err(x) => prev = x,
+                    }
+                }
+                // 模拟 50ms 的工作耗时，让并发冲突暴露出来
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                inflight.fetch_sub(1, Ordering::SeqCst);
+                Ok(())
+            })
+        });
+
+        let hb = Arc::new(OrchestratorHeartbeat::new(
+            Arc::clone(&registry),
+            session,
+            dispatch_fn,
+            Duration::from_millis(20), // 快速 tick
+            2, // max_parallel = 2
+        ));
+
+        let hb_clone = Arc::clone(&hb);
+        let handle = tokio::spawn(async move { hb_clone.run().await });
+        // 运行足够长时间让所有 5 个任务都被调度
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        handle.abort();
+
+        let peak = max_inflight.load(Ordering::SeqCst);
+        assert!(
+            peak <= 2,
+            "max concurrent dispatches should be <= 2 (max_parallel), got peak = {}",
+            peak
+        );
+        assert!(peak >= 1, "at least 1 task should have been dispatched");
+    }
+
     #[tokio::test]
     async fn test_heartbeat_failure_callback_fires_on_max_retries() {
         let registry = Arc::new(TaskRegistry::new_in_memory().unwrap());
@@ -378,6 +464,7 @@ mod tests {
                 session,
                 dispatch_fn,
                 Duration::from_millis(50),
+                4,
             )
             .with_failure_notify(Arc::new(move |task_id, _reason| {
                 notified_clone.lock().unwrap().push(task_id);

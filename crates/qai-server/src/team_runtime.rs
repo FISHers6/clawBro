@@ -112,8 +112,8 @@ pub async fn wire_team_runtime(
                 if let Ok(Some(ref reply_text)) = result {
                     let _ = team_session.append_specialist_reply(&agent, &task.id, reply_text);
                 }
-                // ── 任务派发通知 → IM 群 ─────────────────────────────────────────
-                {
+                // ── 任务派发通知 → IM 群（仅在派发成功时推送）─────────────────
+                if result.is_ok() {
                     let notify_msg = format!(
                         "🚀 任务 **{}**「{}」已派发给 @{}",
                         task.id, task.title, agent

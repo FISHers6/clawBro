@@ -500,15 +500,13 @@ impl TeamOrchestrator {
             *self.team_state_inner.lock().unwrap() = TeamState::Done;
             self.publish_milestone("all_done", "所有任务已完成 ✅")?;
         } else {
-            // 当前任务完成通知
-            let task_title = self
-                .registry
-                .get_task(task_id)
-                .ok()
-                .flatten()
-                .map(|t| t.title)
-                .unwrap_or_else(|| task_id.to_string());
+            // 当前任务完成通知（all_tasks() 只调用一次，task_title 从结果中提取）
             let tasks = self.registry.all_tasks().unwrap_or_default();
+            let task_title = tasks
+                .iter()
+                .find(|t| t.id == task_id)
+                .map(|t| t.title.clone())
+                .unwrap_or_else(|| task_id.to_string());
             let done_count = tasks
                 .iter()
                 .filter(|t| t.status_raw == "done" || t.status_raw.starts_with("accepted:"))
@@ -1500,8 +1498,13 @@ mod tests {
 
         let msgs = messages.lock().unwrap();
         assert!(
-            msgs.iter().any(|m| m.contains("T120")),
-            "checkpoint should publish IM milestone with task ID, got: {:?}",
+            msgs.iter().any(|m| m.contains("T120") && m.contains("codex") && m.contains("📍")),
+            "checkpoint should publish IM milestone with task ID, agent, and 📍 emoji, got: {:?}",
+            msgs
+        );
+        assert!(
+            msgs.iter().any(|m| m.contains("halfway there")),
+            "checkpoint message should include the note text, got: {:?}",
             msgs
         );
     }
@@ -1530,8 +1533,13 @@ mod tests {
 
         let msgs = messages.lock().unwrap();
         assert!(
-            msgs.iter().any(|m| m.contains("T121")),
-            "submit should publish IM milestone with task ID, got: {:?}",
+            msgs.iter().any(|m| m.contains("T121") && m.contains("codex") && m.contains("📨")),
+            "submit should publish IM milestone with task ID, agent, and 📨 emoji, got: {:?}",
+            msgs
+        );
+        assert!(
+            msgs.iter().any(|m| m.contains("Implement JWT")),
+            "submit message should include the task title, got: {:?}",
             msgs
         );
     }
@@ -1560,8 +1568,13 @@ mod tests {
 
         let msgs = messages.lock().unwrap();
         assert!(
-            msgs.iter().any(|m| m.contains("T122")),
-            "blocked should publish IM milestone with task ID, got: {:?}",
+            msgs.iter().any(|m| m.contains("T122") && m.contains("codex") && m.contains("🚧")),
+            "blocked should publish IM milestone with task ID, agent, and 🚧 emoji, got: {:?}",
+            msgs
+        );
+        assert!(
+            msgs.iter().any(|m| m.contains("missing dep")),
+            "blocked message should include the reason text, got: {:?}",
             msgs
         );
     }
@@ -1597,9 +1610,206 @@ mod tests {
 
         let msgs = messages.lock().unwrap();
         assert!(
-            msgs.iter().any(|m| m.contains("T130")),
-            "individual done should publish IM milestone with task ID, got: {:?}",
+            msgs.iter().any(|m| m.contains("T130") && m.contains("codex") && m.contains("✅")),
+            "individual done should publish IM milestone with task ID, agent, and ✅ emoji, got: {:?}",
             msgs
         );
+        assert!(
+            msgs.iter().any(|m| m.contains("First task")),
+            "done message should include the task title, got: {:?}",
+            msgs
+        );
+        // Progress counter: should show 1/2
+        assert!(
+            msgs.iter().any(|m| m.contains("1/2")),
+            "done message should include progress counter 1/2, got: {:?}",
+            msgs
+        );
+    }
+
+    // ─── 功能测试：完整 Agent Swarm 生命周期 ──────────────────────────────────
+
+    /// 验证 publish_milestone 在未注册 notify_fn/scope 时不 panic，直接返回 Ok
+    #[test]
+    fn test_publish_milestone_noop_without_notify_fn() {
+        let (orch, _tmp) = make_orchestrator();
+        // 故意不调用 set_notify_fn / set_scope
+
+        orch.registry
+            .create_task(CreateTask {
+                id: "NOOP01".into(),
+                title: "no-op test".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        orch.registry.try_claim("NOOP01", "codex").unwrap();
+
+        // 调用任意会触发 publish_milestone 的 handler，不应 panic
+        let result = orch.handle_specialist_checkpoint("NOOP01", "codex", "halfway");
+        assert!(
+            result.is_ok(),
+            "checkpoint without notify_fn should return Ok, not panic; got: {:?}",
+            result
+        );
+    }
+
+    /// 完整 Agent Swarm 生命周期：T_A（无依赖）→ T_B（依赖 T_A）
+    /// 验证：T_A done → IM 包含 ✅ + 🔓 解锁通知；T_B done → 所有任务已完成 ✅
+    #[test]
+    fn test_full_swarm_lifecycle_dep_chain_im_milestones() {
+        let (orch, _tmp) = make_orchestrator();
+        let messages: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(vec![]));
+        let msgs_clone = Arc::clone(&messages);
+        orch.set_notify_fn(Arc::new(move |_scope, msg| {
+            msgs_clone.lock().unwrap().push(msg);
+        }));
+        orch.set_scope(qai_protocol::SessionKey::new("lark", "group:swarm-test"));
+
+        // 建立依赖链 T_A → T_B
+        orch.registry
+            .create_task(CreateTask {
+                id: "T_A".into(),
+                title: "Init DB".into(),
+                assignee_hint: Some("codex".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        orch.registry
+            .create_task(CreateTask {
+                id: "T_B".into(),
+                title: "Seed Data".into(),
+                assignee_hint: Some("claude".into()),
+                deps: vec!["T_A".into()],
+                ..Default::default()
+            })
+            .unwrap();
+
+        // ── 阶段 1：T_A 完成 ────────────────────────────────────────────────
+        orch.registry.try_claim("T_A", "codex").unwrap();
+        orch.handle_specialist_done("T_A", "codex", "db schema created").unwrap();
+
+        {
+            let msgs = messages.lock().unwrap();
+            // T_A done 通知：含 ✅、任务ID、agent
+            assert!(
+                msgs.iter().any(|m| m.contains("T_A") && m.contains("codex") && m.contains("✅")),
+                "T_A done should emit IM milestone with ✅, task ID, agent; got: {:?}", msgs
+            );
+            // T_A done 进度计数 1/2
+            assert!(
+                msgs.iter().any(|m| m.contains("1/2")),
+                "T_A done should show progress 1/2; got: {:?}", msgs
+            );
+            // T_B 解锁通知：含 🔓 和 T_B
+            assert!(
+                msgs.iter().any(|m| m.contains("🔓") && m.contains("T_B")),
+                "T_A done should trigger 🔓 unlock notification for T_B; got: {:?}", msgs
+            );
+            // 全部完成通知不应出现（T_B 还未完成）
+            assert!(
+                !msgs.iter().any(|m| m.contains("所有任务已完成")),
+                "all_done message must NOT fire before T_B completes; got: {:?}", msgs
+            );
+        }
+
+        // ── 阶段 2：T_B 完成 ────────────────────────────────────────────────
+        orch.registry.try_claim("T_B", "claude").unwrap();
+        orch.handle_specialist_done("T_B", "claude", "data seeded").unwrap();
+
+        {
+            let msgs = messages.lock().unwrap();
+            // 全部完成通知
+            assert!(
+                msgs.iter().any(|m| m.contains("所有任务已完成") && m.contains("✅")),
+                "after T_B done, all_done milestone must fire; got: {:?}", msgs
+            );
+        }
+
+        // TeamState 应变为 Done
+        assert!(
+            matches!(*orch.team_state_inner.lock().unwrap(), TeamState::Done),
+            "team state must be Done after all tasks complete"
+        );
+    }
+
+    /// 验证 checkpoint → submit → accept 完整提交验收路径中 IM 通知顺序正确
+    #[test]
+    fn test_submit_accept_flow_im_notifications() {
+        let (orch, _tmp) = make_orchestrator();
+        let messages: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(vec![]));
+        let msgs_clone = Arc::clone(&messages);
+        orch.set_notify_fn(Arc::new(move |_scope, msg| {
+            msgs_clone.lock().unwrap().push(msg);
+        }));
+        orch.set_scope(qai_protocol::SessionKey::new("dingtalk", "group:qa"));
+
+        orch.registry
+            .create_task(CreateTask {
+                id: "SA01".into(),
+                title: "Write Auth API".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        orch.registry.try_claim("SA01", "codex").unwrap();
+
+        // Checkpoint 中间进度
+        orch.handle_specialist_checkpoint("SA01", "codex", "50% done").unwrap();
+        // Submit 提交待验收
+        orch.handle_specialist_submitted("SA01", "codex", "auth.rs complete").unwrap();
+
+        let msgs = messages.lock().unwrap();
+        // checkpoint 在 submit 之前出现
+        let cp_pos = msgs.iter().position(|m| m.contains("📍") && m.contains("SA01"));
+        let sub_pos = msgs.iter().position(|m| m.contains("📨") && m.contains("SA01"));
+        assert!(cp_pos.is_some(), "checkpoint IM message must exist; got: {:?}", msgs);
+        assert!(sub_pos.is_some(), "submit IM message must exist; got: {:?}", msgs);
+        assert!(
+            cp_pos.unwrap() < sub_pos.unwrap(),
+            "checkpoint IM must appear before submit IM in notification stream"
+        );
+        // submit 消息含任务标题
+        assert!(
+            msgs.iter().any(|m| m.contains("Write Auth API") && m.contains("📨")),
+            "submit IM message must include task title; got: {:?}", msgs
+        );
+    }
+
+    /// 验证 blocked 后 specialist 重新尝试 checkpoint 依然可以推送通知
+    #[test]
+    fn test_blocked_then_retry_checkpoint_both_notify() {
+        let (orch, _tmp) = make_orchestrator();
+        let messages: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(vec![]));
+        let msgs_clone = Arc::clone(&messages);
+        orch.set_notify_fn(Arc::new(move |_scope, msg| {
+            msgs_clone.lock().unwrap().push(msg);
+        }));
+        orch.set_scope(qai_protocol::SessionKey::new("ws", "group:dev"));
+
+        orch.registry
+            .create_task(CreateTask {
+                id: "BR01".into(),
+                title: "Deploy service".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        orch.registry.try_claim("BR01", "codex").unwrap();
+
+        // 先 blocked
+        orch.handle_specialist_blocked("BR01", "codex", "missing env vars").unwrap();
+        // 再 checkpoint（模拟问题解决后继续）
+        orch.handle_specialist_checkpoint("BR01", "codex", "env vars fixed, proceeding").unwrap();
+
+        let msgs = messages.lock().unwrap();
+        assert!(
+            msgs.iter().any(|m| m.contains("🚧") && m.contains("BR01")),
+            "blocked IM milestone must be present; got: {:?}", msgs
+        );
+        assert!(
+            msgs.iter().any(|m| m.contains("📍") && m.contains("BR01")),
+            "post-block checkpoint IM milestone must be present; got: {:?}", msgs
+        );
+        let blocked_pos = msgs.iter().position(|m| m.contains("🚧")).unwrap();
+        let checkpoint_pos = msgs.iter().position(|m| m.contains("📍")).unwrap();
+        assert!(blocked_pos < checkpoint_pos, "blocked IM must appear before checkpoint IM");
     }
 }

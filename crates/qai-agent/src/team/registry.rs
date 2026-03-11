@@ -891,4 +891,137 @@ mod tests {
         // Task is pending (not claimed), so is_claimed_by must return false
         assert!(!registry.is_claimed_by("T2", "alice").unwrap());
     }
+
+    // ─── 功能测试：状态机完整路径 ─────────────────────────────────────────────
+
+    /// 验证 Pending → Claimed → Submitted → Accepted 完整路径
+    /// 每个中间状态都显式断言，确保无状态跳跃
+    #[test]
+    fn test_full_state_machine_path_pending_to_accepted() {
+        let registry = TaskRegistry::new_in_memory().unwrap();
+        registry
+            .create_task(CreateTask {
+                id: "SM01".into(),
+                title: "Auth flow".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Pending
+        let t = registry.get_task("SM01").unwrap().unwrap();
+        assert!(matches!(t.status_parsed(), TaskStatus::Pending), "initial state must be Pending");
+
+        // Claimed
+        assert!(registry.try_claim("SM01", "codex").unwrap());
+        let t = registry.get_task("SM01").unwrap().unwrap();
+        assert!(
+            matches!(t.status_parsed(), TaskStatus::Claimed { ref agent, .. } if agent == "codex"),
+            "after claim, state must be Claimed by codex"
+        );
+
+        // Submitted
+        registry.submit_task_result("SM01", "codex", "impl done").unwrap();
+        let t = registry.get_task("SM01").unwrap().unwrap();
+        assert!(
+            matches!(t.status_parsed(), TaskStatus::Submitted { ref agent, .. } if agent == "codex"),
+            "after submit, state must be Submitted"
+        );
+        assert_eq!(t.completion_note.as_deref(), Some("impl done"));
+
+        // Accepted
+        registry.accept_task("SM01", "lead").unwrap();
+        let t = registry.get_task("SM01").unwrap().unwrap();
+        assert!(
+            matches!(t.status_parsed(), TaskStatus::Accepted { ref by, .. } if by == "lead"),
+            "after accept, state must be Accepted by lead"
+        );
+        assert!(t.done_at.is_some(), "done_at must be set after acceptance");
+        assert!(registry.all_done().unwrap(), "all_done() must return true when only task is Accepted");
+    }
+
+    /// 验证非法状态转换被拒绝：对 Pending 任务调用 submit/accept 应报错
+    #[test]
+    fn test_invalid_state_transition_rejected() {
+        let registry = TaskRegistry::new_in_memory().unwrap();
+        registry
+            .create_task(CreateTask {
+                id: "INV01".into(),
+                title: "test invalid transitions".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // submit on Pending (not Claimed) must fail
+        let err = registry.submit_task_result("INV01", "codex", "premature submit");
+        assert!(err.is_err(), "submit on Pending task must return Err, not Ok");
+
+        // Task state must be unchanged after failed submit
+        let t = registry.get_task("INV01").unwrap().unwrap();
+        assert!(
+            matches!(t.status_parsed(), TaskStatus::Pending),
+            "task must still be Pending after failed submit, got: {}",
+            t.status_raw
+        );
+
+        // accept on Pending (not Submitted) must fail
+        let err2 = registry.accept_task("INV01", "lead");
+        assert!(err2.is_err(), "accept on Pending task must return Err, not Ok");
+
+        // Claim then try accept without submit — accept on Claimed must also fail
+        registry.try_claim("INV01", "codex").unwrap();
+        let err3 = registry.accept_task("INV01", "lead");
+        assert!(err3.is_err(), "accept on Claimed (not Submitted) task must return Err");
+
+        let t = registry.get_task("INV01").unwrap().unwrap();
+        assert!(
+            matches!(t.status_parsed(), TaskStatus::Claimed { .. }),
+            "task must still be Claimed after failed accept, got: {}",
+            t.status_raw
+        );
+    }
+
+    /// 验证依赖链：T_A done → T_B 解锁；T_B done → all_done
+    #[test]
+    fn test_dep_chain_unlocks_sequentially() {
+        let registry = TaskRegistry::new_in_memory().unwrap();
+        registry
+            .create_task(CreateTask {
+                id: "DA01".into(),
+                title: "setup DB".into(),
+                assignee_hint: Some("codex".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        registry
+            .create_task(CreateTask {
+                id: "DA02".into(),
+                title: "seed data".into(),
+                assignee_hint: Some("claude".into()),
+                deps: vec!["DA01".into()],
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Before DA01 done: DA02 must not be in ready list
+        let ready = registry.find_ready_tasks().unwrap();
+        assert!(!ready.iter().any(|t| t.id == "DA02"), "DA02 must be blocked while DA01 is pending");
+        assert!(ready.iter().any(|t| t.id == "DA01"), "DA01 must be ready initially");
+
+        // Complete DA01 (old direct-done path)
+        registry.try_claim("DA01", "codex").unwrap();
+        registry.mark_done("DA01", "codex", "schema created").unwrap();
+
+        // After DA01 done: DA02 must be in ready list
+        let ready2 = registry.find_ready_tasks().unwrap();
+        assert!(ready2.iter().any(|t| t.id == "DA02"), "DA02 must be unlocked after DA01 done");
+
+        // all_done must still be false
+        assert!(!registry.all_done().unwrap(), "all_done must be false while DA02 is pending");
+
+        // Complete DA02
+        registry.try_claim("DA02", "claude").unwrap();
+        registry.mark_done("DA02", "claude", "data seeded").unwrap();
+
+        assert!(registry.all_done().unwrap(), "all_done must be true after both tasks done");
+    }
 }
