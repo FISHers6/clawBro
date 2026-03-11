@@ -105,6 +105,7 @@ pub struct TeamOrchestrator {
     heartbeat_handle: std::sync::Mutex<Option<JoinHandle<()>>>,
     dispatch_fn: DispatchFn,
     heartbeat_interval: std::time::Duration,
+    max_parallel: std::sync::Mutex<usize>,
     /// IM scope to forward milestone notifications to (set at team-start time).
     scope: std::sync::OnceLock<qai_protocol::SessionKey>,
     /// Sends milestone message to the IM channel (injected from main.rs).
@@ -141,6 +142,7 @@ impl TeamOrchestrator {
             heartbeat_handle: std::sync::Mutex::new(None),
             dispatch_fn,
             heartbeat_interval,
+            max_parallel: std::sync::Mutex::new(3),
             scope: std::sync::OnceLock::new(),
             notify_fn: std::sync::OnceLock::new(),
             mcp_server_handle: tokio::sync::Mutex::new(None),
@@ -195,6 +197,11 @@ impl TeamOrchestrator {
     /// Called by main.rs during wiring so lead_layer_0 can list assignable agents.
     pub fn set_available_specialists(&self, agents: Vec<String>) {
         let _ = self.available_specialists.set(agents);
+    }
+
+    /// Configure the max number of concurrent specialist dispatches for the heartbeat.
+    pub fn set_max_parallel(&self, max_parallel: usize) {
+        *self.max_parallel.lock().unwrap() = max_parallel.max(1);
     }
 
     #[cfg(test)]
@@ -391,6 +398,7 @@ impl TeamOrchestrator {
                 std::sync::Arc::clone(&self.session),
                 std::sync::Arc::clone(&self.dispatch_fn),
                 self.heartbeat_interval,
+                *self.max_parallel.lock().unwrap(),
             )
             .with_failure_notify(failure_notify),
         );
@@ -492,10 +500,32 @@ impl TeamOrchestrator {
             *self.team_state_inner.lock().unwrap() = TeamState::Done;
             self.publish_milestone("all_done", "所有任务已完成 ✅")?;
         } else {
+            // 当前任务完成通知
+            let task_title = self
+                .registry
+                .get_task(task_id)
+                .ok()
+                .flatten()
+                .map(|t| t.title)
+                .unwrap_or_else(|| task_id.to_string());
+            let tasks = self.registry.all_tasks().unwrap_or_default();
+            let done_count = tasks
+                .iter()
+                .filter(|t| t.status_raw == "done" || t.status_raw.starts_with("accepted:"))
+                .count();
+            let total = tasks.len();
+            self.publish_milestone(
+                "done",
+                &format!(
+                    "✅ 任务 {}「{}」@{} 已完成（{}/{}）",
+                    task_id, task_title, agent, done_count, total
+                ),
+            )?;
+            // 下游任务解锁通知
             let ready = self.registry.find_ready_tasks()?;
             if !ready.is_empty() {
                 let ids: Vec<_> = ready.iter().map(|t| t.id.as_str()).collect();
-                self.publish_milestone("checkpoint", &format!("新任务已解锁：{}", ids.join(", ")))?;
+                self.publish_milestone("unlocked", &format!("🔓 新任务已解锁：{}", ids.join(", ")))?;
             }
         }
 
@@ -532,6 +562,17 @@ impl TeamOrchestrator {
         let _ = self.session.sync_tasks_md(&self.registry);
 
         self.dispatch_team_notify_submitted(task_id, agent, summary);
+        let task_title = self
+            .registry
+            .get_task(task_id)
+            .ok()
+            .flatten()
+            .map(|t| t.title)
+            .unwrap_or_else(|| task_id.to_string());
+        let _ = self.publish_milestone(
+            "submitted",
+            &format!("📨 任务 {}「{}」@{} 已提交待验收", task_id, task_title, agent),
+        );
         Ok(())
     }
 
@@ -856,6 +897,17 @@ impl TeamOrchestrator {
 
         // Escalation → Lead via team_notify_tx (same path as task completion)
         self.dispatch_team_notify_blocked(task_id, agent, reason);
+        let task_title = self
+            .registry
+            .get_task(task_id)
+            .ok()
+            .flatten()
+            .map(|t| t.title)
+            .unwrap_or_else(|| task_id.to_string());
+        let _ = self.publish_milestone(
+            "blocked",
+            &format!("🚧 任务 {}「{}」@{} 阻塞：{}", task_id, task_title, agent, reason),
+        );
 
         Ok(())
     }
@@ -886,6 +938,10 @@ impl TeamOrchestrator {
             ),
         );
         self.dispatch_team_notify_checkpoint(task_id, agent, note);
+        let _ = self.publish_milestone(
+            "checkpoint",
+            &format!("📍 [{}] @{} 进度：{}", task_id, agent, note),
+        );
         Ok(())
     }
 
@@ -1418,5 +1474,132 @@ mod tests {
         assert!(progress.contains("halfway there"));
         assert!(progress.contains("requested help"));
         assert!(progress.contains("need API guidance"));
+    }
+
+    #[test]
+    fn test_checkpoint_publishes_milestone_to_im() {
+        let (orch, _tmp) = make_orchestrator();
+        let messages: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(vec![]));
+        let msgs_clone = Arc::clone(&messages);
+        orch.set_notify_fn(Arc::new(move |_scope, msg| {
+            msgs_clone.lock().unwrap().push(msg);
+        }));
+        orch.set_scope(qai_protocol::SessionKey::new("lark", "group:test"));
+
+        orch.registry
+            .create_task(CreateTask {
+                id: "T120".into(),
+                title: "Design schema".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        orch.registry.try_claim("T120", "codex").unwrap();
+
+        orch.handle_specialist_checkpoint("T120", "codex", "halfway there")
+            .unwrap();
+
+        let msgs = messages.lock().unwrap();
+        assert!(
+            msgs.iter().any(|m| m.contains("T120")),
+            "checkpoint should publish IM milestone with task ID, got: {:?}",
+            msgs
+        );
+    }
+
+    #[test]
+    fn test_submit_publishes_milestone_to_im() {
+        let (orch, _tmp) = make_orchestrator();
+        let messages: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(vec![]));
+        let msgs_clone = Arc::clone(&messages);
+        orch.set_notify_fn(Arc::new(move |_scope, msg| {
+            msgs_clone.lock().unwrap().push(msg);
+        }));
+        orch.set_scope(qai_protocol::SessionKey::new("lark", "group:test"));
+
+        orch.registry
+            .create_task(CreateTask {
+                id: "T121".into(),
+                title: "Implement JWT".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        orch.registry.try_claim("T121", "codex").unwrap();
+
+        orch.handle_specialist_submitted("T121", "codex", "added jwt.rs")
+            .unwrap();
+
+        let msgs = messages.lock().unwrap();
+        assert!(
+            msgs.iter().any(|m| m.contains("T121")),
+            "submit should publish IM milestone with task ID, got: {:?}",
+            msgs
+        );
+    }
+
+    #[test]
+    fn test_blocked_publishes_milestone_to_im() {
+        let (orch, _tmp) = make_orchestrator();
+        let messages: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(vec![]));
+        let msgs_clone = Arc::clone(&messages);
+        orch.set_notify_fn(Arc::new(move |_scope, msg| {
+            msgs_clone.lock().unwrap().push(msg);
+        }));
+        orch.set_scope(qai_protocol::SessionKey::new("lark", "group:test"));
+
+        orch.registry
+            .create_task(CreateTask {
+                id: "T122".into(),
+                title: "Write tests".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        orch.registry.try_claim("T122", "codex").unwrap();
+
+        orch.handle_specialist_blocked("T122", "codex", "missing dep")
+            .unwrap();
+
+        let msgs = messages.lock().unwrap();
+        assert!(
+            msgs.iter().any(|m| m.contains("T122")),
+            "blocked should publish IM milestone with task ID, got: {:?}",
+            msgs
+        );
+    }
+
+    #[test]
+    fn test_done_individual_publishes_milestone_to_im() {
+        let (orch, _tmp) = make_orchestrator();
+        // Two tasks so all_done is false after first completes
+        orch.registry
+            .create_task(CreateTask {
+                id: "T130".into(),
+                title: "First task".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        orch.registry
+            .create_task(CreateTask {
+                id: "T131".into(),
+                title: "Second task".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        orch.registry.try_claim("T130", "codex").unwrap();
+
+        let messages: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(vec![]));
+        let msgs_clone = Arc::clone(&messages);
+        orch.set_notify_fn(Arc::new(move |_scope, msg| {
+            msgs_clone.lock().unwrap().push(msg);
+        }));
+        orch.set_scope(qai_protocol::SessionKey::new("lark", "group:test"));
+
+        orch.handle_specialist_done("T130", "codex", "done").unwrap();
+
+        let msgs = messages.lock().unwrap();
+        assert!(
+            msgs.iter().any(|m| m.contains("T130")),
+            "individual done should publish IM milestone with task ID, got: {:?}",
+            msgs
+        );
     }
 }
