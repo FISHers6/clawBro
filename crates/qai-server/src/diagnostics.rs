@@ -2,7 +2,9 @@ use crate::{config, state::AppState};
 use qai_agent::team::orchestrator::{
     TeamArtifactHealthSummary, TeamRuntimeSummary, TeamState, TeamTaskCounts,
 };
-use qai_runtime::{BackendFamily, CapabilityProfile};
+use qai_runtime::{
+    provider_profiles::ConfiguredProviderProtocol, AcpBackend, BackendFamily, CapabilityProfile,
+};
 use serde::Serialize;
 use std::collections::BTreeSet;
 
@@ -46,6 +48,35 @@ pub struct DiagnosticFinding {
     pub suggested_action: String,
 }
 
+/// Support category for ACP backends, for diagnostic reporting.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AcpSupportCategory {
+    /// Validated in QuickAI with a dedicated bridge adapter package.
+    SupportedWithBridge,
+    /// Generic ACP CLI path — expected to work if the tool speaks ACP over stdio.
+    GenericAcpCli,
+}
+
+impl AcpSupportCategory {
+    pub fn for_backend(backend: Option<AcpBackend>) -> Option<Self> {
+        match backend {
+            None => None, // generic, no explicit identity
+            Some(AcpBackend::Claude) | Some(AcpBackend::Codex) | Some(AcpBackend::Codebuddy) => {
+                Some(Self::SupportedWithBridge)
+            }
+            Some(AcpBackend::Qwen)
+            | Some(AcpBackend::Iflow)
+            | Some(AcpBackend::Goose)
+            | Some(AcpBackend::Kimi)
+            | Some(AcpBackend::Opencode)
+            | Some(AcpBackend::Qoder)
+            | Some(AcpBackend::Vibe)
+            | Some(AcpBackend::Custom) => Some(Self::GenericAcpCli),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct BackendDiagnostic {
     pub backend_id: String,
@@ -57,6 +88,10 @@ pub struct BackendDiagnostic {
     pub healthy: bool,
     pub error: Option<String>,
     pub capability_profile: Option<CapabilityProfile>,
+    /// ACP backend identity, if declared. Only present when `family == Acp`.
+    pub acp_backend: Option<AcpBackend>,
+    /// ACP support category, derived from backend identity. `None` for non-ACP or generic backends.
+    pub acp_support_category: Option<AcpSupportCategory>,
     pub notes: Vec<String>,
 }
 
@@ -151,6 +186,21 @@ pub async fn collect_backend_diagnostics(state: &AppState) -> Vec<BackendDiagnos
             None
         };
 
+        let acp_backend = spec.acp_backend;
+        let acp_support_category = AcpSupportCategory::for_backend(acp_backend);
+        if spec.family == BackendFamily::QuickAiNative {
+            if let Some(profile) = &spec.provider_profile {
+                if let ConfiguredProviderProtocol::AnthropicCompatible { base_url, .. } =
+                    &profile.protocol
+                {
+                    if base_url.contains("deepseek.com/anthropic") {
+                        notes.push(
+                            "native + DeepSeek anthropic_compatible is vendor-dependent; prefer openai_compatible for validated operation".to_string(),
+                        );
+                    }
+                }
+            }
+        }
         backends.push(BackendDiagnostic {
             backend_id: spec.backend_id,
             family: spec.family,
@@ -161,6 +211,8 @@ pub async fn collect_backend_diagnostics(state: &AppState) -> Vec<BackendDiagnos
             healthy: adapter_registered && probed,
             error,
             capability_profile,
+            acp_backend,
+            acp_support_category,
             notes,
         });
     }
@@ -195,8 +247,18 @@ pub fn collect_channel_diagnostics(state: &AppState) -> Vec<ChannelDiagnostic> {
                 _ => false,
             };
             let enabled = match channel.as_str() {
-                "lark" => state.cfg.channels.lark.as_ref().is_some_and(|cfg| cfg.enabled),
-                "dingtalk" => state.cfg.channels.dingtalk.as_ref().is_some_and(|cfg| cfg.enabled),
+                "lark" => state
+                    .cfg
+                    .channels
+                    .lark
+                    .as_ref()
+                    .is_some_and(|cfg| cfg.enabled),
+                "dingtalk" => state
+                    .cfg
+                    .channels
+                    .dingtalk
+                    .as_ref()
+                    .is_some_and(|cfg| cfg.enabled),
                 "ws" => true,
                 _ => false,
             };
@@ -237,7 +299,12 @@ pub fn collect_topology_diagnostic(state: &AppState) -> TopologyDiagnostic {
         .map(|entry| entry.name.clone())
         .collect();
     let bindings = state.cfg.bindings.iter().map(binding_summary).collect();
-    let group_scopes = state.cfg.groups.iter().map(|group| group.scope.clone()).collect();
+    let group_scopes = state
+        .cfg
+        .groups
+        .iter()
+        .map(|group| group.scope.clone())
+        .collect();
     let team_groups = state
         .cfg
         .groups
@@ -260,7 +327,11 @@ pub fn collect_topology_diagnostic(state: &AppState) -> TopologyDiagnostic {
 pub async fn collect_status_report(state: &AppState) -> StatusReport {
     let backends = collect_backend_diagnostics(state).await;
     let teams = collect_team_diagnostics(state);
-    let status = overall_status(&doctor_findings(&backends, &teams, &collect_channel_diagnostics(state)));
+    let status = overall_status(&doctor_findings(
+        &backends,
+        &teams,
+        &collect_channel_diagnostics(state),
+    ));
 
     StatusReport {
         ok: status.ok(),
@@ -274,7 +345,11 @@ pub async fn collect_status_report(state: &AppState) -> StatusReport {
 
 pub async fn collect_health_report(state: &AppState) -> HealthReport {
     let status = collect_status_report(state).await;
-    let unhealthy_backends = status.backends.iter().filter(|backend| !backend.healthy).count();
+    let unhealthy_backends = status
+        .backends
+        .iter()
+        .filter(|backend| !backend.healthy)
+        .count();
     let unhealthy_teams = status.teams.iter().filter(|team| !team.healthy).count();
 
     HealthReport {
@@ -317,7 +392,9 @@ fn team_diagnostic_from_summary(summary: TeamRuntimeSummary) -> TeamDiagnostic {
     if expects_full_team_surface && !summary.artifact_health.context_md_present {
         notes.push("CONTEXT.md missing".to_string());
     }
-    if expects_full_team_surface && summary.task_counts.total > 0 && !summary.artifact_health.tasks_md_present
+    if expects_full_team_surface
+        && summary.task_counts.total > 0
+        && !summary.artifact_health.tasks_md_present
     {
         notes.push("TASKS.md missing".to_string());
     }
@@ -357,7 +434,8 @@ fn doctor_findings(
                     .error
                     .clone()
                     .unwrap_or_else(|| "backend adapter is missing".to_string()),
-                suggested_action: "register the adapter for this backend family or fix adapter_key".to_string(),
+                suggested_action: "register the adapter for this backend family or fix adapter_key"
+                    .to_string(),
             });
         } else if !backend.probed {
             findings.push(DiagnosticFinding {
@@ -365,7 +443,8 @@ fn doctor_findings(
                 scope: DiagnosticScope::Backend,
                 subject: backend.backend_id.clone(),
                 message: "backend has not been probed yet".to_string(),
-                suggested_action: "trigger a backend probe or wait for the first runtime use".to_string(),
+                suggested_action: "trigger a backend probe or wait for the first runtime use"
+                    .to_string(),
             });
         }
     }
@@ -377,7 +456,8 @@ fn doctor_findings(
                 scope: DiagnosticScope::Team,
                 subject: team.team_id.clone(),
                 message: "team is running but tool surface is not ready".to_string(),
-                suggested_action: "verify team runtime wiring and MCP/tool endpoint startup".to_string(),
+                suggested_action: "verify team runtime wiring and MCP/tool endpoint startup"
+                    .to_string(),
             });
         }
         if !team.artifact_health.root_present {
@@ -386,7 +466,8 @@ fn doctor_findings(
                 scope: DiagnosticScope::Team,
                 subject: team.team_id.clone(),
                 message: "team artifact root is missing".to_string(),
-                suggested_action: "check team session directory creation and filesystem permissions".to_string(),
+                suggested_action:
+                    "check team session directory creation and filesystem permissions".to_string(),
             });
         } else if !team.artifact_health.team_md_present
             || !team.artifact_health.context_md_present
@@ -397,7 +478,9 @@ fn doctor_findings(
                 scope: DiagnosticScope::Team,
                 subject: team.team_id.clone(),
                 message: "team artifact set is incomplete".to_string(),
-                suggested_action: "inspect team session files and regenerate TEAM/CONTEXT/task artifacts".to_string(),
+                suggested_action:
+                    "inspect team session files and regenerate TEAM/CONTEXT/task artifacts"
+                        .to_string(),
             });
         }
     }
@@ -408,8 +491,10 @@ fn doctor_findings(
                 severity: DiagnosticSeverity::Warn,
                 scope: DiagnosticScope::Channel,
                 subject: channel.channel.clone(),
-                message: "channel is enabled but no routing or group wiring references it".to_string(),
-                suggested_action: "add group or binding wiring for this channel, or disable it".to_string(),
+                message: "channel is enabled but no routing or group wiring references it"
+                    .to_string(),
+                suggested_action: "add group or binding wiring for this channel, or disable it"
+                    .to_string(),
             });
         }
     }
@@ -475,14 +560,25 @@ fn channel_has_routing(cfg: &config::GatewayConfig, channel: &str) -> bool {
         return true;
     }
     cfg.groups.iter().any(|group| {
-        group.mode.channel.as_deref() == Some(channel) || scope_channel(&group.scope) == Some(channel)
+        group.mode.channel.as_deref() == Some(channel)
+            || scope_channel(&group.scope) == Some(channel)
     }) || cfg.bindings.iter().any(|binding| match binding {
-        config::BindingConfig::Thread { channel: binding_channel, .. }
-        | config::BindingConfig::Scope { channel: binding_channel, .. }
-        | config::BindingConfig::Peer { channel: binding_channel, .. } => {
-            binding_channel.as_deref() == Some(channel)
+        config::BindingConfig::Thread {
+            channel: binding_channel,
+            ..
         }
-        config::BindingConfig::Channel { channel: binding_channel, .. } => binding_channel == channel,
+        | config::BindingConfig::Scope {
+            channel: binding_channel,
+            ..
+        }
+        | config::BindingConfig::Peer {
+            channel: binding_channel,
+            ..
+        } => binding_channel.as_deref() == Some(channel),
+        config::BindingConfig::Channel {
+            channel: binding_channel,
+            ..
+        } => binding_channel == channel,
         config::BindingConfig::Team { .. } | config::BindingConfig::Default { .. } => false,
     })
 }
@@ -576,12 +672,19 @@ mod tests {
                 id: "native-main".to_string(),
                 family: config::BackendFamilyConfig::QuickAiNative,
                 adapter_key: Some("native".to_string()),
+                acp_backend: None,
+                acp_auth_method: None,
+                codex: None,
+                provider_profile: None,
+                approval: Default::default(),
+                external_mcp_servers: vec![],
                 launch: config::BackendLaunchConfig::Embedded,
             }],
             channels: config::ChannelsSection {
                 lark: Some(config::LarkSection {
                     enabled: true,
                     presentation: config::ProgressPresentationMode::FinalOnly,
+                    trigger_policy: None,
                 }),
                 dingtalk: Some(config::DingTalkSection {
                     enabled: false,
@@ -625,6 +728,12 @@ mod tests {
                 family: BackendFamily::QuickAiNative,
                 adapter_key: "native".into(),
                 launch: LaunchSpec::Embedded,
+                approval_mode: Default::default(),
+                external_mcp_servers: vec![],
+                provider_profile: None,
+                acp_backend: None,
+                acp_auth_method: None,
+                codex_projection: None,
             })
             .await;
 
@@ -638,16 +747,61 @@ mod tests {
         }
     }
 
+    #[test]
+    fn acp_support_category_bridge_backed_for_claude_codex_codebuddy() {
+        use super::AcpSupportCategory;
+        use qai_runtime::AcpBackend;
+        assert_eq!(
+            AcpSupportCategory::for_backend(Some(AcpBackend::Claude)),
+            Some(AcpSupportCategory::SupportedWithBridge)
+        );
+        assert_eq!(
+            AcpSupportCategory::for_backend(Some(AcpBackend::Codex)),
+            Some(AcpSupportCategory::SupportedWithBridge)
+        );
+        assert_eq!(
+            AcpSupportCategory::for_backend(Some(AcpBackend::Codebuddy)),
+            Some(AcpSupportCategory::SupportedWithBridge)
+        );
+    }
+
+    #[test]
+    fn acp_support_category_generic_for_qwen_goose_etc() {
+        use super::AcpSupportCategory;
+        use qai_runtime::AcpBackend;
+        assert_eq!(
+            AcpSupportCategory::for_backend(Some(AcpBackend::Qwen)),
+            Some(AcpSupportCategory::GenericAcpCli)
+        );
+        assert_eq!(
+            AcpSupportCategory::for_backend(Some(AcpBackend::Goose)),
+            Some(AcpSupportCategory::GenericAcpCli)
+        );
+        assert_eq!(
+            AcpSupportCategory::for_backend(Some(AcpBackend::Iflow)),
+            Some(AcpSupportCategory::GenericAcpCli)
+        );
+    }
+
+    #[test]
+    fn acp_support_category_none_when_identity_omitted() {
+        use super::AcpSupportCategory;
+        // Omitted acp_backend = generic ACP, no category label
+        assert_eq!(AcpSupportCategory::for_backend(None), None);
+    }
+
     #[tokio::test]
     async fn doctor_report_marks_missing_backend_adapter_as_error() {
         let state = diagnostics_state(false).await;
         let report = collect_doctor_report(&state).await;
         assert_eq!(report.state, DiagnosticsStatus::Unavailable);
-        assert!(report
-            .findings
-            .iter()
-            .any(|finding| matches!(finding.scope, DiagnosticScope::Backend)
-                && matches!(finding.severity, DiagnosticSeverity::Error)));
+        assert!(report.findings.iter().any(|finding| matches!(
+            finding.scope,
+            DiagnosticScope::Backend
+        ) && matches!(
+            finding.severity,
+            DiagnosticSeverity::Error
+        )));
     }
 
     #[tokio::test]
@@ -686,7 +840,10 @@ mod tests {
     async fn collect_team_diagnostics_running_team_reports_missing_required_files() {
         let state = diagnostics_state(true).await;
         let tmp = tempdir().unwrap();
-        let session = Arc::new(TeamSession::from_dir("team-running", tmp.path().to_path_buf()));
+        let session = Arc::new(TeamSession::from_dir(
+            "team-running",
+            tmp.path().to_path_buf(),
+        ));
         session.write_team_md("manifest").unwrap();
         let registry = Arc::new(TaskRegistry::new_in_memory().unwrap());
         registry
@@ -716,9 +873,6 @@ mod tests {
             .notes
             .iter()
             .any(|note| note.contains("CONTEXT.md")));
-        assert!(teams[0]
-            .notes
-            .iter()
-            .any(|note| note.contains("TASKS.md")));
+        assert!(teams[0].notes.iter().any(|note| note.contains("TASKS.md")));
     }
 }

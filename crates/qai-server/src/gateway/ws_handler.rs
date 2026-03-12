@@ -10,7 +10,7 @@ use axum::{
 use qai_protocol::{AgentEvent, InboundMsg, SessionKey};
 use qai_runtime::ApprovalDecision;
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use tokio::sync::mpsc;
 
 fn extract_bearer(header: &str) -> Option<&str> {
@@ -64,26 +64,47 @@ pub async fn ws_upgrade(
         .into_response()
 }
 
+/// Subscribe this WS connection to `session_key` events.
+///
+/// Each subscription gets its own dedicated channel (`sub_tx`/`sub_rx`).  The
+/// registry delivers events into `sub_tx`; a forwarder task relays them to the
+/// connection-wide `private_tx`.  Dropping `sub_tx` (on `Unsubscribe` or
+/// connection close) closes the forwarding channel — the registry's next
+/// `retain(!tx.is_closed())` pass removes the dead entry automatically.
 fn ensure_subscription(
     state: &AppState,
     private_tx: &mpsc::UnboundedSender<AgentEvent>,
-    local_subscriptions: &mut HashSet<SessionKey>,
+    local_subscriptions: &mut HashMap<SessionKey, mpsc::UnboundedSender<AgentEvent>>,
     session_key: &SessionKey,
 ) {
-    if local_subscriptions.insert(session_key.clone()) {
-        state
-            .registry
-            .ws_subs
-            .entry(session_key.clone())
-            .or_default()
-            .push(private_tx.clone());
-        tracing::debug!(?session_key, "WS client subscribed to session");
+    if local_subscriptions.contains_key(session_key) {
+        return;
     }
+    let (sub_tx, mut sub_rx) = mpsc::unbounded_channel::<AgentEvent>();
+    let fwd_tx = private_tx.clone();
+    tokio::spawn(async move {
+        while let Some(event) = sub_rx.recv().await {
+            if fwd_tx.send(event).is_err() {
+                break;
+            }
+        }
+    });
+    state
+        .registry
+        .ws_subs
+        .entry(session_key.clone())
+        .or_default()
+        .push(sub_tx.clone());
+    local_subscriptions.insert(session_key.clone(), sub_tx);
+    tracing::debug!(?session_key, "WS client subscribed to session");
 }
 
 async fn handle_socket(mut socket: WebSocket, state: AppState) {
     let (private_tx, mut private_rx) = mpsc::unbounded_channel::<AgentEvent>();
-    let mut local_subscriptions = HashSet::<SessionKey>::new();
+    // Maps session_key → per-subscription sender. Dropping the sender closes
+    // the per-subscription channel and removes this WS connection from ws_subs
+    // at the next delivery pass.
+    let mut local_subscriptions = HashMap::<SessionKey, mpsc::UnboundedSender<AgentEvent>>::new();
 
     loop {
         tokio::select! {
@@ -101,15 +122,17 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                                 );
                             }
                             Ok(WsClientMsg::Unsubscribe { session_key }) => {
-                                // Best-effort: prune dead/closed senders from this session's subscriber list.
-                                // Full unsubscribe by sender ID requires a subscription token (future work).
-                                local_subscriptions.remove(&session_key);
-                                state.registry.ws_subs.alter(&session_key, |_, mut vec| {
-                                    // A sender is "alive" if it can receive (closed channel = dead)
-                                    vec.retain(|tx| !tx.is_closed());
-                                    vec
-                                });
-                                tracing::debug!("WS client unsubscribed from {:?}", session_key);
+                                // Dropping the per-subscription sub_tx closes its channel.
+                                // The registry's retain(!tx.is_closed()) will remove the
+                                // dead entry on the next event delivery pass.
+                                if let Some(_sub_tx) = local_subscriptions.remove(&session_key) {
+                                    // Eagerly prune now-closed entries to keep ws_subs compact.
+                                    state.registry.ws_subs.alter(&session_key, |_, mut vec| {
+                                        vec.retain(|tx| !tx.is_closed());
+                                        vec
+                                    });
+                                    tracing::debug!(?session_key, "WS client unsubscribed from session");
+                                }
                             }
                             Ok(WsClientMsg::ResolveApproval {
                                 approval_id,

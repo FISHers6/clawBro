@@ -5,10 +5,10 @@
 //! - Registry resolves target_agent via AgentRoster (generic name lookup)
 //! - No platform-specific text parsing here
 
-use crate::control::session_router::get_orchestrator_for_session as route_orchestrator_for_session;
-use crate::context_assembly::{assemble_context, ContextAssemblyRequest};
-use crate::dedup::DedupStore;
 use crate::bindings::BindingRule;
+use crate::context_assembly::{assemble_context, ContextAssemblyRequest};
+use crate::control::session_router::get_orchestrator_for_session as route_orchestrator_for_session;
+use crate::dedup::DedupStore;
 use crate::memory::{MemoryEvent, MemorySystem, MemoryTarget};
 use crate::post_turn::{process_post_turn, PostTurnInput, PostTurnProcessor};
 use crate::relay::RelayEngine;
@@ -27,7 +27,7 @@ use qai_channels::mention_trigger::MentionTrigger;
 use qai_protocol::{AgentEvent, InboundMsg, SessionKey};
 use qai_runtime::contract::{TeamCallback, TurnResult};
 use qai_runtime::{RuntimeEvent, TeamToolCall, TeamToolResponse};
-use qai_session::{SessionManager, StoredMessage};
+use qai_session::{SessionManager, SessionMeta, StoredMessage};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -111,7 +111,9 @@ impl<'a> MemoryControlContext<'a> {
     }
 
     pub(crate) fn arm_pending_reset(self, session_key: &SessionKey, now: std::time::Instant) {
-        self.registry.pending_resets.insert(session_key.clone(), now);
+        self.registry
+            .pending_resets
+            .insert(session_key.clone(), now);
     }
 }
 
@@ -141,7 +143,12 @@ impl<'a> SlashControlContext<'a> {
     }
 
     pub(crate) async fn clear_session_history(self, session_key: &SessionKey) {
-        if let Ok(session_id) = self.registry.session_manager.get_or_create(session_key).await {
+        if let Ok(session_id) = self
+            .registry
+            .session_manager
+            .get_or_create(session_key)
+            .await
+        {
             self.registry
                 .session_manager
                 .storage()
@@ -183,7 +190,8 @@ impl<'a> SlashControlContext<'a> {
     }
 
     pub(crate) fn render_team_status(self, session_key: &SessionKey) -> String {
-        let orch_arc = route_orchestrator_for_session(&self.registry.team_orchestrators, session_key);
+        let orch_arc =
+            route_orchestrator_for_session(&self.registry.team_orchestrators, session_key);
         if let Some(orch) = orch_arc {
             let team_manifest = orch.session.read_team_md();
             let tasks_snapshot = orch.session.read_tasks_md();
@@ -314,7 +322,7 @@ impl SessionRegistry {
         skill_loader_dirs: Vec<std::path::PathBuf>,
         runtime_dispatch: Arc<dyn RuntimeDispatch>,
     ) -> (Arc<Self>, broadcast::Receiver<AgentEvent>) {
-        let (global_tx, global_rx) = broadcast::channel(256);
+        let (global_tx, global_rx) = broadcast::channel(1024);
         let registry = Arc::new(Self {
             sessions: DashMap::new(),
             default_backend_id,
@@ -502,13 +510,9 @@ impl SessionRegistry {
 
     pub fn register_binding(&self, binding: BindingRule) {
         let agent_name = binding.agent_name().to_string();
-        if self
-            .roster
-            .as_ref()
-            .is_some_and(|roster| {
-                crate::routing::resolve_roster_match_by_name(Some(roster), &agent_name).is_none()
-            })
-        {
+        if self.roster.as_ref().is_some_and(|roster| {
+            crate::routing::resolve_roster_match_by_name(Some(roster), &agent_name).is_none()
+        }) {
             tracing::warn!(
                 agent = %agent_name,
                 "ignoring routing binding for unknown roster agent"
@@ -713,7 +717,10 @@ impl SessionRegistry {
             }
         }
 
-        let specialist_task_reminder = self.team_task_reminders.get(&session_key).map(|v| v.clone());
+        let specialist_task_reminder = self
+            .team_task_reminders
+            .get(&session_key)
+            .map(|v| v.clone());
         let session_backend_id = self.get_or_create_session(&session_key).backend_id.clone();
         let bindings = self.bindings.read().unwrap().clone();
         let routing = resolve_turn_routing(
@@ -782,7 +789,7 @@ impl SessionRegistry {
             team_tool_url: self.team_tool_url.get().cloned(),
         })
         .await;
-        let ctx = assembled.ctx;
+        let mut ctx = assembled.ctx;
         let persona_prefix = assembled.persona_prefix;
         let resolved_persona_dir = assembled.resolved_persona_dir;
         let crate::routing::RoutingDecision {
@@ -794,9 +801,29 @@ impl SessionRegistry {
             ..
         } = routing;
 
+        // Resolve the expected backend_id for session lifecycle tracking.
+        let expected_backend_id: Option<String> = intent
+            .target_backend
+            .clone()
+            .or_else(|| intent.leader_candidate.clone())
+            .or_else(|| fallback_backend_id.clone());
+        // Load stored ACP session ID for this backend (if any) and stamp into ctx.
+        if let Some(ref bid) = expected_backend_id {
+            let meta: Option<SessionMeta> = self
+                .session_manager
+                .load_meta(session_id)
+                .await
+                .ok()
+                .flatten();
+            ctx.backend_session_id = meta.and_then(|m| m.backend_session_ids.get(bid).cloned());
+            if let Err(e) = self.session_manager.begin_turn(session_id, bid).await {
+                tracing::warn!(error = %e, backend_id = %bid, "begin_turn failed");
+            }
+        }
+
         // Per-call event channel: forward to global_tx + ws_subs
         // TurnComplete is enriched with sender_name here (engine itself doesn't know roster)
-        let (session_tx, _) = broadcast::channel::<AgentEvent>(256);
+        let (session_tx, _) = broadcast::channel::<AgentEvent>(1024);
         let global_tx = self.global_tx.clone();
         let ws_subs_clone = Arc::clone(&self.ws_subs);
         let sk_for_fwd = session_key.clone();
@@ -833,16 +860,51 @@ impl SessionRegistry {
 
         // Control-plane execution crosses a narrow runtime dispatch boundary into
         // the canonical multi-backend conductor.
-        let turn = self
+        let turn_result = self
             .runtime_dispatch
             .dispatch(RuntimeDispatchRequest {
                 intent,
                 ctx,
-                fallback_backend_id,
+                fallback_backend_id: fallback_backend_id.clone(),
                 event_tx: session_tx,
             })
-            .await?;
+            .await;
+        tracing::debug!(
+            session_id = %session_id,
+            ok = turn_result.is_ok(),
+            has_expected_backend = expected_backend_id.is_some(),
+            "runtime dispatch completed"
+        );
+        // Persist the emitted ACP session ID and reset turn status — unconditionally,
+        // even on dispatch failure, so sessions never stay permanently in Running state.
+        let emitted_session_id = turn_result
+            .as_ref()
+            .ok()
+            .and_then(|r| r.emitted_backend_session_id.clone());
+        let complete_backend_id = turn_result
+            .as_ref()
+            .ok()
+            .and_then(|r| r.used_backend_id.clone())
+            .or(expected_backend_id);
+        if let Some(ref bid) = complete_backend_id {
+            if let Err(e) = self
+                .session_manager
+                .complete_turn(session_id, bid, emitted_session_id)
+                .await
+            {
+                tracing::warn!(error = %e, backend_id = %bid, "complete_turn failed");
+            } else {
+                tracing::debug!(session_id = %session_id, backend_id = %bid, "complete_turn succeeded");
+            }
+        }
+        let turn = turn_result?;
         self.apply_runtime_events(&session_key, &turn).await?;
+        tracing::debug!(
+            session_id = %session_id,
+            full_text_len = turn.full_text.len(),
+            event_count = turn.events.len(),
+            "runtime events applied"
+        );
         let reply_text = process_post_turn(
             PostTurnProcessor {
                 relay_engine: self.relay_engine.get(),
@@ -866,6 +928,11 @@ impl SessionRegistry {
             },
         )
         .await?;
+        tracing::debug!(
+            session_id = %session_id,
+            reply_text_len = reply_text.len(),
+            "post turn processing completed"
+        );
         Ok(Some(reply_text))
     }
 
@@ -896,10 +963,10 @@ impl SessionRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ApprovalDecision;
     use crate::memory::{distiller::NoopDistiller, store::FileMemoryStore, MemorySystem};
     use crate::roster::{AgentEntry, AgentRoster};
     use crate::runtime_dispatch::{RuntimeDispatch, RuntimeDispatchRequest};
+    use crate::ApprovalDecision;
     use qai_protocol::{InboundMsg, MsgContent};
     use qai_runtime::contract::{TeamCallback, TurnResult};
     use qai_runtime::RuntimeEvent;
@@ -966,6 +1033,8 @@ mod tests {
             Ok(TurnResult {
                 full_text: format!("fake-dispatch: {}", request.intent.user_text),
                 events: vec![],
+                emitted_backend_session_id: None,
+                used_backend_id: None,
             })
         }
     }
@@ -2294,6 +2363,8 @@ mod tests {
                         summary: "bridge implemented".into(),
                         agent: "openclaw-main".into(),
                     })],
+                    emitted_backend_session_id: None,
+                    used_backend_id: None,
                 },
             )
             .await

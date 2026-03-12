@@ -9,8 +9,8 @@
 
 This document describes the runtime side only: backend families, their adapters, and their current status.
 
-Routing precedence is documented separately in [`routing-contract.md`](/Users/fishers/Desktop/repo/quickai-openclaw/quickai-gateway/docs/routing-contract.md).
-Validated backend capability levels and current product-facing boundaries are documented separately in [`backend-support-matrix.md`](/Users/fishers/Desktop/repo/quickai-openclaw/quickai-gateway/docs/backend-support-matrix.md).
+Routing precedence is documented separately in [`routing-contract.md`](routing-contract.md).
+Validated backend capability levels and current product-facing boundaries are documented separately in [`backend-support-matrix.md`](backend-support-matrix.md).
 
 Current control-plane decomposition in `qai-agent`:
 
@@ -115,7 +115,119 @@ Team contract note:
 
 ## Config Model
 
-Primary path:
+### ACP Backend Identity
+
+The `acp` family supports an optional `acp_backend` field that identifies the specific CLI agent being used. When omitted, the backend is treated as a generic ACP CLI backend.
+
+**Constraints:**
+- `acp_backend` is only valid when `family = "acp"`. Other families reject it at config validation.
+- `config.toml` does **not** support `${ENV_VAR}` interpolation inside TOML values. All values must be literal strings.
+- Gemini is not a validated `acp_backend` in this version.
+
+### Claude via claude-agent-acp (bridge-backed)
+
+```toml
+[[backend]]
+id = "claude-main"
+family = "acp"
+acp_backend = "claude"
+
+[backend.launch]
+type = "command"
+command = "npx"
+args = ["--yes", "--prefer-offline", "@zed-industries/claude-agent-acp@0.18.0"]
+
+[backend.launch.env]
+ANTHROPIC_BASE_URL = "https://api.anthropic.com"
+ANTHROPIC_AUTH_TOKEN = "sk-ant-your-key-here"
+```
+
+### Codex via codex-acp (bridge-backed)
+
+```toml
+[[backend]]
+id = "codex-main"
+family = "acp"
+acp_backend = "codex"
+
+[backend.launch]
+type = "command"
+command = "npx"
+args = ["--yes", "--prefer-offline", "@zed-industries/codex-acp@latest"]
+```
+
+### CodeBuddy via codebuddy-code (bridge-backed)
+
+```toml
+[[backend]]
+id = "codebuddy-main"
+family = "acp"
+acp_backend = "codebuddy"
+
+[backend.launch]
+type = "command"
+command = "npx"
+args = ["@tencent-ai/codebuddy-code", "--acp"]
+```
+
+### Qwen via generic ACP CLI
+
+```toml
+[[backend]]
+id = "qwen-main"
+family = "acp"
+acp_backend = "qwen"
+
+[backend.launch]
+type = "command"
+command = "npx"
+args = ["@qwen-code/qwen-code", "--acp"]
+```
+
+### iFlow via generic ACP CLI
+
+```toml
+[[backend]]
+id = "iflow-main"
+family = "acp"
+acp_backend = "iflow"
+
+[backend.launch]
+type = "command"
+command = "iflow"
+args = ["--acp"]
+```
+
+### Goose via ACP subcommand path
+
+```toml
+[[backend]]
+id = "goose-main"
+family = "acp"
+acp_backend = "goose"
+
+[backend.launch]
+type = "command"
+command = "goose"
+args = ["acp"]
+```
+
+### Generic or custom ACP backend (no explicit identity)
+
+When `acp_backend` is omitted, QuickAI uses the generic ACP CLI path with no special policy:
+
+```toml
+[[backend]]
+id = "my-acp-tool"
+family = "acp"
+
+[backend.launch]
+type = "command"
+command = "my-acp-tool"
+args = ["--acp"]
+```
+
+### Primary path (legacy format, still valid)
 
 ```toml
 [[backend]]
@@ -182,3 +294,58 @@ Notes:
 - `backend_id` is the new routing target.
 - `backend_id` is required for both default agent routing and roster entries.
 - There is no engine-centric fallback path in production config anymore.
+
+## External MCP Servers
+
+Current scope:
+
+- `quick_ai_native`: supported
+- `acp`: supported
+- `open_claw_gateway`: not supported in this phase
+
+Ownership:
+
+- external MCP servers are configured at the `[[backend]]` level
+- not at `[[agent_roster]]`
+- not at `[[group]]`
+
+Example:
+
+```toml
+[[backend]]
+id = "claude-main"
+family = "acp"
+
+[backend.launch]
+type = "command"
+command = "claude-code"
+args = ["--dangerously-skip-permissions"]
+
+[[backend.external_mcp_servers]]
+name = "filesystem"
+url = "http://127.0.0.1:3001/sse"
+
+[[backend.external_mcp_servers]]
+name = "github"
+url = "http://127.0.0.1:3002/sse"
+```
+
+Contract behavior:
+
+- QuickAI normalizes these into `RuntimeSessionSpec.external_mcp_servers`
+- `ACP` merges them with the existing `team-tools` SSE bridge
+- `quick_ai_native` receives them over the native JSON runtime session contract and connects from inside `quickai-rust-agent`
+- `OpenClaw` keeps its current protocol boundary and does not claim external MCP parity yet
+
+Important:
+
+- this phase supports `SSE` only
+- `ToolSurfaceSpec.external_mcp` is now meaningful only as a derived capability bit
+- team tools and user-configured external MCP are separate concerns
+- external MCP server names must be unique per backend and may not use the reserved name `team-tools`
+
+Why not `OpenClaw` yet:
+
+- QuickAI can normalize OpenClaw runtime events and team helper callbacks
+- but current OpenClaw gateway integration still does not expose an equivalent external MCP registration surface for normal chat sessions
+- pretending parity here would be dishonest

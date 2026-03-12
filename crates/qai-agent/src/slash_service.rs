@@ -128,14 +128,12 @@ mod tests {
     }
 
     fn make_registry() -> (Arc<SessionRegistry>, broadcast::Receiver<AgentEvent>) {
-        let dir = std::env::temp_dir().join(format!(
-            "test-slash-service-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir = std::env::temp_dir().join(format!("test-slash-service-{}", uuid::Uuid::new_v4()));
         let storage = SessionStorage::new(dir);
         let session_manager = Arc::new(SessionManager::new(storage));
-        let store: Arc<dyn crate::memory::MemoryStore> =
-            Arc::new(FileMemoryStore::new(std::env::temp_dir().join(uuid::Uuid::new_v4().to_string())));
+        let store: Arc<dyn crate::memory::MemoryStore> = Arc::new(FileMemoryStore::new(
+            std::env::temp_dir().join(uuid::Uuid::new_v4().to_string()),
+        ));
         let distiller: Arc<dyn crate::memory::MemoryDistiller> = Arc::new(NoopDistiller);
         let memory_system = MemorySystem::new(vec![], store, distiller);
         SessionRegistry::new(

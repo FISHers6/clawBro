@@ -584,7 +584,10 @@ fn parse_generic_tool_event(payload: &Value) -> Result<Option<RuntimeEvent>> {
         return Ok(None);
     };
 
-    let phase = data.get("phase").and_then(Value::as_str).unwrap_or_default();
+    let phase = data
+        .get("phase")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let tool_name = data
         .get("name")
         .and_then(Value::as_str)
@@ -623,7 +626,11 @@ fn parse_generic_tool_event(payload: &Value) -> Result<Option<RuntimeEvent>> {
                         .trim()
                         .to_string()
                 });
-            if data.get("isError").and_then(Value::as_bool).unwrap_or(false) {
+            if data
+                .get("isError")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
                 RuntimeEvent::ToolCallFailed {
                     tool_name,
                     call_id,

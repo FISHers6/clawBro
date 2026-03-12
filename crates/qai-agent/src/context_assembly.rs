@@ -37,9 +37,7 @@ pub(crate) struct ContextAssemblyResult {
     pub resolved_persona_dir: Option<PathBuf>,
 }
 
-pub(crate) async fn assemble_context(
-    request: ContextAssemblyRequest<'_>,
-) -> ContextAssemblyResult {
+pub(crate) async fn assemble_context(request: ContextAssemblyRequest<'_>) -> ContextAssemblyResult {
     let history = build_history(request.recent_messages);
     let workspace_dir_resolved = request
         .session_workspace
@@ -74,14 +72,15 @@ pub(crate) async fn assemble_context(
         None
     };
 
-    let canonical_team_manifest = if matches!(request.agent_role, AgentRole::Lead | AgentRole::Specialist) {
-        request
-            .session_team_orch
-            .map(|o| o.session.read_team_md())
-            .filter(|manifest| !manifest.trim().is_empty())
-    } else {
-        None
-    };
+    let canonical_team_manifest =
+        if matches!(request.agent_role, AgentRole::Lead | AgentRole::Specialist) {
+            request
+                .session_team_orch
+                .map(|o| o.session.read_team_md())
+                .filter(|manifest| !manifest.trim().is_empty())
+        } else {
+            None
+        };
 
     let mut canonical_agent_memory = None;
     let system_injection = if resolved_persona_dir.is_some() {
@@ -141,12 +140,7 @@ pub(crate) async fn assemble_context(
             session_id: request.session_id,
             session_key: request.inbound.session_key.clone(),
             participant_name: request.roster_match.map(|rm| rm.agent_name.clone()),
-            user_text: request
-                .inbound
-                .content
-                .as_text()
-                .unwrap_or("")
-                .to_string(),
+            user_text: request.inbound.content.as_text().unwrap_or("").to_string(),
             history,
             system_injection,
             persona_dir: resolved_persona_dir,
@@ -160,6 +154,7 @@ pub(crate) async fn assemble_context(
             shared_memory: canonical_shared_memory,
             agent_memory: canonical_agent_memory,
             team_manifest: canonical_team_manifest,
+            backend_session_id: None, // populated by registry after context assembly
         },
     }
 }
@@ -253,7 +248,10 @@ fn load_skill_injection(
     let loader = SkillLoader::with_dirs(all_dirs);
     let skills = loader.load_all();
     let personas = loader.load_personas();
-    (loader.build_system_injection(&skills), personas.into_iter().next())
+    (
+        loader.build_system_injection(&skills),
+        personas.into_iter().next(),
+    )
 }
 
 fn resolve_persona_dir(
@@ -289,8 +287,8 @@ fn resolve_persona_dir(
 mod tests {
     use super::*;
     use dashmap::DashSet;
-    use qai_protocol::{InboundMsg, MsgContent, MsgSource};
     use qai_protocol::SessionKey;
+    use qai_protocol::{InboundMsg, MsgContent, MsgSource};
     use uuid::Uuid;
 
     #[test]
@@ -409,25 +407,20 @@ mod tests {
         std::fs::create_dir_all(persona_dir.path().join("memory")).unwrap();
         let session_key = SessionKey::new("lark", "group:test");
         std::fs::write(
-            persona_dir
-                .path()
-                .join("memory")
-                .join("lark_group:test.md"),
+            persona_dir.path().join("memory").join("lark_group:test.md"),
             "scoped memory layer",
         )
         .unwrap();
 
         let inbound = inbound(session_key.clone());
         let initialized = DashSet::new();
-        let result = assemble_context(
-            request_with_persona(
-                &session_key,
-                &inbound,
-                Some(persona_dir.path().to_path_buf()),
-                None,
-                &initialized,
-            ),
-        )
+        let result = assemble_context(request_with_persona(
+            &session_key,
+            &inbound,
+            Some(persona_dir.path().to_path_buf()),
+            None,
+            &initialized,
+        ))
         .await;
 
         assert!(result.ctx.system_injection.contains("SOUL layer"));
@@ -450,10 +443,7 @@ mod tests {
         std::fs::create_dir_all(persona_dir.path().join("memory")).unwrap();
         let session_key = SessionKey::new("lark", "group:test");
         std::fs::write(
-            persona_dir
-                .path()
-                .join("memory")
-                .join("lark_group:test.md"),
+            persona_dir.path().join("memory").join("lark_group:test.md"),
             "scoped memory layer",
         )
         .unwrap();
@@ -467,19 +457,21 @@ mod tests {
             extra_skills_dirs: vec![],
         };
 
-        let single = assemble_context(
-            request_with_persona(
-                &session_key,
-                &inbound,
-                Some(persona_dir.path().to_path_buf()),
-                None,
-                &initialized,
-            ),
-        )
+        let single = assemble_context(request_with_persona(
+            &session_key,
+            &inbound,
+            Some(persona_dir.path().to_path_buf()),
+            None,
+            &initialized,
+        ))
         .await;
-        let roster = assemble_context(
-            request_with_persona(&session_key, &inbound, None, Some(&roster_match), &initialized),
-        )
+        let roster = assemble_context(request_with_persona(
+            &session_key,
+            &inbound,
+            None,
+            Some(&roster_match),
+            &initialized,
+        ))
         .await;
 
         assert_eq!(single.ctx.system_injection, roster.ctx.system_injection);

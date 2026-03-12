@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::backend::ApprovalMode;
+use crate::provider_profiles::RuntimeProviderProfile;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TurnMode {
     Solo,
@@ -147,11 +150,35 @@ pub struct RuntimeSessionSpec {
     pub workspace_dir: Option<PathBuf>,
     pub prompt_text: String,
     pub tool_surface: ToolSurfaceSpec,
+    #[serde(default)]
+    pub approval_mode: ApprovalMode,
     /// ACP-family MCP bridge endpoint (typically SSE).
     pub tool_bridge_url: Option<String>,
+    /// User-configured external MCP servers for backend families that support them.
+    #[serde(default)]
+    pub external_mcp_servers: Vec<ExternalMcpServerSpec>,
+    /// Resolved host-owned provider profile for this turn, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_profile: Option<RuntimeProviderProfile>,
     /// Family-agnostic synchronous Team Tool RPC endpoint.
     pub team_tool_url: Option<String>,
     pub context: RuntimeContext,
+    /// 上次该 session 在此 backend 使用的 ACP session ID（来自 SessionMeta）。
+    /// ACP bridge-backed backend 用于 session/load resume；其他 backend 忽略。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalMcpServerSpec {
+    pub name: String,
+    pub transport: ExternalMcpTransport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ExternalMcpTransport {
+    Sse { url: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -213,7 +240,9 @@ pub enum TeamCallback {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RuntimeEvent {
-    TextDelta { text: String },
+    TextDelta {
+        text: String,
+    },
     ToolCallStarted {
         tool_name: String,
         call_id: String,
@@ -232,14 +261,27 @@ pub enum RuntimeEvent {
     },
     ApprovalRequest(PermissionRequest),
     ToolCallback(TeamCallback),
-    TurnComplete { full_text: String },
-    TurnFailed { error: String },
+    TurnComplete {
+        full_text: String,
+    },
+    TurnFailed {
+        error: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnResult {
     pub full_text: String,
     pub events: Vec<RuntimeEvent>,
+    /// 本次 turn 由 ACP backend 发出的新 session ID。
+    /// new_session() 路径：Some(id)，需要持久化到 SessionMeta。
+    /// load_session() 路径（resume）：None，prior_id 不变，无需写入。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emitted_backend_session_id: Option<String>,
+    /// 本次 turn 实际使用的 backend_id（由 run_dispatch_job 注入）。
+    /// registry 层用此 key 调用 complete_turn()。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_backend_id: Option<String>,
 }
 
 pub fn render_history_lines(
@@ -251,8 +293,8 @@ pub fn render_history_lines(
         .iter()
         .filter(|msg| msg.role.eq_ignore_ascii_case("assistant"))
         .count();
-    let protected_assistant_cutoff = assistant_count
-        .saturating_sub(semantics.pruning_policy.keep_last_assistants);
+    let protected_assistant_cutoff =
+        assistant_count.saturating_sub(semantics.pruning_policy.keep_last_assistants);
     let mut assistant_seen = 0usize;
 
     for msg in history_messages {
@@ -292,7 +334,11 @@ pub fn render_history_lines(
                 "[tool_call:{}{}]: {}",
                 call.name, call_suffix, call.input_json
             ));
-            if let Some(output) = call.output.as_deref().filter(|output| !output.trim().is_empty()) {
+            if let Some(output) = call
+                .output
+                .as_deref()
+                .filter(|output| !output.trim().is_empty())
+            {
                 let rendered_output = if should_prune_tool_results {
                     soft_trim_tool_result(
                         output,
@@ -334,9 +380,7 @@ fn soft_trim_tool_result(
         .rev()
         .collect();
     let omitted = total_chars.saturating_sub(head_chars + tail_chars);
-    format!(
-        "{head}\n...[tool result pruned; omitted {omitted} chars]...\n{tail}"
-    )
+    format!("{head}\n...[tool result pruned; omitted {omitted} chars]...\n{tail}")
 }
 
 pub fn render_runtime_prompt(session: &RuntimeSessionSpec) -> String {
@@ -469,8 +513,25 @@ mod tests {
                 external_mcp: false,
                 backend_native_tools: true,
             },
+            approval_mode: Default::default(),
             tool_bridge_url: Some("http://127.0.0.1:9999/sse".into()),
+            external_mcp_servers: vec![
+                ExternalMcpServerSpec {
+                    name: "filesystem".into(),
+                    transport: ExternalMcpTransport::Sse {
+                        url: "http://127.0.0.1:3001/sse".into(),
+                    },
+                },
+                ExternalMcpServerSpec {
+                    name: "github".into(),
+                    transport: ExternalMcpTransport::Sse {
+                        url: "http://127.0.0.1:3002/sse".into(),
+                    },
+                },
+            ],
             team_tool_url: Some("http://127.0.0.1:9999/runtime/team-tools".into()),
+            provider_profile: None,
+            backend_session_id: None,
             context: RuntimeContext::default(),
         };
 
@@ -482,6 +543,7 @@ mod tests {
             spec.tool_bridge_url.as_deref(),
             Some("http://127.0.0.1:9999/sse")
         );
+        assert_eq!(spec.external_mcp_servers.len(), 2);
         assert_eq!(
             spec.team_tool_url.as_deref(),
             Some("http://127.0.0.1:9999/runtime/team-tools")
@@ -498,8 +560,12 @@ mod tests {
             workspace_dir: None,
             prompt_text: "legacy raw prompt".into(),
             tool_surface: ToolSurfaceSpec::default(),
+            approval_mode: Default::default(),
             tool_bridge_url: None,
+            external_mcp_servers: vec![],
             team_tool_url: None,
+            provider_profile: None,
+            backend_session_id: None,
             context: RuntimeContext {
                 system_prompt: Some("system rules".into()),
                 history_messages: vec![RuntimeHistoryMessage {
@@ -531,8 +597,12 @@ mod tests {
             workspace_dir: None,
             prompt_text: "legacy raw prompt".into(),
             tool_surface: ToolSurfaceSpec::default(),
+            approval_mode: Default::default(),
             tool_bridge_url: None,
+            external_mcp_servers: vec![],
             team_tool_url: None,
+            provider_profile: None,
+            backend_session_id: None,
             context: RuntimeContext {
                 history_messages: vec![
                     RuntimeHistoryMessage {
@@ -569,21 +639,24 @@ mod tests {
 
     #[test]
     fn render_history_lines_keeps_tool_identity_visible_for_prompt_backends() {
-        let lines = render_history_lines(&[RuntimeHistoryMessage {
-            role: "assistant".into(),
-            content: "checking".into(),
-            sender: Some("@codex".into()),
-            tool_calls: vec![RuntimeToolCall {
-                tool_call_id: Some("tool-42".into()),
-                name: "search".into(),
-                input_json: "{\"q\":\"history\"}".into(),
-                output: Some("done".into()),
+        let lines = render_history_lines(
+            &[RuntimeHistoryMessage {
+                role: "assistant".into(),
+                content: "checking".into(),
+                sender: Some("@codex".into()),
+                tool_calls: vec![RuntimeToolCall {
+                    tool_call_id: Some("tool-42".into()),
+                    name: "search".into(),
+                    input_json: "{\"q\":\"history\"}".into(),
+                    output: Some("done".into()),
+                }],
             }],
-        }], &RuntimeTranscriptSemantics {
-            pruning: TranscriptPruningMode::Off,
-            pruning_policy: RuntimePruningPolicy::default(),
-            compaction: TranscriptCompactionMode::RawTranscriptOnly,
-        });
+            &RuntimeTranscriptSemantics {
+                pruning: TranscriptPruningMode::Off,
+                pruning_policy: RuntimePruningPolicy::default(),
+                compaction: TranscriptCompactionMode::RawTranscriptOnly,
+            },
+        );
 
         assert_eq!(
             lines,
@@ -598,56 +671,59 @@ mod tests {
     #[test]
     fn render_history_lines_soft_trims_old_tool_results_but_keeps_recent_assistants() {
         let long_output = "x".repeat(5000);
-        let lines = render_history_lines(&[
-            RuntimeHistoryMessage {
-                role: "assistant".into(),
-                content: "older".into(),
-                sender: None,
-                tool_calls: vec![RuntimeToolCall {
-                    tool_call_id: Some("old".into()),
-                    name: "search".into(),
-                    input_json: "{\"q\":\"old\"}".into(),
-                    output: Some(long_output.clone()),
-                }],
+        let lines = render_history_lines(
+            &[
+                RuntimeHistoryMessage {
+                    role: "assistant".into(),
+                    content: "older".into(),
+                    sender: None,
+                    tool_calls: vec![RuntimeToolCall {
+                        tool_call_id: Some("old".into()),
+                        name: "search".into(),
+                        input_json: "{\"q\":\"old\"}".into(),
+                        output: Some(long_output.clone()),
+                    }],
+                },
+                RuntimeHistoryMessage {
+                    role: "assistant".into(),
+                    content: "recent-a".into(),
+                    sender: None,
+                    tool_calls: vec![RuntimeToolCall {
+                        tool_call_id: Some("recent-a".into()),
+                        name: "search".into(),
+                        input_json: "{\"q\":\"recent-a\"}".into(),
+                        output: Some(long_output.clone()),
+                    }],
+                },
+                RuntimeHistoryMessage {
+                    role: "assistant".into(),
+                    content: "recent-b".into(),
+                    sender: None,
+                    tool_calls: vec![RuntimeToolCall {
+                        tool_call_id: Some("recent-b".into()),
+                        name: "search".into(),
+                        input_json: "{\"q\":\"recent-b\"}".into(),
+                        output: Some(long_output.clone()),
+                    }],
+                },
+                RuntimeHistoryMessage {
+                    role: "assistant".into(),
+                    content: "recent-c".into(),
+                    sender: None,
+                    tool_calls: vec![RuntimeToolCall {
+                        tool_call_id: Some("recent-c".into()),
+                        name: "search".into(),
+                        input_json: "{\"q\":\"recent-c\"}".into(),
+                        output: Some(long_output.clone()),
+                    }],
+                },
+            ],
+            &RuntimeTranscriptSemantics {
+                pruning: TranscriptPruningMode::RequestLocal,
+                pruning_policy: RuntimePruningPolicy::default(),
+                compaction: TranscriptCompactionMode::RawTranscriptOnly,
             },
-            RuntimeHistoryMessage {
-                role: "assistant".into(),
-                content: "recent-a".into(),
-                sender: None,
-                tool_calls: vec![RuntimeToolCall {
-                    tool_call_id: Some("recent-a".into()),
-                    name: "search".into(),
-                    input_json: "{\"q\":\"recent-a\"}".into(),
-                    output: Some(long_output.clone()),
-                }],
-            },
-            RuntimeHistoryMessage {
-                role: "assistant".into(),
-                content: "recent-b".into(),
-                sender: None,
-                tool_calls: vec![RuntimeToolCall {
-                    tool_call_id: Some("recent-b".into()),
-                    name: "search".into(),
-                    input_json: "{\"q\":\"recent-b\"}".into(),
-                    output: Some(long_output.clone()),
-                }],
-            },
-            RuntimeHistoryMessage {
-                role: "assistant".into(),
-                content: "recent-c".into(),
-                sender: None,
-                tool_calls: vec![RuntimeToolCall {
-                    tool_call_id: Some("recent-c".into()),
-                    name: "search".into(),
-                    input_json: "{\"q\":\"recent-c\"}".into(),
-                    output: Some(long_output.clone()),
-                }],
-            },
-        ], &RuntimeTranscriptSemantics {
-            pruning: TranscriptPruningMode::RequestLocal,
-            pruning_policy: RuntimePruningPolicy::default(),
-            compaction: TranscriptCompactionMode::RawTranscriptOnly,
-        });
+        );
 
         let old_tool_result = lines
             .iter()
@@ -698,6 +774,44 @@ mod tests {
     }
 
     #[test]
+    fn runtime_session_spec_round_trips_external_mcp_servers() {
+        let spec = RuntimeSessionSpec {
+            backend_id: "native-main".into(),
+            participant_name: None,
+            session_key: qai_protocol::SessionKey::new("ws", "user:test"),
+            role: RuntimeRole::Solo,
+            workspace_dir: None,
+            prompt_text: "hello".into(),
+            tool_surface: ToolSurfaceSpec::default(),
+            approval_mode: Default::default(),
+            tool_bridge_url: Some("http://127.0.0.1:3000/sse".into()),
+            external_mcp_servers: vec![
+                ExternalMcpServerSpec {
+                    name: "filesystem".into(),
+                    transport: ExternalMcpTransport::Sse {
+                        url: "http://127.0.0.1:3001/sse".into(),
+                    },
+                },
+                ExternalMcpServerSpec {
+                    name: "github".into(),
+                    transport: ExternalMcpTransport::Sse {
+                        url: "http://127.0.0.1:3002/sse".into(),
+                    },
+                },
+            ],
+            team_tool_url: Some("http://127.0.0.1:3000/runtime/team-tools".into()),
+            provider_profile: None,
+            backend_session_id: None,
+            context: RuntimeContext::default(),
+        };
+
+        let json = serde_json::to_string(&spec).unwrap();
+        let round_trip: RuntimeSessionSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_trip.external_mcp_servers, spec.external_mcp_servers);
+        assert_eq!(round_trip.team_tool_url, spec.team_tool_url);
+    }
+
+    #[test]
     fn render_history_lines_keeps_full_tool_results_when_pruning_is_off() {
         let output = "z".repeat(5000);
         let lines = render_history_lines(
@@ -737,8 +851,12 @@ mod tests {
             workspace_dir: None,
             prompt_text: String::new(),
             tool_surface: ToolSurfaceSpec::default(),
+            approval_mode: Default::default(),
             tool_bridge_url: None,
+            external_mcp_servers: vec![],
             team_tool_url: None,
+            provider_profile: None,
+            backend_session_id: None,
             context: RuntimeContext {
                 task_reminder: Some("T1 implement jwt".into()),
                 team_manifest: Some("Leader: claude\nSpecialist: codex".into()),
@@ -770,8 +888,12 @@ mod tests {
             workspace_dir: None,
             prompt_text: String::new(),
             tool_surface: ToolSurfaceSpec::default(),
+            approval_mode: Default::default(),
             tool_bridge_url: None,
+            external_mcp_servers: vec![],
             team_tool_url: None,
+            provider_profile: None,
+            backend_session_id: None,
             context: RuntimeContext {
                 agent_memory: Some("long term reviewer memory".into()),
                 user_input: Some("继续".into()),

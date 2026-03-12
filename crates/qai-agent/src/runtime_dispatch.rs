@@ -2,18 +2,21 @@ use crate::traits::AgentCtx;
 use anyhow::Result;
 use async_trait::async_trait;
 use qai_protocol::AgentEvent;
+use qai_runtime::contract::RuntimeToolCall;
 use qai_runtime::{
     acp::AcpBackendAdapter, ApprovalBroker, BackendRegistry, OpenClawBackendAdapter,
     QuickAiNativeBackendAdapter, RuntimeConductor, RuntimeContext, RuntimeEvent,
-    RuntimeHistoryMessage, RuntimePruningPolicy, RuntimeRole, TranscriptCompactionMode,
-    TranscriptPruningMode, RuntimeTranscriptSemantics,
-    RuntimeSessionSpec, ToolSurfaceSpec, TurnIntent, TurnResult,
+    RuntimeHistoryMessage, RuntimePruningPolicy, RuntimeRole, RuntimeSessionSpec,
+    RuntimeTranscriptSemantics, ToolSurfaceSpec, TranscriptCompactionMode, TranscriptPruningMode,
+    TurnIntent, TurnResult,
 };
-use qai_runtime::contract::RuntimeToolCall;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::time::{timeout, Duration};
+
+const RUNTIME_FORWARDER_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Clone)]
 pub struct RuntimeDispatchRequest {
@@ -28,6 +31,15 @@ pub trait RuntimeDispatch: Send + Sync {
     async fn dispatch(&self, request: RuntimeDispatchRequest) -> Result<TurnResult>;
 }
 
+/// Convenience constructor that pre-registers all three adapters and returns a dispatch handle.
+///
+/// **Constraint:** Must be called from a **synchronous** context — i.e., before entering or
+/// outside of any Tokio async runtime. Internally uses `futures::executor::block_on` to drive
+/// the async adapter registration. Calling this from inside an async Tokio task will panic.
+///
+/// In production (`main.rs`) adapters are registered directly with `.await` on the runtime
+/// and `ConductorRuntimeDispatch::new` is called explicitly. This function exists as a
+/// test-support convenience only.
 pub fn default_runtime_dispatch() -> Arc<dyn RuntimeDispatch> {
     let approvals = ApprovalBroker::default();
     let registry = Arc::new(BackendRegistry::new());
@@ -163,6 +175,7 @@ async fn run_dispatch_job(
     request: RuntimeDispatchRequest,
 ) -> Result<TurnResult> {
     let session_id = request.ctx.session_id;
+    tracing::debug!(session_id = %session_id, "Starting runtime dispatch job");
     let backend_id = request
         .intent
         .target_backend
@@ -174,6 +187,15 @@ async fn run_dispatch_job(
         .backend_spec(&backend_id)
         .await
         .ok_or_else(|| anyhow::anyhow!("backend `{backend_id}` is not registered"))?;
+    tracing::debug!(
+        session_id = %session_id,
+        backend_id = %backend_id,
+        family = ?spec.family,
+        approval_mode = ?spec.approval_mode,
+        external_mcp_servers = spec.external_mcp_servers.len(),
+        provider_profile = spec.provider_profile.is_some(),
+        "Resolved runtime backend spec"
+    );
 
     let conductor = RuntimeConductor::new(Arc::clone(&registry));
     let intent = request.intent;
@@ -190,19 +212,36 @@ async fn run_dispatch_job(
     let forward_session_key = ctx_session_key.clone();
     let (forward_done_tx, forward_done_rx) = oneshot::channel();
     tokio::task::spawn_local(async move {
+        tracing::debug!(session_id = %session_id, "Runtime event forwarder started");
         while let Some(event) = runtime_rx.recv().await {
+            tracing::debug!(
+                session_id = %session_id,
+                event_kind = runtime_event_kind(&event),
+                "Runtime event received for forwarding"
+            );
             if matches!(event, RuntimeEvent::TurnComplete { .. }) {
                 forward_complete_seen.store(true, Ordering::SeqCst);
             }
             forward_runtime_event(&event_tx, session_id, &forward_session_key, &event);
         }
+        tracing::debug!(session_id = %session_id, "Runtime event forwarder drained");
         let _ = forward_done_tx.send(());
     });
+    let provider_profile = spec
+        .provider_profile
+        .as_ref()
+        .map(|profile| profile.resolve_from_env())
+        .transpose()?;
+    tracing::debug!(
+        session_id = %session_id,
+        backend_id = %backend_id,
+        "Calling runtime conductor execute_prepared_streaming"
+    );
     let turn = conductor
         .execute_prepared_streaming(
             intent,
             RuntimeSessionSpec {
-                backend_id,
+                backend_id: backend_id.clone(),
                 participant_name: ctx.participant_name.clone(),
                 session_key: intent_session_key,
                 role: runtime_role_from_agent_role(ctx.agent_role),
@@ -211,21 +250,59 @@ async fn run_dispatch_job(
                 tool_surface: ToolSurfaceSpec {
                     team_tools: ctx.mcp_server_url.is_some() || ctx.team_tool_url.is_some(),
                     local_skills: false,
-                    external_mcp: false,
+                    external_mcp: !spec.external_mcp_servers.is_empty(),
                     backend_native_tools: true,
                 },
+                approval_mode: spec.approval_mode,
                 tool_bridge_url: ctx.mcp_server_url.clone(),
+                external_mcp_servers: spec.external_mcp_servers.clone(),
+                provider_profile,
                 team_tool_url: ctx.team_tool_url.clone(),
                 context: runtime_context_from_ctx(&ctx, spec.family),
+                backend_session_id: ctx.backend_session_id.clone(),
             },
             runtime_sink,
         )
         .await?;
-    let _ = forward_done_rx.await;
+    tracing::debug!(
+        session_id = %session_id,
+        backend_id = %backend_id,
+        full_text_len = turn.full_text.len(),
+        emitted_backend_session_id = turn
+            .emitted_backend_session_id
+            .as_deref()
+            .unwrap_or("<none>"),
+        "Runtime conductor execute_prepared_streaming completed"
+    );
+    tracing::debug!(
+        session_id = %session_id,
+        "Waiting for runtime event forwarder to finish"
+    );
+    match timeout(RUNTIME_FORWARDER_DRAIN_TIMEOUT, forward_done_rx).await {
+        Ok(_) => {
+            tracing::debug!(
+                session_id = %session_id,
+                runtime_complete_seen = runtime_complete_seen.load(Ordering::SeqCst),
+                "Runtime event forwarder finished"
+            );
+        }
+        Err(_) => {
+            tracing::warn!(
+                session_id = %session_id,
+                timeout_ms = RUNTIME_FORWARDER_DRAIN_TIMEOUT.as_millis(),
+                runtime_complete_seen = runtime_complete_seen.load(Ordering::SeqCst),
+                "Runtime event forwarder drain timed out; continuing turn finalization"
+            );
+        }
+    }
     if !runtime_complete_seen.load(Ordering::SeqCst) && !turn.full_text.is_empty() {
         let complete = RuntimeEvent::TurnComplete {
             full_text: turn.full_text.clone(),
         };
+        tracing::debug!(
+            session_id = %session_id,
+            "Synthesizing TurnComplete because runtime stream ended without one"
+        );
         forward_runtime_event(
             &completion_event_tx,
             session_id,
@@ -233,7 +310,11 @@ async fn run_dispatch_job(
             &complete,
         );
     }
-    Ok(turn)
+    // Stamp the resolved backend_id so registry can call complete_turn() with the correct key.
+    Ok(TurnResult {
+        used_backend_id: Some(backend_id),
+        ..turn
+    })
 }
 
 fn runtime_role_from_agent_role(role: crate::traits::AgentRole) -> RuntimeRole {
@@ -382,6 +463,11 @@ fn forward_runtime_event(
     session_key: &qai_protocol::SessionKey,
     event: &RuntimeEvent,
 ) {
+    tracing::debug!(
+        session_id = %session_id,
+        event_kind = runtime_event_kind(event),
+        "Forwarding runtime event to agent event bus"
+    );
     match event {
         RuntimeEvent::TextDelta { text } => {
             let _ = event_tx.send(AgentEvent::TextDelta {
@@ -403,9 +489,7 @@ fn forward_runtime_event(
             });
         }
         RuntimeEvent::ToolCallStarted {
-            tool_name,
-            call_id,
-            ..
+            tool_name, call_id, ..
         } => {
             let _ = event_tx.send(AgentEvent::ToolCallStart {
                 session_id,
@@ -448,7 +532,26 @@ fn forward_runtime_event(
             });
             tracing::warn!(session_id = %session_id, %error, "runtime turn failed");
         }
-        RuntimeEvent::ToolCallback(_) => {}
+        RuntimeEvent::ToolCallback(callback) => {
+            tracing::debug!(
+                session_id = %session_id,
+                callback = ?callback,
+                "ToolCallback event received but not yet forwarded to agent event bus"
+            );
+        }
+    }
+}
+
+fn runtime_event_kind(event: &RuntimeEvent) -> &'static str {
+    match event {
+        RuntimeEvent::TextDelta { .. } => "text_delta",
+        RuntimeEvent::ToolCallStarted { .. } => "tool_call_started",
+        RuntimeEvent::ToolCallCompleted { .. } => "tool_call_completed",
+        RuntimeEvent::ToolCallFailed { .. } => "tool_call_failed",
+        RuntimeEvent::ApprovalRequest(_) => "approval_request",
+        RuntimeEvent::ToolCallback(_) => "tool_callback",
+        RuntimeEvent::TurnComplete { .. } => "turn_complete",
+        RuntimeEvent::TurnFailed { .. } => "turn_failed",
     }
 }
 
@@ -466,6 +569,8 @@ mod tests {
     use tempfile::tempdir;
 
     struct FakeBackendAdapter;
+
+    struct LeakyEventAdapter;
 
     #[async_trait::async_trait(?Send)]
     impl BackendAdapter for FakeBackendAdapter {
@@ -510,6 +615,51 @@ mod tests {
             Ok(TurnResult {
                 full_text: "hello world".into(),
                 events: vec![],
+                emitted_backend_session_id: None,
+                used_backend_id: None,
+            })
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl BackendAdapter for LeakyEventAdapter {
+        async fn probe(&self, _spec: &BackendSpec) -> Result<CapabilityProfile> {
+            Ok(CapabilityProfile {
+                streaming: true,
+                workspace_native_contract: false,
+                tool_bridge: ToolBridgeKind::None,
+                native_team: NativeTeamCapability::Unsupported,
+                role_eligibility: RoleEligibility {
+                    solo: true,
+                    relay: true,
+                    specialist: true,
+                    lead: true,
+                },
+            })
+        }
+
+        async fn run_turn(
+            &self,
+            _spec: &BackendSpec,
+            _session: RuntimeSessionSpec,
+            sink: RuntimeEventSink,
+        ) -> Result<TurnResult> {
+            let leaked = sink.clone();
+            tokio::task::spawn_local(async move {
+                let _hold = leaked;
+                std::future::pending::<()>().await;
+            });
+            sink.emit(RuntimeEvent::TextDelta {
+                text: "hello ".into(),
+            })?;
+            sink.emit(RuntimeEvent::TurnComplete {
+                full_text: "hello world".into(),
+            })?;
+            Ok(TurnResult {
+                full_text: "hello world".into(),
+                events: vec![],
+                emitted_backend_session_id: None,
+                used_backend_id: None,
             })
         }
     }
@@ -530,6 +680,12 @@ mod tests {
                     args: vec![],
                     env: vec![],
                 },
+                external_mcp_servers: vec![],
+                provider_profile: None,
+                acp_backend: None,
+                acp_auth_method: None,
+                codex_projection: None,
+                approval_mode: Default::default(),
             })
             .await;
         let dispatcher = ConductorRuntimeDispatch::new(Arc::clone(&runtime_registry));
@@ -591,6 +747,121 @@ mod tests {
         assert_eq!(spec.family, BackendFamily::Acp);
         assert_eq!(spec.adapter_key, "acp");
         assert!(matches!(spec.launch, LaunchSpec::Command { .. }));
+    }
+
+    #[tokio::test]
+    async fn dispatch_does_not_block_forever_when_runtime_sender_lingers() {
+        let runtime_registry = Arc::new(BackendRegistry::new());
+        runtime_registry
+            .register_adapter("acp", Arc::new(LeakyEventAdapter))
+            .await;
+        runtime_registry
+            .register_backend(BackendSpec {
+                backend_id: "claude".into(),
+                family: BackendFamily::Acp,
+                adapter_key: "acp".into(),
+                launch: LaunchSpec::Embedded,
+                external_mcp_servers: vec![],
+                provider_profile: None,
+                acp_backend: None,
+                acp_auth_method: None,
+                codex_projection: None,
+                approval_mode: Default::default(),
+            })
+            .await;
+        let dispatcher = ConductorRuntimeDispatch::new(Arc::clone(&runtime_registry));
+        let (tx, mut rx) = broadcast::channel(8);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            dispatcher.dispatch(RuntimeDispatchRequest {
+                intent: TurnIntent {
+                    session_key: qai_protocol::SessionKey::new("ws", "user"),
+                    mode: qai_runtime::contract::TurnMode::Solo,
+                    leader_candidate: None,
+                    target_backend: Some("claude".into()),
+                    user_text: "hello".into(),
+                },
+                ctx: AgentCtx::default(),
+                fallback_backend_id: None,
+                event_tx: tx,
+            }),
+        )
+        .await
+        .expect("dispatch should not hang when runtime sender lingers")
+        .unwrap();
+
+        assert_eq!(result.full_text, "hello world");
+
+        let mut saw_complete = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while tokio::time::Instant::now() < deadline {
+            if let Ok(Ok(event)) = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await
+            {
+                if let AgentEvent::TurnComplete { full_text, .. } = event {
+                    if full_text == "hello world" {
+                        saw_complete = true;
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(saw_complete, "expected TurnComplete despite lingering sender");
+    }
+
+    #[tokio::test]
+    async fn runtime_context_includes_external_mcp_servers() {
+        let runtime_registry = Arc::new(BackendRegistry::new());
+        runtime_registry
+            .register_adapter("acp", Arc::new(FakeBackendAdapter))
+            .await;
+        runtime_registry
+            .register_backend(BackendSpec {
+                backend_id: "codex".into(),
+                family: BackendFamily::Acp,
+                adapter_key: "acp".into(),
+                launch: LaunchSpec::Embedded,
+                external_mcp_servers: vec![qai_runtime::ExternalMcpServerSpec {
+                    name: "filesystem".into(),
+                    transport: qai_runtime::ExternalMcpTransport::Sse {
+                        url: "http://127.0.0.1:3001/sse".into(),
+                    },
+                }],
+                provider_profile: None,
+                acp_backend: None,
+                acp_auth_method: None,
+                codex_projection: None,
+                approval_mode: Default::default(),
+            })
+            .await;
+
+        let spec = runtime_registry.backend_spec("codex").await.unwrap();
+        assert_eq!(spec.external_mcp_servers.len(), 1);
+
+        let session = RuntimeSessionSpec {
+            backend_id: spec.backend_id.clone(),
+            participant_name: None,
+            session_key: qai_protocol::SessionKey::new("ws", "user"),
+            role: RuntimeRole::Solo,
+            workspace_dir: None,
+            prompt_text: String::new(),
+            tool_surface: ToolSurfaceSpec {
+                team_tools: false,
+                local_skills: false,
+                external_mcp: !spec.external_mcp_servers.is_empty(),
+                backend_native_tools: true,
+            },
+            provider_profile: None,
+            tool_bridge_url: None,
+            external_mcp_servers: spec.external_mcp_servers.clone(),
+            approval_mode: Default::default(),
+            team_tool_url: None,
+            context: RuntimeContext::default(),
+            backend_session_id: None,
+        };
+
+        assert!(session.tool_surface.external_mcp);
+        assert_eq!(session.external_mcp_servers.len(), 1);
     }
 
     #[test]
@@ -665,7 +936,10 @@ mod tests {
         std::fs::write(persona.path().join("MEMORY.md"), "long term").unwrap();
         std::fs::create_dir_all(persona.path().join("memory")).unwrap();
         std::fs::write(
-            persona.path().join("memory").join("specialist_team-1:coder.md"),
+            persona
+                .path()
+                .join("memory")
+                .join("specialist_team-1:coder.md"),
             "specialist scoped",
         )
         .unwrap();
@@ -722,7 +996,10 @@ mod tests {
         assert_eq!(projected.history_messages.len(), 2);
         assert_eq!(projected.history_messages[0].role, "user");
         assert_eq!(projected.history_messages[0].content, "hello");
-        assert_eq!(projected.history_messages[0].sender.as_deref(), Some("alice"));
+        assert_eq!(
+            projected.history_messages[0].sender.as_deref(),
+            Some("alice")
+        );
         assert_eq!(projected.history_messages[1].role, "assistant");
         assert_eq!(projected.history_messages[1].content, "hi there");
         assert_eq!(
@@ -732,7 +1009,9 @@ mod tests {
         assert_eq!(projected.history_messages[1].tool_calls.len(), 1);
         assert_eq!(projected.history_messages[1].tool_calls[0].name, "read");
         assert_eq!(
-            projected.history_messages[1].tool_calls[0].tool_call_id.as_deref(),
+            projected.history_messages[1].tool_calls[0]
+                .tool_call_id
+                .as_deref(),
             Some("call-1")
         );
         assert_eq!(
@@ -788,7 +1067,9 @@ mod tests {
 
         let projected = runtime_context_from_ctx(&ctx, qai_runtime::BackendFamily::Acp);
         assert_eq!(
-            projected.history_messages[0].tool_calls[0].output.as_deref(),
+            projected.history_messages[0].tool_calls[0]
+                .output
+                .as_deref(),
             Some(long_output.as_str())
         );
         let rendered = projected
@@ -816,9 +1097,15 @@ mod tests {
         }];
 
         let projected = runtime_context_from_ctx(&ctx, qai_runtime::BackendFamily::QuickAiNative);
-        assert_eq!(projected.transcript_semantics.pruning, TranscriptPruningMode::Off);
         assert_eq!(
-            projected.transcript_semantics.pruning_policy.keep_last_assistants,
+            projected.transcript_semantics.pruning,
+            TranscriptPruningMode::Off
+        );
+        assert_eq!(
+            projected
+                .transcript_semantics
+                .pruning_policy
+                .keep_last_assistants,
             3
         );
         let rendered = projected

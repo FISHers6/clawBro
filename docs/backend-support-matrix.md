@@ -84,14 +84,67 @@ Status: `Structured`
 - QuickAI normalizes these into canonical runtime events
 - This is not text guessing and not fake progress
 
+ACP update compatibility:
+
+- `SessionUpdate::UsageUpdate` — decoded and silently ignored (features: `unstable_session_usage`)
+- `SessionUpdate::SessionInfoUpdate` — decoded and silently ignored (features: `unstable_session_info_update`)
+- Additive protocol variants no longer fail a prompt turn
+
 Validated by:
 
 - `cargo test -p qai-runtime`
 - `cargo test -p qai-server`
+- Echo fixture emits `UsageUpdate` + `SessionInfoUpdate` before text; all ACP E2E tests pass
 
 Current limitation:
 
 - tool labels come from ACP title/fields and are not yet mapped into a host-level canonical tool class
+
+### ACP Backend Identity and Support Levels
+
+The `acp` family supports multiple CLI-backed agents. QuickAI models them in three categories:
+
+#### Category A: Bridge-Backed ACP Backends
+
+Require a dedicated adapter package, not a raw CLI `--acp` flag.
+
+| Backend | `acp_backend` | Launch | Status |
+| --- | --- | --- | --- |
+| Claude | `claude` | `npx @zed-industries/claude-agent-acp` | `Bridge-backed (e2e-validated)` |
+| Codex | `codex` | `npx @zed-industries/codex-acp` | `Bridge-backed (code-supported)` |
+| CodeBuddy | `codebuddy` | `npx @tencent-ai/codebuddy-code --acp` | `Bridge-backed (code-supported)` |
+
+These require the adapter npm package to be installed or npx-resolvable.
+
+#### Category B: Generic ACP CLI Backends
+
+Can be launched with a direct command + args. Expected to speak ACP over stdio.
+
+| Backend | `acp_backend` | Example launch | Status |
+| --- | --- | --- | --- |
+| Qwen Code | `qwen` | `npx @qwen-code/qwen-code --acp` | `Experimental` |
+| iFlow | `iflow` | `iflow --acp` | `Experimental` |
+| Goose | `goose` | `goose acp` | `Experimental` |
+| Kimi | `kimi` | `kimi --acp` | `Experimental` |
+| OpenCode | `opencode` | `opencode --acp` | `Experimental` |
+| Qoder | `qoder` | `qoder --acp` | `Experimental` |
+| Vibe | `vibe` | `vibe --acp` | `Experimental` |
+| Custom | `custom` | user-defined | `Experimental` |
+| (unspecified) | _(omitted)_ | user-defined | `Experimental` |
+
+`acp_backend` is optional. When omitted, the generic ACP CLI path is used.
+
+#### Category C: Declared but Not Yet Enabled
+
+| Backend | Status | Notes |
+| --- | --- | --- |
+| Gemini CLI | `Declared` | No validated ACP path in QuickAI; not in the `acp_backend` enum |
+
+**Support level semantics:**
+
+- `Bridge-backed (code-supported)` — adapter package required; bridge bootstrap path and host-side code path exist; backend-specific E2E validation may still be pending
+- `Experimental` — config model exists; generic ACP CLI path; no end-to-end validation guarantee
+- `Declared` — planned backend identity; no validated adapter path
 
 #### `open_claw_gateway`
 
@@ -117,6 +170,26 @@ Current limitation:
 
 - QuickAI does not yet normalize OpenClaw `phase: "update"` into a host event
 - That is acceptable for `final_only` and `progress_compact`, but not enough for a future verbose/debug surface
+
+## External MCP Support
+
+| Family | External MCP config ownership | Current support | Notes |
+| --- | --- | --- | --- |
+| `quick_ai_native` | `[[backend.external_mcp_servers]]` | `Complete` | native runtime now receives the list through `RuntimeSessionSpec`, connects from inside `quickai-rust-agent`, and is covered by real SSE MCP integration tests |
+| `acp` | `[[backend.external_mcp_servers]]` | `Structured` | ACP merges external SSE MCP servers with the existing `team-tools` bridge |
+| `open_claw_gateway` | n/a in this phase | `Not Yet` | OpenClaw still keeps team helper CLI bridge, but does not claim generic external MCP parity |
+
+Important:
+
+- external MCP is a backend capability, not a roster/persona capability
+- this phase supports `SSE` only
+- `team-tools` MCP and user-configured external MCP are separate paths
+
+This is intentional. It keeps system ownership clear:
+
+- backend owns launch env, protocol family, and external tool transport
+- roster owns persona/workspace/mention identity
+- group owns routing and team mode, not backend transport capability
 
 ## Channel Presentation
 
@@ -148,6 +221,51 @@ Important:
 - It is a presentation-layer rollout boundary
 
 ## What users can honestly expect today
+
+## Provider Profile Validation Snapshot
+
+Current provider/profile reality is intentionally conservative:
+
+- `quick_ai_native + openai_compatible` is validated end-to-end
+- `quick_ai_native + anthropic_compatible` remains vendor-dependent
+- `ACP/Claude + official_session` is validated end-to-end
+- `ACP/Claude + anthropic_compatible` is validated end-to-end on the DeepSeek Anthropic-compatible path
+- `ACP/Codex + local_config_projection + DeepSeek /v1` ACP decode compatibility is resolved; provider-side 404 on `/v1/responses` remains the blocker (requires a Codex-responses-compatible endpoint)
+- DeepSeek should currently be treated as an `openai_compatible` target for the native family
+
+Reason:
+
+- the native runtime uses `rig`
+- the OpenAI-compatible DeepSeek path validated end-to-end
+- the DeepSeek `/anthropic` path did not validate as a stable native Anthropic-compatible streaming target
+
+### Codex Local-Config Projection Constraint
+
+`Codex` now supports two distinct projection paths in QuickAI:
+
+- `acp_auth_projection`
+  - for `chatgpt`, `openai_api_key`, and `codex_api_key`
+- `local_config_projection`
+  - for Codex-native `auth.json + config.toml`
+  - used for custom provider/base URL scenarios
+
+However, `local_config_projection` is only usable when the target provider
+supports the Codex `responses` API surface.
+
+A generic OpenAI-compatible `/v1` endpoint is not sufficient by itself.
+
+QuickAI has already validated one negative case:
+
+- `Codex + local_config_projection + DeepSeek /v1`
+  - projection succeeded
+  - isolated `CODEX_HOME` was written correctly
+  - upstream provider returned `404 Not Found` for `/v1/responses`
+
+Therefore, `Codex local_config_projection` should currently be treated as:
+
+- `code-supported`
+- `provider-dependent`
+- requiring explicit E2E validation per vendor
 
 ### For `quick_ai_native + Lark`
 

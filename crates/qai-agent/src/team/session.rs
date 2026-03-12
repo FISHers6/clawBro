@@ -34,15 +34,9 @@ pub struct TaskArtifactMeta {
 impl TaskArtifactMeta {
     pub fn from_task(task: &Task) -> Self {
         let (claimed_by, submitted_by, accepted_by, updated_at) = match task.status_parsed() {
-            TaskStatus::Claimed { agent, at } => {
-                (Some(agent), None, None, at.to_rfc3339())
-            }
-            TaskStatus::Submitted { agent, at } => {
-                (None, Some(agent), None, at.to_rfc3339())
-            }
-            TaskStatus::Accepted { by, at } => {
-                (None, None, Some(by), at.to_rfc3339())
-            }
+            TaskStatus::Claimed { agent, at } => (Some(agent), None, None, at.to_rfc3339()),
+            TaskStatus::Submitted { agent, at } => (None, Some(agent), None, at.to_rfc3339()),
+            TaskStatus::Accepted { by, at } => (None, None, Some(by), at.to_rfc3339()),
             TaskStatus::Done => (
                 None,
                 None,
@@ -52,12 +46,7 @@ impl TaskArtifactMeta {
                     .map(chrono::DateTime::to_rfc3339)
                     .unwrap_or_else(|| task.created_at.to_rfc3339()),
             ),
-            _ => (
-                None,
-                None,
-                None,
-                task.created_at.to_rfc3339(),
-            ),
+            _ => (None, None, None, task.created_at.to_rfc3339()),
         };
 
         Self {
@@ -280,6 +269,24 @@ impl TeamSession {
             )
         };
 
+        // If the task is already Claimed, it means this is a resume after an interruption.
+        let resume_note = match task.status_parsed() {
+            crate::team::registry::TaskStatus::Claimed { agent, at } => {
+                let elapsed = chrono::Utc::now().signed_duration_since(at);
+                let mins = elapsed.num_minutes();
+                if mins >= 2 {
+                    format!(
+                        "\n[⚠️ 任务恢复] 此任务之前已由 {} 领取（{}分钟前）并可能因 Gateway 重启而中断。\
+                         请检查已完成的工作并从中断处继续。",
+                        agent, mins
+                    )
+                } else {
+                    format!("\n[任务进行中] 此任务已由 {} 领取，请继续执行。", agent)
+                }
+            }
+            _ => String::new(),
+        };
+
         format!(
             "══════ 当前任务（自动注入，最高优先级）══════\n\
              任务ID: {id}\n\
@@ -297,7 +304,7 @@ impl TeamSession {
              3. 遇到阻塞时调用 `block_task(task_id, reason)` 释放任务并上报；仅需协助时调用 `request_help(task_id, message)`，保留 claim\n\
              4. 兼容旧路径时仍可调用 `complete_task(task_id, note)`，但新语义优先使用 submit_task_result\n\
              5. 重要产出（文件路径、关键发现）写在 summary / note 参数中\n\
-             ══════════════════════════════════════════{upstream_section}",
+             ══════════════════════════════════════════{resume_note}{upstream_section}",
             id = task.id,
             title = task.title,
             spec = task.spec.as_deref().unwrap_or("（无详细说明）"),
@@ -307,6 +314,7 @@ impl TeamSession {
                 .success_criteria
                 .as_deref()
                 .unwrap_or("完成任务说明中描述的工作"),
+            resume_note = resume_note,
             upstream_section = upstream_section,
         )
     }
@@ -542,7 +550,9 @@ mod tests {
         };
 
         session.write_task_meta("T010", &meta).unwrap();
-        session.write_task_spec("T010", "# Spec\nImplement auth").unwrap();
+        session
+            .write_task_spec("T010", "# Spec\nImplement auth")
+            .unwrap();
         session
             .append_task_progress("T010", "[checkpoint] schema drafted")
             .unwrap();
@@ -571,11 +581,16 @@ mod tests {
     #[test]
     fn test_append_task_progress_appends_instead_of_overwriting() {
         let (session, _tmp) = make_session();
-        session.append_task_progress("T011", "checkpoint one").unwrap();
-        session.append_task_progress("T011", "checkpoint two").unwrap();
-
-        let progress = std::fs::read_to_string(_tmp.path().join("tasks").join("T011").join("progress.md"))
+        session
+            .append_task_progress("T011", "checkpoint one")
             .unwrap();
+        session
+            .append_task_progress("T011", "checkpoint two")
+            .unwrap();
+
+        let progress =
+            std::fs::read_to_string(_tmp.path().join("tasks").join("T011").join("progress.md"))
+                .unwrap();
         assert!(progress.contains("checkpoint one"));
         assert!(progress.contains("checkpoint two"));
         assert_eq!(progress.lines().count(), 2);

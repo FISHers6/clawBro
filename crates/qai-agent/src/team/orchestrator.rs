@@ -21,7 +21,7 @@ use std::sync::Arc;
 use tokio::task::JoinHandle;
 
 use super::heartbeat::DispatchFn;
-use super::milestone::{render_for_im, TeamMilestoneEvent};
+use super::milestone::TeamMilestoneEvent;
 use super::registry::{Task, TaskRegistry};
 use super::session::{TaskArtifactMeta, TeamSession};
 
@@ -101,8 +101,7 @@ pub struct PlannedTask {
 ///
 /// 生产端：将 event 渲染为字符串后推送到 IM channel。
 /// 测试端：收集事件到 Vec 供断言，不涉及任何字符串操作。
-pub type MilestoneFn =
-    Arc<dyn Fn(qai_protocol::SessionKey, TeamMilestoneEvent) + Send + Sync>;
+pub type MilestoneFn = Arc<dyn Fn(qai_protocol::SessionKey, TeamMilestoneEvent) + Send + Sync>;
 
 pub struct TeamOrchestrator {
     pub registry: Arc<TaskRegistry>,
@@ -487,9 +486,7 @@ impl TeamOrchestrator {
         self.sync_task_artifacts(task_id)?;
         let _ = self.session.write_task_result(
             task_id,
-            &format!(
-                "# Result\n\nSubmitted by: {agent}\n\nFinal note:\n{note}\n"
-            ),
+            &format!("# Result\n\nSubmitted by: {agent}\n\nFinal note:\n{note}\n"),
         );
 
         // 2. 事件日志
@@ -555,9 +552,7 @@ impl TeamOrchestrator {
         self.sync_task_artifacts(task_id)?;
         let _ = self.session.write_task_result(
             task_id,
-            &format!(
-                "# Result\n\nSubmitted by: {agent}\n\nSummary:\n{summary}\n"
-            ),
+            &format!("# Result\n\nSubmitted by: {agent}\n\nSummary:\n{summary}\n"),
         );
 
         let event = serde_json::json!({
@@ -592,16 +587,9 @@ impl TeamOrchestrator {
         self.sync_task_artifacts(task_id)?;
         let _ = self.session.append_task_progress(
             task_id,
-            &format!(
-                "[{}] {} accepted submission",
-                Utc::now().to_rfc3339(),
-                by
-            ),
+            &format!("[{}] {} accepted submission", Utc::now().to_rfc3339(), by),
         );
-        let previous = self
-            .session
-            .task_dir(task_id)
-            .join("result.md");
+        let previous = self.session.task_dir(task_id).join("result.md");
         let acceptance_note = format!(
             "\n\n## Acceptance\n\nAccepted by: {by}\nTimestamp: {}\n",
             Utc::now().to_rfc3339()
@@ -699,7 +687,10 @@ impl TeamOrchestrator {
                 summary
             )
         } else {
-            let done_count = tasks.iter().filter(|t| t.status_raw == "done").count();
+            let done_count = tasks
+                .iter()
+                .filter(|t| t.status_raw == "done" || t.status_raw.starts_with("accepted:"))
+                .count();
             let total = tasks.len();
             format!(
                 "[团队通知] 任务 {} 已完成（执行者：{}）\n\n完成摘要：\n{}\n\n当前进度：{} / {} 完成",
@@ -1257,8 +1248,9 @@ mod tests {
         use crate::team::registry::TaskStatus;
         assert!(matches!(task.status_parsed(), TaskStatus::Done));
         assert_eq!(task.completion_note.as_deref(), Some("created jwt.rs"));
-        let result = std::fs::read_to_string(tmp.path().join("tasks").join("T003").join("result.md"))
-            .unwrap();
+        let result =
+            std::fs::read_to_string(tmp.path().join("tasks").join("T003").join("result.md"))
+                .unwrap();
         assert!(result.contains("created jwt.rs"));
         let meta = std::fs::read_to_string(tmp.path().join("tasks").join("T003").join("meta.json"))
             .unwrap();
@@ -1287,8 +1279,9 @@ mod tests {
             TaskStatus::Submitted { ref agent, .. } if agent == "codex"
         ));
         assert_eq!(task.completion_note.as_deref(), Some("ready for review"));
-        let result = std::fs::read_to_string(tmp.path().join("tasks").join("T004").join("result.md"))
-            .unwrap();
+        let result =
+            std::fs::read_to_string(tmp.path().join("tasks").join("T004").join("result.md"))
+                .unwrap();
         assert!(result.contains("ready for review"));
         let meta = std::fs::read_to_string(tmp.path().join("tasks").join("T004").join("meta.json"))
             .unwrap();
@@ -1328,11 +1321,14 @@ mod tests {
 
         let evs = events.lock().unwrap();
         assert!(
-            evs.iter().any(|e| matches!(e, TeamMilestoneEvent::AllTasksDone)),
-            "AllTasksDone event must fire after accept; got: {:?}", evs
+            evs.iter()
+                .any(|e| matches!(e, TeamMilestoneEvent::AllTasksDone)),
+            "AllTasksDone event must fire after accept; got: {:?}",
+            evs
         );
-        let result = std::fs::read_to_string(tmp.path().join("tasks").join("T005").join("result.md"))
-            .unwrap();
+        let result =
+            std::fs::read_to_string(tmp.path().join("tasks").join("T005").join("result.md"))
+                .unwrap();
         assert!(result.contains("Accepted by: claude"));
         let progress =
             std::fs::read_to_string(tmp.path().join("tasks").join("T005").join("progress.md"))
@@ -1365,8 +1361,10 @@ mod tests {
 
         let evs = events.lock().unwrap();
         assert!(
-            evs.iter().any(|e| matches!(e, TeamMilestoneEvent::AllTasksDone)),
-            "AllTasksDone event must fire; got: {:?}", evs
+            evs.iter()
+                .any(|e| matches!(e, TeamMilestoneEvent::AllTasksDone)),
+            "AllTasksDone event must fire; got: {:?}",
+            evs
         );
     }
 
@@ -1489,7 +1487,9 @@ mod tests {
     // 测试仅断言 TeamMilestoneEvent 枚举变体和字段，不依赖 emoji/文案字符串。
     // IM 渲染逻辑由 milestone::render_for_im() 独立测试。
 
-    fn collect_events(orch: &Arc<TeamOrchestrator>) -> Arc<std::sync::Mutex<Vec<TeamMilestoneEvent>>> {
+    fn collect_events(
+        orch: &Arc<TeamOrchestrator>,
+    ) -> Arc<std::sync::Mutex<Vec<TeamMilestoneEvent>>> {
         let events: Arc<std::sync::Mutex<Vec<TeamMilestoneEvent>>> =
             Arc::new(std::sync::Mutex::new(vec![]));
         let evs_clone = Arc::clone(&events);
@@ -1513,7 +1513,8 @@ mod tests {
             })
             .unwrap();
         orch.registry.try_claim("T120", "codex").unwrap();
-        orch.handle_specialist_checkpoint("T120", "codex", "halfway there").unwrap();
+        orch.handle_specialist_checkpoint("T120", "codex", "halfway there")
+            .unwrap();
 
         let evs = events.lock().unwrap();
         assert!(
@@ -1522,7 +1523,8 @@ mod tests {
                 TeamMilestoneEvent::TaskCheckpoint { task_id, agent, note }
                 if task_id == "T120" && agent == "codex" && note == "halfway there"
             )),
-            "checkpoint must emit TaskCheckpoint {{ task_id, agent, note }}; got: {:?}", evs
+            "checkpoint must emit TaskCheckpoint {{ task_id, agent, note }}; got: {:?}",
+            evs
         );
     }
 
@@ -1539,7 +1541,8 @@ mod tests {
             })
             .unwrap();
         orch.registry.try_claim("T121", "codex").unwrap();
-        orch.handle_specialist_submitted("T121", "codex", "added jwt.rs").unwrap();
+        orch.handle_specialist_submitted("T121", "codex", "added jwt.rs")
+            .unwrap();
 
         let evs = events.lock().unwrap();
         assert!(
@@ -1548,7 +1551,8 @@ mod tests {
                 TeamMilestoneEvent::TaskSubmitted { task_id, task_title, agent }
                 if task_id == "T121" && task_title == "Implement JWT" && agent == "codex"
             )),
-            "submit must emit TaskSubmitted {{ task_id, task_title, agent }}; got: {:?}", evs
+            "submit must emit TaskSubmitted {{ task_id, task_title, agent }}; got: {:?}",
+            evs
         );
     }
 
@@ -1565,7 +1569,8 @@ mod tests {
             })
             .unwrap();
         orch.registry.try_claim("T122", "codex").unwrap();
-        orch.handle_specialist_blocked("T122", "codex", "missing dep").unwrap();
+        orch.handle_specialist_blocked("T122", "codex", "missing dep")
+            .unwrap();
 
         let evs = events.lock().unwrap();
         assert!(
@@ -1574,7 +1579,8 @@ mod tests {
                 TeamMilestoneEvent::TaskBlocked { task_id, agent, reason, .. }
                 if task_id == "T122" && agent == "codex" && reason == "missing dep"
             )),
-            "blocked must emit TaskBlocked {{ task_id, agent, reason }}; got: {:?}", evs
+            "blocked must emit TaskBlocked {{ task_id, agent, reason }}; got: {:?}",
+            evs
         );
     }
 
@@ -1599,7 +1605,8 @@ mod tests {
         orch.registry.try_claim("T130", "codex").unwrap();
         let events = collect_events(&orch);
 
-        orch.handle_specialist_done("T130", "codex", "done").unwrap();
+        orch.handle_specialist_done("T130", "codex", "done")
+            .unwrap();
 
         let evs = events.lock().unwrap();
         assert!(
@@ -1614,7 +1621,8 @@ mod tests {
                     && *done_count == 1
                     && *total == 2
             )),
-            "individual done must emit TaskDone with correct progress counts; got: {:?}", evs
+            "individual done must emit TaskDone with correct progress counts; got: {:?}",
+            evs
         );
     }
 
@@ -1670,7 +1678,8 @@ mod tests {
 
         // ── 阶段 1：T_A 完成 ────────────────────────────────────────────────
         orch.registry.try_claim("T_A", "codex").unwrap();
-        orch.handle_specialist_done("T_A", "codex", "db schema created").unwrap();
+        orch.handle_specialist_done("T_A", "codex", "db schema created")
+            .unwrap();
 
         {
             let evs = events.lock().unwrap();
@@ -1680,7 +1689,8 @@ mod tests {
                     TeamMilestoneEvent::TaskDone { task_id, agent, done_count, total, .. }
                     if task_id == "T_A" && agent == "codex" && *done_count == 1 && *total == 2
                 )),
-                "T_A done must emit TaskDone(1/2); got: {:?}", evs
+                "T_A done must emit TaskDone(1/2); got: {:?}",
+                evs
             );
             assert!(
                 evs.iter().any(|e| matches!(
@@ -1688,23 +1698,29 @@ mod tests {
                     TeamMilestoneEvent::TasksUnlocked { task_ids }
                     if task_ids.contains(&"T_B".to_string())
                 )),
-                "T_A done must emit TasksUnlocked([T_B]); got: {:?}", evs
+                "T_A done must emit TasksUnlocked([T_B]); got: {:?}",
+                evs
             );
             assert!(
-                !evs.iter().any(|e| matches!(e, TeamMilestoneEvent::AllTasksDone)),
-                "AllTasksDone must NOT fire before T_B completes; got: {:?}", evs
+                !evs.iter()
+                    .any(|e| matches!(e, TeamMilestoneEvent::AllTasksDone)),
+                "AllTasksDone must NOT fire before T_B completes; got: {:?}",
+                evs
             );
         }
 
         // ── 阶段 2：T_B 完成 ────────────────────────────────────────────────
         orch.registry.try_claim("T_B", "claude").unwrap();
-        orch.handle_specialist_done("T_B", "claude", "data seeded").unwrap();
+        orch.handle_specialist_done("T_B", "claude", "data seeded")
+            .unwrap();
 
         {
             let evs = events.lock().unwrap();
             assert!(
-                evs.iter().any(|e| matches!(e, TeamMilestoneEvent::AllTasksDone)),
-                "AllTasksDone must fire after T_B done; got: {:?}", evs
+                evs.iter()
+                    .any(|e| matches!(e, TeamMilestoneEvent::AllTasksDone)),
+                "AllTasksDone must fire after T_B done; got: {:?}",
+                evs
             );
         }
 
@@ -1729,19 +1745,33 @@ mod tests {
             .unwrap();
         orch.registry.try_claim("SA01", "codex").unwrap();
 
-        orch.handle_specialist_checkpoint("SA01", "codex", "50% done").unwrap();
-        orch.handle_specialist_submitted("SA01", "codex", "auth.rs complete").unwrap();
+        orch.handle_specialist_checkpoint("SA01", "codex", "50% done")
+            .unwrap();
+        orch.handle_specialist_submitted("SA01", "codex", "auth.rs complete")
+            .unwrap();
 
         let evs = events.lock().unwrap();
-        let cp_pos = evs.iter().position(|e| matches!(
-            e, TeamMilestoneEvent::TaskCheckpoint { task_id, .. } if task_id == "SA01"
-        ));
-        let sub_pos = evs.iter().position(|e| matches!(
-            e, TeamMilestoneEvent::TaskSubmitted { task_id, task_title, .. }
-            if task_id == "SA01" && task_title == "Write Auth API"
-        ));
-        assert!(cp_pos.is_some(), "TaskCheckpoint event must exist; got: {:?}", evs);
-        assert!(sub_pos.is_some(), "TaskSubmitted event must exist; got: {:?}", evs);
+        let cp_pos = evs.iter().position(|e| {
+            matches!(
+                e, TeamMilestoneEvent::TaskCheckpoint { task_id, .. } if task_id == "SA01"
+            )
+        });
+        let sub_pos = evs.iter().position(|e| {
+            matches!(
+                e, TeamMilestoneEvent::TaskSubmitted { task_id, task_title, .. }
+                if task_id == "SA01" && task_title == "Write Auth API"
+            )
+        });
+        assert!(
+            cp_pos.is_some(),
+            "TaskCheckpoint event must exist; got: {:?}",
+            evs
+        );
+        assert!(
+            sub_pos.is_some(),
+            "TaskSubmitted event must exist; got: {:?}",
+            evs
+        );
         assert!(
             cp_pos.unwrap() < sub_pos.unwrap(),
             "TaskCheckpoint must precede TaskSubmitted in event stream"
@@ -1763,20 +1793,34 @@ mod tests {
             .unwrap();
         orch.registry.try_claim("BR01", "codex").unwrap();
 
-        orch.handle_specialist_blocked("BR01", "codex", "missing env vars").unwrap();
-        orch.handle_specialist_checkpoint("BR01", "codex", "env vars fixed").unwrap();
+        orch.handle_specialist_blocked("BR01", "codex", "missing env vars")
+            .unwrap();
+        orch.handle_specialist_checkpoint("BR01", "codex", "env vars fixed")
+            .unwrap();
 
         let evs = events.lock().unwrap();
-        let blocked_pos = evs.iter().position(|e| matches!(
-            e, TeamMilestoneEvent::TaskBlocked { task_id, reason, .. }
-            if task_id == "BR01" && reason == "missing env vars"
-        ));
-        let cp_pos = evs.iter().position(|e| matches!(
-            e, TeamMilestoneEvent::TaskCheckpoint { task_id, note, .. }
-            if task_id == "BR01" && note == "env vars fixed"
-        ));
-        assert!(blocked_pos.is_some(), "TaskBlocked event must exist; got: {:?}", evs);
-        assert!(cp_pos.is_some(), "TaskCheckpoint event must exist after blocked; got: {:?}", evs);
+        let blocked_pos = evs.iter().position(|e| {
+            matches!(
+                e, TeamMilestoneEvent::TaskBlocked { task_id, reason, .. }
+                if task_id == "BR01" && reason == "missing env vars"
+            )
+        });
+        let cp_pos = evs.iter().position(|e| {
+            matches!(
+                e, TeamMilestoneEvent::TaskCheckpoint { task_id, note, .. }
+                if task_id == "BR01" && note == "env vars fixed"
+            )
+        });
+        assert!(
+            blocked_pos.is_some(),
+            "TaskBlocked event must exist; got: {:?}",
+            evs
+        );
+        assert!(
+            cp_pos.is_some(),
+            "TaskCheckpoint event must exist after blocked; got: {:?}",
+            evs
+        );
         assert!(
             blocked_pos.unwrap() < cp_pos.unwrap(),
             "TaskBlocked must precede TaskCheckpoint in event stream"

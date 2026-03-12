@@ -150,7 +150,9 @@ pub(crate) fn resolve_turn_routing(
     }
 }
 
-pub(crate) fn resolve_default_roster_match(roster: Option<&AgentRoster>) -> Option<RosterMatchData> {
+pub(crate) fn resolve_default_roster_match(
+    roster: Option<&AgentRoster>,
+) -> Option<RosterMatchData> {
     roster
         .and_then(|r| r.default_agent())
         .map(roster_match_from_entry)
@@ -296,7 +298,10 @@ mod tests {
 
     fn make_orchestrator() -> Arc<TeamOrchestrator> {
         let tmp = tempfile::tempdir().unwrap();
-        let session = Arc::new(TeamSession::from_dir("team-routing", tmp.path().to_path_buf()));
+        let session = Arc::new(TeamSession::from_dir(
+            "team-routing",
+            tmp.path().to_path_buf(),
+        ));
         let registry = Arc::new(TaskRegistry::new_in_memory().unwrap());
         let dispatch: DispatchFn = Arc::new(|_, _| Box::pin(async { Ok(()) }));
         let orch = TeamOrchestrator::new(registry, session, dispatch, Duration::from_secs(60));
@@ -333,10 +338,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(
-            bound.intent.target_backend.as_deref(),
-            Some("claude-main")
-        );
+        assert_eq!(bound.intent.target_backend.as_deref(), Some("claude-main"));
 
         let manual = resolve_turn_routing(
             &inbound("group:route", None),
@@ -372,7 +374,10 @@ mod tests {
 
         assert!(decision.is_lead);
         assert_eq!(decision.agent_role, AgentRole::Lead);
-        assert_eq!(decision.intent.target_backend.as_deref(), Some("claude-main"));
+        assert_eq!(
+            decision.intent.target_backend.as_deref(),
+            Some("claude-main")
+        );
         assert!(decision
             .task_reminder
             .as_deref()
@@ -424,7 +429,10 @@ mod tests {
             Some("task reminder".into()),
         );
 
-        assert_eq!(decision.intent.target_backend.as_deref(), Some("openclaw-main"));
+        assert_eq!(
+            decision.intent.target_backend.as_deref(),
+            Some("openclaw-main")
+        );
         assert_eq!(decision.agent_role, AgentRole::Specialist);
         assert_eq!(decision.task_reminder.as_deref(), Some("task reminder"));
     }

@@ -20,7 +20,7 @@
 use futures_util::{SinkExt, StreamExt};
 use qai_agent::roster::AgentEntry;
 use qai_protocol::{AgentEvent, InboundMsg, MsgContent, SessionKey};
-use qai_runtime::{BackendFamily, BackendSpec, LaunchSpec};
+use qai_runtime::{AcpBackend, ApprovalMode, BackendFamily, BackendSpec, LaunchSpec};
 use qai_server::{
     build_test_state_with_config,
     config::{BackendCatalogEntry, BackendFamilyConfig, BackendLaunchConfig, GatewayConfig},
@@ -158,6 +158,12 @@ async fn test_gateway_e2e_claude_agent() {
             args: vec![],
             env: vec![],
         },
+        external_mcp_servers: vec![],
+        provider_profile: None,
+        acp_backend: None,
+        acp_auth_method: None,
+        codex_projection: None,
+        approval_mode: Default::default(),
     })
     .await
     .expect("Failed to start test gateway with Claude ACP backend");
@@ -220,6 +226,540 @@ async fn test_gateway_e2e_claude_agent() {
     }
 }
 
+/// E2E test: Gateway WS -> codex-acp bridge -> codex CLI -> tool approval -> final reply
+///
+/// Requires:
+/// - `codex` CLI installed and logged in on the local machine
+/// - network access for `npx @zed-industries/codex-acp@0.9.5`
+///
+/// To run:
+///   cargo test -p qai-server --test e2e_gateway -- test_gateway_e2e_codex_bridge --ignored --nocapture
+#[tokio::test]
+#[ignore = "requires codex CLI authenticated locally and codex-acp bridge via npx"]
+async fn test_gateway_e2e_codex_bridge() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let workspace = std::env::current_dir()
+        .expect("current dir")
+        .canonicalize()
+        .expect("canonical workspace");
+
+    let mut cfg = GatewayConfig::default();
+    cfg.gateway.default_workspace = Some(workspace.clone());
+    cfg.agent.backend_id = "codex-main".to_string();
+    let (acp_auth_method, launch_env) = if let Ok(api_key) = std::env::var("OPENAI_API_KEY") {
+        if api_key.is_empty() {
+            panic!("OPENAI_API_KEY is set but empty");
+        }
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("OPENAI_API_KEY".into(), api_key);
+        (
+            Some(qai_server::config::AcpAuthMethodConfig::OpenaiApiKey),
+            env,
+        )
+    } else if let Ok(api_key) = std::env::var("CODEX_API_KEY") {
+        if api_key.is_empty() {
+            panic!("CODEX_API_KEY is set but empty");
+        }
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("CODEX_API_KEY".into(), api_key);
+        (
+            Some(qai_server::config::AcpAuthMethodConfig::CodexApiKey),
+            env,
+        )
+    } else {
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("HOME".into(), "/Users/fishers".into());
+        (Some(qai_server::config::AcpAuthMethodConfig::Chatgpt), env)
+    };
+    cfg.backends.push(BackendCatalogEntry {
+        id: "codex-main".into(),
+        family: BackendFamilyConfig::Acp,
+        adapter_key: None,
+        acp_backend: Some(qai_server::config::AcpBackendConfig::Codex),
+        acp_auth_method,
+        codex: None,
+        provider_profile: None,
+        approval: Default::default(),
+        external_mcp_servers: vec![],
+        launch: BackendLaunchConfig::Command {
+            command: "npx".into(),
+            args: vec!["--yes".into(), "@zed-industries/codex-acp@0.9.5".into()],
+            env: launch_env,
+        },
+    });
+
+    let addr = start_test_gateway_with_config(cfg)
+        .await
+        .expect("Failed to start test gateway with Codex ACP backend");
+
+    let (mut ws_write, mut ws_read) = connect_ws(addr).await;
+    let session_key = SessionKey::new("ws", "e2e_codex_bridge_user");
+    subscribe_ws(&mut ws_write, &session_key).await;
+
+    let inbound = InboundMsg {
+        id: uuid::Uuid::new_v4().to_string(),
+        session_key: session_key.clone(),
+        content: MsgContent::text("Reply with exactly the word: PONG"),
+        sender: "e2e_codex_bridge_user".to_string(),
+        channel: "ws".to_string(),
+        timestamp: chrono::Utc::now(),
+        thread_ts: None,
+        target_agent: None,
+        source: qai_protocol::MsgSource::Human,
+    };
+    send_inbound(&mut ws_write, &inbound).await;
+
+    let result = tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            match next_event(&mut ws_read, 120).await {
+                AgentEvent::TurnComplete { full_text, .. } => break full_text,
+                AgentEvent::ApprovalRequest { approval_id, .. } => {
+                    let resolve = serde_json::json!({
+                        "type": "ResolveApproval",
+                        "approval_id": approval_id,
+                        "decision": "allow-once",
+                    })
+                    .to_string();
+                    ws_write
+                        .send(WsMsg::Text(resolve.into()))
+                        .await
+                        .expect("WS codex text-turn resolve failed");
+                }
+                AgentEvent::TextDelta { .. }
+                | AgentEvent::Thinking { .. }
+                | AgentEvent::ToolCallStart { .. }
+                | AgentEvent::ToolCallResult { .. }
+                | AgentEvent::ToolCallFailed { .. } => {}
+                other => panic!("unexpected event during codex text turn: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for codex text turn");
+    assert!(
+        result.trim().contains("PONG"),
+        "expected PONG-like reply, got: {result}"
+    );
+
+    let proof = format!("CODEX_BRIDGE_PROOF_{}", uuid::Uuid::new_v4().simple());
+    let proof_path = std::env::temp_dir().join("qai-codex-e2e-proof.txt");
+    std::fs::write(&proof_path, &proof).expect("write proof file");
+
+    let tool_inbound = InboundMsg {
+        id: uuid::Uuid::new_v4().to_string(),
+        session_key: session_key.clone(),
+        content: MsgContent::text(format!(
+            "Read the file {} and reply with its exact contents only.",
+            proof_path.display()
+        )),
+        sender: "e2e_codex_bridge_user".to_string(),
+        channel: "ws".to_string(),
+        timestamp: chrono::Utc::now(),
+        thread_ts: None,
+        target_agent: None,
+        source: qai_protocol::MsgSource::Human,
+    };
+    send_inbound(&mut ws_write, &tool_inbound).await;
+
+    let approval_id = loop {
+        match next_event(&mut ws_read, 120).await {
+            AgentEvent::ApprovalRequest { approval_id, .. } => break approval_id,
+            AgentEvent::TextDelta { .. }
+            | AgentEvent::Thinking { .. }
+            | AgentEvent::ToolCallStart { .. }
+            | AgentEvent::ToolCallResult { .. } => {}
+            other => panic!("unexpected event before codex approval: {other:?}"),
+        }
+    };
+
+    let resolve = serde_json::json!({
+        "type": "ResolveApproval",
+        "approval_id": approval_id,
+        "decision": "allow-once",
+    })
+    .to_string();
+    ws_write
+        .send(WsMsg::Text(resolve.into()))
+        .await
+        .expect("WS codex resolve failed");
+
+    let final_text = tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            match next_event(&mut ws_read, 120).await {
+                AgentEvent::TurnComplete { full_text, .. } => break full_text,
+                AgentEvent::TextDelta { .. }
+                | AgentEvent::Thinking { .. }
+                | AgentEvent::ToolCallStart { .. }
+                | AgentEvent::ToolCallResult { .. }
+                | AgentEvent::ToolCallFailed { .. } => {}
+                other => panic!("unexpected event after codex approval: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for codex tool turn");
+
+    assert!(
+        final_text.contains(&proof),
+        "expected final codex reply to contain proof token, got: {final_text}"
+    );
+}
+
+/// E2E test: Gateway WS -> codex-acp bridge -> Codex local_config_projection ->
+/// DeepSeek OpenAI-compatible provider -> tool approval -> final reply
+///
+/// Requires:
+/// - `codex` CLI installed locally
+/// - `DEEPSEEK_API_KEY` set to a valid key
+/// - network access for `npx @zed-industries/codex-acp@0.9.5`
+///
+/// To run:
+///   DEEPSEEK_API_KEY=sk-xxx \
+///   cargo test -p qai-server --test e2e_gateway -- test_gateway_e2e_codex_local_config_deepseek --ignored --nocapture
+#[tokio::test]
+#[ignore = "requires codex CLI plus DEEPSEEK_API_KEY for local_config_projection"]
+async fn test_gateway_e2e_codex_local_config_deepseek() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let api_key = match std::env::var("DEEPSEEK_API_KEY") {
+        Ok(k) if !k.is_empty() => k,
+        _ => {
+            eprintln!(
+                "SKIP test_gateway_e2e_codex_local_config_deepseek: DEEPSEEK_API_KEY not set"
+            );
+            return;
+        }
+    };
+    let _ = api_key;
+
+    let workspace = std::env::current_dir()
+        .expect("current dir")
+        .canonicalize()
+        .expect("canonical workspace");
+
+    let mut cfg = GatewayConfig::default();
+    cfg.gateway.default_workspace = Some(workspace.clone());
+    cfg.agent.backend_id = "codex-main".to_string();
+    cfg.provider_profiles
+        .push(qai_server::config::ProviderProfileConfig {
+            id: "deepseek-openai".into(),
+            protocol: qai_server::config::ProviderProfileProtocolConfig::OpenaiCompatible {
+                base_url: "https://api.deepseek.com/v1".into(),
+                auth_token_env: "DEEPSEEK_API_KEY".into(),
+                default_model: "deepseek-chat".into(),
+            },
+        });
+    cfg.backends.push(BackendCatalogEntry {
+        id: "codex-main".into(),
+        family: BackendFamilyConfig::Acp,
+        adapter_key: None,
+        acp_backend: Some(qai_server::config::AcpBackendConfig::Codex),
+        acp_auth_method: None,
+        codex: Some(qai_server::config::BackendCodexConfig {
+            projection: qai_runtime::CodexProjectionMode::LocalConfig,
+        }),
+        provider_profile: Some("deepseek-openai".into()),
+        approval: Default::default(),
+        external_mcp_servers: vec![],
+        launch: BackendLaunchConfig::Command {
+            command: "npx".into(),
+            args: vec!["--yes".into(), "@zed-industries/codex-acp@0.9.5".into()],
+            env: std::collections::BTreeMap::new(),
+        },
+    });
+
+    let addr = start_test_gateway_with_config(cfg)
+        .await
+        .expect("Failed to start test gateway with Codex local_config backend");
+
+    let (mut ws_write, mut ws_read) = connect_ws(addr).await;
+    let session_key = SessionKey::new("ws", "e2e_codex_local_config_user");
+    subscribe_ws(&mut ws_write, &session_key).await;
+
+    let inbound = InboundMsg {
+        id: uuid::Uuid::new_v4().to_string(),
+        session_key: session_key.clone(),
+        content: MsgContent::text("Reply with exactly the word: PONG"),
+        sender: "e2e_codex_local_config_user".to_string(),
+        channel: "ws".to_string(),
+        timestamp: chrono::Utc::now(),
+        thread_ts: None,
+        target_agent: None,
+        source: qai_protocol::MsgSource::Human,
+    };
+    send_inbound(&mut ws_write, &inbound).await;
+
+    let result = tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            match next_event(&mut ws_read, 120).await {
+                AgentEvent::TurnComplete { full_text, .. } => break full_text,
+                AgentEvent::ApprovalRequest { approval_id, .. } => {
+                    let resolve = serde_json::json!({
+                        "type": "ResolveApproval",
+                        "approval_id": approval_id,
+                        "decision": "allow-once",
+                    })
+                    .to_string();
+                    ws_write
+                        .send(WsMsg::Text(resolve.into()))
+                        .await
+                        .expect("WS codex local_config text-turn resolve failed");
+                }
+                AgentEvent::TextDelta { .. }
+                | AgentEvent::Thinking { .. }
+                | AgentEvent::ToolCallStart { .. }
+                | AgentEvent::ToolCallResult { .. }
+                | AgentEvent::ToolCallFailed { .. } => {}
+                other => panic!("unexpected event during codex local_config text turn: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for codex local_config text turn");
+    assert!(
+        result.trim().contains("PONG"),
+        "expected PONG-like reply, got: {result}"
+    );
+
+    let proof = format!("CODEX_LOCAL_CONFIG_PROOF_{}", uuid::Uuid::new_v4().simple());
+    let proof_path = std::env::temp_dir().join("qai-codex-local-config-proof.txt");
+    std::fs::write(&proof_path, &proof).expect("write proof file");
+
+    let tool_inbound = InboundMsg {
+        id: uuid::Uuid::new_v4().to_string(),
+        session_key: session_key.clone(),
+        content: MsgContent::text(format!(
+            "Read the file {} and reply with its exact contents only.",
+            proof_path.display()
+        )),
+        sender: "e2e_codex_local_config_user".to_string(),
+        channel: "ws".to_string(),
+        timestamp: chrono::Utc::now(),
+        thread_ts: None,
+        target_agent: None,
+        source: qai_protocol::MsgSource::Human,
+    };
+    send_inbound(&mut ws_write, &tool_inbound).await;
+
+    let approval_id = loop {
+        match next_event(&mut ws_read, 120).await {
+            AgentEvent::ApprovalRequest { approval_id, .. } => break approval_id,
+            AgentEvent::TextDelta { .. }
+            | AgentEvent::Thinking { .. }
+            | AgentEvent::ToolCallStart { .. }
+            | AgentEvent::ToolCallResult { .. } => {}
+            other => panic!("unexpected event before codex local_config approval: {other:?}"),
+        }
+    };
+
+    let resolve = serde_json::json!({
+        "type": "ResolveApproval",
+        "approval_id": approval_id,
+        "decision": "allow-once",
+    })
+    .to_string();
+    ws_write
+        .send(WsMsg::Text(resolve.into()))
+        .await
+        .expect("WS codex local_config resolve failed");
+
+    let final_text = tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            match next_event(&mut ws_read, 120).await {
+                AgentEvent::TurnComplete { full_text, .. } => break full_text,
+                AgentEvent::TextDelta { .. }
+                | AgentEvent::Thinking { .. }
+                | AgentEvent::ToolCallStart { .. }
+                | AgentEvent::ToolCallResult { .. }
+                | AgentEvent::ToolCallFailed { .. } => {}
+                other => panic!("unexpected event after codex local_config approval: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for codex local_config tool turn");
+
+    assert!(
+        final_text.contains(&proof),
+        "expected final codex local_config reply to contain proof token, got: {final_text}"
+    );
+}
+
+/// Run manually with:
+///   AICODEWITH_API_KEY=... cargo test -p qai-server --test e2e_gateway -- test_gateway_e2e_codex_local_config_aicodewith --ignored --nocapture
+#[tokio::test]
+#[ignore = "requires codex CLI plus AICODEWITH_API_KEY for local_config_projection"]
+async fn test_gateway_e2e_codex_local_config_aicodewith() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+
+    let api_key = match std::env::var("AICODEWITH_API_KEY") {
+        Ok(k) if !k.is_empty() => k,
+        _ => {
+            eprintln!(
+                "SKIP test_gateway_e2e_codex_local_config_aicodewith: AICODEWITH_API_KEY not set"
+            );
+            return;
+        }
+    };
+    let _ = api_key;
+
+    let workspace = std::env::current_dir()
+        .expect("current dir")
+        .canonicalize()
+        .expect("canonical workspace");
+
+    let mut cfg = GatewayConfig::default();
+    cfg.gateway.default_workspace = Some(workspace.clone());
+    cfg.agent.backend_id = "codex-main".to_string();
+    cfg.provider_profiles
+        .push(qai_server::config::ProviderProfileConfig {
+            id: "aicodewith-openai".into(),
+            protocol: qai_server::config::ProviderProfileProtocolConfig::OpenaiCompatible {
+                base_url: "https://api.aicodewith.com/chatgpt/v1".into(),
+                auth_token_env: "AICODEWITH_API_KEY".into(),
+                default_model: "gpt-5.3-codex".into(),
+            },
+        });
+    cfg.backends.push(BackendCatalogEntry {
+        id: "codex-main".into(),
+        family: BackendFamilyConfig::Acp,
+        adapter_key: None,
+        acp_backend: Some(qai_server::config::AcpBackendConfig::Codex),
+        // local_config projection pre-writes CODEX_HOME/auth.json and also injects
+        // OPENAI_API_KEY into the child process env so that the authenticate() call
+        // (openai_api_key) can confirm auth to codex-acp before it starts processing.
+        acp_auth_method: Some(qai_server::config::AcpAuthMethodConfig::OpenaiApiKey),
+        codex: Some(qai_server::config::BackendCodexConfig {
+            projection: qai_runtime::CodexProjectionMode::LocalConfig,
+        }),
+        provider_profile: Some("aicodewith-openai".into()),
+        approval: Default::default(),
+        external_mcp_servers: vec![],
+        launch: BackendLaunchConfig::Command {
+            command: "npx".into(),
+            args: vec!["--yes".into(), "@zed-industries/codex-acp".into()],
+            env: std::collections::BTreeMap::new(),
+        },
+    });
+
+    let addr = start_test_gateway_with_config(cfg)
+        .await
+        .expect("Failed to start test gateway with Codex local_config backend");
+
+    let (mut ws_write, mut ws_read) = connect_ws(addr).await;
+    // Use a unique session key per test run to ensure new_session() is always called
+    // instead of load_session() with a stale prior session ID.
+    let session_key = SessionKey::new(
+        "ws",
+        format!("e2e_codex_aicodewith_{}", uuid::Uuid::new_v4().simple()),
+    );
+    subscribe_ws(&mut ws_write, &session_key).await;
+
+    let inbound = InboundMsg {
+        id: uuid::Uuid::new_v4().to_string(),
+        session_key: session_key.clone(),
+        content: MsgContent::text("Reply with exactly the word: PONG"),
+        sender: "e2e_codex_local_config_aicodewith_user".to_string(),
+        channel: "ws".to_string(),
+        timestamp: chrono::Utc::now(),
+        thread_ts: None,
+        target_agent: None,
+        source: qai_protocol::MsgSource::Human,
+    };
+    send_inbound(&mut ws_write, &inbound).await;
+
+    let result = tokio::time::timeout(Duration::from_secs(240), async {
+        loop {
+            match next_event(&mut ws_read, 240).await {
+                AgentEvent::TurnComplete { full_text, .. } => break full_text,
+                AgentEvent::ApprovalRequest { approval_id, .. } => {
+                    let resolve = serde_json::json!({
+                        "type": "ResolveApproval",
+                        "approval_id": approval_id,
+                        "decision": "allow-once",
+                    })
+                    .to_string();
+                    ws_write
+                        .send(WsMsg::Text(resolve.into()))
+                        .await
+                        .expect("WS codex aicodewith text-turn resolve failed");
+                }
+                AgentEvent::TextDelta { .. }
+                | AgentEvent::Thinking { .. }
+                | AgentEvent::ToolCallStart { .. }
+                | AgentEvent::ToolCallResult { .. }
+                | AgentEvent::ToolCallFailed { .. } => {}
+                other => panic!("unexpected event during codex aicodewith text turn: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for codex aicodewith text turn");
+    assert!(
+        result.trim().contains("PONG"),
+        "expected PONG-like reply, got: {result}"
+    );
+
+    let proof = format!("CODEX_AICODEWITH_PROOF_{}", uuid::Uuid::new_v4().simple());
+    let proof_path = std::env::temp_dir().join("qai-codex-aicodewith-proof.txt");
+    std::fs::write(&proof_path, &proof).expect("write proof file");
+
+    let tool_inbound = InboundMsg {
+        id: uuid::Uuid::new_v4().to_string(),
+        session_key: session_key.clone(),
+        content: MsgContent::text(format!(
+            "Read the file {} and reply with its exact contents only.",
+            proof_path.display()
+        )),
+        sender: "e2e_codex_local_config_aicodewith_user".to_string(),
+        channel: "ws".to_string(),
+        timestamp: chrono::Utc::now(),
+        thread_ts: None,
+        target_agent: None,
+        source: qai_protocol::MsgSource::Human,
+    };
+    send_inbound(&mut ws_write, &tool_inbound).await;
+
+    // codex-acp may or may not call request_permission for file reads depending
+    // on its internal policy. Handle both: approval-gated and auto-approved paths.
+    let final_text = tokio::time::timeout(Duration::from_secs(240), async {
+        loop {
+            match next_event(&mut ws_read, 240).await {
+                AgentEvent::TurnComplete { full_text, .. } => break full_text,
+                AgentEvent::ApprovalRequest { approval_id, .. } => {
+                    let resolve = serde_json::json!({
+                        "type": "ResolveApproval",
+                        "approval_id": approval_id,
+                        "decision": "allow-once",
+                    })
+                    .to_string();
+                    ws_write
+                        .send(WsMsg::Text(resolve.into()))
+                        .await
+                        .expect("WS codex aicodewith resolve failed");
+                }
+                AgentEvent::TextDelta { .. }
+                | AgentEvent::Thinking { .. }
+                | AgentEvent::ToolCallStart { .. }
+                | AgentEvent::ToolCallResult { .. }
+                | AgentEvent::ToolCallFailed { .. } => {}
+                other => panic!("unexpected event during codex aicodewith tool turn: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for codex aicodewith tool turn");
+
+    assert!(
+        final_text.contains(&proof),
+        "expected final codex aicodewith reply to contain proof token, got: {final_text}"
+    );
+}
+
 #[tokio::test]
 async fn test_gateway_ws_inbound_auto_subscribes_socket_to_session() {
     let fixture = native_echo_fixture_bin();
@@ -232,6 +772,12 @@ async fn test_gateway_ws_inbound_auto_subscribes_socket_to_session() {
             args: vec![],
             env: vec![],
         },
+        external_mcp_servers: vec![],
+        provider_profile: None,
+        acp_backend: None,
+        acp_auth_method: None,
+        codex_projection: None,
+        approval_mode: Default::default(),
     })
     .await
     .expect("Failed to start gateway with native echo fixture");
@@ -495,6 +1041,12 @@ async fn test_gateway_e2e_custom_acp_approval_via_ws_resolution() {
             args: vec![],
             env: vec![],
         },
+        external_mcp_servers: vec![],
+        provider_profile: None,
+        acp_backend: None,
+        acp_auth_method: None,
+        codex_projection: None,
+        approval_mode: Default::default(),
     })
     .await
     .expect("Failed to start gateway with approval fixture");
@@ -573,6 +1125,12 @@ async fn test_gateway_e2e_custom_acp_approval_via_slash_command() {
             args: vec![],
             env: vec![],
         },
+        external_mcp_servers: vec![],
+        provider_profile: None,
+        acp_backend: None,
+        acp_auth_method: None,
+        codex_projection: None,
+        approval_mode: Default::default(),
     })
     .await
     .expect("Failed to start gateway with approval fixture");
@@ -644,6 +1202,66 @@ async fn test_gateway_e2e_custom_acp_approval_via_slash_command() {
 }
 
 #[tokio::test]
+async fn test_gateway_e2e_codex_auto_allow_projects_mode_on_new_and_load_session() {
+    let fixture = approval_fixture_bin();
+    let addr = start_test_gateway_with_backend(BackendSpec {
+        backend_id: "codex-fixture".to_string(),
+        family: BackendFamily::Acp,
+        adapter_key: "acp".into(),
+        launch: LaunchSpec::Command {
+            command: fixture,
+            args: vec![],
+            env: vec![],
+        },
+        external_mcp_servers: vec![],
+        provider_profile: None,
+        acp_backend: Some(AcpBackend::Codex),
+        acp_auth_method: None,
+        codex_projection: None,
+        approval_mode: ApprovalMode::AutoAllow,
+    })
+    .await
+    .expect("Failed to start gateway with codex approval fixture");
+
+    let (mut ws_write, mut ws_read) = connect_ws(addr).await;
+    let session_key = SessionKey::new("ws", "codex-auto-allow");
+    subscribe_ws(&mut ws_write, &session_key).await;
+
+    for turn_idx in 0..2 {
+        let inbound = InboundMsg {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_key: session_key.clone(),
+            content: MsgContent::text(format!("turn-{turn_idx}")),
+            sender: "codex-auto-allow".to_string(),
+            channel: "ws".to_string(),
+            timestamp: chrono::Utc::now(),
+            thread_ts: None,
+            target_agent: None,
+            source: qai_protocol::MsgSource::Human,
+        };
+        send_inbound(&mut ws_write, &inbound).await;
+
+        loop {
+            match next_event(&mut ws_read, 20).await {
+                AgentEvent::TurnComplete { full_text, .. } => {
+                    assert_eq!(full_text, "fixture full-access:0");
+                    break;
+                }
+                AgentEvent::ApprovalRequest { .. } => {
+                    panic!("codex auto-allow turn {turn_idx} should not request approval")
+                }
+                AgentEvent::TextDelta { .. }
+                | AgentEvent::Thinking { .. }
+                | AgentEvent::ToolCallStart { .. }
+                | AgentEvent::ToolCallResult { .. }
+                | AgentEvent::ToolCallFailed { .. } => {}
+                other => panic!("unexpected event during codex auto-allow turn: {other:?}"),
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn test_gateway_e2e_mixed_backends_route_by_target_agent() {
     let native_bin = native_echo_fixture_bin();
     let acp_bin = acp_echo_fixture_bin();
@@ -652,9 +1270,15 @@ async fn test_gateway_e2e_mixed_backends_route_by_target_agent() {
     cfg.agent.backend_id = "native-main".to_string();
     cfg.backends = vec![
         BackendCatalogEntry {
+            acp_backend: None,
+            acp_auth_method: None,
+            codex: None,
+            provider_profile: None,
+            approval: Default::default(),
             id: "native-main".into(),
             family: BackendFamilyConfig::QuickAiNative,
             adapter_key: None,
+            external_mcp_servers: vec![],
             launch: BackendLaunchConfig::Command {
                 command: native_bin,
                 args: vec![],
@@ -662,9 +1286,15 @@ async fn test_gateway_e2e_mixed_backends_route_by_target_agent() {
             },
         },
         BackendCatalogEntry {
+            acp_backend: None,
+            acp_auth_method: None,
+            codex: None,
+            provider_profile: None,
+            approval: Default::default(),
             id: "acp-main".into(),
             family: BackendFamilyConfig::Acp,
             adapter_key: None,
+            external_mcp_servers: vec![],
             launch: BackendLaunchConfig::Command {
                 command: acp_bin,
                 args: vec![],
@@ -757,9 +1387,15 @@ async fn test_gateway_e2e_native_team_pipeline() {
     cfg.agent.backend_id = "leader-main".to_string();
     cfg.backends = vec![
         BackendCatalogEntry {
+            acp_backend: None,
+            acp_auth_method: None,
+            codex: None,
+            provider_profile: None,
+            approval: Default::default(),
             id: "leader-main".into(),
             family: BackendFamilyConfig::QuickAiNative,
             adapter_key: None,
+            external_mcp_servers: vec![],
             launch: BackendLaunchConfig::Command {
                 command: fixture.clone(),
                 args: vec![],
@@ -767,9 +1403,15 @@ async fn test_gateway_e2e_native_team_pipeline() {
             },
         },
         BackendCatalogEntry {
+            acp_backend: None,
+            acp_auth_method: None,
+            codex: None,
+            provider_profile: None,
+            approval: Default::default(),
             id: "worker-main".into(),
             family: BackendFamilyConfig::QuickAiNative,
             adapter_key: None,
+            external_mcp_servers: vec![],
             launch: BackendLaunchConfig::Command {
                 command: fixture,
                 args: vec![],
@@ -865,9 +1507,15 @@ async fn test_gateway_e2e_mixed_team_native_leader_acp_specialist() {
     cfg.agent.backend_id = "leader-main".to_string();
     cfg.backends = vec![
         BackendCatalogEntry {
+            acp_backend: None,
+            acp_auth_method: None,
+            codex: None,
+            provider_profile: None,
+            approval: Default::default(),
             id: "leader-main".into(),
             family: BackendFamilyConfig::QuickAiNative,
             adapter_key: None,
+            external_mcp_servers: vec![],
             launch: BackendLaunchConfig::Command {
                 command: leader_fixture,
                 args: vec![],
@@ -875,9 +1523,15 @@ async fn test_gateway_e2e_mixed_team_native_leader_acp_specialist() {
             },
         },
         BackendCatalogEntry {
+            acp_backend: None,
+            acp_auth_method: None,
+            codex: None,
+            provider_profile: None,
+            approval: Default::default(),
             id: "worker-main".into(),
             family: BackendFamilyConfig::Acp,
             adapter_key: None,
+            external_mcp_servers: vec![],
             launch: BackendLaunchConfig::Command {
                 command: worker_fixture,
                 args: vec![],
@@ -974,9 +1628,15 @@ async fn test_gateway_e2e_mixed_team_native_leader_openclaw_specialist() {
     cfg.agent.backend_id = "leader-main".to_string();
     cfg.backends = vec![
         BackendCatalogEntry {
+            acp_backend: None,
+            acp_auth_method: None,
+            codex: None,
+            provider_profile: None,
+            approval: Default::default(),
             id: "leader-main".into(),
             family: BackendFamilyConfig::QuickAiNative,
             adapter_key: None,
+            external_mcp_servers: vec![],
             launch: BackendLaunchConfig::Command {
                 command: leader_fixture,
                 args: vec![],
@@ -984,9 +1644,15 @@ async fn test_gateway_e2e_mixed_team_native_leader_openclaw_specialist() {
             },
         },
         BackendCatalogEntry {
+            acp_backend: None,
+            acp_auth_method: None,
+            codex: None,
+            provider_profile: None,
+            approval: Default::default(),
             id: "worker-openclaw".into(),
             family: BackendFamilyConfig::OpenClawGateway,
             adapter_key: None,
+            external_mcp_servers: vec![],
             launch: BackendLaunchConfig::GatewayWs {
                 endpoint: openclaw.endpoint.clone(),
                 token: None,
@@ -1100,9 +1766,15 @@ async fn test_gateway_e2e_mixed_team_openclaw_leader_native_specialist() {
     cfg.agent.backend_id = "leader-openclaw".to_string();
     cfg.backends = vec![
         BackendCatalogEntry {
+            acp_backend: None,
+            acp_auth_method: None,
+            codex: None,
+            provider_profile: None,
+            approval: Default::default(),
             id: "leader-openclaw".into(),
             family: BackendFamilyConfig::OpenClawGateway,
             adapter_key: None,
+            external_mcp_servers: vec![],
             launch: BackendLaunchConfig::GatewayWs {
                 endpoint: openclaw.endpoint.clone(),
                 token: None,
@@ -1116,9 +1788,15 @@ async fn test_gateway_e2e_mixed_team_openclaw_leader_native_specialist() {
             },
         },
         BackendCatalogEntry {
+            acp_backend: None,
+            acp_auth_method: None,
+            codex: None,
+            provider_profile: None,
+            approval: Default::default(),
             id: "worker-native".into(),
             family: BackendFamilyConfig::QuickAiNative,
             adapter_key: None,
+            external_mcp_servers: vec![],
             launch: BackendLaunchConfig::Command {
                 command: specialist_fixture,
                 args: vec![],
@@ -1221,9 +1899,15 @@ async fn test_gateway_e2e_mixed_team_openclaw_leader_acp_specialist() {
     cfg.agent.backend_id = "leader-openclaw".to_string();
     cfg.backends = vec![
         BackendCatalogEntry {
+            acp_backend: None,
+            acp_auth_method: None,
+            codex: None,
+            provider_profile: None,
+            approval: Default::default(),
             id: "leader-openclaw".into(),
             family: BackendFamilyConfig::OpenClawGateway,
             adapter_key: None,
+            external_mcp_servers: vec![],
             launch: BackendLaunchConfig::GatewayWs {
                 endpoint: openclaw.endpoint.clone(),
                 token: None,
@@ -1237,9 +1921,15 @@ async fn test_gateway_e2e_mixed_team_openclaw_leader_acp_specialist() {
             },
         },
         BackendCatalogEntry {
+            acp_backend: None,
+            acp_auth_method: None,
+            codex: None,
+            provider_profile: None,
+            approval: Default::default(),
             id: "worker-acp".into(),
             family: BackendFamilyConfig::Acp,
             adapter_key: None,
+            external_mcp_servers: vec![],
             launch: BackendLaunchConfig::Command {
                 command: specialist_fixture,
                 args: vec![],
@@ -1341,9 +2031,15 @@ async fn test_registry_mixed_team_native_leader_acp_specialist_pipeline() {
     cfg.agent.backend_id = "leader-main".to_string();
     cfg.backends = vec![
         BackendCatalogEntry {
+            acp_backend: None,
+            acp_auth_method: None,
+            codex: None,
+            provider_profile: None,
+            approval: Default::default(),
             id: "leader-main".into(),
             family: BackendFamilyConfig::QuickAiNative,
             adapter_key: None,
+            external_mcp_servers: vec![],
             launch: BackendLaunchConfig::Command {
                 command: leader_fixture,
                 args: vec![],
@@ -1351,9 +2047,15 @@ async fn test_registry_mixed_team_native_leader_acp_specialist_pipeline() {
             },
         },
         BackendCatalogEntry {
+            acp_backend: None,
+            acp_auth_method: None,
+            codex: None,
+            provider_profile: None,
+            approval: Default::default(),
             id: "worker-main".into(),
             family: BackendFamilyConfig::Acp,
             adapter_key: None,
+            external_mcp_servers: vec![],
             launch: BackendLaunchConfig::Command {
                 command: worker_fixture,
                 args: vec![],
@@ -1463,9 +2165,15 @@ async fn test_registry_mixed_team_native_leader_openclaw_specialist_pipeline() {
     cfg.agent.backend_id = "leader-main".to_string();
     cfg.backends = vec![
         BackendCatalogEntry {
+            acp_backend: None,
+            acp_auth_method: None,
+            codex: None,
+            provider_profile: None,
+            approval: Default::default(),
             id: "leader-main".into(),
             family: BackendFamilyConfig::QuickAiNative,
             adapter_key: None,
+            external_mcp_servers: vec![],
             launch: BackendLaunchConfig::Command {
                 command: leader_fixture,
                 args: vec![],
@@ -1473,9 +2181,15 @@ async fn test_registry_mixed_team_native_leader_openclaw_specialist_pipeline() {
             },
         },
         BackendCatalogEntry {
+            acp_backend: None,
+            acp_auth_method: None,
+            codex: None,
+            provider_profile: None,
+            approval: Default::default(),
             id: "worker-openclaw".into(),
             family: BackendFamilyConfig::OpenClawGateway,
             adapter_key: None,
+            external_mcp_servers: vec![],
             launch: BackendLaunchConfig::GatewayWs {
                 endpoint: openclaw.endpoint.clone(),
                 token: None,

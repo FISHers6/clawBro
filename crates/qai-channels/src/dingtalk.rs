@@ -9,6 +9,8 @@ use chrono::Utc;
 use futures::{SinkExt, StreamExt};
 use qai_protocol::{InboundMsg, MsgContent, OutboundMsg, SessionKey};
 use serde::Deserialize;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMsg;
 use uuid::Uuid;
@@ -63,6 +65,8 @@ pub struct DingTalkChannel {
     config: DingTalkConfig,
     client: reqwest::Client,
     require_mention_in_groups: bool,
+    /// Cached (token, fetch_time). DingTalk tokens are valid for 7200s; we refresh at 7000s.
+    token_cache: Mutex<Option<(String, Instant)>>,
 }
 
 impl DingTalkChannel {
@@ -71,10 +75,22 @@ impl DingTalkChannel {
             config,
             client: reqwest::Client::new(),
             require_mention_in_groups,
+            token_cache: Mutex::new(None),
         }
     }
 
     async fn get_access_token(&self) -> Result<String> {
+        const TOKEN_TTL: Duration = Duration::from_secs(7000);
+        // Check cache under a short-lived lock
+        {
+            let cache = self.token_cache.lock().unwrap();
+            if let Some((token, fetched_at)) = cache.as_ref() {
+                if fetched_at.elapsed() < TOKEN_TTL {
+                    return Ok(token.clone());
+                }
+            }
+        }
+        // Fetch a fresh token
         #[derive(Deserialize)]
         struct TokenResp {
             access_token: String,
@@ -91,7 +107,9 @@ impl DingTalkChannel {
             .error_for_status()?
             .json()
             .await?;
-        Ok(resp.access_token)
+        let token = resp.access_token;
+        *self.token_cache.lock().unwrap() = Some((token.clone(), Instant::now()));
+        Ok(token)
     }
 }
 

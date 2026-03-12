@@ -1,5 +1,5 @@
-use std::path::PathBuf;
 use qai_session::ToolCallRecord;
+use std::path::PathBuf;
 use uuid::Uuid;
 
 /// Agent 在团队中的角色（决定 SystemPromptBuilder 的行为）
@@ -46,6 +46,8 @@ pub struct AgentCtx {
     pub agent_memory: Option<String>,
     /// Canonical team manifest for lead/specialist turns.
     pub team_manifest: Option<String>,
+    /// ACP backend session ID for resuming a previous session.
+    pub backend_session_id: Option<String>,
 }
 
 impl Default for AgentCtx {
@@ -68,6 +70,7 @@ impl Default for AgentCtx {
             shared_memory: None,
             agent_memory: None,
             team_manifest: None,
+            backend_session_id: None,
         }
     }
 }

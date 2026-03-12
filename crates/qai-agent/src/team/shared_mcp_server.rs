@@ -40,7 +40,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::orchestrator::TeamOrchestrator;
 use super::registry::CreateTask;
-use super::tool_executor::{execute_team_tool_call, resolve_claimed_agent};
+use super::tool_executor::execute_team_tool_call;
 use qai_runtime::{RuntimeRole, TeamToolCall};
 
 // ─── Parameter structs ──────────────────────────────────────────────────────
@@ -352,12 +352,18 @@ impl SharedTeamToolServer {
         description = "Specialist only. Mark a task as complete. Provide the task_id, a short completion note, and your agent name."
     )]
     async fn complete_task(&self, Parameters(p): Parameters<CompleteTaskParams>) -> String {
-        let agent = resolve_claimed_agent(&self.orchestrator, &p.task_id, p.agent.as_deref());
         match self
-            .orchestrator
-            .handle_specialist_done(&p.task_id, &agent, &p.note)
+            .invoke_canonical(
+                RuntimeRole::Specialist,
+                TeamToolCall::CompleteTask {
+                    task_id: p.task_id.clone(),
+                    note: p.note.clone(),
+                    agent: p.agent,
+                },
+            )
+            .await
         {
-            Ok(()) => format!("Task {} marked done.", p.task_id),
+            Ok(msg) => msg,
             Err(e) => format!("Error completing task {}: {e}", p.task_id),
         }
     }

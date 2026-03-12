@@ -378,6 +378,9 @@ mod tests {
             .iter()
             .filter(|s| *s == "progress:start:View")
             .count();
-        assert_eq!(progress_count, 1, "duplicate compact progress should be coalesced");
+        assert_eq!(
+            progress_count, 1,
+            "duplicate compact progress should be coalesced"
+        );
     }
 }

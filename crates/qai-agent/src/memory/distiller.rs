@@ -65,6 +65,9 @@ impl MemoryDistiller for AcpDistiller {
                         args: vec![],
                         env: vec![],
                     },
+                    None, // memory distiller uses generic ACP path
+                    None, // no ACP auth-method negotiation for the generic distiller path
+                    None, // no Codex projection for the generic distiller path
                     RuntimeSessionSpec {
                         backend_id: "memory-distiller".into(),
                         participant_name: None,
@@ -81,8 +84,12 @@ impl MemoryDistiller for AcpDistiller {
                             external_mcp: false,
                             backend_native_tools: false,
                         },
+                        approval_mode: Default::default(),
                         tool_bridge_url: None,
+                        external_mcp_servers: vec![],
                         team_tool_url: None,
+                        provider_profile: None,
+                        backend_session_id: None,
                         context: RuntimeContext {
                             system_prompt: Some(DISTILL_PROMPT.to_string()),
                             workspace_native_files: Vec::new(),

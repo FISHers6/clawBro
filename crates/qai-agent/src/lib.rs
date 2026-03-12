@@ -1,7 +1,8 @@
 pub mod approval;
 pub mod bindings;
-pub mod control_reply;
+pub mod context_assembly;
 pub mod control;
+pub mod control_reply;
 pub mod dedup;
 pub mod memory;
 pub mod memory_service;
@@ -19,7 +20,6 @@ pub mod slash;
 pub mod slash_service;
 pub mod team;
 pub mod traits;
-pub mod context_assembly;
 
 pub use approval::{ApprovalDecision, ApprovalResolver};
 pub use control_reply::ControlReply;

@@ -148,6 +148,11 @@ fn parse_call(mut args: Vec<String>) -> Result<TeamToolCall> {
             summary: take_flag(&mut args, "--summary")?,
             agent: take_optional_flag(&mut args, "--agent"),
         }),
+        "complete-task" => Ok(TeamToolCall::CompleteTask {
+            task_id: take_flag(&mut args, "--task-id")?,
+            note: take_flag(&mut args, "--note")?,
+            agent: take_optional_flag(&mut args, "--agent"),
+        }),
         "block-task" => Ok(TeamToolCall::BlockTask {
             task_id: take_flag(&mut args, "--task-id")?,
             reason: take_flag(&mut args, "--reason")?,
@@ -192,7 +197,7 @@ fn print_help() {
     println!(
         "qai-team-cli --url <endpoint> --session-channel <channel> --session-scope <scope> <subcommand> [flags]\n\
          subcommands: create-task, start-execution, request-confirmation, post-update, get-task-status,\n\
-         assign-task, accept-task, reopen-task, checkpoint-task, submit-task-result, block-task, request-help"
+         assign-task, accept-task, reopen-task, checkpoint-task, submit-task-result, complete-task, block-task, request-help"
     );
 }
 
@@ -319,6 +324,15 @@ fn render_helper_output(call: &TeamToolCall, response: TeamToolResponse) -> Valu
                 ("payload".into(), response.payload.unwrap_or(Value::Null)),
             ]),
         ),
+        TeamToolCall::CompleteTask { task_id, note, .. } => render_team_helper_success(
+            "complete_task",
+            Map::from_iter([
+                ("task_id".into(), Value::String(task_id.clone())),
+                ("note".into(), Value::String(note.clone())),
+                ("message".into(), Value::String(response.message)),
+                ("payload".into(), response.payload.unwrap_or(Value::Null)),
+            ]),
+        ),
         TeamToolCall::RequestHelp {
             task_id, message, ..
         } => render_team_helper_success(
@@ -350,6 +364,7 @@ fn helper_action_name(call: &TeamToolCall) -> &'static str {
         TeamToolCall::AssignTask { .. } => "assign_task",
         TeamToolCall::CheckpointTask { .. } => "checkpoint_task",
         TeamToolCall::SubmitTaskResult { .. } => "submit_task_result",
+        TeamToolCall::CompleteTask { .. } => "complete_task",
         TeamToolCall::AcceptTask { .. } => "accept_task",
         TeamToolCall::ReopenTask { .. } => "reopen_task",
         TeamToolCall::BlockTask { .. } => "block_task",

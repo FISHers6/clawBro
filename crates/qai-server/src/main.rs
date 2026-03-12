@@ -36,6 +36,18 @@ async fn main() -> Result<()> {
     let storage = SessionStorage::new(cfg.session.dir.clone());
     let session_manager = Arc::new(SessionManager::new(storage));
 
+    // Reset any sessions that were stuck Running at last shutdown (crash recovery).
+    match session_manager.recover_stuck_sessions().await {
+        Ok(recovered) if !recovered.is_empty() => {
+            tracing::warn!(
+                count = recovered.len(),
+                "reset stuck sessions from previous run"
+            );
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "recover_stuck_sessions failed; continuing"),
+    }
+
     // 加载 Skills（主目录 + global_dirs 合并）
     let mut all_skill_dirs = vec![cfg.skills.dir.clone()];
     all_skill_dirs.extend(cfg.skills.global_dirs.iter().cloned());
@@ -87,7 +99,9 @@ async fn main() -> Result<()> {
         .await;
     for backend in &cfg.backends {
         runtime_registry
-            .register_backend(backend.to_backend_spec())
+            .register_backend(backend.to_backend_spec(
+                cfg.resolve_provider_profile(backend.provider_profile.as_deref())?,
+            ))
             .await;
     }
     let runtime_dispatch = Arc::new(ConductorRuntimeDispatch::new(Arc::clone(&runtime_registry)));
@@ -190,7 +204,7 @@ async fn main() -> Result<()> {
                     (Ok(id), Ok(secret)) => Ok(qai_channels::LarkChannel::new(
                         id,
                         secret,
-                        cfg.gateway.require_mention_in_groups,
+                        lark_cfg.resolved_trigger_policy(&cfg.gateway),
                     )),
                     _ => Err(anyhow::anyhow!("LARK_APP_ID or LARK_APP_SECRET not set")),
                 }
@@ -328,6 +342,8 @@ async fn main() -> Result<()> {
                     );
                 }
             }
+            tracing::error!("Approval notify task exited unexpectedly; shutting down");
+            std::process::exit(1);
         });
         tracing::info!("Approval notify task started");
     }
@@ -428,6 +444,8 @@ async fn main() -> Result<()> {
                     Err(e) => tracing::error!("BotMention redispatch handle error: {e}"),
                 }
             }
+            tracing::error!("BotMention redispatch task exited unexpectedly; shutting down");
+            std::process::exit(1);
         });
         tracing::info!("BotMention redispatch task started");
     }

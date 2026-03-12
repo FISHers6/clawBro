@@ -204,7 +204,9 @@ mod tests {
             &scope(),
             &MsgSource::Human,
         );
-        let msg = rx.try_recv().expect("newline-separated @mention should trigger");
+        let msg = rx
+            .try_recv()
+            .expect("newline-separated @mention should trigger");
         assert_eq!(msg.target_agent, Some("@codex".to_string()));
         assert_eq!(msg.content.as_text().unwrap(), "帮我实现 JWT 验证");
     }

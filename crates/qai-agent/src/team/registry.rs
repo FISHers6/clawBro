@@ -909,7 +909,10 @@ mod tests {
 
         // Pending
         let t = registry.get_task("SM01").unwrap().unwrap();
-        assert!(matches!(t.status_parsed(), TaskStatus::Pending), "initial state must be Pending");
+        assert!(
+            matches!(t.status_parsed(), TaskStatus::Pending),
+            "initial state must be Pending"
+        );
 
         // Claimed
         assert!(registry.try_claim("SM01", "codex").unwrap());
@@ -920,7 +923,9 @@ mod tests {
         );
 
         // Submitted
-        registry.submit_task_result("SM01", "codex", "impl done").unwrap();
+        registry
+            .submit_task_result("SM01", "codex", "impl done")
+            .unwrap();
         let t = registry.get_task("SM01").unwrap().unwrap();
         assert!(
             matches!(t.status_parsed(), TaskStatus::Submitted { ref agent, .. } if agent == "codex"),
@@ -936,7 +941,10 @@ mod tests {
             "after accept, state must be Accepted by lead"
         );
         assert!(t.done_at.is_some(), "done_at must be set after acceptance");
-        assert!(registry.all_done().unwrap(), "all_done() must return true when only task is Accepted");
+        assert!(
+            registry.all_done().unwrap(),
+            "all_done() must return true when only task is Accepted"
+        );
     }
 
     /// 验证非法状态转换被拒绝：对 Pending 任务调用 submit/accept 应报错
@@ -953,7 +961,10 @@ mod tests {
 
         // submit on Pending (not Claimed) must fail
         let err = registry.submit_task_result("INV01", "codex", "premature submit");
-        assert!(err.is_err(), "submit on Pending task must return Err, not Ok");
+        assert!(
+            err.is_err(),
+            "submit on Pending task must return Err, not Ok"
+        );
 
         // Task state must be unchanged after failed submit
         let t = registry.get_task("INV01").unwrap().unwrap();
@@ -965,12 +976,18 @@ mod tests {
 
         // accept on Pending (not Submitted) must fail
         let err2 = registry.accept_task("INV01", "lead");
-        assert!(err2.is_err(), "accept on Pending task must return Err, not Ok");
+        assert!(
+            err2.is_err(),
+            "accept on Pending task must return Err, not Ok"
+        );
 
         // Claim then try accept without submit — accept on Claimed must also fail
         registry.try_claim("INV01", "codex").unwrap();
         let err3 = registry.accept_task("INV01", "lead");
-        assert!(err3.is_err(), "accept on Claimed (not Submitted) task must return Err");
+        assert!(
+            err3.is_err(),
+            "accept on Claimed (not Submitted) task must return Err"
+        );
 
         let t = registry.get_task("INV01").unwrap().unwrap();
         assert!(
@@ -1004,24 +1021,41 @@ mod tests {
 
         // Before DA01 done: DA02 must not be in ready list
         let ready = registry.find_ready_tasks().unwrap();
-        assert!(!ready.iter().any(|t| t.id == "DA02"), "DA02 must be blocked while DA01 is pending");
-        assert!(ready.iter().any(|t| t.id == "DA01"), "DA01 must be ready initially");
+        assert!(
+            !ready.iter().any(|t| t.id == "DA02"),
+            "DA02 must be blocked while DA01 is pending"
+        );
+        assert!(
+            ready.iter().any(|t| t.id == "DA01"),
+            "DA01 must be ready initially"
+        );
 
         // Complete DA01 (old direct-done path)
         registry.try_claim("DA01", "codex").unwrap();
-        registry.mark_done("DA01", "codex", "schema created").unwrap();
+        registry
+            .mark_done("DA01", "codex", "schema created")
+            .unwrap();
 
         // After DA01 done: DA02 must be in ready list
         let ready2 = registry.find_ready_tasks().unwrap();
-        assert!(ready2.iter().any(|t| t.id == "DA02"), "DA02 must be unlocked after DA01 done");
+        assert!(
+            ready2.iter().any(|t| t.id == "DA02"),
+            "DA02 must be unlocked after DA01 done"
+        );
 
         // all_done must still be false
-        assert!(!registry.all_done().unwrap(), "all_done must be false while DA02 is pending");
+        assert!(
+            !registry.all_done().unwrap(),
+            "all_done must be false while DA02 is pending"
+        );
 
         // Complete DA02
         registry.try_claim("DA02", "claude").unwrap();
         registry.mark_done("DA02", "claude", "data seeded").unwrap();
 
-        assert!(registry.all_done().unwrap(), "all_done must be true after both tasks done");
+        assert!(
+            registry.all_done().unwrap(),
+            "all_done must be true after both tasks done"
+        );
     }
 }

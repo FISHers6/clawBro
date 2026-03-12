@@ -28,6 +28,29 @@ pub struct ToolCallRecord {
     pub output: Option<String>,
 }
 
+/// ACP backend session 的运行状态，用于检测 Gateway 崩溃后遗留的卡死 session。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum SessionStatus {
+    Idle,
+    Running {
+        backend_id: String,
+        started_at: DateTime<Utc>,
+    },
+}
+
+impl SessionStatus {
+    pub fn default_idle() -> Self {
+        Self::Idle
+    }
+}
+
+impl Default for SessionStatus {
+    fn default() -> Self {
+        Self::Idle
+    }
+}
+
 /// Session 元数据
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMeta {
@@ -37,6 +60,13 @@ pub struct SessionMeta {
     pub channel: String,
     pub scope: String,
     pub message_count: usize,
+    /// Per-backend 的后端侧 ACP session ID（backend_id → acp_session_id）。
+    /// 用于下次 turn 时通过 ACP session/load 恢复后端 session 状态。
+    #[serde(default)]
+    pub backend_session_ids: std::collections::HashMap<String, String>,
+    /// 当前运行状态，用于检测 Gateway 崩溃后卡死的 session。
+    #[serde(default = "SessionStatus::default_idle")]
+    pub session_status: SessionStatus,
 }
 
 /// Session 磁盘存储（append-only JSONL + metadata.json）
@@ -47,6 +77,10 @@ pub struct SessionStorage {
 impl SessionStorage {
     pub fn new(base_dir: PathBuf) -> Self {
         Self { base_dir }
+    }
+
+    pub fn base_dir(&self) -> &std::path::Path {
+        &self.base_dir
     }
 
     /// 默认路径: ~/.quickai/sessions/
@@ -195,6 +229,8 @@ mod tests {
             channel: "dingtalk".to_string(),
             scope: "user_123".to_string(),
             message_count: 0,
+            backend_session_ids: Default::default(),
+            session_status: SessionStatus::Idle,
         };
         storage.save_meta(&meta).await.unwrap();
         let loaded = storage.load_meta(session_id).await.unwrap().unwrap();
@@ -305,5 +341,34 @@ mod tests {
         assert_eq!(roundtrip.tool_call_id.as_deref(), Some("call-1"));
         assert_eq!(roundtrip.name, "read_file");
         assert_eq!(roundtrip.output.as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn session_meta_old_json_deserializes_with_defaults() {
+        // Old metadata.json without backend_session_ids / session_status
+        let old_json = r#"{
+            "session_id": "00000000-0000-0000-0000-000000000001",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "channel": "ws",
+            "scope": "u1",
+            "message_count": 5
+        }"#;
+        let meta: SessionMeta = serde_json::from_str(old_json).unwrap();
+        assert!(meta.backend_session_ids.is_empty());
+        assert_eq!(meta.session_status, SessionStatus::Idle);
+    }
+
+    #[test]
+    fn session_status_running_roundtrips() {
+        let status = SessionStatus::Running {
+            backend_id: "acp-claude".into(),
+            started_at: chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        let roundtrip: SessionStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(status, roundtrip);
     }
 }

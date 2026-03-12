@@ -28,6 +28,88 @@ fn extract_first_mention(text: &str) -> Option<String> {
         })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LarkTriggerMode {
+    AllMessages,
+    MentionOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LarkTriggerPolicy {
+    pub group: LarkTriggerMode,
+    pub dm: LarkTriggerMode,
+}
+
+impl LarkTriggerPolicy {
+    pub const fn all_messages() -> Self {
+        Self {
+            group: LarkTriggerMode::AllMessages,
+            dm: LarkTriggerMode::AllMessages,
+        }
+    }
+
+    pub const fn from_require_mention_in_groups(require_mention_in_groups: bool) -> Self {
+        Self {
+            group: if require_mention_in_groups {
+                LarkTriggerMode::MentionOnly
+            } else {
+                LarkTriggerMode::AllMessages
+            },
+            dm: LarkTriggerMode::AllMessages,
+        }
+    }
+}
+
+fn normalize_lark_text(text: &str) -> String {
+    let mut tokens = text.split_whitespace().peekable();
+
+    while let Some(token) = tokens.peek().copied() {
+        if !is_lark_placeholder_mention(token) {
+            break;
+        }
+        tokens.next();
+    }
+
+    tokens.collect::<Vec<_>>().join(" ")
+}
+
+fn is_lark_placeholder_mention(token: &str) -> bool {
+    token
+        .strip_prefix("@_")
+        .map(|rest| {
+            !rest.is_empty()
+                && rest
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+        })
+        .unwrap_or(false)
+}
+
+fn extract_target_agent_mention(text: &str) -> Option<String> {
+    extract_first_mention(text).filter(|mention| !is_lark_placeholder_mention(mention))
+}
+
+fn has_lark_platform_trigger(text: &str) -> bool {
+    text.split_whitespace().any(is_lark_placeholder_mention)
+}
+
+fn should_accept_lark_scope(
+    policy: LarkTriggerPolicy,
+    scope: &str,
+    has_platform_trigger: bool,
+) -> bool {
+    let mode = if scope.starts_with("group:") {
+        policy.group
+    } else {
+        policy.dm
+    };
+
+    match mode {
+        LarkTriggerMode::AllMessages => true,
+        LarkTriggerMode::MentionOnly => has_platform_trigger,
+    }
+}
+
 const FEISHU_BASE: &str = "https://open.feishu.cn/open-apis";
 /// WebSocket endpoint discovery URL (official Go SDK: /callback/ws/endpoint).
 /// Posts {"AppID": ..., "AppSecret": ...} and returns {"code":0,"data":{"URL":"wss://..."}}
@@ -37,7 +119,7 @@ pub struct LarkChannel {
     pub app_id: String,
     pub app_secret: String,
     client: reqwest::Client,
-    require_mention_in_groups: bool,
+    trigger_policy: LarkTriggerPolicy,
     /// Cached access token: (token_string, time_fetched).
     /// Feishu app_access_token is valid for 7200s; we treat it as valid for 7000s
     /// to provide a safety margin against clock skew and network latency.
@@ -46,12 +128,12 @@ pub struct LarkChannel {
 }
 
 impl LarkChannel {
-    pub fn new(app_id: String, app_secret: String, require_mention_in_groups: bool) -> Self {
+    pub fn new(app_id: String, app_secret: String, trigger_policy: LarkTriggerPolicy) -> Self {
         Self {
             app_id,
             app_secret,
             client: reqwest::Client::new(),
-            require_mention_in_groups,
+            trigger_policy,
             token_cache: tokio::sync::Mutex::new(None),
             seen_message_ids: tokio::sync::Mutex::new(HashMap::new()),
         }
@@ -70,15 +152,19 @@ impl LarkChannel {
         true
     }
 
-    /// Deprecated: use `LarkChannel::new()` with explicit config for full feature support.
-    /// This method always sets `require_mention_in_groups = false`.
-    #[deprecated(note = "use LarkChannel::new() with explicit require_mention_in_groups")]
+    /// Deprecated: use `LarkChannel::new()` with explicit trigger policy for full feature support.
+    /// This method defaults to all-messages mode for both group and dm scopes.
+    #[deprecated(note = "use LarkChannel::new() with explicit trigger policy")]
     pub fn from_env() -> Result<Self> {
         let app_id =
             std::env::var("LARK_APP_ID").map_err(|_| anyhow::anyhow!("LARK_APP_ID not set"))?;
         let app_secret = std::env::var("LARK_APP_SECRET")
             .map_err(|_| anyhow::anyhow!("LARK_APP_SECRET not set"))?;
-        Ok(Self::new(app_id, app_secret, false))
+        Ok(Self::new(
+            app_id,
+            app_secret,
+            LarkTriggerPolicy::all_messages(),
+        ))
     }
 
     async fn get_access_token(&self) -> Result<String> {
@@ -372,8 +458,8 @@ fn binary_ack_frame(frame: &PbFrame) -> Option<PbFrame> {
     let mut ack = frame.clone();
     ack.payload = Some(br#"{"code":200,"headers":{},"data":[]}"#.to_vec());
     ack.headers.push(PbHeader {
-            key: "biz_rt".to_string(),
-            value: "0".to_string(),
+        key: "biz_rt".to_string(),
+        value: "0".to_string(),
     });
     Some(ack)
 }
@@ -469,8 +555,7 @@ impl Channel for LarkChannel {
                         }
                         "event" => {
                             if let Some(data) = frame.data {
-                                handle_event(self, data, &tx, &checker, self.require_mention_in_groups)
-                                    .await;
+                                handle_event(self, data, &tx, &checker, self.trigger_policy).await;
                             }
                         }
                         _ => {}
@@ -489,8 +574,7 @@ impl Channel for LarkChannel {
                     }
 
                     if let Some(data) = decode_binary_event_payload(&frame) {
-                        handle_event(self, data, &tx, &checker, self.require_mention_in_groups)
-                            .await;
+                        handle_event(self, data, &tx, &checker, self.trigger_policy).await;
                     }
                 }
                 Ok(WsMsg::Close(_)) => {
@@ -525,7 +609,7 @@ async fn handle_event(
     data: serde_json::Value,
     tx: &mpsc::Sender<InboundMsg>,
     checker: &crate::allowlist::AllowlistChecker,
-    require_mention_in_groups: bool,
+    trigger_policy: LarkTriggerPolicy,
 ) {
     let event_type = data
         .get("header")
@@ -568,10 +652,12 @@ async fn handle_event(
         return;
     }
 
-    let text = text_content.text.trim().to_string();
-    if text.is_empty() {
+    let raw_text = text_content.text.trim();
+    if raw_text.is_empty() {
         return;
     }
+    let has_platform_trigger = has_lark_platform_trigger(raw_text);
+    let text = normalize_lark_text(raw_text);
 
     // Allowlist check
     if !checker.is_allowed("lark", &open_id) {
@@ -581,7 +667,7 @@ async fn handle_event(
 
     // Extract first @mention from text for agent routing (platform-specific extraction)
     // Examples: "@claude review this" → Some("@claude")
-    let target_agent = extract_first_mention(&text);
+    let target_agent = extract_target_agent_mention(&text);
 
     // Derive scope: group uses chat_id, p2p uses open_id
     let scope = derive_scope(
@@ -590,16 +676,23 @@ async fn handle_event(
         &open_id,
     );
 
-    // Group mention-only mode: skip group messages with no @mention.
-    if require_mention_in_groups && scope.starts_with("group:") {
-        let has_mention = extract_first_mention(&text).is_some();
-        if !has_mention {
-            tracing::debug!(
-                "Lark group message skipped (require_mention_in_groups): scope={}",
-                scope
-            );
-            return;
-        }
+    if !should_accept_lark_scope(trigger_policy, &scope, has_platform_trigger) {
+        tracing::debug!(
+            scope = %scope,
+            has_platform_trigger,
+            ?trigger_policy,
+            "Lark message skipped by trigger policy"
+        );
+        return;
+    }
+
+    if text.is_empty() {
+        tracing::debug!(
+            scope = %scope,
+            message_id = %event.event.message.message_id,
+            "Lark inbound dropped after platform mention normalization"
+        );
+        return;
     }
 
     // Use Feishu message_id as InboundMsg.id so that
@@ -700,6 +793,27 @@ mod tests {
     }
 
     #[test]
+    fn test_strip_lark_placeholder_mentions() {
+        assert_eq!(normalize_lark_text("@_user_1 你好"), "你好");
+        assert_eq!(
+            normalize_lark_text("@_user_1 @_user_2 hello there"),
+            "hello there"
+        );
+        assert_eq!(
+            normalize_lark_text("@claude please review"),
+            "@claude please review"
+        );
+        assert_eq!(normalize_lark_text("@_user_1"), "");
+    }
+
+    #[test]
+    fn test_lark_platform_trigger_detected_from_placeholder() {
+        assert!(has_lark_platform_trigger("@_user_1 你好"));
+        assert!(has_lark_platform_trigger("hello @_user_1"));
+        assert!(!has_lark_platform_trigger("@codex please review"));
+    }
+
+    #[test]
     fn test_lark_group_scope_from_event() {
         let scope = derive_scope("group", "oc_test_group", "ou_sender");
         assert_eq!(scope, "group:oc_test_group");
@@ -707,7 +821,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_lark_message_dedup_accepts_first_and_rejects_duplicate() {
-        let channel = LarkChannel::new("app".into(), "secret".into(), false);
+        let channel = LarkChannel::new(
+            "app".into(),
+            "secret".into(),
+            LarkTriggerPolicy::all_messages(),
+        );
         assert!(channel.should_accept_message("om_1").await);
         assert!(!channel.should_accept_message("om_1").await);
         assert!(channel.should_accept_message("om_2").await);
@@ -746,78 +864,58 @@ mod tests {
         assert_eq!(event.event.message.chat_id, "oc_group_abc");
     }
 
-    // ── require_mention_in_groups tests ────────────────────────────────────
+    // ── trigger policy tests ───────────────────────────────────────────────
 
-    /// Helper: decide whether a group message with the given text passes the filter.
-    /// Mirrors the production logic in handle_event().
-    fn lark_group_msg_passes_filter(require_mention: bool, text: &str) -> bool {
-        if !require_mention {
-            return true;
-        }
+    fn policy(group: LarkTriggerMode, dm: LarkTriggerMode) -> LarkTriggerPolicy {
+        LarkTriggerPolicy { group, dm }
+    }
+
+    #[test]
+    fn test_lark_group_all_messages_always_processes() {
         let scope = "group:oc_test";
-        if !scope.starts_with("group:") {
-            return true;
-        }
-        extract_first_mention(text).is_some()
-    }
-
-    /// Group message, flag=false → always processes.
-    #[test]
-    fn test_lark_group_no_flag_always_processes() {
-        assert!(lark_group_msg_passes_filter(false, "hello everyone"));
-        assert!(lark_group_msg_passes_filter(false, "no mention"));
-    }
-
-    /// Group message, flag=true, no @mention → skipped.
-    #[test]
-    fn test_lark_group_flag_true_no_mention_skipped() {
-        assert!(!lark_group_msg_passes_filter(true, "hello everyone"));
-        assert!(!lark_group_msg_passes_filter(true, "plain text"));
-    }
-
-    /// Group message, flag=true, has @mention → processes normally.
-    #[test]
-    fn test_lark_group_flag_true_with_mention_processes() {
-        assert!(lark_group_msg_passes_filter(
-            true,
-            "@claude please summarize"
+        assert!(should_accept_lark_scope(
+            policy(LarkTriggerMode::AllMessages, LarkTriggerMode::AllMessages),
+            scope,
+            false
         ));
-        assert!(lark_group_msg_passes_filter(true, "hey @bot"));
     }
 
-    /// Private (p2p) message scope, flag=true → not filtered (only groups are filtered).
     #[test]
-    fn test_lark_p2p_scope_never_filtered() {
+    fn test_lark_group_mention_only_requires_platform_trigger() {
+        let scope = "group:oc_test";
+        let policy = policy(LarkTriggerMode::MentionOnly, LarkTriggerMode::AllMessages);
+        assert!(!should_accept_lark_scope(policy, scope, false));
+        assert!(should_accept_lark_scope(policy, scope, true));
+    }
+
+    #[test]
+    fn test_lark_dm_all_messages_accepts_without_platform_trigger() {
         let scope = "user:ou_sender";
-        assert!(
-            !scope.starts_with("group:"),
-            "p2p scope should not match group prefix"
-        );
-    }
-
-    /// Email addresses ("user@example.com") must NOT trigger the mention filter.
-    /// Only @word tokens (no dot in the handle) should count as mentions.
-    #[test]
-    fn test_email_address_not_treated_as_mention() {
-        // "send to user@example.com" — no standalone @word token — should be filtered out.
-        assert!(!lark_group_msg_passes_filter(
-            true,
-            "send to user@example.com"
-        ));
-        // A real @mention still passes.
-        assert!(lark_group_msg_passes_filter(
-            true,
-            "@claude please check user@example.com"
+        assert!(should_accept_lark_scope(
+            policy(LarkTriggerMode::MentionOnly, LarkTriggerMode::AllMessages),
+            scope,
+            false
         ));
     }
 
-    /// Verify that LarkChannel::new correctly stores require_mention_in_groups.
     #[test]
-    fn test_lark_channel_new_stores_flag() {
-        let ch = LarkChannel::new("id".to_string(), "secret".to_string(), true);
-        assert!(ch.require_mention_in_groups);
-        let ch2 = LarkChannel::new("id".to_string(), "secret".to_string(), false);
-        assert!(!ch2.require_mention_in_groups);
+    fn test_lark_dm_mention_only_requires_platform_trigger() {
+        let scope = "user:ou_sender";
+        let policy = policy(LarkTriggerMode::AllMessages, LarkTriggerMode::MentionOnly);
+        assert!(!should_accept_lark_scope(policy, scope, false));
+        assert!(should_accept_lark_scope(policy, scope, true));
+    }
+
+    #[test]
+    fn test_email_address_not_treated_as_platform_trigger() {
+        assert!(!has_lark_platform_trigger("send to user@example.com"));
+    }
+
+    #[test]
+    fn test_lark_channel_new_stores_policy() {
+        let p = policy(LarkTriggerMode::MentionOnly, LarkTriggerMode::AllMessages);
+        let ch = LarkChannel::new("id".to_string(), "secret".to_string(), p);
+        assert_eq!(ch.trigger_policy, p);
     }
 
     #[test]
@@ -895,9 +993,12 @@ mod tests {
     #[tokio::test]
     async fn test_lark_binary_event_dispatches_inbound_message() {
         let (tx, mut rx) = mpsc::channel(1);
-        let checker =
-            crate::allowlist::AllowlistChecker::from_path(None::<std::path::PathBuf>);
-        let channel = LarkChannel::new("app".into(), "secret".into(), false);
+        let checker = crate::allowlist::AllowlistChecker::from_path(None::<std::path::PathBuf>);
+        let channel = LarkChannel::new(
+            "app".into(),
+            "secret".into(),
+            LarkTriggerPolicy::all_messages(),
+        );
         let payload = serde_json::json!({
             "header": { "event_type": "im.message.receive_v1" },
             "event": {
@@ -912,7 +1013,14 @@ mod tests {
             }
         });
 
-        handle_event(&channel, payload, &tx, &checker, false).await;
+        handle_event(
+            &channel,
+            payload,
+            &tx,
+            &checker,
+            LarkTriggerPolicy::all_messages(),
+        )
+        .await;
 
         let inbound = rx.recv().await.expect("inbound message should dispatch");
         assert_eq!(inbound.id, "om_binary_dispatch");
@@ -924,5 +1032,117 @@ mod tests {
             MsgContent::Text { text } => assert_eq!(text, "ping from binary"),
             other => panic!("unexpected content: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn lark_platform_mention_is_removed_from_model_visible_text() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let checker = crate::allowlist::AllowlistChecker::from_path(None::<std::path::PathBuf>);
+        let channel = LarkChannel::new(
+            "app".into(),
+            "secret".into(),
+            LarkTriggerPolicy::all_messages(),
+        );
+        let payload = serde_json::json!({
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "sender": { "sender_id": { "open_id": "ou_normalize" } },
+                "message": {
+                    "message_id": "om_normalize",
+                    "message_type": "text",
+                    "content": "{\"text\":\"@_user_1 你好\"}",
+                    "chat_type": "p2p",
+                    "chat_id": ""
+                }
+            }
+        });
+
+        handle_event(
+            &channel,
+            payload,
+            &tx,
+            &checker,
+            LarkTriggerPolicy::all_messages(),
+        )
+        .await;
+
+        let inbound = rx.recv().await.expect("message should dispatch");
+        assert_eq!(inbound.target_agent, None);
+        assert_eq!(inbound.content.as_text(), Some("你好"));
+    }
+
+    #[tokio::test]
+    async fn lark_explicit_agent_mention_survives_normalization() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let checker = crate::allowlist::AllowlistChecker::from_path(None::<std::path::PathBuf>);
+        let channel = LarkChannel::new(
+            "app".into(),
+            "secret".into(),
+            LarkTriggerPolicy::all_messages(),
+        );
+        let payload = serde_json::json!({
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "sender": { "sender_id": { "open_id": "ou_route" } },
+                "message": {
+                    "message_id": "om_route",
+                    "message_type": "text",
+                    "content": "{\"text\":\"@_user_1 @codex 帮我看下\"}",
+                    "chat_type": "p2p",
+                    "chat_id": ""
+                }
+            }
+        });
+
+        handle_event(
+            &channel,
+            payload,
+            &tx,
+            &checker,
+            LarkTriggerPolicy::all_messages(),
+        )
+        .await;
+
+        let inbound = rx.recv().await.expect("message should dispatch");
+        assert_eq!(inbound.target_agent.as_deref(), Some("@codex"));
+        assert_eq!(inbound.content.as_text(), Some("@codex 帮我看下"));
+    }
+
+    #[tokio::test]
+    async fn lark_message_with_only_platform_mention_is_dropped() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let checker = crate::allowlist::AllowlistChecker::from_path(None::<std::path::PathBuf>);
+        let channel = LarkChannel::new(
+            "app".into(),
+            "secret".into(),
+            LarkTriggerPolicy::all_messages(),
+        );
+        let payload = serde_json::json!({
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "sender": { "sender_id": { "open_id": "ou_empty" } },
+                "message": {
+                    "message_id": "om_empty",
+                    "message_type": "text",
+                    "content": "{\"text\":\"@_user_1\"}",
+                    "chat_type": "p2p",
+                    "chat_id": ""
+                }
+            }
+        });
+
+        handle_event(
+            &channel,
+            payload,
+            &tx,
+            &checker,
+            LarkTriggerPolicy::all_messages(),
+        )
+        .await;
+
+        assert!(
+            rx.try_recv().is_err(),
+            "mention-only message should be dropped"
+        );
     }
 }

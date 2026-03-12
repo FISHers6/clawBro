@@ -56,7 +56,10 @@ pub(crate) async fn handle_memory_request(req: MemoryRequest<'_>) -> Result<Cont
                     .filter(|line| !line.to_lowercase().contains(&keyword))
                     .map(|line| format!("{line}\n"))
                     .collect();
-                store.overwrite_shared(req.session_key, &filtered).await.ok();
+                store
+                    .overwrite_shared(req.session_key, &filtered)
+                    .await
+                    .ok();
             }
             Ok(ControlReply::Final(req.command.confirmation_text()))
         }
@@ -73,7 +76,10 @@ async fn render_shared_memory(
         return Ok("❌ 当前运行实例未启用记忆系统。".to_string());
     };
     let store = ms.store();
-    let shared = store.load_shared_memory(session_key).await.unwrap_or_default();
+    let shared = store
+        .load_shared_memory(session_key)
+        .await
+        .unwrap_or_default();
     let scope_display = &session_key.scope;
     if shared.is_empty() {
         return Ok(format!(
@@ -137,14 +143,13 @@ mod tests {
         roster: Option<AgentRoster>,
         default_persona_dir: Option<std::path::PathBuf>,
     ) -> (Arc<SessionRegistry>, broadcast::Receiver<AgentEvent>) {
-        let dir = std::env::temp_dir().join(format!(
-            "test-memory-service-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("test-memory-service-{}", uuid::Uuid::new_v4()));
         let storage = SessionStorage::new(dir);
         let session_manager = Arc::new(SessionManager::new(storage));
-        let store: Arc<dyn crate::memory::MemoryStore> =
-            Arc::new(FileMemoryStore::new(std::env::temp_dir().join(uuid::Uuid::new_v4().to_string())));
+        let store: Arc<dyn crate::memory::MemoryStore> = Arc::new(FileMemoryStore::new(
+            std::env::temp_dir().join(uuid::Uuid::new_v4().to_string()),
+        ));
         let distiller: Arc<dyn crate::memory::MemoryDistiller> = Arc::new(NoopDistiller);
         let triggers: Vec<Arc<dyn MemoryTrigger>> = vec![Arc::new(UserRememberTrigger)];
         let memory_system = MemorySystem::new(triggers, store, distiller);
@@ -256,7 +261,10 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(first.final_text().unwrap().contains("再次发送 /memory reset"));
+        assert!(first
+            .final_text()
+            .unwrap()
+            .contains("再次发送 /memory reset"));
 
         let second = handle_memory_request(MemoryRequest {
             session_key: &session_key,
@@ -285,14 +293,16 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(reply.final_text().unwrap().contains("再次发送 /memory reset"));
+        assert!(reply
+            .final_text()
+            .unwrap()
+            .contains("再次发送 /memory reset"));
     }
 
     #[tokio::test]
     async fn agent_memory_returns_missing_message_when_file_absent() {
         let persona_dir = tempdir().unwrap();
-        let (registry, _rx) =
-            make_registry_with_persona(Some(persona_dir.path().to_path_buf()));
+        let (registry, _rx) = make_registry_with_persona(Some(persona_dir.path().to_path_buf()));
         let session_key = scope();
         let command = SlashCommand::Memory(Some("reviewer".to_string()));
         let reply = handle_memory_request(MemoryRequest {
@@ -303,7 +313,10 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(reply.final_text(), Some("No memory found for agent @reviewer"));
+        assert_eq!(
+            reply.final_text(),
+            Some("No memory found for agent @reviewer")
+        );
     }
 
     #[tokio::test]
@@ -336,14 +349,16 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(reply.final_text().unwrap().contains("reviewer memory content"));
+        assert!(reply
+            .final_text()
+            .unwrap()
+            .contains("reviewer memory content"));
     }
 
     #[tokio::test]
     async fn agent_memory_does_not_guess_from_default_persona_dir() {
         let persona_dir = tempdir().unwrap();
-        let (registry, _rx) =
-            make_registry_with_persona(Some(persona_dir.path().to_path_buf()));
+        let (registry, _rx) = make_registry_with_persona(Some(persona_dir.path().to_path_buf()));
         let session_key = scope();
         registry
             .memory_control()
@@ -362,7 +377,10 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(reply.final_text(), Some("No memory found for agent @reviewer"));
+        assert_eq!(
+            reply.final_text(),
+            Some("No memory found for agent @reviewer")
+        );
     }
 
     #[tokio::test]

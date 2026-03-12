@@ -120,6 +120,18 @@ async fn run_prompt_action(
     conn: &acp::AgentSideConnection,
     session_id: acp::SessionId,
 ) -> Result<acp::PromptResponse, acp::Error> {
+    // Emit usage_update and session_info_update before the text chunk.
+    // These are additive ACP protocol variants; the client must not fail on them.
+    conn.session_notification(acp::SessionNotification::new(
+        session_id.clone(),
+        acp::SessionUpdate::UsageUpdate(acp::UsageUpdate::new(10, 100)),
+    ))
+    .await?;
+    conn.session_notification(acp::SessionNotification::new(
+        session_id.clone(),
+        acp::SessionUpdate::SessionInfoUpdate(acp::SessionInfoUpdate::new()),
+    ))
+    .await?;
     send_text(conn, session_id.clone(), "acp:fixture").await?;
     Ok(acp::PromptResponse::new(acp::StopReason::EndTurn))
 }

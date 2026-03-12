@@ -51,7 +51,16 @@ impl BackendAdapter for AcpBackendAdapter {
         sink: RuntimeEventSink,
     ) -> anyhow::Result<TurnResult> {
         let config = Self::command_config(spec)?;
-        run_command_turn(&config, session, sink, self.approvals.clone()).await
+        run_command_turn(
+            &config,
+            spec.acp_backend,
+            spec.acp_auth_method,
+            spec.codex_projection,
+            session,
+            sink,
+            self.approvals.clone(),
+        )
+        .await
     }
 }
 
@@ -78,6 +87,12 @@ mod tests {
                 team_helper_args: vec![],
                 lead_helper_mode: false,
             },
+            approval_mode: Default::default(),
+            external_mcp_servers: vec![],
+            provider_profile: None,
+            acp_backend: None,
+            acp_auth_method: None,
+            codex_projection: None,
         };
 
         let err = adapter.probe(&spec).await.unwrap_err();

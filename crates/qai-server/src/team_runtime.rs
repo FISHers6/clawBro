@@ -147,26 +147,24 @@ pub async fn wire_team_runtime(
         );
 
         let channels_for_notify = Arc::clone(&channel_map);
-        team_orch.set_milestone_fn(Arc::new(
-            move |scope: qai_protocol::SessionKey, event| {
-                use qai_agent::team::milestone::render_for_im;
-                let msg = render_for_im(&event);
-                let channels = Arc::clone(&channels_for_notify);
-                tokio::spawn(async move {
-                    if let Some(ch) = channels.get(&scope.channel) {
-                        let outbound = qai_protocol::OutboundMsg {
-                            session_key: scope,
-                            content: qai_protocol::MsgContent::text(msg),
-                            reply_to: None,
-                            thread_ts: None,
-                        };
-                        if let Err(e) = ch.send(&outbound).await {
-                            tracing::error!("Milestone notify send error: {e}");
-                        }
+        team_orch.set_milestone_fn(Arc::new(move |scope: qai_protocol::SessionKey, event| {
+            use qai_agent::team::milestone::render_for_im;
+            let msg = render_for_im(&event);
+            let channels = Arc::clone(&channels_for_notify);
+            tokio::spawn(async move {
+                if let Some(ch) = channels.get(&scope.channel) {
+                    let outbound = qai_protocol::OutboundMsg {
+                        session_key: scope,
+                        content: qai_protocol::MsgContent::text(msg),
+                        reply_to: None,
+                        thread_ts: None,
+                    };
+                    if let Err(e) = ch.send(&outbound).await {
+                        tracing::error!("Milestone notify send error: {e}");
                     }
-                });
-            },
-        ));
+                }
+            });
+        }));
 
         team_orch.set_lead_session_key(lead_key.clone());
         team_orch.set_scope(lead_key);

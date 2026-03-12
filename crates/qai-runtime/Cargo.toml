@@ -14,7 +14,7 @@ futures.workspace = true
 tokio-util = { version = "0.7", features = ["compat"] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
 tracing.workspace = true
-agent-client-protocol = "0.9"
+agent-client-protocol = { path = "../../../acp/rust-sdk/src/agent-client-protocol", features = ["unstable_session_usage", "unstable_session_info_update"] }
 serde_json.workspace = true
 uuid.workspace = true
 

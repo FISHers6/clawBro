@@ -1,7 +1,7 @@
 use crate::{
     adapter::{BackendAdapter, LaunchSpec},
     approval::ApprovalBroker,
-    backend::{BackendFamily, CapabilityProfile},
+    backend::{ApprovalMode, BackendFamily, CapabilityProfile},
     contract::{PermissionRequest, RuntimeSessionSpec, TurnResult},
     event_sink::RuntimeEventSink,
     openclaw::{
@@ -151,11 +151,15 @@ impl BackendAdapter for OpenClawBackendAdapter {
         });
 
         let mut full_text = String::new();
+        let turn_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
         loop {
-            match client
-                .read_inbound(&session_key, run_id.as_deref(), &full_text)
-                .await?
-            {
+            let inbound = tokio::time::timeout_at(
+                turn_deadline,
+                client.read_inbound(&session_key, run_id.as_deref(), &full_text),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("OpenClaw turn timed out after 300s"))??;
+            match inbound {
                 Some(GatewayInbound::Runtime(event)) => match event {
                     crate::contract::RuntimeEvent::TextDelta { ref text } => {
                         full_text.push_str(text);
@@ -163,7 +167,9 @@ impl BackendAdapter for OpenClawBackendAdapter {
                     }
                     crate::contract::RuntimeEvent::ApprovalRequest(request) => {
                         let approval_id = request.id.clone();
-                        let decision = self.handle_approval_request(&sink, request).await?;
+                        let decision = self
+                            .handle_approval_request(&sink, session.approval_mode, request)
+                            .await?;
                         client
                             .resolve_exec_approval(&approval_id, &decision)
                             .await
@@ -187,6 +193,8 @@ impl BackendAdapter for OpenClawBackendAdapter {
                     return Ok(TurnResult {
                         full_text: text,
                         events: Vec::new(),
+                        emitted_backend_session_id: None,
+                        used_backend_id: None,
                     });
                 }
                 Some(GatewayInbound::Started { .. }) | Some(GatewayInbound::Ack) => continue,
@@ -200,11 +208,19 @@ impl OpenClawBackendAdapter {
     async fn handle_approval_request(
         &self,
         sink: &RuntimeEventSink,
+        approval_mode: ApprovalMode,
         request: PermissionRequest,
     ) -> anyhow::Result<String> {
-        let pending = self.approvals.register(&request);
-        sink.emit(crate::contract::RuntimeEvent::ApprovalRequest(request))?;
-        Ok(pending.wait().await.as_openclaw_str().to_string())
+        let decision = match approval_mode {
+            ApprovalMode::Manual => {
+                let pending = self.approvals.register(&request);
+                sink.emit(crate::contract::RuntimeEvent::ApprovalRequest(request))?;
+                pending.wait().await
+            }
+            ApprovalMode::AutoAllow => crate::approval::ApprovalDecision::AllowOnce,
+            ApprovalMode::AutoDeny => crate::approval::ApprovalDecision::Deny,
+        };
+        Ok(decision.as_openclaw_str().to_string())
     }
 }
 
@@ -497,6 +513,12 @@ mod tests {
                 team_helper_args: vec![],
                 lead_helper_mode: false,
             },
+            approval_mode: Default::default(),
+            external_mcp_servers: vec![],
+            provider_profile: None,
+            acp_backend: None,
+            acp_auth_method: None,
+            codex_projection: None,
         }
     }
 
@@ -557,8 +579,12 @@ mod tests {
                     workspace_dir: None,
                     prompt_text: "hello".into(),
                     tool_surface: ToolSurfaceSpec::default(),
+                    approval_mode: Default::default(),
                     tool_bridge_url: None,
+                    external_mcp_servers: vec![],
                     team_tool_url: None,
+                    provider_profile: None,
+                    backend_session_id: None,
                     context: RuntimeContext::default(),
                 },
                 RuntimeEventSink::new(tx),
@@ -682,8 +708,12 @@ mod tests {
                 external_mcp: false,
                 backend_native_tools: true,
             },
+            approval_mode: Default::default(),
             tool_bridge_url: None,
+            external_mcp_servers: vec![],
             team_tool_url: Some(helper.team_tool_url.clone()),
+            provider_profile: None,
+            backend_session_id: None,
             context: RuntimeContext::default(),
         };
 
@@ -715,8 +745,12 @@ mod tests {
                 external_mcp: false,
                 backend_native_tools: true,
             },
+            approval_mode: Default::default(),
             tool_bridge_url: None,
+            external_mcp_servers: vec![],
             team_tool_url: Some(helper.team_tool_url.clone()),
+            provider_profile: None,
+            backend_session_id: None,
             context: RuntimeContext {
                 history_lines: vec![
                     "[user]: [alice]: 第一条".into(),
@@ -760,8 +794,12 @@ mod tests {
                 external_mcp: false,
                 backend_native_tools: true,
             },
+            approval_mode: Default::default(),
             tool_bridge_url: None,
+            external_mcp_servers: vec![],
             team_tool_url: Some(helper.team_tool_url.clone()),
+            provider_profile: None,
+            backend_session_id: None,
             context: RuntimeContext::default(),
         };
 

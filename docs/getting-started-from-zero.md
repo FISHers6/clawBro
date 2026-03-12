@@ -327,9 +327,98 @@ family = "quick_ai_native"
 type = "embedded"
 ```
 
+如果你要给 `quick_ai_native` 挂外部 MCP SSE server，可以直接配在 backend 下：
+
+```toml
+[[backend.external_mcp_servers]]
+name = "filesystem"
+url = "http://127.0.0.1:3001/sse"
+
+[[backend.external_mcp_servers]]
+name = "github"
+url = "http://127.0.0.1:3002/sse"
+```
+
+当前行为：
+
+- 这些 server 会作为宿主级 `external_mcp_servers` 进入 `RuntimeSessionSpec`
+- `quickai-rust-agent` 会在 native runtime 内部通过 `rig/rmcp` 连接并注册工具
+- 这和 `team_tool_url` 是两条不同路径：
+  - `team_tool_url` 负责 QuickAI 自己的 team tools
+  - `external_mcp_servers` 负责用户配置的外部 MCP tools
+- 名称必须唯一，且不能使用保留名 `team-tools`
+
 ### 9.2 `acp`
 
 适合接支持 ACP 的 CLI agent 或 bridge。
+
+`acp` family 内部支持多种不同的 ACP backend，使用可选的 `acp_backend` 字段标识。
+
+**注意：**
+- `acp_backend` 只在 `family = "acp"` 时有效，其他 family 会拒绝该字段
+- `config.toml` 不支持 `${ENV_VAR}` 环境变量插值，所有值必须是字面字符串
+- Gemini 尚未作为 `acp_backend` 值在 QuickAI 中验证
+
+**Bridge-backed backends（需要 npx 适配器包）：**
+
+```toml
+# Claude
+[[backend]]
+id = "claude-main"
+family = "acp"
+acp_backend = "claude"
+
+[backend.launch]
+type = "command"
+command = "npx"
+args = ["--yes", "--prefer-offline", "@zed-industries/claude-agent-acp@0.18.0"]
+
+[backend.launch.env]
+ANTHROPIC_AUTH_TOKEN = "sk-ant-your-key-here"
+```
+
+```toml
+# Codex
+[[backend]]
+id = "codex-main"
+family = "acp"
+acp_backend = "codex"
+
+[backend.launch]
+type = "command"
+command = "npx"
+args = ["--yes", "--prefer-offline", "@zed-industries/codex-acp@latest"]
+```
+
+**Generic ACP CLI backends（直接命令行启动）：**
+
+```toml
+# Qwen
+[[backend]]
+id = "qwen-main"
+family = "acp"
+acp_backend = "qwen"
+
+[backend.launch]
+type = "command"
+command = "npx"
+args = ["@qwen-code/qwen-code", "--acp"]
+```
+
+```toml
+# Goose（使用子命令）
+[[backend]]
+id = "goose-main"
+family = "acp"
+acp_backend = "goose"
+
+[backend.launch]
+type = "command"
+command = "goose"
+args = ["acp"]
+```
+
+**Generic path（省略 acp_backend）：**
 
 ```toml
 [[backend]]
@@ -342,7 +431,26 @@ command = "codex-acp"
 args = ["--stdio"]
 ```
 
-也可以接 `quickai-claude-agent`、其它 ACP server，只要它是标准命令式启动。
+省略 `acp_backend` 时走通用 ACP CLI 路径，没有特殊策略。
+
+如果你要给 ACP backend 挂外部 MCP SSE server，同样配在 backend 下：
+
+```toml
+[[backend.external_mcp_servers]]
+name = "filesystem"
+url = "http://127.0.0.1:3001/sse"
+
+[[backend.external_mcp_servers]]
+name = "github"
+url = "http://127.0.0.1:3002/sse"
+```
+
+当前行为：
+
+- gateway 会把 `team-tools` 和这些外部 MCP SSE servers 一起注册进 ACP session
+- 这一阶段只支持 `SSE`
+- 如果 ACP agent 本身不声明 `mcp_capabilities.sse = true`，这些 MCP server 不会生效
+- 名称必须唯一，且不能使用保留名 `team-tools`
 
 ### 9.3 `open_claw_gateway`
 
@@ -371,6 +479,12 @@ team_helper_args = []
 ```toml
 lead_helper_mode = true
 ```
+
+注意：
+
+- 这一阶段 `OpenClaw` 不支持像 `ACP / quick_ai_native` 那样的外部 MCP server parity
+- 原因不是 QuickAI 偷懒，而是当前 OpenClaw gateway chat/client 路径没有对等的外部 MCP 注入面
+- `OpenClaw` 当前仍然支持 team helper CLI bridge，这是另一条能力路径，不等同于外部 MCP
 
 ## 10. 多 Agent roster 场景
 
@@ -406,6 +520,25 @@ workspace_dir = "/Users/yourname/work/app1"
 - 定义 persona 目录
 - 定义 workspace
 - 定义每个 agent 的额外 skills 目录
+
+### 为什么 external MCP 放在 `[[backend]]` 而不是 `[[agent_roster]]`
+
+当前 QuickAI 把外部 MCP server 视为 backend execution capability，而不是 persona/roster 属性。
+
+这意味着：
+
+- 同一个 backend 下的多个 agent 共享同一组外部 MCP tools
+- 这和 `backend.launch.env`、命令、协议能力属于同一层
+- `agent_roster` 继续负责：
+  - mention
+  - persona_dir
+  - workspace_dir
+  - extra skills
+
+这样做的好处是：
+
+- 多 CLI backend 的 ownership 更清楚
+- 不会把系统做成“backend 一套工具，agent 再覆盖一套工具”的双层混乱结构
 
 ### roster-only 模式
 

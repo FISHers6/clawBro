@@ -6,7 +6,7 @@ pub mod traits;
 
 pub use allowlist::AllowlistChecker;
 pub use dingtalk::{DingTalkChannel, DingTalkConfig};
-pub use lark::LarkChannel;
+pub use lark::{LarkChannel, LarkTriggerMode, LarkTriggerPolicy};
 pub use traits::{BoxChannel, Channel};
 
 /// Maximum number of retries for transient send errors (not counting the first attempt).

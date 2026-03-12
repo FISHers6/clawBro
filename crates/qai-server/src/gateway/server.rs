@@ -42,9 +42,10 @@ pub async fn start(state: AppState, host: &str, port: u16) -> anyhow::Result<Soc
     tracing::info!("Gateway listening on {}", bound_addr);
 
     tokio::spawn(async move {
-        axum::serve(listener, app)
-            .await
-            .expect("Gateway server failed");
+        if let Err(e) = axum::serve(listener, app).await {
+            tracing::error!("Gateway HTTP server terminated unexpectedly: {e}");
+            std::process::exit(1);
+        }
     });
 
     Ok(bound_addr)
@@ -90,11 +91,11 @@ mod tests {
     use crate::{config, state::AppState};
     use axum::{body::Body, http::Request};
     use qai_agent::{
+        roster::AgentEntry,
         team::{
             heartbeat::DispatchFn, orchestrator::TeamOrchestrator, registry::TaskRegistry,
             session::TeamSession,
         },
-        roster::AgentEntry,
         SessionRegistry,
     };
     use qai_runtime::{
@@ -111,12 +112,19 @@ mod tests {
                 id: "native-main".to_string(),
                 family: config::BackendFamilyConfig::QuickAiNative,
                 adapter_key: Some("native".to_string()),
+                acp_backend: None,
+                acp_auth_method: None,
+                codex: None,
+                provider_profile: None,
+                approval: Default::default(),
+                external_mcp_servers: vec![],
                 launch: config::BackendLaunchConfig::Embedded,
             }],
             channels: config::ChannelsSection {
                 lark: Some(config::LarkSection {
                     enabled: true,
                     presentation: config::ProgressPresentationMode::FinalOnly,
+                    trigger_policy: None,
                 }),
                 dingtalk: Some(config::DingTalkSection {
                     enabled: false,
@@ -171,6 +179,12 @@ mod tests {
                 family: BackendFamily::QuickAiNative,
                 adapter_key: "native".into(),
                 launch: LaunchSpec::Embedded,
+                approval_mode: Default::default(),
+                external_mcp_servers: vec![],
+                provider_profile: None,
+                acp_backend: None,
+                acp_auth_method: None,
+                codex_projection: None,
             })
             .await;
         let _ = runtime_registry.probe_backend("native-main").await.unwrap();

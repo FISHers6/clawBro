@@ -12,6 +12,7 @@ pub enum TeamTool {
     AssignTask,
     CheckpointTask,
     SubmitTaskResult,
+    CompleteTask,
     AcceptTask,
     ReopenTask,
     BlockTask,
@@ -58,6 +59,11 @@ pub enum TeamToolCall {
         task_id: String,
         reason: String,
         by: Option<String>,
+    },
+    CompleteTask {
+        task_id: String,
+        note: String,
+        agent: Option<String>,
     },
     BlockTask {
         task_id: String,
@@ -107,6 +113,7 @@ pub fn visible_team_tools_for_role(role: RuntimeRole) -> TeamToolVisibility {
         RuntimeRole::Specialist => vec![
             TeamTool::CheckpointTask,
             TeamTool::SubmitTaskResult,
+            TeamTool::CompleteTask,
             TeamTool::BlockTask,
             TeamTool::RequestHelp,
         ],
@@ -139,6 +146,7 @@ mod tests {
         assert_eq!(policy.role, RuntimeRole::Specialist);
         assert!(policy.visible.contains(&TeamTool::CheckpointTask));
         assert!(policy.visible.contains(&TeamTool::SubmitTaskResult));
+        assert!(policy.visible.contains(&TeamTool::CompleteTask));
         assert!(policy.visible.contains(&TeamTool::BlockTask));
         assert!(policy.visible.contains(&TeamTool::RequestHelp));
         assert!(!policy.visible.contains(&TeamTool::CreateTask));

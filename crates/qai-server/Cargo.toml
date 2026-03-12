@@ -41,7 +41,7 @@ toml.workspace     = true
 dirs.workspace     = true
 async-trait.workspace = true
 reqwest.workspace = true
-agent-client-protocol = "0.9"
+agent-client-protocol = { path = "../../../acp/rust-sdk/src/agent-client-protocol" }
 tokio-util = { version = "0.7", features = ["compat"] }
 rmcp = { version = "=0.8.5", features = ["client", "transport-sse-client-reqwest"] }
 rustls = { version = "0.23", features = ["ring"] }

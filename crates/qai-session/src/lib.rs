@@ -6,4 +6,4 @@ pub mod storage;
 pub use key::{key_to_session_id, SessionId};
 pub use manager::SessionManager;
 pub use queue::LaneQueue;
-pub use storage::{SessionMeta, SessionStorage, StoredMessage, ToolCallRecord};
+pub use storage::{SessionMeta, SessionStatus, SessionStorage, StoredMessage, ToolCallRecord};

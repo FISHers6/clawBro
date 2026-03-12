@@ -81,6 +81,12 @@ mod tests {
             family: BackendFamily::QuickAiNative,
             adapter_key: "native".into(),
             launch: LaunchSpec::Embedded,
+            approval_mode: Default::default(),
+            external_mcp_servers: vec![],
+            provider_profile: None,
+            acp_backend: None,
+            acp_auth_method: None,
+            codex_projection: None,
         }
     }
 
@@ -116,6 +122,12 @@ mod tests {
                         team_helper_args: vec![],
                         lead_helper_mode: false,
                     },
+                    approval_mode: Default::default(),
+                    external_mcp_servers: vec![],
+                    provider_profile: None,
+                    acp_backend: None,
+                    acp_auth_method: None,
+                    codex_projection: None,
                 },
                 RuntimeSessionSpec {
                     backend_id: "quickai-native".into(),
@@ -125,8 +137,12 @@ mod tests {
                     workspace_dir: None,
                     prompt_text: "hello".into(),
                     tool_surface: ToolSurfaceSpec::default(),
+                    approval_mode: Default::default(),
                     tool_bridge_url: None,
+                    external_mcp_servers: vec![],
                     team_tool_url: None,
+                    provider_profile: None,
+                    backend_session_id: None,
                     context: RuntimeContext::default(),
                 },
                 RuntimeEventSink::new(tx),

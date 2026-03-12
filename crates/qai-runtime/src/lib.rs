@@ -2,6 +2,7 @@ pub mod acp;
 pub mod adapter;
 pub mod approval;
 pub mod backend;
+pub mod codex_local_config;
 pub mod conductor;
 pub mod contract;
 pub mod event_sink;
@@ -9,21 +10,24 @@ pub mod helper_contract;
 pub mod native;
 pub mod observability;
 pub mod openclaw;
+pub mod provider_profiles;
 pub mod registry;
 pub mod testing;
 pub mod tool_bridge;
 
+pub use acp::{AcpAuthMethod, AcpBackend, CodexProjectionMode};
 pub use adapter::{BackendAdapter, LaunchSpec};
 pub use approval::{ApprovalBroker, ApprovalDecision};
 pub use backend::{
-    BackendFamily, CapabilityProfile, NativeTeamCapability, RoleEligibility, ToolBridgeKind,
+    ApprovalMode, BackendFamily, CapabilityProfile, NativeTeamCapability, RoleEligibility,
+    ToolBridgeKind,
 };
 pub use conductor::RuntimeConductor;
 pub use contract::{
-    render_history_lines, render_runtime_prompt, PermissionRequest, RuntimeContext,
-    RuntimeEvent, RuntimeHistoryMessage, RuntimePruningPolicy, RuntimeRole,
-    RuntimeSessionSpec, TeamCallback, ToolSurfaceSpec, TranscriptCompactionMode,
-    TranscriptPruningMode, RuntimeTranscriptSemantics, TurnIntent, TurnMode, TurnResult,
+    render_history_lines, render_runtime_prompt, ExternalMcpServerSpec, ExternalMcpTransport,
+    PermissionRequest, RuntimeContext, RuntimeEvent, RuntimeHistoryMessage, RuntimePruningPolicy,
+    RuntimeRole, RuntimeSessionSpec, RuntimeTranscriptSemantics, TeamCallback, ToolSurfaceSpec,
+    TranscriptCompactionMode, TranscriptPruningMode, TurnIntent, TurnMode, TurnResult,
 };
 pub use event_sink::RuntimeEventSink;
 pub use helper_contract::{
@@ -35,6 +39,10 @@ pub use observability::{
     backend_family_name, runtime_role_name, team_id_from_scope, turn_mode_name,
 };
 pub use openclaw::OpenClawBackendAdapter;
+pub use provider_profiles::{
+    ConfiguredProviderProfile, ConfiguredProviderProtocol, RuntimeProviderProfile,
+    RuntimeProviderProtocol,
+};
 pub use registry::{BackendRegistry, BackendSpec};
 pub use testing::{CapturedTurn, ScriptedAdapter, ScriptedTurn};
 pub use tool_bridge::{

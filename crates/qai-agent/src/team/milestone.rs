@@ -57,15 +57,11 @@ pub enum TeamMilestoneEvent {
         total: usize,
     },
     /// 新任务因依赖已满足而解锁
-    TasksUnlocked {
-        task_ids: Vec<String>,
-    },
+    TasksUnlocked { task_ids: Vec<String> },
     /// 全部任务完成
     AllTasksDone,
     /// Lead 发布任意文字更新（通过 post_message / post_update 工具）
-    LeadMessage {
-        text: String,
-    },
+    LeadMessage { text: String },
 }
 
 impl TeamMilestoneEvent {
@@ -174,7 +170,10 @@ mod tests {
         // Rendered string contains structured data (not just checking emoji)
         assert!(rendered.contains("T1"), "rendered must contain task_id");
         assert!(rendered.contains("codex"), "rendered must contain agent");
-        assert!(rendered.contains("1/3"), "rendered must contain progress ratio");
+        assert!(
+            rendered.contains("1/3"),
+            "rendered must contain progress ratio"
+        );
     }
 
     #[test]

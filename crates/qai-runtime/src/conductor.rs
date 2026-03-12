@@ -28,9 +28,13 @@ impl RuntimeConductor {
             workspace_dir: None,
             prompt_text: intent.user_text.clone(),
             tool_surface: tool_surface_from_intent(&intent),
+            approval_mode: Default::default(),
             tool_bridge_url: None,
+            external_mcp_servers: vec![],
             team_tool_url: None,
+            provider_profile: None,
             context: RuntimeContext::default(),
+            backend_session_id: None,
         };
         self.execute_prepared(intent, session).await
     }
@@ -206,6 +210,8 @@ mod tests {
             Ok(TurnResult {
                 full_text: "hello world".into(),
                 events: Vec::new(),
+                emitted_backend_session_id: None,
+                used_backend_id: None,
             })
         }
     }
@@ -240,6 +246,12 @@ mod tests {
                 family: BackendFamily::Acp,
                 adapter_key: "fake".into(),
                 launch: LaunchSpec::Embedded,
+                approval_mode: Default::default(),
+                external_mcp_servers: vec![],
+                provider_profile: None,
+                acp_backend: None,
+                acp_auth_method: None,
+                codex_projection: None,
             })
             .await;
         let conductor = RuntimeConductor::new(Arc::clone(&registry));
@@ -309,6 +321,12 @@ mod tests {
                     team_helper_args: vec![],
                     lead_helper_mode: false,
                 },
+                approval_mode: Default::default(),
+                external_mcp_servers: vec![],
+                provider_profile: None,
+                acp_backend: None,
+                acp_auth_method: None,
+                codex_projection: None,
             })
             .await;
         let conductor = RuntimeConductor::new(Arc::clone(&registry));
@@ -370,6 +388,12 @@ mod tests {
                     team_helper_args: vec![],
                     lead_helper_mode: false,
                 },
+                approval_mode: Default::default(),
+                external_mcp_servers: vec![],
+                provider_profile: None,
+                acp_backend: None,
+                acp_auth_method: None,
+                codex_projection: None,
             })
             .await;
         let conductor = RuntimeConductor::new(Arc::clone(&registry));
@@ -431,6 +455,12 @@ mod tests {
                     team_helper_args: vec![],
                     lead_helper_mode: false,
                 },
+                approval_mode: Default::default(),
+                external_mcp_servers: vec![],
+                provider_profile: None,
+                acp_backend: None,
+                acp_auth_method: None,
+                codex_projection: None,
             })
             .await;
         let conductor = RuntimeConductor::new(Arc::clone(&registry));

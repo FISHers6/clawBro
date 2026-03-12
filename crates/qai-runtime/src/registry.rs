@@ -10,6 +10,17 @@ pub struct BackendSpec {
     pub family: crate::backend::BackendFamily,
     pub adapter_key: String,
     pub launch: crate::adapter::LaunchSpec,
+    pub approval_mode: crate::backend::ApprovalMode,
+    pub external_mcp_servers: Vec<crate::contract::ExternalMcpServerSpec>,
+    pub provider_profile: Option<crate::provider_profiles::ConfiguredProviderProfile>,
+    /// Optional ACP backend identity. Only populated when `family == Acp`.
+    /// `None` means generic ACP CLI backend.
+    pub acp_backend: Option<crate::acp::AcpBackend>,
+    /// Optional ACP auth method to negotiate after initialize().
+    /// Currently only bridge-backed backends such as Codex consume this.
+    pub acp_auth_method: Option<crate::acp::AcpAuthMethod>,
+    /// Optional Codex-specific provider projection mode within the ACP family.
+    pub codex_projection: Option<crate::acp::CodexProjectionMode>,
 }
 
 pub struct BackendRegistry {
@@ -159,6 +170,8 @@ mod tests {
             Ok(TurnResult {
                 full_text: String::new(),
                 events: Vec::new(),
+                emitted_backend_session_id: None,
+                used_backend_id: None,
             })
         }
     }
@@ -178,6 +191,12 @@ mod tests {
                 family: BackendFamily::Acp,
                 adapter_key: "fake".into(),
                 launch: LaunchSpec::Embedded,
+                approval_mode: Default::default(),
+                external_mcp_servers: vec![],
+                provider_profile: None,
+                acp_backend: None,
+                acp_auth_method: None,
+                codex_projection: None,
             })
             .await;
 
@@ -204,6 +223,12 @@ mod tests {
                 family: BackendFamily::OpenClawGateway,
                 adapter_key: "fake".into(),
                 launch: LaunchSpec::Embedded,
+                approval_mode: Default::default(),
+                external_mcp_servers: vec![],
+                provider_profile: None,
+                acp_backend: None,
+                acp_auth_method: None,
+                codex_projection: None,
             })
             .await;
 
@@ -229,6 +254,12 @@ mod tests {
                 family: BackendFamily::QuickAiNative,
                 adapter_key: "fake".into(),
                 launch: LaunchSpec::Embedded,
+                approval_mode: Default::default(),
+                external_mcp_servers: vec![],
+                provider_profile: None,
+                acp_backend: None,
+                acp_auth_method: None,
+                codex_projection: None,
             })
             .await;
 
@@ -251,6 +282,12 @@ mod tests {
                     args: vec!["--stdio".into()],
                     env: vec![("RUST_LOG".into(), "debug".into())],
                 },
+                approval_mode: Default::default(),
+                external_mcp_servers: vec![],
+                provider_profile: None,
+                acp_backend: None,
+                acp_auth_method: None,
+                codex_projection: None,
             })
             .await;
 
@@ -265,5 +302,80 @@ mod tests {
             }
             other => panic!("unexpected launch spec: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn acp_backend_spec_preserves_explicit_identity() {
+        use crate::acp::AcpBackend;
+        let registry = BackendRegistry::new();
+        registry
+            .register_backend(BackendSpec {
+                backend_id: "claude-main".into(),
+                family: BackendFamily::Acp,
+                adapter_key: "acp".into(),
+                launch: LaunchSpec::Command {
+                    command: "npx".into(),
+                    args: vec!["@zed-industries/claude-agent-acp".into()],
+                    env: vec![],
+                },
+                approval_mode: Default::default(),
+                external_mcp_servers: vec![],
+                provider_profile: None,
+                acp_backend: Some(AcpBackend::Claude),
+                acp_auth_method: None,
+                codex_projection: None,
+            })
+            .await;
+
+        let spec = registry.backend_spec("claude-main").await.unwrap();
+        assert_eq!(spec.acp_backend, Some(AcpBackend::Claude));
+    }
+
+    #[tokio::test]
+    async fn acp_backend_spec_preserves_none_when_omitted() {
+        let registry = BackendRegistry::new();
+        registry
+            .register_backend(BackendSpec {
+                backend_id: "generic-acp".into(),
+                family: BackendFamily::Acp,
+                adapter_key: "acp".into(),
+                launch: LaunchSpec::Command {
+                    command: "some-acp-tool".into(),
+                    args: vec!["--acp".into()],
+                    env: vec![],
+                },
+                approval_mode: Default::default(),
+                external_mcp_servers: vec![],
+                provider_profile: None,
+                acp_backend: None,
+                acp_auth_method: None,
+                codex_projection: None,
+            })
+            .await;
+
+        let spec = registry.backend_spec("generic-acp").await.unwrap();
+        assert_eq!(spec.acp_backend, None);
+    }
+
+    #[tokio::test]
+    async fn non_acp_backend_spec_always_has_none() {
+        let registry = BackendRegistry::new();
+        registry
+            .register_backend(BackendSpec {
+                backend_id: "native-main".into(),
+                family: BackendFamily::QuickAiNative,
+                adapter_key: "native".into(),
+                launch: LaunchSpec::Embedded,
+                approval_mode: Default::default(),
+                external_mcp_servers: vec![],
+                provider_profile: None,
+                acp_backend: None,
+                acp_auth_method: None,
+                codex_projection: None,
+            })
+            .await;
+
+        let spec = registry.backend_spec("native-main").await.unwrap();
+        assert_eq!(spec.acp_backend, None);
     }
 }

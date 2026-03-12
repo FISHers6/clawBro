@@ -75,6 +75,8 @@ impl BackendAdapter for ScriptedAdapter {
         Ok(TurnResult {
             full_text: scripted.full_text,
             events: scripted.events,
+            emitted_backend_session_id: None,
+            used_backend_id: None,
         })
     }
 }

@@ -61,6 +61,7 @@ pub fn ensure_team_tool_allowed(role: RuntimeRole, call: &TeamToolCall) -> Resul
         TeamToolCall::AssignTask { .. } => TeamTool::AssignTask,
         TeamToolCall::CheckpointTask { .. } => TeamTool::CheckpointTask,
         TeamToolCall::SubmitTaskResult { .. } => TeamTool::SubmitTaskResult,
+        TeamToolCall::CompleteTask { .. } => TeamTool::CompleteTask,
         TeamToolCall::AcceptTask { .. } => TeamTool::AcceptTask,
         TeamToolCall::ReopenTask { .. } => TeamTool::ReopenTask,
         TeamToolCall::BlockTask { .. } => TeamTool::BlockTask,
@@ -204,6 +205,26 @@ pub async fn execute_team_tool_call(
             TeamToolResponse {
                 ok: true,
                 message: format!("Task {} reopened by {}.", task_id, by),
+                payload: None,
+            }
+        }
+        TeamToolCall::CompleteTask {
+            task_id,
+            note,
+            agent,
+        } => {
+            let agent = resolve_claimed_agent(&team_orch, &task_id, agent.as_deref());
+            if !team_orch
+                .registry
+                .is_claimed_by(&task_id, &agent)
+                .unwrap_or(false)
+            {
+                anyhow::bail!("task '{}' is not currently claimed by '{}'", task_id, agent);
+            }
+            team_orch.handle_specialist_done(&task_id, &agent, &note)?;
+            TeamToolResponse {
+                ok: true,
+                message: format!("Task {} marked done.", task_id),
                 payload: None,
             }
         }

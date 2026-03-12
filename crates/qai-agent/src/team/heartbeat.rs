@@ -227,14 +227,10 @@ mod tests {
         let registry = Arc::new(TaskRegistry::new_in_memory().unwrap());
         let tmp = tempdir().unwrap();
         let session = Arc::new(TeamSession::from_dir("test-team", tmp.path().to_path_buf()));
-        let dispatch_fn: DispatchFn = Arc::new(move |_agent, _task| Box::pin(async move { Ok(()) }));
-        let hb = OrchestratorHeartbeat::new(
-            registry,
-            session,
-            dispatch_fn,
-            Duration::from_secs(1),
-            1,
-        );
+        let dispatch_fn: DispatchFn =
+            Arc::new(move |_agent, _task| Box::pin(async move { Ok(()) }));
+        let hb =
+            OrchestratorHeartbeat::new(registry, session, dispatch_fn, Duration::from_secs(1), 1);
         assert_eq!(hb.dispatch_semaphore.available_permits(), 1);
     }
 
@@ -379,7 +375,10 @@ mod tests {
         let max_c = Arc::clone(&max_inflight);
 
         let tmp = tempdir().unwrap();
-        let session = Arc::new(TeamSession::from_dir("test-concurrent", tmp.path().to_path_buf()));
+        let session = Arc::new(TeamSession::from_dir(
+            "test-concurrent",
+            tmp.path().to_path_buf(),
+        ));
 
         let dispatch_fn: DispatchFn = Arc::new(move |_agent, _task| {
             let inflight = Arc::clone(&inflight_c);
@@ -406,7 +405,7 @@ mod tests {
             session,
             dispatch_fn,
             Duration::from_millis(20), // 快速 tick
-            2, // max_parallel = 2
+            2,                         // max_parallel = 2
         ));
 
         let hb_clone = Arc::clone(&hb);

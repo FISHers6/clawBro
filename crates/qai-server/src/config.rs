@@ -1,7 +1,7 @@
 use anyhow::Result;
 use qai_agent::bindings::{BindingPeerKind, BindingRule};
 use qai_agent::roster::AgentEntry;
-use qai_runtime::{BackendFamily, BackendSpec, LaunchSpec};
+use qai_runtime::{AcpBackend, ApprovalMode, BackendFamily, BackendSpec, LaunchSpec};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -94,6 +94,9 @@ pub struct GatewayConfig {
     /// Canonical backend catalog (`[[backend]]`).
     #[serde(default, rename = "backend")]
     pub backends: Vec<BackendCatalogEntry>,
+    /// Canonical provider profile registry (`[[provider_profile]]`).
+    #[serde(default, rename = "provider_profile")]
+    pub provider_profiles: Vec<ProviderProfileConfig>,
     #[serde(default)]
     pub memory: MemorySection,
     #[serde(default)]
@@ -141,6 +144,78 @@ impl GatewayConfig {
             anyhow::bail!("at least one [[backend]] entry is required");
         }
 
+        for backend in &self.backends {
+            if backend.acp_backend.is_some() && !matches!(backend.family, BackendFamilyConfig::Acp)
+            {
+                anyhow::bail!(
+                    "backend `{}` sets acp_backend but family is not `acp`",
+                    backend.id
+                );
+            }
+            if backend.acp_auth_method.is_some()
+                && !matches!(backend.family, BackendFamilyConfig::Acp)
+            {
+                anyhow::bail!(
+                    "backend `{}` sets acp_auth_method but family is not `acp`",
+                    backend.id
+                );
+            }
+            if backend.acp_auth_method.is_some() && backend.acp_backend != Some(AcpBackend::Codex) {
+                anyhow::bail!(
+                    "backend `{}` sets acp_auth_method but only acp_backend = \"codex\" is supported in the current phase",
+                    backend.id
+                );
+            }
+            if backend.codex.is_some() && !matches!(backend.family, BackendFamilyConfig::Acp) {
+                anyhow::bail!(
+                    "backend `{}` sets [backend.codex] but family is not `acp`",
+                    backend.id
+                );
+            }
+            if backend.codex.is_some() && backend.acp_backend != Some(AcpBackend::Codex) {
+                anyhow::bail!(
+                    "backend `{}` sets [backend.codex] but only acp_backend = \"codex\" is supported in the current phase",
+                    backend.id
+                );
+            }
+
+            let mut seen_mcp_names = BTreeSet::new();
+            for server in &backend.external_mcp_servers {
+                let name = server.name.trim();
+                if name.is_empty() {
+                    anyhow::bail!(
+                        "backend `{}` contains an external MCP server with an empty name",
+                        backend.id
+                    );
+                }
+                if name == "team-tools" {
+                    anyhow::bail!(
+                        "backend `{}` uses reserved external MCP server name `team-tools`",
+                        backend.id
+                    );
+                }
+                if !seen_mcp_names.insert(name.to_string()) {
+                    anyhow::bail!(
+                        "backend `{}` contains duplicate external MCP server name `{}`",
+                        backend.id,
+                        name
+                    );
+                }
+            }
+        }
+
+        let mut seen_provider_ids = BTreeSet::new();
+        for profile in &self.provider_profiles {
+            let id = profile.id.trim();
+            if id.is_empty() {
+                anyhow::bail!("provider_profile id cannot be empty");
+            }
+            if !seen_provider_ids.insert(id.to_string()) {
+                anyhow::bail!("duplicate provider_profile id `{id}`");
+            }
+            profile.validate()?;
+        }
+
         let backend_ids: BTreeSet<&str> = self
             .backends
             .iter()
@@ -169,13 +244,59 @@ impl GatewayConfig {
             }
         }
 
+        let provider_ids: BTreeSet<&str> = self
+            .provider_profiles
+            .iter()
+            .map(|p| p.id.as_str())
+            .collect();
+        for backend in &self.backends {
+            if let Some(profile_id) = backend.provider_profile.as_deref() {
+                if !provider_ids.contains(profile_id) {
+                    anyhow::bail!(
+                        "backend `{}` references provider_profile `{}` which is not present in [[provider_profile]]",
+                        backend.id,
+                        profile_id
+                    );
+                }
+            }
+            if let Some(codex) = &backend.codex {
+                if matches!(codex.projection, CodexProjectionModeConfig::LocalConfig) {
+                    let profile_id = backend.provider_profile.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "backend `{}` sets codex projection = \"local_config\" but has no provider_profile",
+                            backend.id
+                        )
+                    })?;
+                    let profile = self
+                        .provider_profiles
+                        .iter()
+                        .find(|profile| profile.id == profile_id)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("unknown provider_profile `{profile_id}`")
+                        })?;
+                    if !matches!(
+                        profile.protocol,
+                        ProviderProfileProtocolConfig::OpenaiCompatible { .. }
+                    ) {
+                        anyhow::bail!(
+                            "backend `{}` sets codex projection = \"local_config\" but provider_profile `{}` is not openai_compatible",
+                            backend.id,
+                            profile_id
+                        );
+                    }
+                }
+            }
+        }
+
         let roster_names: BTreeSet<&str> = self
             .agent_roster
             .iter()
             .map(|entry| entry.name.as_str())
             .collect();
         if !self.bindings.is_empty() && roster_names.is_empty() {
-            anyhow::bail!("[[binding]] requires [[agent_roster]] so bindings can resolve to named agents");
+            anyhow::bail!(
+                "[[binding]] requires [[agent_roster]] so bindings can resolve to named agents"
+            );
         }
         for group in &self.groups {
             if let Some(front_bot) = group.mode.front_bot.as_deref() {
@@ -213,6 +334,23 @@ impl GatewayConfig {
     }
 }
 
+impl GatewayConfig {
+    pub fn resolve_provider_profile(
+        &self,
+        provider_profile_id: Option<&str>,
+    ) -> Result<Option<qai_runtime::ConfiguredProviderProfile>> {
+        let Some(id) = provider_profile_id else {
+            return Ok(None);
+        };
+        let profile = self
+            .provider_profiles
+            .iter()
+            .find(|profile| profile.id == id)
+            .ok_or_else(|| anyhow::anyhow!("unknown provider_profile `{id}`"))?;
+        Ok(Some(profile.to_runtime_profile()))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AgentSection {
     #[serde(default)]
@@ -236,6 +374,15 @@ impl BackendFamilyConfig {
         }
     }
 }
+
+/// Config-layer alias for the runtime ACP backend identity type.
+/// Re-exported from `qai_runtime` so TOML deserialization and runtime use share the same type.
+pub type AcpBackendConfig = AcpBackend;
+pub type AcpAuthMethodConfig = qai_runtime::AcpAuthMethod;
+pub type CodexProjectionModeConfig = qai_runtime::CodexProjectionMode;
+
+/// Config-layer alias for backend approval mode.
+pub type ApprovalModeConfig = ApprovalMode;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -309,6 +456,23 @@ pub struct BackendCatalogEntry {
     pub family: BackendFamilyConfig,
     #[serde(default)]
     pub adapter_key: Option<String>,
+    /// Optional ACP backend identity. Only valid when `family = "acp"`.
+    /// When omitted, the backend is treated as a generic ACP CLI backend.
+    #[serde(default)]
+    pub acp_backend: Option<AcpBackend>,
+    /// Optional ACP auth-method identity. Only valid for selected bridge-backed ACP backends.
+    #[serde(default)]
+    pub acp_auth_method: Option<AcpAuthMethodConfig>,
+    /// Optional Codex-specific projection mode. Only valid when `family = "acp"` and `acp_backend = "codex"`.
+    #[serde(default)]
+    pub codex: Option<BackendCodexConfig>,
+    /// Optional provider profile binding. Resolved against the top-level `[[provider_profile]]` registry.
+    #[serde(default)]
+    pub provider_profile: Option<String>,
+    #[serde(default)]
+    pub approval: BackendApprovalConfig,
+    #[serde(default)]
+    pub external_mcp_servers: Vec<ExternalMcpServerConfig>,
     pub launch: BackendLaunchConfig,
 }
 
@@ -321,12 +485,144 @@ impl BackendCatalogEntry {
         })
     }
 
-    pub fn to_backend_spec(&self) -> BackendSpec {
+    pub fn to_backend_spec(
+        &self,
+        provider_profile: Option<qai_runtime::ConfiguredProviderProfile>,
+    ) -> BackendSpec {
         BackendSpec {
             backend_id: self.id.clone(),
             family: self.family.clone().into_runtime_family(),
             adapter_key: self.adapter_key().to_string(),
             launch: self.launch.clone().into_launch_spec(),
+            approval_mode: self.approval.mode,
+            external_mcp_servers: self
+                .external_mcp_servers
+                .iter()
+                .cloned()
+                .map(ExternalMcpServerConfig::into_runtime_spec)
+                .collect(),
+            provider_profile,
+            acp_backend: self.acp_backend,
+            acp_auth_method: self.acp_auth_method,
+            codex_projection: self.codex.as_ref().map(|cfg| cfg.projection),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackendCodexConfig {
+    pub projection: CodexProjectionModeConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct BackendApprovalConfig {
+    #[serde(default)]
+    pub mode: ApprovalModeConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderProfileConfig {
+    pub id: String,
+    #[serde(flatten)]
+    pub protocol: ProviderProfileProtocolConfig,
+}
+
+impl ProviderProfileConfig {
+    fn validate(&self) -> Result<()> {
+        match &self.protocol {
+            ProviderProfileProtocolConfig::OfficialSession => Ok(()),
+            ProviderProfileProtocolConfig::AnthropicCompatible {
+                base_url,
+                auth_token_env,
+                default_model,
+                ..
+            }
+            | ProviderProfileProtocolConfig::OpenaiCompatible {
+                base_url,
+                auth_token_env,
+                default_model,
+            } => {
+                if base_url.trim().is_empty() {
+                    anyhow::bail!("provider_profile `{}` requires non-empty base_url", self.id);
+                }
+                if auth_token_env.trim().is_empty() {
+                    anyhow::bail!(
+                        "provider_profile `{}` requires non-empty auth_token_env",
+                        self.id
+                    );
+                }
+                if default_model.trim().is_empty() {
+                    anyhow::bail!(
+                        "provider_profile `{}` requires non-empty default_model",
+                        self.id
+                    );
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn to_runtime_profile(&self) -> qai_runtime::ConfiguredProviderProfile {
+        qai_runtime::ConfiguredProviderProfile {
+            id: self.id.clone(),
+            protocol: match &self.protocol {
+                ProviderProfileProtocolConfig::OfficialSession => {
+                    qai_runtime::ConfiguredProviderProtocol::OfficialSession
+                }
+                ProviderProfileProtocolConfig::AnthropicCompatible {
+                    base_url,
+                    auth_token_env,
+                    default_model,
+                    small_fast_model,
+                } => qai_runtime::ConfiguredProviderProtocol::AnthropicCompatible {
+                    base_url: base_url.clone(),
+                    auth_token_env: auth_token_env.clone(),
+                    default_model: default_model.clone(),
+                    small_fast_model: small_fast_model.clone(),
+                },
+                ProviderProfileProtocolConfig::OpenaiCompatible {
+                    base_url,
+                    auth_token_env,
+                    default_model,
+                } => qai_runtime::ConfiguredProviderProtocol::OpenaiCompatible {
+                    base_url: base_url.clone(),
+                    auth_token_env: auth_token_env.clone(),
+                    default_model: default_model.clone(),
+                },
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "protocol", rename_all = "snake_case")]
+pub enum ProviderProfileProtocolConfig {
+    OfficialSession,
+    AnthropicCompatible {
+        base_url: String,
+        auth_token_env: String,
+        default_model: String,
+        #[serde(default)]
+        small_fast_model: Option<String>,
+    },
+    OpenaiCompatible {
+        base_url: String,
+        auth_token_env: String,
+        default_model: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExternalMcpServerConfig {
+    pub name: String,
+    pub url: String,
+}
+
+impl ExternalMcpServerConfig {
+    fn into_runtime_spec(self) -> qai_runtime::ExternalMcpServerSpec {
+        qai_runtime::ExternalMcpServerSpec {
+            name: self.name,
+            transport: qai_runtime::ExternalMcpTransport::Sse { url: self.url },
         }
     }
 }
@@ -359,6 +655,55 @@ pub struct LarkSection {
     pub enabled: bool,
     #[serde(default)]
     pub presentation: ProgressPresentationMode,
+    #[serde(default)]
+    pub trigger_policy: Option<LarkTriggerPolicyConfig>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelTriggerModeConfig {
+    #[default]
+    AllMessages,
+    MentionOnly,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct ScopeTriggerPolicyConfig {
+    #[serde(default)]
+    pub mode: ChannelTriggerModeConfig,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct LarkTriggerPolicyConfig {
+    #[serde(default)]
+    pub group: ScopeTriggerPolicyConfig,
+    #[serde(default)]
+    pub dm: ScopeTriggerPolicyConfig,
+}
+
+impl LarkSection {
+    pub fn resolved_trigger_policy(
+        &self,
+        gateway: &GatewaySection,
+    ) -> qai_channels::LarkTriggerPolicy {
+        let fallback = qai_channels::LarkTriggerPolicy::from_require_mention_in_groups(
+            gateway.require_mention_in_groups,
+        );
+        let Some(policy) = self.trigger_policy else {
+            return fallback;
+        };
+
+        qai_channels::LarkTriggerPolicy {
+            group: match policy.group.mode {
+                ChannelTriggerModeConfig::AllMessages => qai_channels::LarkTriggerMode::AllMessages,
+                ChannelTriggerModeConfig::MentionOnly => qai_channels::LarkTriggerMode::MentionOnly,
+            },
+            dm: match policy.dm.mode {
+                ChannelTriggerModeConfig::AllMessages => qai_channels::LarkTriggerMode::AllMessages,
+                ChannelTriggerModeConfig::MentionOnly => qai_channels::LarkTriggerMode::MentionOnly,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -666,7 +1011,7 @@ args = ["--stdio"]
         "#;
         let cfg: GatewayConfig = toml::from_str(toml).unwrap();
         assert_eq!(cfg.backends.len(), 1);
-        let spec = cfg.backends[0].to_backend_spec();
+        let spec = cfg.backends[0].to_backend_spec(None);
         assert_eq!(spec.backend_id, "codex-main");
         assert_eq!(spec.family, BackendFamily::Acp);
         assert_eq!(spec.adapter_key, "acp");
@@ -687,7 +1032,7 @@ token = "test-token"
 scopes = ["operator.admin"]
         "#;
         let cfg: GatewayConfig = toml::from_str(toml).unwrap();
-        let spec = cfg.backends[0].to_backend_spec();
+        let spec = cfg.backends[0].to_backend_spec(None);
         assert_eq!(spec.family, BackendFamily::OpenClawGateway);
         assert_eq!(spec.adapter_key, "openclaw");
         match spec.launch {
@@ -730,7 +1075,7 @@ team_helper_command = "/bin/qai_team_cli"
 lead_helper_mode = true
         "#;
         let cfg: GatewayConfig = toml::from_str(toml).unwrap();
-        let spec = cfg.backends[0].to_backend_spec();
+        let spec = cfg.backends[0].to_backend_spec(None);
         match spec.launch {
             LaunchSpec::GatewayWs {
                 team_helper_command,
@@ -755,10 +1100,37 @@ family = "quick_ai_native"
 type = "embedded"
         "#;
         let cfg: GatewayConfig = toml::from_str(toml).unwrap();
-        let spec = cfg.backends[0].to_backend_spec();
+        let spec = cfg.backends[0].to_backend_spec(None);
         assert_eq!(spec.family, BackendFamily::QuickAiNative);
         assert_eq!(spec.adapter_key, "native");
         assert!(matches!(spec.launch, LaunchSpec::Embedded));
+    }
+
+    #[test]
+    fn parse_backend_with_external_mcp_servers() {
+        let toml = r#"
+[[backend]]
+id = "native-main"
+family = "quick_ai_native"
+
+[backend.launch]
+type = "embedded"
+
+[[backend.external_mcp_servers]]
+name = "filesystem"
+url = "http://127.0.0.1:3001/sse"
+        "#;
+        let cfg: GatewayConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.backends.len(), 1);
+        assert_eq!(cfg.backends[0].external_mcp_servers.len(), 1);
+        assert_eq!(cfg.backends[0].external_mcp_servers[0].name, "filesystem");
+        let spec = cfg.backends[0].to_backend_spec(None);
+        assert_eq!(spec.external_mcp_servers.len(), 1);
+        match &spec.external_mcp_servers[0].transport {
+            qai_runtime::ExternalMcpTransport::Sse { url } => {
+                assert_eq!(url, "http://127.0.0.1:3001/sse");
+            }
+        }
     }
 
     #[test]
@@ -1128,6 +1500,55 @@ default_workspace = "/home/user/workspace"
     }
 
     #[test]
+    fn lark_trigger_policy_defaults_are_group_compatible_and_dm_open() {
+        let toml = r#"
+[gateway]
+host = "127.0.0.1"
+port = 8080
+require_mention_in_groups = true
+
+[channels.lark]
+enabled = true
+"#;
+        let cfg: GatewayConfig = toml::from_str(toml).unwrap();
+        let policy = cfg
+            .channels
+            .lark
+            .as_ref()
+            .unwrap()
+            .resolved_trigger_policy(&cfg.gateway);
+        assert_eq!(policy.group, qai_channels::LarkTriggerMode::MentionOnly);
+        assert_eq!(policy.dm, qai_channels::LarkTriggerMode::AllMessages);
+    }
+
+    #[test]
+    fn lark_trigger_policy_parses_group_and_dm_modes() {
+        let toml = r#"
+[gateway]
+host = "127.0.0.1"
+port = 8080
+
+[channels.lark]
+enabled = true
+
+[channels.lark.trigger_policy.group]
+mode = "mention_only"
+
+[channels.lark.trigger_policy.dm]
+mode = "all_messages"
+"#;
+        let cfg: GatewayConfig = toml::from_str(toml).unwrap();
+        let policy = cfg
+            .channels
+            .lark
+            .as_ref()
+            .unwrap()
+            .resolved_trigger_policy(&cfg.gateway);
+        assert_eq!(policy.group, qai_channels::LarkTriggerMode::MentionOnly);
+        assert_eq!(policy.dm, qai_channels::LarkTriggerMode::AllMessages);
+    }
+
+    #[test]
     fn test_group_config_deserializes() {
         let toml_str = r#"
 [[group]]
@@ -1306,6 +1727,195 @@ agent = "claude"
         .unwrap();
 
         let err = cfg.validate_runtime_topology().unwrap_err();
-        assert!(err.to_string().contains("[[binding]] requires [[agent_roster]]"));
+        assert!(err
+            .to_string()
+            .contains("[[binding]] requires [[agent_roster]]"));
+    }
+
+    #[test]
+    fn test_validate_runtime_topology_rejects_empty_external_mcp_name() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+[[backend]]
+id = "native-main"
+family = "quick_ai_native"
+
+[backend.launch]
+type = "embedded"
+
+[[backend.external_mcp_servers]]
+name = "   "
+url = "http://127.0.0.1:3001/sse"
+
+[agent]
+backend_id = "native-main"
+"#,
+        )
+        .unwrap();
+
+        let err = cfg.validate_runtime_topology().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("contains an external MCP server with an empty name"));
+    }
+
+    #[test]
+    fn test_validate_runtime_topology_rejects_duplicate_external_mcp_names() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+[[backend]]
+id = "native-main"
+family = "quick_ai_native"
+
+[backend.launch]
+type = "embedded"
+
+[[backend.external_mcp_servers]]
+name = "filesystem"
+url = "http://127.0.0.1:3001/sse"
+
+[[backend.external_mcp_servers]]
+name = "filesystem"
+url = "http://127.0.0.1:3002/sse"
+
+[agent]
+backend_id = "native-main"
+"#,
+        )
+        .unwrap();
+
+        let err = cfg.validate_runtime_topology().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("contains duplicate external MCP server name `filesystem`"));
+    }
+
+    #[test]
+    fn test_validate_runtime_topology_rejects_reserved_external_mcp_name() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+[[backend]]
+id = "native-main"
+family = "quick_ai_native"
+
+[backend.launch]
+type = "embedded"
+
+[[backend.external_mcp_servers]]
+name = "team-tools"
+url = "http://127.0.0.1:3001/sse"
+
+[agent]
+backend_id = "native-main"
+"#,
+        )
+        .unwrap();
+
+        let err = cfg.validate_runtime_topology().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("uses reserved external MCP server name `team-tools`"));
+    }
+
+    #[test]
+    fn acp_backend_accepts_claude() {
+        let toml = r#"
+[[backend]]
+id = "claude-main"
+family = "acp"
+acp_backend = "claude"
+
+[backend.launch]
+type = "command"
+command = "npx"
+args = ["@zed-industries/claude-agent-acp"]
+
+[agent]
+backend_id = "claude-main"
+        "#;
+        let cfg: GatewayConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.backends[0].acp_backend, Some(AcpBackendConfig::Claude));
+        cfg.validate_runtime_topology().unwrap();
+    }
+
+    #[test]
+    fn acp_backend_accepts_qwen() {
+        let toml = r#"
+[[backend]]
+id = "qwen-main"
+family = "acp"
+acp_backend = "qwen"
+
+[backend.launch]
+type = "command"
+command = "npx"
+args = ["@qwen-code/qwen-code", "--acp"]
+
+[agent]
+backend_id = "qwen-main"
+        "#;
+        let cfg: GatewayConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.backends[0].acp_backend, Some(AcpBackendConfig::Qwen));
+        cfg.validate_runtime_topology().unwrap();
+    }
+
+    #[test]
+    fn acp_backend_may_be_omitted() {
+        let toml = r#"
+[[backend]]
+id = "generic-acp"
+family = "acp"
+
+[backend.launch]
+type = "command"
+command = "some-acp-tool"
+args = ["--acp"]
+
+[agent]
+backend_id = "generic-acp"
+        "#;
+        let cfg: GatewayConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.backends[0].acp_backend, None);
+        cfg.validate_runtime_topology().unwrap();
+    }
+
+    #[test]
+    fn non_acp_backend_rejects_acp_backend_field() {
+        let toml = r#"
+[[backend]]
+id = "native-main"
+family = "quick_ai_native"
+acp_backend = "claude"
+
+[backend.launch]
+type = "embedded"
+
+[agent]
+backend_id = "native-main"
+        "#;
+        let cfg: GatewayConfig = toml::from_str(toml).unwrap();
+        let err = cfg.validate_runtime_topology().unwrap_err();
+        assert!(err.to_string().contains("acp_backend"));
+        assert!(err.to_string().contains("native-main"));
+    }
+
+    #[test]
+    fn acp_backend_rejects_unknown_value() {
+        let toml = r#"
+[[backend]]
+id = "gemini-main"
+family = "acp"
+acp_backend = "gemini"
+
+[backend.launch]
+type = "command"
+command = "gemini"
+args = ["--acp"]
+        "#;
+        let result: Result<GatewayConfig, _> = toml::from_str(toml);
+        assert!(
+            result.is_err(),
+            "unknown acp_backend value should be rejected at parse time"
+        );
     }
 }

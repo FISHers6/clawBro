@@ -5,7 +5,7 @@ use qai_agent::{throttled_stream, OutputSink, SessionRegistry, StreamControl};
 use qai_channels::Channel;
 use qai_protocol::{InboundMsg, OutboundMsg, SessionKey};
 use std::sync::Arc;
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{oneshot, Mutex};
 
 pub struct ImProgressSink {
     channel: Arc<dyn Channel>,
@@ -72,6 +72,12 @@ impl OutputSink for ImProgressSink {
         };
         if let Err(e) = self.channel.send(&msg).await {
             tracing::error!(channel = %self.channel.name(), "IM send_final failed: {e}");
+        } else {
+            tracing::debug!(
+                channel = %self.channel.name(),
+                text_len = text.len(),
+                "IM send_final succeeded"
+            );
         }
     }
 
@@ -176,9 +182,7 @@ mod tests {
         }
     }
 
-    fn sink(
-        presentation: ProgressPresentationMode,
-    ) -> (ImProgressSink, Arc<MockChannel>) {
+    fn sink(presentation: ProgressPresentationMode) -> (ImProgressSink, Arc<MockChannel>) {
         let channel = Arc::new(MockChannel {
             sent: StdMutex::new(Vec::new()),
         });
@@ -211,10 +215,7 @@ mod tests {
         let sent = channel.sent.lock().unwrap().clone();
         assert_eq!(
             sent,
-            vec![
-                "⏳ 正在搜索代码".to_string(),
-                "⏳ 正在整理结果".to_string()
-            ]
+            vec!["⏳ 正在搜索代码".to_string(), "⏳ 正在整理结果".to_string()]
         );
     }
 }

@@ -89,12 +89,28 @@ async fn build_team_harness(
     std::fs::write(worker_persona.join("MEMORY.md"), "worker-long-term-memory").unwrap();
     write_scoped_memory(&leader_persona, &lead_key, "leader-private-memory");
     write_scoped_memory(&worker_persona, &specialist_key, "worker-private-memory");
-    std::fs::write(leader_workspace.join("AGENTS.md"), "leader workspace agents").unwrap();
+    std::fs::write(
+        leader_workspace.join("AGENTS.md"),
+        "leader workspace agents",
+    )
+    .unwrap();
     std::fs::write(leader_workspace.join("USER.md"), "leader workspace user").unwrap();
-    std::fs::write(leader_workspace.join("HEARTBEAT.md"), "leader workspace heartbeat").unwrap();
-    std::fs::write(worker_workspace.join("AGENTS.md"), "worker workspace agents").unwrap();
+    std::fs::write(
+        leader_workspace.join("HEARTBEAT.md"),
+        "leader workspace heartbeat",
+    )
+    .unwrap();
+    std::fs::write(
+        worker_workspace.join("AGENTS.md"),
+        "worker workspace agents",
+    )
+    .unwrap();
     std::fs::write(worker_workspace.join("USER.md"), "worker workspace user").unwrap();
-    std::fs::write(worker_workspace.join("HEARTBEAT.md"), "worker workspace heartbeat").unwrap();
+    std::fs::write(
+        worker_workspace.join("HEARTBEAT.md"),
+        "worker workspace heartbeat",
+    )
+    .unwrap();
 
     let storage = SessionStorage::new(root.path().join("sessions"));
     let session_manager = Arc::new(SessionManager::new(storage));
@@ -254,6 +270,12 @@ fn backend_spec(backend_id: &str, family: BackendFamily, adapter_key: &str) -> B
         family,
         adapter_key: adapter_key.to_string(),
         launch: LaunchSpec::Embedded,
+        external_mcp_servers: vec![],
+        provider_profile: None,
+        acp_backend: None,
+        acp_auth_method: None,
+        codex_projection: None,
+        approval_mode: Default::default(),
     }
 }
 
@@ -414,11 +436,11 @@ async fn mixed_backend_smoke_acp_lead_native_specialist_submit_and_accept() {
             ],
         ) && has_scoped_memory_file(capture, "specialist")
             && !capture
-            .session
-            .context
-            .workspace_native_files
-            .iter()
-            .any(|entry| entry == "MEMORY.md")
+                .session
+                .context
+                .workspace_native_files
+                .iter()
+                .any(|entry| entry == "MEMORY.md")
     }));
     assert_eq!(
         harness.orchestrator.team_state(),
@@ -542,8 +564,7 @@ async fn mixed_backend_smoke_native_lead_acp_specialist_submit_and_accept() {
                 "TEAM.md",
                 "CONTEXT.md",
             ],
-        )
-            && has_scoped_memory_file(capture, "ws")
+        ) && has_scoped_memory_file(capture, "ws")
     }));
     assert!(specialist_captures
         .iter()
@@ -554,14 +575,20 @@ async fn mixed_backend_smoke_native_lead_acp_specialist_submit_and_accept() {
     assert!(specialist_captures.iter().all(|capture| {
         has_all_files(
             capture,
-            &["SOUL.md", "IDENTITY.md", "AGENTS.md", "TEAM.md", "CONTEXT.md"],
+            &[
+                "SOUL.md",
+                "IDENTITY.md",
+                "AGENTS.md",
+                "TEAM.md",
+                "CONTEXT.md",
+            ],
         ) && has_scoped_memory_file(capture, "specialist")
             && !capture
-            .session
-            .context
-            .workspace_native_files
-            .iter()
-            .any(|entry| entry == "MEMORY.md")
+                .session
+                .context
+                .workspace_native_files
+                .iter()
+                .any(|entry| entry == "MEMORY.md")
     }));
     let meta = read_task_artifact(&harness, "T001", "meta.json");
     let result = read_task_artifact(&harness, "T001", "result.md");
@@ -703,14 +730,20 @@ async fn mixed_backend_smoke_openclaw_specialist_uses_canonical_team_surface_and
     assert!(specialist_captures.iter().all(|capture| {
         has_all_files(
             capture,
-            &["SOUL.md", "IDENTITY.md", "AGENTS.md", "TEAM.md", "CONTEXT.md"],
+            &[
+                "SOUL.md",
+                "IDENTITY.md",
+                "AGENTS.md",
+                "TEAM.md",
+                "CONTEXT.md",
+            ],
         ) && has_scoped_memory_file(capture, "specialist")
             && !capture
-            .session
-            .context
-            .workspace_native_files
-            .iter()
-            .any(|entry| entry == "MEMORY.md")
+                .session
+                .context
+                .workspace_native_files
+                .iter()
+                .any(|entry| entry == "MEMORY.md")
     }));
     let meta = read_task_artifact(&harness, "T001", "meta.json");
     let progress = read_task_artifact(&harness, "T001", "progress.md");

@@ -41,6 +41,7 @@ pub async fn run_command_turn(
     let mut lines = BufReader::new(stdout).lines();
     let mut events = Vec::new();
     let mut full_text = String::new();
+    let mut turn_failed_error: Option<String> = None;
 
     while let Some(line) = lines.next_line().await? {
         if line.trim().is_empty() {
@@ -61,6 +62,9 @@ pub async fn run_command_turn(
                 sink.emit(event.clone())?;
             }
             RuntimeEvent::TurnFailed { .. } => {
+                if let RuntimeEvent::TurnFailed { error } = &event {
+                    turn_failed_error = Some(error.clone());
+                }
                 sink.emit(event.clone())?;
             }
         }
@@ -69,6 +73,14 @@ pub async fn run_command_turn(
 
     let status = child.wait().await?;
     if !status.success() {
+        if turn_failed_error.is_some() {
+            return Ok(TurnResult {
+                full_text,
+                events,
+                emitted_backend_session_id: None,
+                used_backend_id: None,
+            });
+        }
         anyhow::bail!("native backend process exited with status {status}");
     }
 
@@ -81,7 +93,12 @@ pub async fn run_command_turn(
         }
     }
 
-    Ok(TurnResult { full_text, events })
+    Ok(TurnResult {
+        full_text,
+        events,
+        emitted_backend_session_id: None,
+        used_backend_id: None,
+    })
 }
 
 fn spawn_command(
@@ -110,6 +127,7 @@ fn spawn_command(
 mod tests {
     use super::*;
     use crate::{RuntimeContext, RuntimeRole, ToolSurfaceSpec};
+    use tokio::sync::mpsc;
 
     #[test]
     fn native_command_config_carries_command_env_and_args() {
@@ -133,12 +151,58 @@ mod tests {
             workspace_dir: None,
             prompt_text: "hello".into(),
             tool_surface: ToolSurfaceSpec::default(),
+            approval_mode: Default::default(),
             tool_bridge_url: None,
+            external_mcp_servers: vec![],
             team_tool_url: None,
+            provider_profile: None,
+            backend_session_id: None,
             context: RuntimeContext::default(),
         };
         let json = serde_json::to_string(&session).unwrap();
         assert!(json.contains("\"backend_id\":\"native\""));
         assert!(json.contains("\"prompt_text\":\"hello\""));
+    }
+
+    fn sample_runtime_session() -> RuntimeSessionSpec {
+        RuntimeSessionSpec {
+            backend_id: "native".into(),
+            participant_name: None,
+            session_key: qai_protocol::SessionKey::new("ws", "native:test"),
+            role: RuntimeRole::Solo,
+            workspace_dir: None,
+            prompt_text: "hello".into(),
+            tool_surface: ToolSurfaceSpec::default(),
+            approval_mode: Default::default(),
+            tool_bridge_url: None,
+            external_mcp_servers: vec![],
+            team_tool_url: None,
+            provider_profile: None,
+            backend_session_id: None,
+            context: RuntimeContext::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn nonzero_exit_preserves_turn_failed_event() {
+        let cfg = NativeCommandConfig {
+            command: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                "printf '%s\\n' '{\"TurnFailed\":{\"error\":\"boom\"}}'; exit 1".into(),
+            ],
+            env: vec![],
+        };
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink = RuntimeEventSink::new(tx);
+
+        let result = run_command_turn(&cfg, sample_runtime_session(), sink)
+            .await
+            .expect("turn_failed event should be returned instead of generic exit error");
+
+        assert!(result
+            .events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::TurnFailed { error } if error == "boom")));
     }
 }

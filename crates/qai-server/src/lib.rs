@@ -40,6 +40,12 @@ pub async fn start_test_gateway(agent_binary: &str) -> Result<SocketAddr> {
             args: vec![],
             env: vec![],
         },
+        approval_mode: Default::default(),
+        external_mcp_servers: vec![],
+        provider_profile: None,
+        acp_backend: None,
+        acp_auth_method: None,
+        codex_projection: None,
     }));
     start_test_gateway_with_config(cfg).await
 }
@@ -92,7 +98,9 @@ pub async fn build_test_state_with_config(cfg: GatewayConfig) -> Result<AppState
         .await;
     for backend in &cfg.backends {
         runtime_registry
-            .register_backend(backend.to_backend_spec())
+            .register_backend(backend.to_backend_spec(
+                cfg.resolve_provider_profile(backend.provider_profile.as_deref())?,
+            ))
             .await;
     }
     let runtime_dispatch = Arc::new(ConductorRuntimeDispatch::new(Arc::clone(&runtime_registry)));
@@ -108,7 +116,7 @@ pub async fn build_test_state_with_config(cfg: GatewayConfig) -> Result<AppState
         },
         None,
         None,
-        None,
+        cfg.gateway.default_workspace.clone(),
         vec![cfg.skills.dir.clone()],
         runtime_dispatch,
     );
@@ -174,6 +182,28 @@ fn backend_catalog_entry(spec: BackendSpec) -> config::BackendCatalogEntry {
         id: spec.backend_id,
         family,
         adapter_key: Some(spec.adapter_key),
+        acp_backend: spec.acp_backend,
+        acp_auth_method: spec.acp_auth_method,
+        codex: spec
+            .codex_projection
+            .map(|projection| config::BackendCodexConfig { projection }),
+        provider_profile: spec
+            .provider_profile
+            .as_ref()
+            .map(|profile| profile.id.clone()),
+        approval: config::BackendApprovalConfig {
+            mode: spec.approval_mode,
+        },
+        external_mcp_servers: spec
+            .external_mcp_servers
+            .into_iter()
+            .map(|server| config::ExternalMcpServerConfig {
+                name: server.name,
+                url: match server.transport {
+                    qai_runtime::ExternalMcpTransport::Sse { url } => url,
+                },
+            })
+            .collect(),
         launch,
     }
 }

@@ -49,12 +49,7 @@ pub(crate) async fn process_post_turn(
                 .roster_match
                 .map(|rm| rm.agent_name.as_str())
                 .unwrap_or("agent");
-            trigger.scan_and_dispatch(
-                &full_text,
-                sender,
-                input.session_key,
-                &input.inbound.source,
-            );
+            trigger.scan_and_dispatch(&full_text, sender, input.session_key, &input.inbound.source);
         }
     }
 
@@ -105,7 +100,10 @@ pub(crate) async fn process_post_turn(
         });
     }
 
-    Ok(apply_reply_prefix(&full_text, input.persona_prefix.as_deref()))
+    Ok(apply_reply_prefix(
+        &full_text,
+        input.persona_prefix.as_deref(),
+    ))
 }
 
 pub(crate) async fn apply_relay_hook(
