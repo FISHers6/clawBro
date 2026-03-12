@@ -248,6 +248,13 @@ pub async fn run_command_turn(
             );
             match notification.update {
                 acp::SessionUpdate::AgentMessageChunk(chunk) => {
+                    if self.suppress_replay.get() {
+                        tracing::debug!(
+                            session_id = %session_id,
+                            "Suppressing ACP agent_message_chunk during load_session replay"
+                        );
+                        return Ok(());
+                    }
                     if let acp::ContentBlock::Text(t) = chunk.content {
                         tracing::debug!(
                             session_id = %session_id,
@@ -259,6 +266,14 @@ pub async fn run_command_turn(
                     }
                 }
                 acp::SessionUpdate::ToolCall(tool_call) => {
+                    if self.suppress_replay.get() {
+                        tracing::debug!(
+                            session_id = %session_id,
+                            tool_call_id = %tool_call.tool_call_id,
+                            "Suppressing ACP tool_call during load_session replay"
+                        );
+                        return Ok(());
+                    }
                     let call_id = tool_call.tool_call_id.to_string();
                     self.tool_titles
                         .borrow_mut()
@@ -276,6 +291,14 @@ pub async fn run_command_turn(
                     });
                 }
                 acp::SessionUpdate::ToolCallUpdate(update) => {
+                    if self.suppress_replay.get() {
+                        tracing::debug!(
+                            session_id = %session_id,
+                            tool_call_id = %update.tool_call_id,
+                            "Suppressing ACP tool_call_update during load_session replay"
+                        );
+                        return Ok(());
+                    }
                     let call_id = update.tool_call_id.to_string();
                     let seen_before = self.tool_titles.borrow().contains_key(&call_id);
                     if let Some(title) = update.fields.title.clone() {
@@ -382,12 +405,14 @@ pub async fn run_command_turn(
     }
 
     let accumulated = Rc::new(RefCell::new(String::new()));
+    let suppress_replay = Rc::new(Cell::new(false));
     let client = EventClient {
         sink: sink.clone(),
         accumulated: accumulated.clone(),
         approvals,
         approval_mode: session.approval_mode,
         tool_titles: Rc::new(RefCell::new(HashMap::new())),
+        suppress_replay: suppress_replay.clone(),
     };
     let (conn, handle_io) = acp::ClientSideConnection::new(client, outgoing, incoming, |fut| {
         tokio::task::spawn_local(fut);
@@ -441,17 +466,25 @@ pub async fn run_command_turn(
         let prior_id = session.backend_session_id.as_ref().unwrap();
         tracing::debug!(
             session_id = %prior_id,
-            "Sending ACP load_session request"
+            "Sending ACP load_session request (replay suppression active)"
         );
-        conn.load_session(
+        // Suppress replay notifications for the duration of load_session.
+        // ACP protocol requires the agent to stream the entire conversation history
+        // as session/update notifications before responding to session/load.
+        // Without suppression these replayed chunks would appear as current-turn
+        // live output (sink emissions + accumulated text).
+        suppress_replay.set(true);
+        let load_result = conn.load_session(
             acp::LoadSessionRequest::new(
                 acp::SessionId::new(prior_id.clone()),
                 session_root.clone(),
             )
             .mcp_servers(mcp_servers),
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("ACP load_session failed: {e:?}"))?;
+        .await;
+        // Clear suppression before error propagation so the flag is never left set.
+        suppress_replay.set(false);
+        load_result.map_err(|e| anyhow::anyhow!("ACP load_session failed: {e:?}"))?;
         // LoadSessionResponse has no session_id field; reuse the passed-in prior_id.
         tracing::debug!(session_id = %prior_id, "ACP session resumed via session/load");
         (
