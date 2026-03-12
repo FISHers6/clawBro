@@ -1,4 +1,5 @@
 pub mod heartbeat;
+pub mod milestone;
 pub mod orchestrator;
 pub mod registry;
 pub mod session;

@@ -21,6 +21,7 @@ use std::sync::Arc;
 use tokio::task::JoinHandle;
 
 use super::heartbeat::DispatchFn;
+use super::milestone::{render_for_im, TeamMilestoneEvent};
 use super::registry::{Task, TaskRegistry};
 use super::session::{TaskArtifactMeta, TeamSession};
 
@@ -96,8 +97,12 @@ pub struct PlannedTask {
 
 // ─── TeamOrchestrator ────────────────────────────────────────────────────────
 
-/// 里程碑通知函数：(IM scope, message) → fire-and-forget to IM channel
-pub type NotifyFn = Arc<dyn Fn(qai_protocol::SessionKey, String) + Send + Sync>;
+/// 里程碑事件回调：(IM scope, event) → fire-and-forget
+///
+/// 生产端：将 event 渲染为字符串后推送到 IM channel。
+/// 测试端：收集事件到 Vec 供断言，不涉及任何字符串操作。
+pub type MilestoneFn =
+    Arc<dyn Fn(qai_protocol::SessionKey, TeamMilestoneEvent) + Send + Sync>;
 
 pub struct TeamOrchestrator {
     pub registry: Arc<TaskRegistry>,
@@ -108,8 +113,10 @@ pub struct TeamOrchestrator {
     max_parallel: std::sync::Mutex<usize>,
     /// IM scope to forward milestone notifications to (set at team-start time).
     scope: std::sync::OnceLock<qai_protocol::SessionKey>,
-    /// Sends milestone message to the IM channel (injected from main.rs).
-    notify_fn: std::sync::OnceLock<NotifyFn>,
+    /// Typed milestone event callback (injected from main.rs at startup).
+    /// Production: renders event → IM channel string.
+    /// Tests: collects events into Vec for typed assertions.
+    milestone_fn: std::sync::OnceLock<MilestoneFn>,
     /// Unified MCP server handle (Lead + Specialist tools on one port, spawned at startup).
     /// Uses tokio::sync::Mutex because stop() is async.
     mcp_server_handle: tokio::sync::Mutex<Option<super::shared_mcp_server::SharedMcpServerHandle>>,
@@ -144,7 +151,7 @@ impl TeamOrchestrator {
             heartbeat_interval,
             max_parallel: std::sync::Mutex::new(3),
             scope: std::sync::OnceLock::new(),
-            notify_fn: std::sync::OnceLock::new(),
+            milestone_fn: std::sync::OnceLock::new(),
             mcp_server_handle: tokio::sync::Mutex::new(None),
             mcp_server_port: std::sync::OnceLock::new(),
             team_state_inner: std::sync::Mutex::new(TeamState::Planning),
@@ -164,9 +171,12 @@ impl TeamOrchestrator {
         let _ = self.scope.set(scope);
     }
 
-    /// 注入里程碑通知函数（main.rs 在启动时调用，提供 IM channel send 能力）。
-    pub fn set_notify_fn(&self, f: NotifyFn) {
-        let _ = self.notify_fn.set(f);
+    /// 注入里程碑事件回调（main.rs 在启动时调用）。
+    ///
+    /// 生产端将 event 传给 render_for_im() 后推送到 IM channel。
+    /// 测试端收集类型化事件供 matches! 断言。
+    pub fn set_milestone_fn(&self, f: MilestoneFn) {
+        let _ = self.milestone_fn.set(f);
     }
 
     // ── Team 状态 ──────────────────────────────────────────────────────────────
@@ -209,11 +219,12 @@ impl TeamOrchestrator {
         *self.test_mcp_start_result.lock().unwrap() = Some(result);
     }
 
-    /// 向 IM 频道发布一条消息（Lead 调用 post_update 时使用）
+    /// 向 IM 频道发布 Lead 的任意文字更新（post_update 工具调用时使用）
     pub fn post_message(&self, message: &str) {
-        if let (Some(f), Some(scope)) = (self.notify_fn.get(), self.scope.get()) {
-            (f)(scope.clone(), message.to_string());
-        }
+        let event = TeamMilestoneEvent::LeadMessage {
+            text: message.to_string(),
+        };
+        let _ = self.emit_milestone(event);
     }
 
     pub fn status_snapshot(&self) -> TeamRuntimeSummary {
@@ -498,7 +509,7 @@ impl TeamOrchestrator {
         let all_done = self.registry.all_done()?;
         if all_done {
             *self.team_state_inner.lock().unwrap() = TeamState::Done;
-            self.publish_milestone("all_done", "所有任务已完成 ✅")?;
+            self.emit_milestone(TeamMilestoneEvent::AllTasksDone)?;
         } else {
             // 当前任务完成通知（all_tasks() 只调用一次，task_title 从结果中提取）
             let tasks = self.registry.all_tasks().unwrap_or_default();
@@ -512,18 +523,18 @@ impl TeamOrchestrator {
                 .filter(|t| t.status_raw == "done" || t.status_raw.starts_with("accepted:"))
                 .count();
             let total = tasks.len();
-            self.publish_milestone(
-                "done",
-                &format!(
-                    "✅ 任务 {}「{}」@{} 已完成（{}/{}）",
-                    task_id, task_title, agent, done_count, total
-                ),
-            )?;
+            self.emit_milestone(TeamMilestoneEvent::TaskDone {
+                task_id: task_id.to_string(),
+                task_title,
+                agent: agent.to_string(),
+                done_count,
+                total,
+            })?;
             // 下游任务解锁通知
             let ready = self.registry.find_ready_tasks()?;
             if !ready.is_empty() {
-                let ids: Vec<_> = ready.iter().map(|t| t.id.as_str()).collect();
-                self.publish_milestone("unlocked", &format!("🔓 新任务已解锁：{}", ids.join(", ")))?;
+                let task_ids = ready.iter().map(|t| t.id.clone()).collect();
+                self.emit_milestone(TeamMilestoneEvent::TasksUnlocked { task_ids })?;
             }
         }
 
@@ -567,10 +578,11 @@ impl TeamOrchestrator {
             .flatten()
             .map(|t| t.title)
             .unwrap_or_else(|| task_id.to_string());
-        let _ = self.publish_milestone(
-            "submitted",
-            &format!("📨 任务 {}「{}」@{} 已提交待验收", task_id, task_title, agent),
-        );
+        let _ = self.emit_milestone(TeamMilestoneEvent::TaskSubmitted {
+            task_id: task_id.to_string(),
+            task_title,
+            agent: agent.to_string(),
+        });
         Ok(())
     }
 
@@ -616,12 +628,12 @@ impl TeamOrchestrator {
         let all_done = self.registry.all_done()?;
         if all_done {
             *self.team_state_inner.lock().unwrap() = TeamState::Done;
-            self.publish_milestone("all_done", "所有任务已完成 ✅")?;
+            self.emit_milestone(TeamMilestoneEvent::AllTasksDone)?;
         } else {
             let ready = self.registry.find_ready_tasks()?;
             if !ready.is_empty() {
-                let ids: Vec<_> = ready.iter().map(|t| t.id.as_str()).collect();
-                self.publish_milestone("checkpoint", &format!("新任务已解锁：{}", ids.join(", ")))?;
+                let task_ids = ready.iter().map(|t| t.id.clone()).collect();
+                self.emit_milestone(TeamMilestoneEvent::TasksUnlocked { task_ids })?;
             }
         }
 
@@ -902,10 +914,12 @@ impl TeamOrchestrator {
             .flatten()
             .map(|t| t.title)
             .unwrap_or_else(|| task_id.to_string());
-        let _ = self.publish_milestone(
-            "blocked",
-            &format!("🚧 任务 {}「{}」@{} 阻塞：{}", task_id, task_title, agent, reason),
-        );
+        let _ = self.emit_milestone(TeamMilestoneEvent::TaskBlocked {
+            task_id: task_id.to_string(),
+            task_title,
+            agent: agent.to_string(),
+            reason: reason.to_string(),
+        });
 
         Ok(())
     }
@@ -936,10 +950,11 @@ impl TeamOrchestrator {
             ),
         );
         self.dispatch_team_notify_checkpoint(task_id, agent, note);
-        let _ = self.publish_milestone(
-            "checkpoint",
-            &format!("📍 [{}] @{} 进度：{}", task_id, agent, note),
-        );
+        let _ = self.emit_milestone(TeamMilestoneEvent::TaskCheckpoint {
+            task_id: task_id.to_string(),
+            agent: agent.to_string(),
+            note: note.to_string(),
+        });
         Ok(())
     }
 
@@ -1093,16 +1108,14 @@ impl TeamOrchestrator {
 
     // ── 里程碑 ────────────────────────────────────────────────────────────────
 
-    fn publish_milestone(&self, kind: &str, message: &str) -> Result<()> {
-        // Forward to IM channel via notify_fn (wired from main.rs at startup).
-        if let (Some(f), Some(scope)) = (self.notify_fn.get(), self.scope.get()) {
-            (f)(scope.clone(), message.to_string());
+    fn emit_milestone(&self, event: TeamMilestoneEvent) -> Result<()> {
+        if let (Some(f), Some(scope)) = (self.milestone_fn.get(), self.scope.get()) {
+            (f)(scope.clone(), event.clone());
         }
-
         tracing::info!(
             team_id = %self.session.team_id,
-            kind = %kind,
-            "Milestone: {}", message
+            kind = %event.kind_str(),
+            "Milestone: {:?}", event
         );
         Ok(())
     }
@@ -1285,11 +1298,12 @@ mod tests {
     #[tokio::test]
     async fn test_accept_submitted_task_triggers_all_done_milestone() {
         let (orch, tmp) = make_orchestrator();
-        let received = Arc::new(std::sync::Mutex::new(vec![]));
-        let received_clone = Arc::clone(&received);
+        let events: Arc<std::sync::Mutex<Vec<TeamMilestoneEvent>>> =
+            Arc::new(std::sync::Mutex::new(vec![]));
+        let evs_clone = Arc::clone(&events);
 
-        orch.set_notify_fn(Arc::new(move |_scope, msg| {
-            received_clone.lock().unwrap().push(msg);
+        orch.set_milestone_fn(Arc::new(move |_scope, ev| {
+            evs_clone.lock().unwrap().push(ev);
         }));
         orch.set_scope(qai_protocol::SessionKey::new("test", "test-scope"));
 
@@ -1312,12 +1326,11 @@ mod tests {
             TaskStatus::Accepted { ref by, .. } if by == "claude"
         ));
 
-        let msgs = received.lock().unwrap();
+        let evs = events.lock().unwrap();
         assert!(
-            !msgs.is_empty(),
-            "notify_fn should be called on acceptance milestone"
+            evs.iter().any(|e| matches!(e, TeamMilestoneEvent::AllTasksDone)),
+            "AllTasksDone event must fire after accept; got: {:?}", evs
         );
-        assert!(msgs.iter().any(|m| m.contains("所有任务已完成")));
         let result = std::fs::read_to_string(tmp.path().join("tasks").join("T005").join("result.md"))
             .unwrap();
         assert!(result.contains("Accepted by: claude"));
@@ -1328,14 +1341,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_all_done_triggers_milestone_notify_fn() {
+    async fn test_all_done_triggers_milestone_event() {
         let (orch, _tmp) = make_orchestrator();
-        let received = Arc::new(std::sync::Mutex::new(vec![]));
-        let received_clone = Arc::clone(&received);
+        let events: Arc<std::sync::Mutex<Vec<TeamMilestoneEvent>>> =
+            Arc::new(std::sync::Mutex::new(vec![]));
+        let evs_clone = Arc::clone(&events);
 
-        // Wire notify_fn to capture milestone messages
-        orch.set_notify_fn(Arc::new(move |_scope, msg| {
-            received_clone.lock().unwrap().push(msg);
+        orch.set_milestone_fn(Arc::new(move |_scope, ev| {
+            evs_clone.lock().unwrap().push(ev);
         }));
         orch.set_scope(qai_protocol::SessionKey::new("test", "test-scope"));
 
@@ -1350,12 +1363,10 @@ mod tests {
         orch.handle_specialist_done("T001", "codex", "done")
             .unwrap();
 
-        let msgs = received.lock().unwrap();
-        assert!(!msgs.is_empty(), "notify_fn should be called on milestone");
+        let evs = events.lock().unwrap();
         assert!(
-            msgs[0].contains("所有任务已完成"),
-            "unexpected: {}",
-            msgs[0]
+            evs.iter().any(|e| matches!(e, TeamMilestoneEvent::AllTasksDone)),
+            "AllTasksDone event must fire; got: {:?}", evs
         );
     }
 
@@ -1474,15 +1485,25 @@ mod tests {
         assert!(progress.contains("need API guidance"));
     }
 
-    #[test]
-    fn test_checkpoint_publishes_milestone_to_im() {
-        let (orch, _tmp) = make_orchestrator();
-        let messages: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(vec![]));
-        let msgs_clone = Arc::clone(&messages);
-        orch.set_notify_fn(Arc::new(move |_scope, msg| {
-            msgs_clone.lock().unwrap().push(msg);
+    // ─── 里程碑事件类型化测试 ──────────────────────────────────────────────────
+    // 测试仅断言 TeamMilestoneEvent 枚举变体和字段，不依赖 emoji/文案字符串。
+    // IM 渲染逻辑由 milestone::render_for_im() 独立测试。
+
+    fn collect_events(orch: &Arc<TeamOrchestrator>) -> Arc<std::sync::Mutex<Vec<TeamMilestoneEvent>>> {
+        let events: Arc<std::sync::Mutex<Vec<TeamMilestoneEvent>>> =
+            Arc::new(std::sync::Mutex::new(vec![]));
+        let evs_clone = Arc::clone(&events);
+        orch.set_milestone_fn(Arc::new(move |_scope, ev| {
+            evs_clone.lock().unwrap().push(ev);
         }));
         orch.set_scope(qai_protocol::SessionKey::new("lark", "group:test"));
+        events
+    }
+
+    #[test]
+    fn test_checkpoint_emits_typed_milestone_event() {
+        let (orch, _tmp) = make_orchestrator();
+        let events = collect_events(&orch);
 
         orch.registry
             .create_task(CreateTask {
@@ -1492,32 +1513,23 @@ mod tests {
             })
             .unwrap();
         orch.registry.try_claim("T120", "codex").unwrap();
+        orch.handle_specialist_checkpoint("T120", "codex", "halfway there").unwrap();
 
-        orch.handle_specialist_checkpoint("T120", "codex", "halfway there")
-            .unwrap();
-
-        let msgs = messages.lock().unwrap();
+        let evs = events.lock().unwrap();
         assert!(
-            msgs.iter().any(|m| m.contains("T120") && m.contains("codex") && m.contains("📍")),
-            "checkpoint should publish IM milestone with task ID, agent, and 📍 emoji, got: {:?}",
-            msgs
-        );
-        assert!(
-            msgs.iter().any(|m| m.contains("halfway there")),
-            "checkpoint message should include the note text, got: {:?}",
-            msgs
+            evs.iter().any(|e| matches!(
+                e,
+                TeamMilestoneEvent::TaskCheckpoint { task_id, agent, note }
+                if task_id == "T120" && agent == "codex" && note == "halfway there"
+            )),
+            "checkpoint must emit TaskCheckpoint {{ task_id, agent, note }}; got: {:?}", evs
         );
     }
 
     #[test]
-    fn test_submit_publishes_milestone_to_im() {
+    fn test_submit_emits_typed_milestone_event() {
         let (orch, _tmp) = make_orchestrator();
-        let messages: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(vec![]));
-        let msgs_clone = Arc::clone(&messages);
-        orch.set_notify_fn(Arc::new(move |_scope, msg| {
-            msgs_clone.lock().unwrap().push(msg);
-        }));
-        orch.set_scope(qai_protocol::SessionKey::new("lark", "group:test"));
+        let events = collect_events(&orch);
 
         orch.registry
             .create_task(CreateTask {
@@ -1527,32 +1539,23 @@ mod tests {
             })
             .unwrap();
         orch.registry.try_claim("T121", "codex").unwrap();
+        orch.handle_specialist_submitted("T121", "codex", "added jwt.rs").unwrap();
 
-        orch.handle_specialist_submitted("T121", "codex", "added jwt.rs")
-            .unwrap();
-
-        let msgs = messages.lock().unwrap();
+        let evs = events.lock().unwrap();
         assert!(
-            msgs.iter().any(|m| m.contains("T121") && m.contains("codex") && m.contains("📨")),
-            "submit should publish IM milestone with task ID, agent, and 📨 emoji, got: {:?}",
-            msgs
-        );
-        assert!(
-            msgs.iter().any(|m| m.contains("Implement JWT")),
-            "submit message should include the task title, got: {:?}",
-            msgs
+            evs.iter().any(|e| matches!(
+                e,
+                TeamMilestoneEvent::TaskSubmitted { task_id, task_title, agent }
+                if task_id == "T121" && task_title == "Implement JWT" && agent == "codex"
+            )),
+            "submit must emit TaskSubmitted {{ task_id, task_title, agent }}; got: {:?}", evs
         );
     }
 
     #[test]
-    fn test_blocked_publishes_milestone_to_im() {
+    fn test_blocked_emits_typed_milestone_event() {
         let (orch, _tmp) = make_orchestrator();
-        let messages: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(vec![]));
-        let msgs_clone = Arc::clone(&messages);
-        orch.set_notify_fn(Arc::new(move |_scope, msg| {
-            msgs_clone.lock().unwrap().push(msg);
-        }));
-        orch.set_scope(qai_protocol::SessionKey::new("lark", "group:test"));
+        let events = collect_events(&orch);
 
         orch.registry
             .create_task(CreateTask {
@@ -1562,25 +1565,21 @@ mod tests {
             })
             .unwrap();
         orch.registry.try_claim("T122", "codex").unwrap();
+        orch.handle_specialist_blocked("T122", "codex", "missing dep").unwrap();
 
-        orch.handle_specialist_blocked("T122", "codex", "missing dep")
-            .unwrap();
-
-        let msgs = messages.lock().unwrap();
+        let evs = events.lock().unwrap();
         assert!(
-            msgs.iter().any(|m| m.contains("T122") && m.contains("codex") && m.contains("🚧")),
-            "blocked should publish IM milestone with task ID, agent, and 🚧 emoji, got: {:?}",
-            msgs
-        );
-        assert!(
-            msgs.iter().any(|m| m.contains("missing dep")),
-            "blocked message should include the reason text, got: {:?}",
-            msgs
+            evs.iter().any(|e| matches!(
+                e,
+                TeamMilestoneEvent::TaskBlocked { task_id, agent, reason, .. }
+                if task_id == "T122" && agent == "codex" && reason == "missing dep"
+            )),
+            "blocked must emit TaskBlocked {{ task_id, agent, reason }}; got: {:?}", evs
         );
     }
 
     #[test]
-    fn test_done_individual_publishes_milestone_to_im() {
+    fn test_done_individual_emits_typed_milestone_with_progress() {
         let (orch, _tmp) = make_orchestrator();
         // Two tasks so all_done is false after first completes
         orch.registry
@@ -1598,42 +1597,34 @@ mod tests {
             })
             .unwrap();
         orch.registry.try_claim("T130", "codex").unwrap();
-
-        let messages: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(vec![]));
-        let msgs_clone = Arc::clone(&messages);
-        orch.set_notify_fn(Arc::new(move |_scope, msg| {
-            msgs_clone.lock().unwrap().push(msg);
-        }));
-        orch.set_scope(qai_protocol::SessionKey::new("lark", "group:test"));
+        let events = collect_events(&orch);
 
         orch.handle_specialist_done("T130", "codex", "done").unwrap();
 
-        let msgs = messages.lock().unwrap();
+        let evs = events.lock().unwrap();
         assert!(
-            msgs.iter().any(|m| m.contains("T130") && m.contains("codex") && m.contains("✅")),
-            "individual done should publish IM milestone with task ID, agent, and ✅ emoji, got: {:?}",
-            msgs
-        );
-        assert!(
-            msgs.iter().any(|m| m.contains("First task")),
-            "done message should include the task title, got: {:?}",
-            msgs
-        );
-        // Progress counter: should show 1/2
-        assert!(
-            msgs.iter().any(|m| m.contains("1/2")),
-            "done message should include progress counter 1/2, got: {:?}",
-            msgs
+            evs.iter().any(|e| matches!(
+                e,
+                TeamMilestoneEvent::TaskDone {
+                    task_id, task_title, agent, done_count, total
+                }
+                if task_id == "T130"
+                    && task_title == "First task"
+                    && agent == "codex"
+                    && *done_count == 1
+                    && *total == 2
+            )),
+            "individual done must emit TaskDone with correct progress counts; got: {:?}", evs
         );
     }
 
     // ─── 功能测试：完整 Agent Swarm 生命周期 ──────────────────────────────────
 
-    /// 验证 publish_milestone 在未注册 notify_fn/scope 时不 panic，直接返回 Ok
+    /// emit_milestone 在未注册 milestone_fn/scope 时不 panic，直接返回 Ok
     #[test]
-    fn test_publish_milestone_noop_without_notify_fn() {
+    fn test_emit_milestone_noop_without_milestone_fn() {
         let (orch, _tmp) = make_orchestrator();
-        // 故意不调用 set_notify_fn / set_scope
+        // 故意不调用 set_milestone_fn / set_scope
 
         orch.registry
             .create_task(CreateTask {
@@ -1644,28 +1635,21 @@ mod tests {
             .unwrap();
         orch.registry.try_claim("NOOP01", "codex").unwrap();
 
-        // 调用任意会触发 publish_milestone 的 handler，不应 panic
         let result = orch.handle_specialist_checkpoint("NOOP01", "codex", "halfway");
         assert!(
             result.is_ok(),
-            "checkpoint without notify_fn should return Ok, not panic; got: {:?}",
+            "checkpoint without milestone_fn must return Ok, not panic; got: {:?}",
             result
         );
     }
 
     /// 完整 Agent Swarm 生命周期：T_A（无依赖）→ T_B（依赖 T_A）
-    /// 验证：T_A done → IM 包含 ✅ + 🔓 解锁通知；T_B done → 所有任务已完成 ✅
+    /// 断言：TaskDone(T_A) + TasksUnlocked([T_B]) + AllTasksDone — 全类型化
     #[test]
-    fn test_full_swarm_lifecycle_dep_chain_im_milestones() {
+    fn test_full_swarm_lifecycle_dep_chain_typed_events() {
         let (orch, _tmp) = make_orchestrator();
-        let messages: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(vec![]));
-        let msgs_clone = Arc::clone(&messages);
-        orch.set_notify_fn(Arc::new(move |_scope, msg| {
-            msgs_clone.lock().unwrap().push(msg);
-        }));
-        orch.set_scope(qai_protocol::SessionKey::new("lark", "group:swarm-test"));
+        let events = collect_events(&orch);
 
-        // 建立依赖链 T_A → T_B
         orch.registry
             .create_task(CreateTask {
                 id: "T_A".into(),
@@ -1689,26 +1673,26 @@ mod tests {
         orch.handle_specialist_done("T_A", "codex", "db schema created").unwrap();
 
         {
-            let msgs = messages.lock().unwrap();
-            // T_A done 通知：含 ✅、任务ID、agent
+            let evs = events.lock().unwrap();
             assert!(
-                msgs.iter().any(|m| m.contains("T_A") && m.contains("codex") && m.contains("✅")),
-                "T_A done should emit IM milestone with ✅, task ID, agent; got: {:?}", msgs
+                evs.iter().any(|e| matches!(
+                    e,
+                    TeamMilestoneEvent::TaskDone { task_id, agent, done_count, total, .. }
+                    if task_id == "T_A" && agent == "codex" && *done_count == 1 && *total == 2
+                )),
+                "T_A done must emit TaskDone(1/2); got: {:?}", evs
             );
-            // T_A done 进度计数 1/2
             assert!(
-                msgs.iter().any(|m| m.contains("1/2")),
-                "T_A done should show progress 1/2; got: {:?}", msgs
+                evs.iter().any(|e| matches!(
+                    e,
+                    TeamMilestoneEvent::TasksUnlocked { task_ids }
+                    if task_ids.contains(&"T_B".to_string())
+                )),
+                "T_A done must emit TasksUnlocked([T_B]); got: {:?}", evs
             );
-            // T_B 解锁通知：含 🔓 和 T_B
             assert!(
-                msgs.iter().any(|m| m.contains("🔓") && m.contains("T_B")),
-                "T_A done should trigger 🔓 unlock notification for T_B; got: {:?}", msgs
-            );
-            // 全部完成通知不应出现（T_B 还未完成）
-            assert!(
-                !msgs.iter().any(|m| m.contains("所有任务已完成")),
-                "all_done message must NOT fire before T_B completes; got: {:?}", msgs
+                !evs.iter().any(|e| matches!(e, TeamMilestoneEvent::AllTasksDone)),
+                "AllTasksDone must NOT fire before T_B completes; got: {:?}", evs
             );
         }
 
@@ -1717,31 +1701,24 @@ mod tests {
         orch.handle_specialist_done("T_B", "claude", "data seeded").unwrap();
 
         {
-            let msgs = messages.lock().unwrap();
-            // 全部完成通知
+            let evs = events.lock().unwrap();
             assert!(
-                msgs.iter().any(|m| m.contains("所有任务已完成") && m.contains("✅")),
-                "after T_B done, all_done milestone must fire; got: {:?}", msgs
+                evs.iter().any(|e| matches!(e, TeamMilestoneEvent::AllTasksDone)),
+                "AllTasksDone must fire after T_B done; got: {:?}", evs
             );
         }
 
-        // TeamState 应变为 Done
         assert!(
             matches!(*orch.team_state_inner.lock().unwrap(), TeamState::Done),
-            "team state must be Done after all tasks complete"
+            "TeamState must be Done after all tasks complete"
         );
     }
 
-    /// 验证 checkpoint → submit → accept 完整提交验收路径中 IM 通知顺序正确
+    /// checkpoint → submit 事件顺序：TaskCheckpoint 先于 TaskSubmitted
     #[test]
-    fn test_submit_accept_flow_im_notifications() {
+    fn test_submit_flow_checkpoint_precedes_submit_event() {
         let (orch, _tmp) = make_orchestrator();
-        let messages: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(vec![]));
-        let msgs_clone = Arc::clone(&messages);
-        orch.set_notify_fn(Arc::new(move |_scope, msg| {
-            msgs_clone.lock().unwrap().push(msg);
-        }));
-        orch.set_scope(qai_protocol::SessionKey::new("dingtalk", "group:qa"));
+        let events = collect_events(&orch);
 
         orch.registry
             .create_task(CreateTask {
@@ -1752,38 +1729,30 @@ mod tests {
             .unwrap();
         orch.registry.try_claim("SA01", "codex").unwrap();
 
-        // Checkpoint 中间进度
         orch.handle_specialist_checkpoint("SA01", "codex", "50% done").unwrap();
-        // Submit 提交待验收
         orch.handle_specialist_submitted("SA01", "codex", "auth.rs complete").unwrap();
 
-        let msgs = messages.lock().unwrap();
-        // checkpoint 在 submit 之前出现
-        let cp_pos = msgs.iter().position(|m| m.contains("📍") && m.contains("SA01"));
-        let sub_pos = msgs.iter().position(|m| m.contains("📨") && m.contains("SA01"));
-        assert!(cp_pos.is_some(), "checkpoint IM message must exist; got: {:?}", msgs);
-        assert!(sub_pos.is_some(), "submit IM message must exist; got: {:?}", msgs);
+        let evs = events.lock().unwrap();
+        let cp_pos = evs.iter().position(|e| matches!(
+            e, TeamMilestoneEvent::TaskCheckpoint { task_id, .. } if task_id == "SA01"
+        ));
+        let sub_pos = evs.iter().position(|e| matches!(
+            e, TeamMilestoneEvent::TaskSubmitted { task_id, task_title, .. }
+            if task_id == "SA01" && task_title == "Write Auth API"
+        ));
+        assert!(cp_pos.is_some(), "TaskCheckpoint event must exist; got: {:?}", evs);
+        assert!(sub_pos.is_some(), "TaskSubmitted event must exist; got: {:?}", evs);
         assert!(
             cp_pos.unwrap() < sub_pos.unwrap(),
-            "checkpoint IM must appear before submit IM in notification stream"
-        );
-        // submit 消息含任务标题
-        assert!(
-            msgs.iter().any(|m| m.contains("Write Auth API") && m.contains("📨")),
-            "submit IM message must include task title; got: {:?}", msgs
+            "TaskCheckpoint must precede TaskSubmitted in event stream"
         );
     }
 
-    /// 验证 blocked 后 specialist 重新尝试 checkpoint 依然可以推送通知
+    /// blocked 后继续 checkpoint：TaskBlocked 先于 TaskCheckpoint
     #[test]
-    fn test_blocked_then_retry_checkpoint_both_notify() {
+    fn test_blocked_then_retry_checkpoint_event_order() {
         let (orch, _tmp) = make_orchestrator();
-        let messages: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(vec![]));
-        let msgs_clone = Arc::clone(&messages);
-        orch.set_notify_fn(Arc::new(move |_scope, msg| {
-            msgs_clone.lock().unwrap().push(msg);
-        }));
-        orch.set_scope(qai_protocol::SessionKey::new("ws", "group:dev"));
+        let events = collect_events(&orch);
 
         orch.registry
             .create_task(CreateTask {
@@ -1794,22 +1763,23 @@ mod tests {
             .unwrap();
         orch.registry.try_claim("BR01", "codex").unwrap();
 
-        // 先 blocked
         orch.handle_specialist_blocked("BR01", "codex", "missing env vars").unwrap();
-        // 再 checkpoint（模拟问题解决后继续）
-        orch.handle_specialist_checkpoint("BR01", "codex", "env vars fixed, proceeding").unwrap();
+        orch.handle_specialist_checkpoint("BR01", "codex", "env vars fixed").unwrap();
 
-        let msgs = messages.lock().unwrap();
+        let evs = events.lock().unwrap();
+        let blocked_pos = evs.iter().position(|e| matches!(
+            e, TeamMilestoneEvent::TaskBlocked { task_id, reason, .. }
+            if task_id == "BR01" && reason == "missing env vars"
+        ));
+        let cp_pos = evs.iter().position(|e| matches!(
+            e, TeamMilestoneEvent::TaskCheckpoint { task_id, note, .. }
+            if task_id == "BR01" && note == "env vars fixed"
+        ));
+        assert!(blocked_pos.is_some(), "TaskBlocked event must exist; got: {:?}", evs);
+        assert!(cp_pos.is_some(), "TaskCheckpoint event must exist after blocked; got: {:?}", evs);
         assert!(
-            msgs.iter().any(|m| m.contains("🚧") && m.contains("BR01")),
-            "blocked IM milestone must be present; got: {:?}", msgs
+            blocked_pos.unwrap() < cp_pos.unwrap(),
+            "TaskBlocked must precede TaskCheckpoint in event stream"
         );
-        assert!(
-            msgs.iter().any(|m| m.contains("📍") && m.contains("BR01")),
-            "post-block checkpoint IM milestone must be present; got: {:?}", msgs
-        );
-        let blocked_pos = msgs.iter().position(|m| m.contains("🚧")).unwrap();
-        let checkpoint_pos = msgs.iter().position(|m| m.contains("📍")).unwrap();
-        assert!(blocked_pos < checkpoint_pos, "blocked IM must appear before checkpoint IM");
     }
 }

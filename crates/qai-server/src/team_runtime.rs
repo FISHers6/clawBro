@@ -114,10 +114,13 @@ pub async fn wire_team_runtime(
                 }
                 // ── 任务派发通知 → IM 群（仅在派发成功时推送）─────────────────
                 if result.is_ok() {
-                    let notify_msg = format!(
-                        "🚀 任务 **{}**「{}」已派发给 @{}",
-                        task.id, task.title, agent
-                    );
+                    use qai_agent::team::milestone::{render_for_im, TeamMilestoneEvent};
+                    let event = TeamMilestoneEvent::TaskDispatched {
+                        task_id: task.id.clone(),
+                        task_title: task.title.clone(),
+                        agent: agent.clone(),
+                    };
+                    let notify_msg = render_for_im(&event);
                     tokio::spawn(async move {
                         if let Some(ch) = ch_map.get(&notify_key.channel) {
                             let outbound = qai_protocol::OutboundMsg {
@@ -144,8 +147,10 @@ pub async fn wire_team_runtime(
         );
 
         let channels_for_notify = Arc::clone(&channel_map);
-        team_orch.set_notify_fn(Arc::new(
-            move |scope: qai_protocol::SessionKey, msg: String| {
+        team_orch.set_milestone_fn(Arc::new(
+            move |scope: qai_protocol::SessionKey, event| {
+                use qai_agent::team::milestone::render_for_im;
+                let msg = render_for_im(&event);
                 let channels = Arc::clone(&channels_for_notify);
                 tokio::spawn(async move {
                     if let Some(ch) = channels.get(&scope.channel) {
