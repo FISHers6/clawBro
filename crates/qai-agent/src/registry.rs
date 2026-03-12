@@ -149,12 +149,17 @@ impl<'a> SlashControlContext<'a> {
             .get_or_create(session_key)
             .await
         {
-            self.registry
+            // reset_conversation clears messages + backend_session_ids + message_count
+            // so the next turn starts a fresh ACP session instead of resuming the old
+            // backend session via load_session.
+            if let Err(e) = self
+                .registry
                 .session_manager
-                .storage()
-                .clear_messages(session_id)
+                .reset_conversation(session_id)
                 .await
-                .ok();
+            {
+                tracing::warn!(error = %e, "reset_conversation failed during /reset");
+            }
         }
     }
 

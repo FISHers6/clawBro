@@ -117,6 +117,36 @@ impl SessionManager {
         self.storage.save_meta(&meta).await
     }
 
+    /// 重置会话的 conversation state：清除消息记录、清空所有 backend_session_ids、
+    /// 重置 message_count 为 0、重置 session_status 为 Idle。
+    ///
+    /// 不清除 workspace、shared memory、agent memory。
+    /// 对应 /reset 命令的正确语义：清当前对话，不清长期记忆。
+    pub async fn reset_conversation(&self, session_id: SessionId) -> Result<()> {
+        // 1. 清除宿主侧消息文件
+        self.storage.clear_messages(session_id).await?;
+        // 2. 清除 metadata 里的 backend_session_ids 和 message_count
+        let mut meta = self
+            .storage
+            .load_meta(session_id)
+            .await?
+            .unwrap_or_else(|| SessionMeta {
+                session_id,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                channel: String::new(),
+                scope: String::new(),
+                message_count: 0,
+                backend_session_ids: Default::default(),
+                session_status: SessionStatus::Idle,
+            });
+        meta.backend_session_ids.clear();
+        meta.message_count = 0;
+        meta.session_status = SessionStatus::Idle;
+        meta.updated_at = Utc::now();
+        self.storage.save_meta(&meta).await
+    }
+
     /// 启动时扫描：找出所有 session_status=Running 的 session，重置为 Idle。
     /// 保留 backend_session_ids 不变（下次 turn 仍可尝试 resume）。
     /// 返回恢复的 session_id 列表（用于日志）。
@@ -278,6 +308,88 @@ mod tests {
             let meta = mgr.load_meta(id).await.unwrap().unwrap();
             assert_eq!(meta.session_status, SessionStatus::Idle);
         }
+    }
+
+    #[tokio::test]
+    async fn reset_conversation_clears_messages_and_backend_ids() {
+        let (mgr, _dir) = make_manager();
+        let key = SessionKey::new("lark", "user:reset-test");
+        let session_id = mgr.get_or_create(&key).await.unwrap();
+
+        // Simulate a completed turn that stored a backend session ID
+        mgr.begin_turn(session_id, "claude-main").await.unwrap();
+        mgr.complete_turn(session_id, "claude-main", Some("old-acp-id".into()))
+            .await
+            .unwrap();
+        // Also store a second backend to confirm all are cleared
+        mgr.complete_turn(session_id, "codex", Some("old-codex-id".into()))
+            .await
+            .unwrap();
+
+        // Append a message so we can verify clear_messages works
+        mgr.append_message(
+            session_id,
+            &StoredMessage {
+                id: uuid::Uuid::new_v4(),
+                role: "user".to_string(),
+                content: "hello".to_string(),
+                timestamp: Utc::now(),
+                sender: None,
+                tool_calls: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        mgr.reset_conversation(session_id).await.unwrap();
+
+        let meta = mgr.load_meta(session_id).await.unwrap().unwrap();
+        assert!(
+            meta.backend_session_ids.is_empty(),
+            "reset_conversation must clear all backend_session_ids"
+        );
+        assert_eq!(
+            meta.message_count, 0,
+            "reset_conversation must reset message_count to 0"
+        );
+        assert_eq!(
+            meta.session_status,
+            SessionStatus::Idle,
+            "reset_conversation must set status to Idle"
+        );
+        // messages.jsonl should be gone
+        let msgs = mgr
+            .storage()
+            .load_messages(session_id)
+            .await
+            .unwrap();
+        assert!(msgs.is_empty(), "reset_conversation must clear messages");
+    }
+
+    #[tokio::test]
+    async fn reset_conversation_does_not_affect_other_sessions() {
+        let (mgr, _dir) = make_manager();
+        let key_a = SessionKey::new("lark", "user:session-a");
+        let key_b = SessionKey::new("lark", "user:session-b");
+        let id_a = mgr.get_or_create(&key_a).await.unwrap();
+        let id_b = mgr.get_or_create(&key_b).await.unwrap();
+
+        mgr.complete_turn(id_a, "claude-main", Some("id-a".into()))
+            .await
+            .unwrap();
+        mgr.complete_turn(id_b, "claude-main", Some("id-b".into()))
+            .await
+            .unwrap();
+
+        mgr.reset_conversation(id_a).await.unwrap();
+
+        // session_b must be untouched
+        let meta_b = mgr.load_meta(id_b).await.unwrap().unwrap();
+        assert_eq!(
+            meta_b.backend_session_ids.get("claude-main").map(String::as_str),
+            Some("id-b"),
+            "reset of session_a must not affect session_b backend_session_ids"
+        );
     }
 
     #[tokio::test]
