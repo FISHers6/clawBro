@@ -806,7 +806,10 @@ mod tests {
                 }
             }
         }
-        assert!(saw_complete, "expected TurnComplete despite lingering sender");
+        assert!(
+            saw_complete,
+            "expected TurnComplete despite lingering sender"
+        );
     }
 
     #[tokio::test]

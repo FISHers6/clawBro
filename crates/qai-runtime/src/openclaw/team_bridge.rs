@@ -30,6 +30,7 @@ pub enum OpenClawTeamOutcome {
         task_id: String,
         summary: String,
         artifacts: Vec<String>,
+        result_markdown: Option<String>,
     },
     Blocked {
         task_id: String,
@@ -102,6 +103,10 @@ impl OpenClawTeamOutcome {
                             .collect()
                     })
                     .unwrap_or_default(),
+                result_markdown: value
+                    .get("result_markdown")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
             }),
             "block_task" => Ok(Self::Blocked {
                 task_id: required_task_id(value)?,
@@ -127,10 +132,14 @@ pub fn map_outcome_to_team_callback(
             agent: binding.participant_name.clone(),
         }),
         OpenClawTeamOutcome::Submitted {
-            task_id, summary, ..
+            task_id,
+            summary,
+            result_markdown,
+            ..
         } => Ok(TeamCallback::TaskSubmitted {
             task_id,
             summary,
+            result_markdown,
             agent: binding.participant_name.clone(),
         }),
         OpenClawTeamOutcome::Blocked { task_id, reason } => Ok(TeamCallback::TaskBlocked {
@@ -211,7 +220,7 @@ mod tests {
         let outcome = OpenClawTeamOutcome::from_helper_json(&json).unwrap();
         assert!(matches!(
             outcome,
-            OpenClawTeamOutcome::Submitted { ref task_id, ref summary, ref artifacts }
+            OpenClawTeamOutcome::Submitted { ref task_id, ref summary, ref artifacts, .. }
                 if task_id == "T001" && summary == "done" && artifacts == &vec!["src/lib.rs".to_string()]
         ));
     }
@@ -258,12 +267,13 @@ mod tests {
                 task_id: "T001".into(),
                 summary: "done".into(),
                 artifacts: vec!["src/lib.rs".into()],
+                result_markdown: None,
             },
         )
         .unwrap();
         assert!(matches!(
             callback,
-            TeamCallback::TaskSubmitted { ref task_id, ref summary, ref agent }
+            TeamCallback::TaskSubmitted { ref task_id, ref summary, ref agent, .. }
                 if task_id == "T001" && summary == "done" && agent == "worker"
         ));
     }
@@ -286,6 +296,7 @@ mod tests {
                 ref task_id,
                 ref summary,
                 ref agent,
+                ..
             }) if task_id == "T001" && summary == "done" && agent == "worker"
         ));
     }

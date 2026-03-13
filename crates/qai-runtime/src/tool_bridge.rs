@@ -49,6 +49,7 @@ pub enum TeamToolCall {
     SubmitTaskResult {
         task_id: String,
         summary: String,
+        result_markdown: Option<String>,
         agent: Option<String>,
     },
     AcceptTask {
@@ -63,6 +64,7 @@ pub enum TeamToolCall {
     CompleteTask {
         task_id: String,
         note: String,
+        result_markdown: Option<String>,
         agent: Option<String>,
     },
     BlockTask {
@@ -164,6 +166,7 @@ mod tests {
         let call = TeamToolCall::SubmitTaskResult {
             task_id: "T001".into(),
             summary: "Implemented JWT middleware".into(),
+            result_markdown: Some("# Result\n\nImplemented JWT middleware".into()),
             agent: Some("codex".into()),
         };
 
@@ -171,10 +174,15 @@ mod tests {
             TeamToolCall::SubmitTaskResult {
                 task_id,
                 summary,
+                result_markdown,
                 agent,
             } => {
                 assert_eq!(task_id, "T001");
                 assert_eq!(summary, "Implemented JWT middleware");
+                assert_eq!(
+                    result_markdown.as_deref(),
+                    Some("# Result\n\nImplemented JWT middleware")
+                );
                 assert_eq!(agent.as_deref(), Some("codex"));
             }
             other => panic!("unexpected call: {other:?}"),

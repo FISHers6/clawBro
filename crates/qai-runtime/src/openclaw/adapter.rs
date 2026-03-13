@@ -560,6 +560,7 @@ mod tests {
                 ref task_id,
                 ref summary,
                 ref agent,
+                ..
             }) if task_id == "T1" && summary == "done" && agent == "worker"
         ));
     }

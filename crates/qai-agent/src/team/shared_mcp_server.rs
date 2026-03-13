@@ -79,7 +79,7 @@ pub struct PostUpdateParams {
 /// Parameters for `assign_task`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct AssignTaskParams {
-    /// The task ID to reassign (must be pending).
+    /// The task ID to reassign (must be pending or waiting for lead review).
     pub task_id: String,
     /// The new assignee agent name.
     pub new_assignee: String,
@@ -98,6 +98,7 @@ pub struct CheckpointTaskParams {
 pub struct SubmitTaskResultParams {
     pub task_id: String,
     pub summary: String,
+    pub result_markdown: Option<String>,
     pub agent: Option<String>,
 }
 
@@ -123,6 +124,8 @@ pub struct CompleteTaskParams {
     pub task_id: String,
     /// A short note summarising what was accomplished.
     pub note: String,
+    /// Optional richer durable result body. If omitted, the system falls back to a generated wrapper around `note`.
+    pub result_markdown: Option<String>,
     /// Your agent name (e.g. "codex"). Used to verify you claimed this task.
     pub agent: Option<String>,
 }
@@ -286,7 +289,7 @@ impl SharedTeamToolServer {
 
     /// Reassign a pending task to a different agent.
     #[tool(
-        description = "Lead only. Reassign a pending task to a new agent. task_id must be pending. Provide new_assignee agent name."
+        description = "Lead only. Reassign a pending task to a new agent. task_id may be pending or waiting for lead review after a failed specialist run. Provide new_assignee agent name."
     )]
     async fn assign_task(&self, Parameters(p): Parameters<AssignTaskParams>) -> String {
         match self
@@ -349,7 +352,7 @@ impl SharedTeamToolServer {
 
     /// Mark a task as complete.
     #[tool(
-        description = "Specialist only. Mark a task as complete. Provide the task_id, a short completion note, and your agent name."
+        description = "Specialist only. Mark a task as complete. Provide the task_id, a short completion note, optionally a richer result_markdown body, and your agent name."
     )]
     async fn complete_task(&self, Parameters(p): Parameters<CompleteTaskParams>) -> String {
         match self
@@ -358,6 +361,7 @@ impl SharedTeamToolServer {
                 TeamToolCall::CompleteTask {
                     task_id: p.task_id.clone(),
                     note: p.note.clone(),
+                    result_markdown: p.result_markdown,
                     agent: p.agent,
                 },
             )
@@ -391,7 +395,7 @@ impl SharedTeamToolServer {
 
     /// Submit a completed task result for lead acceptance.
     #[tool(
-        description = "Specialist only. Submit task results for lead review. Provide task_id, summary, and optionally your agent name."
+        description = "Specialist only. Submit task results for lead review. Provide task_id, a short summary, optionally a richer result_markdown body, and optionally your agent name."
     )]
     async fn submit_task_result(
         &self,
@@ -403,6 +407,7 @@ impl SharedTeamToolServer {
                 TeamToolCall::SubmitTaskResult {
                     task_id: p.task_id.clone(),
                     summary: p.summary.clone(),
+                    result_markdown: p.result_markdown,
                     agent: p.agent,
                 },
             )
@@ -622,6 +627,7 @@ mod tests {
             .complete_task(Parameters(CompleteTaskParams {
                 task_id: "T001".to_string(),
                 note: "done".to_string(),
+                result_markdown: Some("# Result\n\nall tests passed".to_string()),
                 agent: Some("codex".to_string()),
             }))
             .await;
@@ -658,6 +664,7 @@ mod tests {
             .submit_task_result(Parameters(SubmitTaskResultParams {
                 task_id: "T010".into(),
                 summary: "ready for review".into(),
+                result_markdown: Some("# Result\n\nadded jwt.rs and tests".into()),
                 agent: Some("codex".into()),
             }))
             .await;
@@ -691,7 +698,7 @@ mod tests {
             .try_claim("T011", "codex")
             .unwrap();
         srv.orchestrator
-            .handle_specialist_submitted("T011", "codex", "ready")
+            .handle_specialist_submitted("T011", "codex", "ready", None)
             .unwrap();
 
         let result = srv

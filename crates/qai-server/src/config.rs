@@ -104,6 +104,9 @@ pub struct GatewayConfig {
     /// 群组专项配置列表（`[[group]]` 段，可配置交互模式和 Team Mode 参数）
     #[serde(default, rename = "group")]
     pub groups: Vec<GroupConfig>,
+    /// 精确 scope team 配置（`[[team_scope]]` 段），用于 DM 等非 group scope。
+    #[serde(default, rename = "team_scope")]
+    pub team_scopes: Vec<TeamScopeConfig>,
     /// Deterministic routing bindings (`[[binding]]`).
     #[serde(default, rename = "binding")]
     pub bindings: Vec<BindingConfig>,
@@ -137,6 +140,42 @@ impl GatewayConfig {
     pub fn resolved_default_backend_id(&self) -> Option<String> {
         let backend_id = self.agent.backend_id.trim();
         (!backend_id.is_empty()).then(|| backend_id.to_string())
+    }
+
+    pub fn normalized_team_scopes(&self) -> Vec<TeamScopeSpec> {
+        let mut by_scope = BTreeMap::new();
+
+        for group in self
+            .groups
+            .iter()
+            .filter(|group| matches!(group.mode.interaction, InteractionMode::Team))
+        {
+            by_scope.insert(
+                (group.mode.channel.clone(), group.scope.clone()),
+                TeamScopeSpec {
+                    scope: group.scope.clone(),
+                    name: group.name.clone(),
+                    mode: group.mode.clone(),
+                    team: group.team.clone(),
+                    source: TeamScopeSource::LegacyGroup,
+                },
+            );
+        }
+
+        for team_scope in &self.team_scopes {
+            by_scope.insert(
+                (team_scope.mode.channel.clone(), team_scope.scope.clone()),
+                TeamScopeSpec {
+                    scope: team_scope.scope.clone(),
+                    name: team_scope.name.clone(),
+                    mode: team_scope.mode.clone(),
+                    team: team_scope.team.clone(),
+                    source: TeamScopeSource::ExactScope,
+                },
+            );
+        }
+
+        by_scope.into_values().collect()
     }
 
     pub fn validate_runtime_topology(&self) -> Result<()> {
@@ -314,6 +353,49 @@ impl GatewayConfig {
                     anyhow::bail!(
                         "group `{}` references team agent `{}` which is not present in [[agent_roster]]",
                         group.scope,
+                        specialist
+                    );
+                }
+            }
+        }
+
+        let mut seen_team_scope_names = BTreeSet::new();
+        for team_scope in &self.team_scopes {
+            if !seen_team_scope_names
+                .insert((team_scope.mode.channel.clone(), team_scope.scope.clone()))
+            {
+                anyhow::bail!(
+                    "duplicate team_scope `{}` for channel `{}`",
+                    team_scope.scope,
+                    team_scope.mode.channel.as_deref().unwrap_or("*")
+                );
+            }
+            if !matches!(team_scope.mode.interaction, InteractionMode::Team) {
+                anyhow::bail!(
+                    "team_scope `{}` must set mode.interaction = \"team\"",
+                    team_scope.scope
+                );
+            }
+            if team_scope.mode.auto_promote {
+                anyhow::bail!(
+                    "team_scope `{}` sets mode.auto_promote = true, but [[team_scope]] entries always create a full team orchestrator and do not support keyword-based auto-promotion; remove auto_promote or use [[group]] instead",
+                    team_scope.scope
+                );
+            }
+            if let Some(front_bot) = team_scope.mode.front_bot.as_deref() {
+                if !roster_names.contains(front_bot) {
+                    anyhow::bail!(
+                        "team_scope `{}` references front_bot `{}` which is not present in [[agent_roster]]",
+                        team_scope.scope,
+                        front_bot
+                    );
+                }
+            }
+            for specialist in &team_scope.team.roster {
+                if !roster_names.contains(specialist.as_str()) {
+                    anyhow::bail!(
+                        "team_scope `{}` references team agent `{}` which is not present in [[agent_roster]]",
+                        team_scope.scope,
                         specialist
                     );
                 }
@@ -828,6 +910,32 @@ pub struct GroupConfig {
     /// Team Mode 配置
     #[serde(default)]
     pub team: GroupTeamConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamScopeConfig {
+    pub scope: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub mode: GroupModeConfig,
+    #[serde(default)]
+    pub team: GroupTeamConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TeamScopeSource {
+    LegacyGroup,
+    ExactScope,
+}
+
+#[derive(Debug, Clone)]
+pub struct TeamScopeSpec {
+    pub scope: String,
+    pub name: Option<String>,
+    pub mode: GroupModeConfig,
+    pub team: GroupTeamConfig,
+    pub source: TeamScopeSource,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1627,6 +1735,334 @@ channel = "lark"
         let toml_str = "[[group]]\nscope = \"group:lark:xyz\"";
         let cfg: GatewayConfig = toml::from_str(toml_str).unwrap();
         assert!(cfg.groups[0].mode.channel.is_none());
+    }
+
+    #[test]
+    fn test_team_scope_config_deserializes() {
+        let toml_str = r#"
+[[team_scope]]
+scope = "user:ou_123"
+name = "私聊工作台"
+
+[team_scope.mode]
+interaction = "team"
+front_bot = "claude"
+channel = "lark"
+
+[team_scope.team]
+roster = ["codex", "researcher"]
+public_updates = "minimal"
+max_parallel = 2
+"#;
+        let cfg: GatewayConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.team_scopes.len(), 1);
+        let team_scope = &cfg.team_scopes[0];
+        assert_eq!(team_scope.scope, "user:ou_123");
+        assert_eq!(team_scope.name.as_deref(), Some("私聊工作台"));
+        assert_eq!(team_scope.mode.interaction, InteractionMode::Team);
+        assert_eq!(team_scope.mode.front_bot.as_deref(), Some("claude"));
+        assert_eq!(team_scope.mode.channel.as_deref(), Some("lark"));
+        assert_eq!(team_scope.team.roster, vec!["codex", "researcher"]);
+        assert_eq!(team_scope.team.max_parallel, 2);
+    }
+
+    #[test]
+    fn test_validate_runtime_topology_accepts_team_scope_front_bot_and_roster() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+[[backend]]
+id = "native-main"
+family = "quick_ai_native"
+
+[backend.launch]
+type = "embedded"
+
+[agent]
+backend_id = "native-main"
+
+[[agent_roster]]
+name = "claude"
+mentions = ["@claude"]
+backend_id = "native-main"
+
+[[agent_roster]]
+name = "codex"
+mentions = ["@codex"]
+backend_id = "native-main"
+
+[[team_scope]]
+scope = "user:ou_abc"
+
+[team_scope.mode]
+interaction = "team"
+front_bot = "claude"
+
+[team_scope.team]
+roster = ["codex"]
+"#,
+        )
+        .unwrap();
+
+        cfg.validate_runtime_topology().unwrap();
+    }
+
+    #[test]
+    fn test_validate_runtime_topology_rejects_team_scope_non_team_interaction() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+[[backend]]
+id = "native-main"
+family = "quick_ai_native"
+
+[backend.launch]
+type = "embedded"
+
+[agent]
+backend_id = "native-main"
+
+[[agent_roster]]
+name = "claude"
+mentions = ["@claude"]
+backend_id = "native-main"
+
+[[team_scope]]
+scope = "user:ou_abc"
+
+[team_scope.mode]
+interaction = "solo"
+front_bot = "claude"
+"#,
+        )
+        .unwrap();
+
+        let err = cfg.validate_runtime_topology().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("team_scope `user:ou_abc` must set mode.interaction = \"team\""));
+    }
+
+    #[test]
+    fn test_validate_runtime_topology_rejects_team_scope_with_auto_promote() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+[[backend]]
+id = "native-main"
+family = "quick_ai_native"
+
+[backend.launch]
+type = "embedded"
+
+[agent]
+backend_id = "native-main"
+
+[[agent_roster]]
+name = "claude"
+mentions = ["@claude"]
+backend_id = "native-main"
+
+[[team_scope]]
+scope = "user:ou_abc"
+
+[team_scope.mode]
+interaction = "team"
+auto_promote = true
+front_bot = "claude"
+"#,
+        )
+        .unwrap();
+
+        let err = cfg.validate_runtime_topology().unwrap_err();
+        assert!(
+            err.to_string().contains("auto_promote"),
+            "expected auto_promote rejection, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("user:ou_abc"),
+            "expected scope in error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_runtime_topology_rejects_duplicate_team_scope() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+[[backend]]
+id = "native-main"
+family = "quick_ai_native"
+
+[backend.launch]
+type = "embedded"
+
+[agent]
+backend_id = "native-main"
+
+[[agent_roster]]
+name = "claude"
+mentions = ["@claude"]
+backend_id = "native-main"
+
+[[team_scope]]
+scope = "user:ou_dup"
+
+[team_scope.mode]
+interaction = "team"
+front_bot = "claude"
+
+[[team_scope]]
+scope = "user:ou_dup"
+
+[team_scope.mode]
+interaction = "team"
+front_bot = "claude"
+"#,
+        )
+        .unwrap();
+
+        let err = cfg.validate_runtime_topology().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("duplicate team_scope `user:ou_dup` for channel `*`"));
+    }
+
+    #[test]
+    fn test_validate_runtime_topology_allows_same_team_scope_on_distinct_channels() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+[[backend]]
+id = "native-main"
+family = "quick_ai_native"
+
+[backend.launch]
+type = "embedded"
+
+[agent]
+backend_id = "native-main"
+
+[[agent_roster]]
+name = "claude"
+mentions = ["@claude"]
+backend_id = "native-main"
+
+[[team_scope]]
+scope = "user:ou_dup"
+
+[team_scope.mode]
+interaction = "team"
+front_bot = "claude"
+channel = "lark"
+
+[[team_scope]]
+scope = "user:ou_dup"
+
+[team_scope.mode]
+interaction = "team"
+front_bot = "claude"
+channel = "dingtalk"
+"#,
+        )
+        .unwrap();
+
+        cfg.validate_runtime_topology().unwrap();
+    }
+
+    #[test]
+    fn test_normalized_team_scopes_explicit_team_scope_overrides_group_team_scope() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+[[backend]]
+id = "native-main"
+family = "quick_ai_native"
+
+[backend.launch]
+type = "embedded"
+
+[agent]
+backend_id = "native-main"
+
+[[group]]
+scope = "user:ou_same"
+name = "legacy"
+
+[group.mode]
+interaction = "team"
+front_bot = "legacy-front"
+
+[group.team]
+roster = ["legacy-worker"]
+
+[[team_scope]]
+scope = "user:ou_same"
+name = "exact"
+
+[team_scope.mode]
+interaction = "team"
+front_bot = "exact-front"
+
+[team_scope.team]
+roster = ["exact-worker"]
+max_parallel = 7
+"#,
+        )
+        .unwrap();
+
+        let normalized = cfg.normalized_team_scopes();
+        assert_eq!(normalized.len(), 1);
+        let team_scope = &normalized[0];
+        assert_eq!(team_scope.scope, "user:ou_same");
+        assert_eq!(team_scope.name.as_deref(), Some("exact"));
+        assert_eq!(team_scope.mode.front_bot.as_deref(), Some("exact-front"));
+        assert_eq!(team_scope.team.roster, vec!["exact-worker"]);
+        assert_eq!(team_scope.team.max_parallel, 7);
+        assert!(matches!(team_scope.source, TeamScopeSource::ExactScope));
+    }
+
+    #[test]
+    fn test_normalized_team_scopes_keeps_same_scope_on_distinct_channels() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+[[backend]]
+id = "native-main"
+family = "quick_ai_native"
+
+[backend.launch]
+type = "embedded"
+
+[agent]
+backend_id = "native-main"
+
+[[team_scope]]
+scope = "user:ou_same"
+name = "lark-team"
+
+[team_scope.mode]
+interaction = "team"
+front_bot = "lark-front"
+channel = "lark"
+
+[[team_scope]]
+scope = "user:ou_same"
+name = "ding-team"
+
+[team_scope.mode]
+interaction = "team"
+front_bot = "ding-front"
+channel = "dingtalk"
+"#,
+        )
+        .unwrap();
+
+        let normalized = cfg.normalized_team_scopes();
+        assert_eq!(normalized.len(), 2);
+        assert!(normalized.iter().any(|team_scope| {
+            team_scope.scope == "user:ou_same"
+                && team_scope.mode.channel.as_deref() == Some("lark")
+                && team_scope.name.as_deref() == Some("lark-team")
+        }));
+        assert!(normalized.iter().any(|team_scope| {
+            team_scope.scope == "user:ou_same"
+                && team_scope.mode.channel.as_deref() == Some("dingtalk")
+                && team_scope.name.as_deref() == Some("ding-team")
+        }));
     }
 
     #[test]

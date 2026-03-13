@@ -44,6 +44,7 @@ The current binding model is intentionally small and matches fields that already
 Two sources feed the same binding engine:
 
 - derived bindings from `[[group]]` `front_bot`
+- derived bindings from exact `[[team_scope]]` `front_bot`
 - explicit `[[binding]]` entries in gateway config
 
 Within the same precedence tier, later bindings win.
@@ -58,6 +59,18 @@ scope = "group:lark:chat-123"
 [group.mode]
 interaction = "solo"
 front_bot = "claude"
+```
+
+Exact-scope Team wiring uses the same derived binding contract. For example, a Lark DM workbench can bind a `user:*` scope to the Team lead without inventing a second routing system:
+
+```toml
+[[team_scope]]
+scope = "user:ou_123"
+
+[team_scope.mode]
+interaction = "team"
+front_bot = "claude"
+channel = "lark"
 ```
 
 This means messages in `group:lark:chat-123` without an explicit `@mention` will resolve to roster agent `claude`, unless the session has already been manually switched with `/backend`.

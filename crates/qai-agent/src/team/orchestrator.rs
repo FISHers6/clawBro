@@ -16,14 +16,22 @@
 
 use anyhow::Result;
 use chrono::Utc;
+use qai_protocol::SessionKey;
 use serde::Serialize;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 
+use super::completion_routing::{
+    RoutingDeliveryStatus, TeamNotifyRequest, TeamRoutingEnvelope, TeamRoutingEvent,
+};
 use super::heartbeat::DispatchFn;
 use super::milestone::TeamMilestoneEvent;
 use super::registry::{Task, TaskRegistry};
 use super::session::{TaskArtifactMeta, TeamSession};
+use super::specialist_turn::{
+    classify_specialist_turn, SpecialistActionKind, SpecialistActionRecord, SpecialistTurnOutcome,
+};
 
 // ─── TeamState ────────────────────────────────────────────────────────────────
 
@@ -60,6 +68,18 @@ pub struct TeamArtifactHealthSummary {
     pub task_artifacts_present: bool,
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct TeamRoutingStats {
+    pub direct_delivered: usize,
+    pub queued_delivered: usize,
+    pub fallback_redirected: usize,
+    pub pending_count: usize,
+    pub missing_delivery_target: usize,
+    pub delivery_dedupe_ledger_size: usize,
+    pub delivery_dedupe_hits: usize,
+    pub failed_terminal: usize,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TeamRuntimeSummary {
     pub team_id: String,
@@ -71,6 +91,7 @@ pub struct TeamRuntimeSummary {
     pub mcp_port: Option<u16>,
     pub task_counts: TeamTaskCounts,
     pub artifact_health: TeamArtifactHealthSummary,
+    pub routing_stats: TeamRoutingStats,
 }
 
 // ─── TeamPlan ─────────────────────────────────────────────────────────────────
@@ -130,9 +151,20 @@ pub struct TeamOrchestrator {
     /// List of Specialist agent names (from `team.roster` in config.toml).
     pub available_specialists: std::sync::OnceLock<Vec<String>>,
     /// TeamNotify MPSC sender — wired from main.rs after registry is ready.
-    team_notify_tx: std::sync::OnceLock<tokio::sync::mpsc::Sender<qai_protocol::InboundMsg>>,
+    team_notify_tx: std::sync::OnceLock<tokio::sync::mpsc::Sender<TeamNotifyRequest>>,
+    pending_store_lock: std::sync::Mutex<()>,
+    /// Recent canonical specialist actions for dispatch-window outcome classification.
+    recent_specialist_actions: std::sync::Mutex<VecDeque<SpecialistActionRecord>>,
+    dispatch_contexts: std::sync::Mutex<HashMap<(String, String), DispatchContextRecord>>,
     #[cfg(test)]
     test_mcp_start_result: std::sync::Mutex<Option<std::result::Result<u16, String>>>,
+}
+
+#[derive(Debug, Clone)]
+struct DispatchContextRecord {
+    run_id: String,
+    requester_session_key: SessionKey,
+    parent_run_id: Option<String>,
 }
 
 impl TeamOrchestrator {
@@ -158,6 +190,9 @@ impl TeamOrchestrator {
             lead_agent_name: std::sync::OnceLock::new(),
             available_specialists: std::sync::OnceLock::new(),
             team_notify_tx: std::sync::OnceLock::new(),
+            pending_store_lock: std::sync::Mutex::new(()),
+            recent_specialist_actions: std::sync::Mutex::new(VecDeque::new()),
+            dispatch_contexts: std::sync::Mutex::new(HashMap::new()),
             #[cfg(test)]
             test_mcp_start_result: std::sync::Mutex::new(None),
         })
@@ -188,12 +223,14 @@ impl TeamOrchestrator {
     /// 设置 Lead 的 IM session key（由 main.rs 在启动时调用）
     pub fn set_lead_session_key(&self, key: qai_protocol::SessionKey) {
         let _ = self.lead_session_key.set(key);
+        self.flush_pending_routing_events();
     }
 
     /// 注入 TeamNotify MPSC sender（main.rs 在启动时调用）。
     /// handle_specialist_done() 和永久失败处理会用此 sender 推通知给 Lead。
-    pub fn set_team_notify_tx(&self, tx: tokio::sync::mpsc::Sender<qai_protocol::InboundMsg>) {
+    pub fn set_team_notify_tx(&self, tx: tokio::sync::mpsc::Sender<TeamNotifyRequest>) {
         let _ = self.team_notify_tx.set(tx);
+        self.flush_pending_routing_events();
     }
 
     /// Set the Lead agent name (from `front_bot` in config.toml).
@@ -226,6 +263,34 @@ impl TeamOrchestrator {
         let _ = self.emit_milestone(event);
     }
 
+    pub fn notify_task_dispatched(&self, task_id: &str, task_title: &str, agent: &str) {
+        let _ = self.emit_milestone(TeamMilestoneEvent::TaskDispatched {
+            task_id: task_id.to_string(),
+            task_title: task_title.to_string(),
+            agent: agent.to_string(),
+        });
+    }
+
+    pub fn record_dispatch_start(
+        &self,
+        task_id: &str,
+        agent: &str,
+        requester_session_key: SessionKey,
+        parent_run_id: Option<String>,
+    ) -> String {
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let mut contexts = self.dispatch_contexts.lock().unwrap();
+        contexts.insert(
+            (task_id.to_string(), agent.to_string()),
+            DispatchContextRecord {
+                run_id: run_id.clone(),
+                requester_session_key,
+                parent_run_id,
+            },
+        );
+        run_id
+    }
+
     pub fn status_snapshot(&self) -> TeamRuntimeSummary {
         let tasks = self.registry.all_tasks().unwrap_or_default();
         let mut counts = TeamTaskCounts {
@@ -234,7 +299,7 @@ impl TeamOrchestrator {
         };
         for task in &tasks {
             let status = task.status_raw.as_str();
-            if status == "pending" {
+            if status == "pending" || status.starts_with("hold:") {
                 counts.pending += 1;
             } else if status.starts_with("claimed:") {
                 counts.claimed += 1;
@@ -255,6 +320,7 @@ impl TeamOrchestrator {
             tasks_md_present: self.session.dir.join("TASKS.md").is_file(),
             task_artifacts_present: self.session.dir.join("tasks").is_dir(),
         };
+        let routing_stats = self.routing_stats();
 
         TeamRuntimeSummary {
             team_id: self.session.team_id.clone(),
@@ -270,7 +336,52 @@ impl TeamOrchestrator {
             mcp_port: self.mcp_server_port.get().copied(),
             task_counts: counts,
             artifact_health,
+            routing_stats,
         }
+    }
+
+    fn routing_stats(&self) -> TeamRoutingStats {
+        let outcomes = self.session.load_routing_outcomes().unwrap_or_default();
+        // Hold the store lock while reading pending completions to get a consistent snapshot.
+        let pending = {
+            let _guard = self.pending_store_lock.lock().unwrap();
+            match self.session.load_pending_completions() {
+                Ok(records) => records,
+                Err(err) => {
+                    tracing::warn!(
+                        team_id = %self.session.team_id,
+                        error = %err,
+                        "Failed to load pending completions for routing stats"
+                    );
+                    vec![]
+                }
+            }
+        };
+        let delivery_dedupe_ledger_size = self.session.delivery_dedupe_ledger_size().unwrap_or(0);
+        let delivery_dedupe_hits = self.session.delivery_dedupe_hit_count().unwrap_or(0);
+        let mut stats = TeamRoutingStats {
+            pending_count: pending.len(),
+            delivery_dedupe_ledger_size,
+            delivery_dedupe_hits,
+            ..TeamRoutingStats::default()
+        };
+        for envelope in &pending {
+            if envelope.requester_session_key.is_none() && envelope.fallback_session_keys.is_empty()
+            {
+                stats.missing_delivery_target += 1;
+            }
+        }
+        for envelope in outcomes {
+            match envelope.delivery_status {
+                RoutingDeliveryStatus::DirectDelivered => stats.direct_delivered += 1,
+                RoutingDeliveryStatus::QueuedDelivered => stats.queued_delivered += 1,
+                RoutingDeliveryStatus::FallbackRedirected => stats.fallback_redirected += 1,
+                RoutingDeliveryStatus::FailedTerminal => stats.failed_terminal += 1,
+                RoutingDeliveryStatus::PersistedPending => stats.pending_count += 1,
+                RoutingDeliveryStatus::NotRouted => {}
+            }
+        }
+        stats
     }
 
     // ── 增量任务注册（供 LeadMcpServer.create_task 调用）────────────────────
@@ -473,21 +584,43 @@ impl TeamOrchestrator {
 
     // ── 完成处理 ──────────────────────────────────────────────────────────────
 
-    /// 处理 Specialist 完成通知（由 MCP complete_task 工具触发）（由 MCP complete_task 工具触发）
+    fn resolve_result_body(
+        &self,
+        agent: &str,
+        label: &str,
+        summary_or_note: &str,
+        result_markdown: Option<&str>,
+    ) -> String {
+        if let Some(body) = result_markdown
+            .map(str::trim)
+            .filter(|body| !body.is_empty())
+        {
+            return body.to_string();
+        }
+        format!("# Result\n\nSubmitted by: {agent}\n\n{label}:\n{summary_or_note}\n")
+    }
+
+    /// 处理 Specialist 完成通知（由 MCP complete_task 工具触发）
     ///
     /// 1. 更新 SQLite（mark_done）
     /// 2. 写事件日志
     /// 3. 导出 TASKS.md 快照
     /// 4. 检查里程碑（all_done 或新任务解锁）
     /// 5. 推 TeamNotify 给 Lead Agent
-    pub fn handle_specialist_done(&self, task_id: &str, agent: &str, note: &str) -> Result<()> {
+    pub fn handle_specialist_done(
+        &self,
+        task_id: &str,
+        agent: &str,
+        note: &str,
+        result_markdown: Option<&str>,
+    ) -> Result<()> {
         // 1. 更新状态（校验认领者身份）
         self.registry.mark_done(task_id, agent, note)?;
+        self.record_specialist_action(task_id, agent, SpecialistActionKind::Done);
         self.sync_task_artifacts(task_id)?;
-        let _ = self.session.write_task_result(
-            task_id,
-            &format!("# Result\n\nSubmitted by: {agent}\n\nFinal note:\n{note}\n"),
-        );
+        let result_artifact_path = format!("tasks/{task_id}/result.md");
+        let result_body = self.resolve_result_body(agent, "Final note", note, result_markdown);
+        let _ = self.session.write_task_result(task_id, &result_body);
 
         // 2. 事件日志
         let event = serde_json::json!({
@@ -536,7 +669,52 @@ impl TeamOrchestrator {
         }
 
         // 5. 推 TeamNotify 给 Lead
-        self.dispatch_team_notify_done(task_id, agent, note, all_done);
+        let tasks = self.registry.all_tasks().unwrap_or_default();
+        let mut routing_event = if result_markdown
+            .map(str::trim)
+            .filter(|body| !body.is_empty())
+            .is_some()
+        {
+            TeamRoutingEvent::completed(task_id, agent, note, all_done)
+                .with_result_payload(result_body, result_artifact_path)
+        } else {
+            // summary-only fallback keeps payload out of transcript to avoid duplicate injection
+            TeamRoutingEvent::completed(task_id, agent, note, all_done)
+                .with_result_artifact_path(result_artifact_path)
+        };
+        if all_done {
+            let summary = tasks
+                .iter()
+                .map(|t| {
+                    format!(
+                        "- {}（{}）：{}",
+                        t.id,
+                        t.assignee_hint.as_deref().unwrap_or("?"),
+                        t.completion_note.as_deref().unwrap_or("完成")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            routing_event.detail = format!(
+                "[团队通知] 所有任务已完成 ✅\n\n完成摘要：\n{}\n\n请生成最终汇总并通过 post_update 发送给用户。",
+                summary
+            );
+        } else {
+            let done_count = tasks
+                .iter()
+                .filter(|t| t.status_raw == "done" || t.status_raw.starts_with("accepted:"))
+                .count();
+            let total = tasks.len();
+            routing_event.detail = format!(
+                "{}\n\n当前进度：{} / {} 完成",
+                routing_event.detail, done_count, total
+            );
+        }
+        self.dispatch_team_routing_event(self.build_routing_envelope(
+            task_id,
+            agent,
+            routing_event,
+        ));
 
         Ok(())
     }
@@ -547,13 +725,14 @@ impl TeamOrchestrator {
         task_id: &str,
         agent: &str,
         summary: &str,
+        result_markdown: Option<&str>,
     ) -> Result<()> {
         self.registry.submit_task_result(task_id, agent, summary)?;
+        self.record_specialist_action(task_id, agent, SpecialistActionKind::Submitted);
         self.sync_task_artifacts(task_id)?;
-        let _ = self.session.write_task_result(
-            task_id,
-            &format!("# Result\n\nSubmitted by: {agent}\n\nSummary:\n{summary}\n"),
-        );
+        let result_artifact_path = format!("tasks/{task_id}/result.md");
+        let result_body = self.resolve_result_body(agent, "Summary", summary, result_markdown);
+        let _ = self.session.write_task_result(task_id, &result_body);
 
         let event = serde_json::json!({
             "event": "SUBMITTED",
@@ -565,7 +744,23 @@ impl TeamOrchestrator {
         let _ = self.session.append_event(&event);
         let _ = self.session.sync_tasks_md(&self.registry);
 
-        self.dispatch_team_notify_submitted(task_id, agent, summary);
+        self.dispatch_team_routing_event(
+            self.build_routing_envelope(
+                task_id,
+                agent,
+                if result_markdown
+                    .map(str::trim)
+                    .filter(|body| !body.is_empty())
+                    .is_some()
+                {
+                    TeamRoutingEvent::submitted(task_id, agent, summary)
+                        .with_result_payload(result_body, result_artifact_path)
+                } else {
+                    TeamRoutingEvent::submitted(task_id, agent, summary)
+                        .with_result_artifact_path(result_artifact_path)
+                },
+            ),
+        );
         let task_title = self
             .registry
             .get_task(task_id)
@@ -625,7 +820,11 @@ impl TeamOrchestrator {
             }
         }
 
-        self.dispatch_team_notify_accepted(task_id, by, all_done);
+        self.dispatch_team_routing_event(self.build_routing_envelope(
+            task_id,
+            by,
+            TeamRoutingEvent::accepted(task_id, by, all_done),
+        ));
         Ok(())
     }
 
@@ -654,209 +853,127 @@ impl TeamOrchestrator {
         let _ = self.session.append_event(&event);
         let _ = self.session.sync_tasks_md(&self.registry);
 
-        self.dispatch_team_notify_reopened(task_id, by, reason);
+        self.dispatch_team_routing_event(self.build_routing_envelope(
+            task_id,
+            by,
+            TeamRoutingEvent::reopened(task_id, by, reason),
+        ));
         Ok(())
     }
 
-    /// 构建并发送 TeamNotify InboundMsg 给 Lead（task 完成）
-    fn dispatch_team_notify_done(&self, task_id: &str, agent: &str, note: &str, all_done: bool) {
-        let lead_key = match self.lead_session_key.get().cloned() {
-            Some(k) => k,
-            None => return, // Lead key 未设置，静默跳过
-        };
-        let tx = match self.team_notify_tx.get() {
-            Some(t) => t.clone(),
-            None => return,
-        };
-        let tasks = self.registry.all_tasks().unwrap_or_default();
-        let notify_content = if all_done {
-            let summary = tasks
-                .iter()
-                .map(|t| {
-                    format!(
-                        "- {}（{}）：{}",
-                        t.id,
-                        t.assignee_hint.as_deref().unwrap_or("?"),
-                        t.completion_note.as_deref().unwrap_or("完成")
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            format!(
-                "[团队通知] 所有任务已完成 ✅\n\n完成摘要：\n{}\n\n请生成最终汇总并通过 post_update 发送给用户。",
-                summary
-            )
-        } else {
-            let done_count = tasks
-                .iter()
-                .filter(|t| t.status_raw == "done" || t.status_raw.starts_with("accepted:"))
-                .count();
-            let total = tasks.len();
-            format!(
-                "[团队通知] 任务 {} 已完成（执行者：{}）\n\n完成摘要：\n{}\n\n当前进度：{} / {} 完成",
-                task_id, agent, note, done_count, total
-            )
-        };
-        let lead_channel = lead_key.channel.clone();
-        let msg = qai_protocol::InboundMsg {
-            id: uuid::Uuid::new_v4().to_string(),
-            session_key: lead_key,
-            content: qai_protocol::MsgContent::text(notify_content),
-            sender: "gateway".to_string(),
-            channel: lead_channel,
-            timestamp: Utc::now(),
-            thread_ts: None,
-            target_agent: None,
-            source: qai_protocol::MsgSource::TeamNotify,
-        };
-        // send().await via spawn: avoids blocking this sync fn while guaranteeing delivery.
-        // try_send was silently dropping notifications when the channel was full under load.
-        let task_id = task_id.to_string();
-        tokio::spawn(async move {
-            if let Err(e) = tx.send(msg).await {
-                tracing::warn!(task_id = %task_id, "TeamNotify dispatch failed: {e}");
+    fn build_routing_envelope(
+        &self,
+        task_id: &str,
+        agent: &str,
+        event: TeamRoutingEvent,
+    ) -> TeamRoutingEnvelope {
+        let context = self.latest_dispatch_context(task_id, agent);
+        let requester_session_key = context
+            .as_ref()
+            .map(|record| record.requester_session_key.clone())
+            .or_else(|| self.lead_session_key.get().cloned())
+            .or_else(|| self.scope.get().cloned());
+        let mut fallback_session_keys = Vec::new();
+        if let Some(lead_key) = self.lead_session_key.get() {
+            if requester_session_key.as_ref() != Some(lead_key)
+                && !fallback_session_keys.contains(lead_key)
+            {
+                fallback_session_keys.push(lead_key.clone());
             }
-        });
+        }
+        if let Some(scope_key) = self.scope.get() {
+            if requester_session_key.as_ref() != Some(scope_key)
+                && !fallback_session_keys.contains(scope_key)
+            {
+                fallback_session_keys.push(scope_key.clone());
+            }
+        }
+        TeamRoutingEnvelope {
+            run_id: context
+                .as_ref()
+                .map(|record| record.run_id.clone())
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            parent_run_id: context
+                .as_ref()
+                .and_then(|record| record.parent_run_id.clone()),
+            requester_session_key,
+            fallback_session_keys,
+            team_id: self.session.team_id.clone(),
+            delivery_status: RoutingDeliveryStatus::NotRouted,
+            event,
+        }
     }
 
-    fn dispatch_team_notify_submitted(&self, task_id: &str, agent: &str, summary: &str) {
-        let lead_key = match self.lead_session_key.get().cloned() {
-            Some(k) => k,
-            None => return,
-        };
-        let tx = match self.team_notify_tx.get() {
-            Some(t) => t.clone(),
-            None => return,
-        };
-        let notify_content = format!(
-            "[团队通知] 任务 {} 已提交待验收（执行者：{}）\n\n提交摘要：\n{}\n\n请检查结果，并决定 accept 或 reopen。",
-            task_id, agent, summary
-        );
-        let lead_channel = lead_key.channel.clone();
-        let msg = qai_protocol::InboundMsg {
-            id: uuid::Uuid::new_v4().to_string(),
-            session_key: lead_key,
-            content: qai_protocol::MsgContent::text(notify_content),
-            sender: "gateway".to_string(),
-            channel: lead_channel,
-            timestamp: Utc::now(),
-            thread_ts: None,
-            target_agent: None,
-            source: qai_protocol::MsgSource::TeamNotify,
-        };
-        let task_id = task_id.to_string();
-        tokio::spawn(async move {
-            if let Err(e) = tx.send(msg).await {
-                tracing::warn!(task_id = %task_id, "TeamNotify (submitted) dispatch failed: {e}");
-            }
-        });
+    fn latest_dispatch_context(&self, task_id: &str, agent: &str) -> Option<DispatchContextRecord> {
+        self.dispatch_contexts
+            .lock()
+            .unwrap()
+            .get(&(task_id.to_string(), agent.to_string()))
+            .cloned()
     }
 
-    fn dispatch_team_notify_accepted(&self, task_id: &str, by: &str, all_done: bool) {
-        let lead_key = match self.lead_session_key.get().cloned() {
-            Some(k) => k,
-            None => return,
-        };
-        let tx = match self.team_notify_tx.get() {
-            Some(t) => t.clone(),
-            None => return,
-        };
-        let notify_content = if all_done {
-            format!(
-                "[团队通知] 任务 {} 已验收（验收者：{}）\n\n所有任务现已完成，请生成最终汇总并通过 post_update 发送给用户。",
-                task_id, by
-            )
-        } else {
-            format!(
-                "[团队通知] 任务 {} 已验收（验收者：{}）\n\n如有新解锁任务，Heartbeat 将继续派发。",
-                task_id, by
-            )
-        };
-        let lead_channel = lead_key.channel.clone();
-        let msg = qai_protocol::InboundMsg {
-            id: uuid::Uuid::new_v4().to_string(),
-            session_key: lead_key,
-            content: qai_protocol::MsgContent::text(notify_content),
-            sender: "gateway".to_string(),
-            channel: lead_channel,
-            timestamp: Utc::now(),
-            thread_ts: None,
-            target_agent: None,
-            source: qai_protocol::MsgSource::TeamNotify,
-        };
-        let task_id = task_id.to_string();
-        tokio::spawn(async move {
-            if let Err(e) = tx.send(msg).await {
-                tracing::warn!(task_id = %task_id, "TeamNotify (accepted) dispatch failed: {e}");
-            }
-        });
-    }
+    fn dispatch_team_routing_event(&self, envelope: TeamRoutingEnvelope) {
+        // Hold pending_store_lock for the entire flush→send→persist sequence to prevent
+        // interleaving with concurrent dispatches that could cause event reordering.
+        let _guard = self.pending_store_lock.lock().unwrap();
 
-    fn dispatch_team_notify_reopened(&self, task_id: &str, by: &str, reason: &str) {
-        let lead_key = match self.lead_session_key.get().cloned() {
-            Some(k) => k,
-            None => return,
-        };
-        let tx = match self.team_notify_tx.get() {
-            Some(t) => t.clone(),
-            None => return,
-        };
-        let notify_content = format!(
-            "[团队通知] 任务 {} 已重新打开（操作者：{}）\n\n原因：{}\n\nHeartbeat 将在依赖满足时重新派发该任务。",
-            task_id, by, reason
-        );
-        let lead_channel = lead_key.channel.clone();
-        let msg = qai_protocol::InboundMsg {
-            id: uuid::Uuid::new_v4().to_string(),
-            session_key: lead_key,
-            content: qai_protocol::MsgContent::text(notify_content),
-            sender: "gateway".to_string(),
-            channel: lead_channel,
-            timestamp: Utc::now(),
-            thread_ts: None,
-            target_agent: None,
-            source: qai_protocol::MsgSource::TeamNotify,
-        };
-        let task_id = task_id.to_string();
-        tokio::spawn(async move {
-            if let Err(e) = tx.send(msg).await {
-                tracing::warn!(task_id = %task_id, "TeamNotify (reopened) dispatch failed: {e}");
+        let Some(tx) = self.team_notify_tx.get().cloned() else {
+            if let Err(err) = self.session.append_pending_completion(
+                &envelope
+                    .clone()
+                    .with_delivery_status(RoutingDeliveryStatus::PersistedPending),
+            ) {
+                tracing::error!(
+                    team_id = %self.session.team_id,
+                    task_id = %envelope.event.task_id,
+                    error = %err,
+                    "Failed to persist pending team routing event (no tx)"
+                );
             }
-        });
+            return;
+        };
+
+        // Flush existing pending events first (inline, lock already held).
+        self.flush_pending_routing_events_locked(&tx);
+
+        let pending_on_error = envelope
+            .clone()
+            .with_delivery_status(RoutingDeliveryStatus::PersistedPending);
+        if let Err(err) = tx.try_send(TeamNotifyRequest {
+            envelope: envelope.clone(),
+        }) {
+            tracing::warn!(
+                team_id = %self.session.team_id,
+                task_id = %envelope.event.task_id,
+                kind = ?envelope.event.kind,
+                "TeamNotify dispatch deferred: {err}"
+            );
+            if let Err(persist_err) = self.session.append_pending_completion(&pending_on_error) {
+                tracing::error!(
+                    team_id = %self.session.team_id,
+                    task_id = %envelope.event.task_id,
+                    error = %persist_err,
+                    "Failed to persist pending team routing event"
+                );
+            }
+        }
     }
 
     /// 构建并发送 TeamNotify InboundMsg 给 Lead（task 永久失败）
     pub fn dispatch_team_notify_failed(&self, task_id: &str, reason: &str) {
-        let lead_key = match self.lead_session_key.get().cloned() {
-            Some(k) => k,
-            None => return,
-        };
-        let tx = match self.team_notify_tx.get() {
-            Some(t) => t.clone(),
-            None => return,
-        };
-        let notify_content = format!(
-            "[团队通知] 任务 {} 永久失败（已超过最大重试次数）\n\n原因：{}\n\n请调用 assign_task() 重新分配或调用 get_task_status() 查看全局状态。",
-            task_id, reason
-        );
-        let lead_channel = lead_key.channel.clone();
-        let msg = qai_protocol::InboundMsg {
-            id: uuid::Uuid::new_v4().to_string(),
-            session_key: lead_key,
-            content: qai_protocol::MsgContent::text(notify_content),
-            sender: "gateway".to_string(),
-            channel: lead_channel,
-            timestamp: Utc::now(),
-            thread_ts: None,
-            target_agent: None,
-            source: qai_protocol::MsgSource::TeamNotify,
-        };
-        let task_id = task_id.to_string();
-        tokio::spawn(async move {
-            if let Err(e) = tx.send(msg).await {
-                tracing::warn!(task_id = %task_id, "TeamNotify (failed) dispatch failed: {e}");
-            }
-        });
+        self.dispatch_team_routing_event(self.build_routing_envelope(
+            task_id,
+            "leader",
+            TeamRoutingEvent::failed(task_id, reason),
+        ));
+    }
+
+    fn dispatch_team_notify_missing_completion(&self, task_id: &str, agent: &str) {
+        self.dispatch_team_routing_event(self.build_routing_envelope(
+            task_id,
+            agent,
+            TeamRoutingEvent::missing_completion(task_id, agent),
+        ));
     }
 
     /// 处理 Specialist 阻塞通知（Escalation → Lead via team_notify_tx）
@@ -875,6 +992,7 @@ impl TeamOrchestrator {
         );
         // ──────────────────────────────────────────────────────────────────────────────────
 
+        self.record_specialist_action(task_id, agent, SpecialistActionKind::Blocked);
         let event = serde_json::json!({
             "event": "BLOCKED",
             "task": task_id,
@@ -897,7 +1015,11 @@ impl TeamOrchestrator {
         );
 
         // Escalation → Lead via team_notify_tx (same path as task completion)
-        self.dispatch_team_notify_blocked(task_id, agent, reason);
+        self.dispatch_team_routing_event(self.build_routing_envelope(
+            task_id,
+            agent,
+            TeamRoutingEvent::blocked(task_id, agent, reason),
+        ));
         let task_title = self
             .registry
             .get_task(task_id)
@@ -922,6 +1044,7 @@ impl TeamOrchestrator {
         agent: &str,
         note: &str,
     ) -> Result<()> {
+        self.record_specialist_action(task_id, agent, SpecialistActionKind::Checkpoint);
         let event = serde_json::json!({
             "event": "CHECKPOINT",
             "task": task_id,
@@ -940,7 +1063,11 @@ impl TeamOrchestrator {
                 note
             ),
         );
-        self.dispatch_team_notify_checkpoint(task_id, agent, note);
+        self.dispatch_team_routing_event(self.build_routing_envelope(
+            task_id,
+            agent,
+            TeamRoutingEvent::checkpoint(task_id, agent, note),
+        ));
         let _ = self.emit_milestone(TeamMilestoneEvent::TaskCheckpoint {
             task_id: task_id.to_string(),
             agent: agent.to_string(),
@@ -956,6 +1083,7 @@ impl TeamOrchestrator {
         agent: &str,
         message: &str,
     ) -> Result<()> {
+        self.record_specialist_action(task_id, agent, SpecialistActionKind::HelpRequested);
         let event = serde_json::json!({
             "event": "HELP_REQUESTED",
             "task": task_id,
@@ -974,108 +1102,74 @@ impl TeamOrchestrator {
                 message
             ),
         );
-        self.dispatch_team_notify_help(task_id, agent, message);
+        self.dispatch_team_routing_event(self.build_routing_envelope(
+            task_id,
+            agent,
+            TeamRoutingEvent::help_requested(task_id, agent, message),
+        ));
         Ok(())
     }
 
-    /// 构建并发送 TeamNotify InboundMsg 给 Lead（task 阻塞）
-    fn dispatch_team_notify_blocked(&self, task_id: &str, agent: &str, reason: &str) {
-        let lead_key = match self.lead_session_key.get().cloned() {
-            Some(k) => k,
-            None => return,
-        };
-        let tx = match self.team_notify_tx.get() {
-            Some(t) => t.clone(),
-            None => return,
-        };
-        let notify_content = format!(
-            "[团队通知] 任务 {} 已阻塞（执行者：{}）\n\n阻塞原因：{}\n\n请调用 assign_task() 重新分配或 post_update() 告知用户。",
-            task_id, agent, reason
-        );
-        let lead_channel = lead_key.channel.clone();
-        let msg = qai_protocol::InboundMsg {
-            id: uuid::Uuid::new_v4().to_string(),
-            session_key: lead_key,
-            content: qai_protocol::MsgContent::text(notify_content),
-            sender: "gateway".to_string(),
-            channel: lead_channel,
-            timestamp: Utc::now(),
-            thread_ts: None,
-            target_agent: None,
-            source: qai_protocol::MsgSource::TeamNotify,
-        };
-        let task_id = task_id.to_string();
-        tokio::spawn(async move {
-            if let Err(e) = tx.send(msg).await {
-                tracing::warn!(task_id = %task_id, "TeamNotify (blocked) dispatch failed: {e}");
-            }
-        });
+    pub fn specialist_actions_since(
+        &self,
+        task_id: &str,
+        agent: &str,
+        started_at: chrono::DateTime<Utc>,
+    ) -> Vec<SpecialistActionRecord> {
+        self.recent_specialist_actions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|record| {
+                record.task_id == task_id && record.agent == agent && record.at >= started_at
+            })
+            .cloned()
+            .collect()
     }
 
-    fn dispatch_team_notify_checkpoint(&self, task_id: &str, agent: &str, note: &str) {
-        let lead_key = match self.lead_session_key.get().cloned() {
-            Some(k) => k,
-            None => return,
-        };
-        let tx = match self.team_notify_tx.get() {
-            Some(t) => t.clone(),
-            None => return,
-        };
-        let notify_content = format!(
-            "[团队通知] 任务 {} 已更新检查点（执行者：{}）\n\n进展：{}\n\n如有必要，可调用 post_update() 向用户同步阶段性进展。",
-            task_id, agent, note
-        );
-        let lead_channel = lead_key.channel.clone();
-        let msg = qai_protocol::InboundMsg {
-            id: uuid::Uuid::new_v4().to_string(),
-            session_key: lead_key,
-            content: qai_protocol::MsgContent::text(notify_content),
-            sender: "gateway".to_string(),
-            channel: lead_channel,
-            timestamp: Utc::now(),
-            thread_ts: None,
-            target_agent: None,
-            source: qai_protocol::MsgSource::TeamNotify,
-        };
-        let task_id = task_id.to_string();
-        tokio::spawn(async move {
-            if let Err(e) = tx.send(msg).await {
-                tracing::warn!(task_id = %task_id, "TeamNotify (checkpoint) dispatch failed: {e}");
-            }
-        });
+    pub fn classify_specialist_turn(
+        &self,
+        task_id: &str,
+        agent: &str,
+        started_at: chrono::DateTime<Utc>,
+    ) -> SpecialistTurnOutcome {
+        let records = self.specialist_actions_since(task_id, agent, started_at);
+        classify_specialist_turn(&records, task_id, agent, started_at)
     }
 
-    fn dispatch_team_notify_help(&self, task_id: &str, agent: &str, message: &str) {
-        let lead_key = match self.lead_session_key.get().cloned() {
-            Some(k) => k,
-            None => return,
-        };
-        let tx = match self.team_notify_tx.get() {
-            Some(t) => t.clone(),
-            None => return,
-        };
-        let notify_content = format!(
-            "[团队通知] 任务 {} 请求协助（执行者：{}）\n\n请求内容：{}\n\n请决定是直接回复思路、重新分配，还是让其继续执行。",
-            task_id, agent, message
+    pub fn handle_specialist_missing_completion(
+        &self,
+        task_id: &str,
+        agent: &str,
+        reply_excerpt: Option<&str>,
+    ) -> Result<()> {
+        if self.registry.is_claimed_by(task_id, agent)? {
+            self.registry
+                .hold_claim(task_id, agent, "missing_completion")?;
+        }
+        self.sync_task_artifacts(task_id)?;
+        let excerpt = reply_excerpt.unwrap_or("(no reply text captured)");
+        let event = serde_json::json!({
+            "event": "MISSING_COMPLETION",
+            "task": task_id,
+            "agent": agent,
+            "reply_excerpt": excerpt,
+            "ts": Utc::now().to_rfc3339(),
+        })
+        .to_string();
+        let _ = self.session.append_event(&event);
+        let _ = self.session.append_task_progress(
+            task_id,
+            &format!(
+                "[{}] {} ended turn without canonical completion/progress tool. Reply excerpt: {}",
+                Utc::now().to_rfc3339(),
+                agent,
+                excerpt
+            ),
         );
-        let lead_channel = lead_key.channel.clone();
-        let msg = qai_protocol::InboundMsg {
-            id: uuid::Uuid::new_v4().to_string(),
-            session_key: lead_key,
-            content: qai_protocol::MsgContent::text(notify_content),
-            sender: "gateway".to_string(),
-            channel: lead_channel,
-            timestamp: Utc::now(),
-            thread_ts: None,
-            target_agent: None,
-            source: qai_protocol::MsgSource::TeamNotify,
-        };
-        let task_id = task_id.to_string();
-        tokio::spawn(async move {
-            if let Err(e) = tx.send(msg).await {
-                tracing::warn!(task_id = %task_id, "TeamNotify (help) dispatch failed: {e}");
-            }
-        });
+        let _ = self.session.sync_tasks_md(&self.registry);
+        self.dispatch_team_notify_missing_completion(task_id, agent);
+        Ok(())
     }
 
     // ── 停止 ──────────────────────────────────────────────────────────────────
@@ -1125,6 +1219,85 @@ impl TeamOrchestrator {
             .write_task_spec(&task.id, &render_task_spec(task))?;
         Ok(())
     }
+
+    fn record_specialist_action(&self, task_id: &str, agent: &str, kind: SpecialistActionKind) {
+        const MAX_RECENT_SPECIALIST_ACTIONS: usize = 256;
+        let mut actions = self.recent_specialist_actions.lock().unwrap();
+        actions.push_back(SpecialistActionRecord {
+            task_id: task_id.to_string(),
+            agent: agent.to_string(),
+            kind,
+            at: Utc::now(),
+        });
+        while actions.len() > MAX_RECENT_SPECIALIST_ACTIONS {
+            actions.pop_front();
+        }
+    }
+
+    /// Called from setters (set_lead_session_key / set_team_notify_tx) where no lock is held yet.
+    fn flush_pending_routing_events(&self) {
+        let Some(tx) = self.team_notify_tx.get().cloned() else {
+            return;
+        };
+        let _guard = self.pending_store_lock.lock().unwrap();
+        self.flush_pending_routing_events_locked(&tx);
+    }
+
+    /// Core flush logic. Caller MUST already hold `pending_store_lock`.
+    fn flush_pending_routing_events_locked(
+        &self,
+        tx: &tokio::sync::mpsc::Sender<TeamNotifyRequest>,
+    ) {
+        let pending = match self.session.load_pending_completions() {
+            Ok(records) => records,
+            Err(err) => {
+                tracing::warn!(
+                    team_id = %self.session.team_id,
+                    error = %err,
+                    "Failed to load pending team routing events"
+                );
+                return;
+            }
+        };
+        if pending.is_empty() {
+            return;
+        }
+        let mut remaining = Vec::new();
+        for envelope in pending {
+            let pending_on_error = envelope
+                .clone()
+                .with_delivery_status(RoutingDeliveryStatus::PersistedPending);
+            if let Err(err) = tx.try_send(TeamNotifyRequest {
+                envelope: envelope.clone(),
+            }) {
+                tracing::warn!(
+                    team_id = %self.session.team_id,
+                    task_id = %envelope.event.task_id,
+                    "Failed to replay pending team routing event: {err}"
+                );
+                remaining.push(pending_on_error);
+            }
+        }
+        if let Err(err) = self.session.replace_pending_completions(&remaining) {
+            tracing::error!(
+                team_id = %self.session.team_id,
+                error = %err,
+                "Failed to rewrite pending team routing events after replay"
+            );
+        }
+    }
+
+    pub fn persist_pending_routing_event(&self, envelope: TeamRoutingEnvelope) {
+        let _guard = self.pending_store_lock.lock().unwrap();
+        if let Err(err) = self.session.append_pending_completion(&envelope) {
+            tracing::error!(
+                team_id = %self.session.team_id,
+                task_id = %envelope.event.task_id,
+                error = %err,
+                "Failed to persist pending team routing event"
+            );
+        }
+    }
 }
 
 fn render_task_spec(task: &Task) -> String {
@@ -1154,6 +1327,7 @@ mod tests {
     use super::*;
     use crate::team::registry::CreateTask;
     use tempfile::tempdir;
+    use tokio::time::{timeout, Duration};
 
     fn make_orchestrator() -> (Arc<TeamOrchestrator>, tempfile::TempDir) {
         let tmp = tempdir().unwrap();
@@ -1241,7 +1415,7 @@ mod tests {
             .unwrap();
         orch.registry.try_claim("T003", "codex").unwrap();
 
-        orch.handle_specialist_done("T003", "codex", "created jwt.rs")
+        orch.handle_specialist_done("T003", "codex", "created jwt.rs", None)
             .unwrap();
 
         let task = orch.registry.get_task("T003").unwrap().unwrap();
@@ -1269,7 +1443,7 @@ mod tests {
             .unwrap();
         orch.registry.try_claim("T004", "codex").unwrap();
 
-        orch.handle_specialist_submitted("T004", "codex", "ready for review")
+        orch.handle_specialist_submitted("T004", "codex", "ready for review", None)
             .unwrap();
 
         let task = orch.registry.get_task("T004").unwrap().unwrap();
@@ -1286,6 +1460,281 @@ mod tests {
         let meta = std::fs::read_to_string(tmp.path().join("tasks").join("T004").join("meta.json"))
             .unwrap();
         assert!(meta.contains("submitted:codex:"));
+    }
+
+    #[test]
+    fn test_handle_specialist_done_routes_result_payload_and_artifact_ref() {
+        let (orch, _tmp) = make_orchestrator();
+        orch.set_scope(SessionKey::new("ws", "group:test-team"));
+        orch.registry
+            .create_task(CreateTask {
+                id: "T003A".into(),
+                title: "JWT impl".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        orch.registry.try_claim("T003A", "codex").unwrap();
+
+        orch.handle_specialist_done("T003A", "codex", "created jwt.rs", None)
+            .unwrap();
+
+        let pending = orch.session.load_pending_completions().unwrap();
+        assert_eq!(pending.len(), 1);
+        // Only artifact path is set; inline payload is intentionally omitted to avoid
+        // duplicate injection (detail already contains the note).
+        assert_eq!(
+            pending[0].event.result_artifact_path.as_deref(),
+            Some("tasks/T003A/result.md")
+        );
+        assert!(
+            pending[0].event.result_payload.is_none(),
+            "done event should NOT carry inline payload (detail already contains the note)"
+        );
+    }
+
+    #[test]
+    fn test_handle_specialist_done_uses_explicit_result_markdown_for_payload_and_artifact() {
+        let (orch, tmp) = make_orchestrator();
+        orch.set_scope(SessionKey::new("ws", "group:test-team"));
+        orch.registry
+            .create_task(CreateTask {
+                id: "T003B".into(),
+                title: "JWT impl".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        orch.registry.try_claim("T003B", "codex").unwrap();
+
+        let result_markdown = "# Result\n\nImplemented middleware\n\n```rust\nfn auth() {}\n```";
+        orch.handle_specialist_done("T003B", "codex", "created jwt.rs", Some(result_markdown))
+            .unwrap();
+
+        let result =
+            std::fs::read_to_string(tmp.path().join("tasks").join("T003B").join("result.md"))
+                .unwrap();
+        assert_eq!(result, result_markdown);
+
+        let pending = orch.session.load_pending_completions().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].event.result_payload.as_deref(),
+            Some(result_markdown)
+        );
+        assert_eq!(
+            pending[0].event.result_artifact_path.as_deref(),
+            Some("tasks/T003B/result.md")
+        );
+    }
+
+    #[test]
+    fn test_handle_specialist_submitted_routes_result_payload_and_artifact_ref() {
+        let (orch, _tmp) = make_orchestrator();
+        orch.set_scope(SessionKey::new("ws", "group:test-team"));
+        orch.registry
+            .create_task(CreateTask {
+                id: "T004A".into(),
+                title: "JWT impl".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        orch.registry.try_claim("T004A", "codex").unwrap();
+
+        orch.handle_specialist_submitted("T004A", "codex", "ready for review", None)
+            .unwrap();
+
+        let pending = orch.session.load_pending_completions().unwrap();
+        assert_eq!(pending.len(), 1);
+        // Only artifact path is set; inline payload is intentionally omitted.
+        assert_eq!(
+            pending[0].event.result_artifact_path.as_deref(),
+            Some("tasks/T004A/result.md")
+        );
+        assert!(
+            pending[0].event.result_payload.is_none(),
+            "submitted event should NOT carry inline payload (detail already contains the summary)"
+        );
+    }
+
+    #[test]
+    fn test_handle_specialist_submitted_uses_explicit_result_markdown_for_payload_and_artifact() {
+        let (orch, tmp) = make_orchestrator();
+        orch.set_scope(SessionKey::new("ws", "group:test-team"));
+        orch.registry
+            .create_task(CreateTask {
+                id: "T004B".into(),
+                title: "JWT impl".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        orch.registry.try_claim("T004B", "codex").unwrap();
+
+        let result_markdown = "# Result\n\nReady for review\n\n- added jwt.rs\n- added tests";
+        orch.handle_specialist_submitted(
+            "T004B",
+            "codex",
+            "ready for review",
+            Some(result_markdown),
+        )
+        .unwrap();
+
+        let result =
+            std::fs::read_to_string(tmp.path().join("tasks").join("T004B").join("result.md"))
+                .unwrap();
+        assert_eq!(result, result_markdown);
+
+        let pending = orch.session.load_pending_completions().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].event.result_payload.as_deref(),
+            Some(result_markdown)
+        );
+        assert_eq!(
+            pending[0].event.result_artifact_path.as_deref(),
+            Some("tasks/T004B/result.md")
+        );
+    }
+
+    #[test]
+    fn test_classify_specialist_turn_uses_recorded_actions() {
+        let (orch, _tmp) = make_orchestrator();
+        orch.registry
+            .create_task(CreateTask {
+                id: "T900".into(),
+                title: "record actions".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        orch.registry.try_claim("T900", "worker").unwrap();
+        let started_at = chrono::Utc::now();
+        orch.handle_specialist_checkpoint("T900", "worker", "halfway")
+            .unwrap();
+        orch.handle_specialist_submitted("T900", "worker", "done", None)
+            .unwrap();
+
+        assert!(matches!(
+            orch.classify_specialist_turn("T900", "worker", started_at),
+            SpecialistTurnOutcome::TerminalSubmitted
+        ));
+    }
+
+    #[test]
+    fn test_handle_specialist_missing_completion_holds_claim_and_logs_diagnostic() {
+        let (orch, tmp) = make_orchestrator();
+        orch.registry
+            .create_task(CreateTask {
+                id: "T901".into(),
+                title: "missing completion".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        orch.registry.try_claim("T901", "worker").unwrap();
+
+        orch.handle_specialist_missing_completion("T901", "worker", Some("WORKER_OK"))
+            .unwrap();
+
+        let task = orch.registry.get_task("T901").unwrap().unwrap();
+        assert!(matches!(
+            task.status_parsed(),
+            crate::team::registry::TaskStatus::Held {
+                ref reason,
+                ref agent,
+                ..
+            } if reason == "missing_completion" && agent == "worker"
+        ));
+        let progress =
+            std::fs::read_to_string(tmp.path().join("tasks").join("T901").join("progress.md"))
+                .unwrap();
+        assert!(progress.contains("without canonical completion/progress tool"));
+        assert!(progress.contains("WORKER_OK"));
+        let events = std::fs::read_to_string(tmp.path().join("events.jsonl")).unwrap();
+        assert!(events.contains("MISSING_COMPLETION"));
+    }
+
+    #[tokio::test]
+    async fn pending_routing_event_replays_once_notify_path_is_available() {
+        let (orch, _tmp) = make_orchestrator();
+        orch.set_scope(SessionKey::new("ws", "group:test-team"));
+        orch.dispatch_team_notify_failed("T404", "no lead yet");
+
+        let pending = orch.session.load_pending_completions().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].requester_session_key.as_ref().unwrap().scope,
+            "group:test-team"
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        orch.set_lead_session_key(SessionKey::new("ws", "group:test-team"));
+        orch.set_team_notify_tx(tx);
+
+        let replayed = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("pending replay timed out")
+            .expect("pending replay channel closed");
+        assert_eq!(
+            replayed
+                .envelope
+                .requester_session_key
+                .as_ref()
+                .unwrap()
+                .scope,
+            "group:test-team"
+        );
+        assert!(replayed
+            .envelope
+            .event
+            .render_for_parent()
+            .contains("永久失败"));
+    }
+
+    #[test]
+    fn build_routing_envelope_includes_distinct_fallback_targets() {
+        let (orch, _tmp) = make_orchestrator();
+        orch.set_lead_session_key(SessionKey::new("ws", "group:lead"));
+        orch.set_scope(SessionKey::new("ws", "group:scope"));
+
+        orch.dispatch_team_notify_failed("T777", "boom");
+
+        let pending = orch.session.load_pending_completions().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].requester_session_key.as_ref().unwrap().scope,
+            "group:lead"
+        );
+        assert_eq!(pending[0].fallback_session_keys.len(), 1);
+        assert_eq!(pending[0].fallback_session_keys[0].scope, "group:scope");
+    }
+
+    #[test]
+    fn routing_envelope_without_live_target_stays_pending_and_reports_missing_target() {
+        let (orch, _tmp) = make_orchestrator();
+
+        orch.dispatch_team_notify_failed("T999", "no routing target");
+
+        let pending = orch.session.load_pending_completions().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].requester_session_key.is_none());
+        assert!(pending[0].fallback_session_keys.is_empty());
+
+        let stats = orch.status_snapshot().routing_stats;
+        assert_eq!(stats.pending_count, 1);
+        assert_eq!(stats.missing_delivery_target, 1);
+    }
+
+    #[test]
+    fn flush_pending_routing_events_preserves_unsent_records_when_channel_is_full() {
+        let (orch, _tmp) = make_orchestrator();
+        orch.set_scope(SessionKey::new("ws", "group:test-team"));
+        orch.dispatch_team_notify_failed("T001", "one");
+        orch.dispatch_team_notify_failed("T002", "two");
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        orch.set_lead_session_key(SessionKey::new("ws", "group:test-team"));
+        orch.set_team_notify_tx(tx);
+
+        let pending = orch.session.load_pending_completions().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].event.task_id, "T002");
     }
 
     #[tokio::test]
@@ -1308,7 +1757,7 @@ mod tests {
             })
             .unwrap();
         orch.registry.try_claim("T005", "codex").unwrap();
-        orch.handle_specialist_submitted("T005", "codex", "ready")
+        orch.handle_specialist_submitted("T005", "codex", "ready", None)
             .unwrap();
         orch.accept_submitted_task("T005", "claude").unwrap();
 
@@ -1356,7 +1805,7 @@ mod tests {
             })
             .unwrap();
         orch.registry.try_claim("T001", "codex").unwrap();
-        orch.handle_specialist_done("T001", "codex", "done")
+        orch.handle_specialist_done("T001", "codex", "done", None)
             .unwrap();
 
         let evs = events.lock().unwrap();
@@ -1541,7 +1990,7 @@ mod tests {
             })
             .unwrap();
         orch.registry.try_claim("T121", "codex").unwrap();
-        orch.handle_specialist_submitted("T121", "codex", "added jwt.rs")
+        orch.handle_specialist_submitted("T121", "codex", "added jwt.rs", None)
             .unwrap();
 
         let evs = events.lock().unwrap();
@@ -1605,7 +2054,7 @@ mod tests {
         orch.registry.try_claim("T130", "codex").unwrap();
         let events = collect_events(&orch);
 
-        orch.handle_specialist_done("T130", "codex", "done")
+        orch.handle_specialist_done("T130", "codex", "done", None)
             .unwrap();
 
         let evs = events.lock().unwrap();
@@ -1678,7 +2127,7 @@ mod tests {
 
         // ── 阶段 1：T_A 完成 ────────────────────────────────────────────────
         orch.registry.try_claim("T_A", "codex").unwrap();
-        orch.handle_specialist_done("T_A", "codex", "db schema created")
+        orch.handle_specialist_done("T_A", "codex", "db schema created", None)
             .unwrap();
 
         {
@@ -1711,7 +2160,7 @@ mod tests {
 
         // ── 阶段 2：T_B 完成 ────────────────────────────────────────────────
         orch.registry.try_claim("T_B", "claude").unwrap();
-        orch.handle_specialist_done("T_B", "claude", "data seeded")
+        orch.handle_specialist_done("T_B", "claude", "data seeded", None)
             .unwrap();
 
         {
@@ -1747,7 +2196,7 @@ mod tests {
 
         orch.handle_specialist_checkpoint("SA01", "codex", "50% done")
             .unwrap();
-        orch.handle_specialist_submitted("SA01", "codex", "auth.rs complete")
+        orch.handle_specialist_submitted("SA01", "codex", "auth.rs complete", None)
             .unwrap();
 
         let evs = events.lock().unwrap();

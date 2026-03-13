@@ -245,6 +245,19 @@ mod tests {
     }
 
     #[test]
+    fn scope_binding_with_channel_does_not_match_other_channel() {
+        let inbound = inbound("dingtalk", "user:ou_123", None, None);
+        let bindings = vec![BindingRule::Scope {
+            channel: Some("lark".into()),
+            scope: "user:ou_123".into(),
+            agent_name: "lark-agent".into(),
+        }];
+
+        let matched = resolve_binding(&inbound, &inbound.session_key, &bindings);
+        assert!(matched.is_none());
+    }
+
+    #[test]
     fn later_binding_overrides_earlier_binding_with_same_precedence() {
         let inbound = inbound("lark", "group:oc_123", None, None);
         let bindings = vec![

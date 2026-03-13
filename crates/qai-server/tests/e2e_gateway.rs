@@ -26,9 +26,70 @@ use qai_server::{
     config::{BackendCatalogEntry, BackendFamilyConfig, BackendLaunchConfig, GatewayConfig},
     gateway, start_test_gateway, start_test_gateway_with_backend, start_test_gateway_with_config,
 };
+use std::collections::BTreeSet;
 use std::time::Duration;
 use tokio::process::{Child, Command};
 use tokio_tungstenite::tungstenite::Message as WsMsg;
+
+#[derive(Debug, Default)]
+struct TurnTrace {
+    approvals: usize,
+    text_deltas: usize,
+    thinking_events: usize,
+    tool_names: BTreeSet<String>,
+    tool_start_ids: BTreeSet<String>,
+    tool_result_ids: BTreeSet<String>,
+    tool_failures: Vec<String>,
+    final_text: Option<String>,
+}
+
+impl TurnTrace {
+    fn record(&mut self, event: &AgentEvent) {
+        match event {
+            AgentEvent::TextDelta { .. } => self.text_deltas += 1,
+            AgentEvent::ApprovalRequest { .. } => self.approvals += 1,
+            AgentEvent::ToolCallStart {
+                tool_name, call_id, ..
+            } => {
+                self.tool_names.insert(tool_name.clone());
+                self.tool_start_ids.insert(call_id.clone());
+            }
+            AgentEvent::ToolCallResult { call_id, .. } => {
+                self.tool_result_ids.insert(call_id.clone());
+            }
+            AgentEvent::ToolCallFailed {
+                tool_name,
+                call_id,
+                error,
+                ..
+            } => {
+                self.tool_failures
+                    .push(format!("{tool_name}:{call_id}:{error}"));
+            }
+            AgentEvent::Thinking { .. } => self.thinking_events += 1,
+            AgentEvent::TurnComplete { full_text, .. } => {
+                self.final_text = Some(full_text.clone());
+            }
+            AgentEvent::Error { message, .. } => {
+                self.tool_failures.push(format!("runtime_error:{message}"));
+            }
+        }
+    }
+
+    fn summary(&self, label: &str) -> String {
+        format!(
+            "{label}: approvals={}, text_deltas={}, thinking={}, tool_names={:?}, tool_start_ids={:?}, tool_result_ids={:?}, tool_failures={:?}, final_text={:?}",
+            self.approvals,
+            self.text_deltas,
+            self.thinking_events,
+            self.tool_names,
+            self.tool_start_ids,
+            self.tool_result_ids,
+            self.tool_failures,
+            self.final_text
+        )
+    }
+}
 
 #[tokio::test]
 #[ignore = "requires OPENAI_API_KEY - run with: cargo test -p qai-server --test e2e_gateway -- --ignored --nocapture"]
@@ -587,20 +648,20 @@ async fn test_gateway_e2e_codex_local_config_deepseek() {
 }
 
 /// Run manually with:
-///   AICODEWITH_API_KEY=... cargo test -p qai-server --test e2e_gateway -- test_gateway_e2e_codex_local_config_aicodewith --ignored --nocapture
+///   OPENAI_API_KEY=... cargo test -p qai-server --test e2e_gateway -- test_gateway_e2e_codex_local_config_aicodewith --ignored --nocapture
 #[tokio::test]
-#[ignore = "requires codex CLI plus AICODEWITH_API_KEY for local_config_projection"]
+#[ignore = "requires codex CLI plus OPENAI_API_KEY for local_config_projection"]
 async fn test_gateway_e2e_codex_local_config_aicodewith() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
 
-    let api_key = match std::env::var("AICODEWITH_API_KEY") {
+    let api_key = match std::env::var("OPENAI_API_KEY") {
         Ok(k) if !k.is_empty() => k,
         _ => {
             eprintln!(
-                "SKIP test_gateway_e2e_codex_local_config_aicodewith: AICODEWITH_API_KEY not set"
+                "SKIP test_gateway_e2e_codex_local_config_aicodewith: OPENAI_API_KEY not set"
             );
             return;
         }
@@ -620,7 +681,7 @@ async fn test_gateway_e2e_codex_local_config_aicodewith() {
             id: "aicodewith-openai".into(),
             protocol: qai_server::config::ProviderProfileProtocolConfig::OpenaiCompatible {
                 base_url: "https://api.aicodewith.com/chatgpt/v1".into(),
-                auth_token_env: "AICODEWITH_API_KEY".into(),
+                auth_token_env: "OPENAI_API_KEY".into(),
                 default_model: "gpt-5.3-codex".into(),
             },
         });
@@ -672,9 +733,12 @@ async fn test_gateway_e2e_codex_local_config_aicodewith() {
     };
     send_inbound(&mut ws_write, &inbound).await;
 
+    let mut text_turn_trace = TurnTrace::default();
     let result = tokio::time::timeout(Duration::from_secs(240), async {
         loop {
-            match next_event(&mut ws_read, 240).await {
+            let event = next_event(&mut ws_read, 240).await;
+            text_turn_trace.record(&event);
+            match event {
                 AgentEvent::TurnComplete { full_text, .. } => break full_text,
                 AgentEvent::ApprovalRequest { approval_id, .. } => {
                     let resolve = serde_json::json!({
@@ -699,9 +763,15 @@ async fn test_gateway_e2e_codex_local_config_aicodewith() {
     })
     .await
     .expect("timed out waiting for codex aicodewith text turn");
+    eprintln!("{}", text_turn_trace.summary("codex_aicodewith_text_turn"));
     assert!(
         result.trim().contains("PONG"),
         "expected PONG-like reply, got: {result}"
+    );
+    assert!(
+        text_turn_trace.tool_failures.is_empty(),
+        "text turn should not fail during system processing: {}",
+        text_turn_trace.summary("codex_aicodewith_text_turn")
     );
 
     let proof = format!("CODEX_AICODEWITH_PROOF_{}", uuid::Uuid::new_v4().simple());
@@ -726,9 +796,12 @@ async fn test_gateway_e2e_codex_local_config_aicodewith() {
 
     // codex-acp may or may not call request_permission for file reads depending
     // on its internal policy. Handle both: approval-gated and auto-approved paths.
+    let mut tool_turn_trace = TurnTrace::default();
     let final_text = tokio::time::timeout(Duration::from_secs(240), async {
         loop {
-            match next_event(&mut ws_read, 240).await {
+            let event = next_event(&mut ws_read, 240).await;
+            tool_turn_trace.record(&event);
+            match event {
                 AgentEvent::TurnComplete { full_text, .. } => break full_text,
                 AgentEvent::ApprovalRequest { approval_id, .. } => {
                     let resolve = serde_json::json!({
@@ -753,10 +826,34 @@ async fn test_gateway_e2e_codex_local_config_aicodewith() {
     })
     .await
     .expect("timed out waiting for codex aicodewith tool turn");
+    eprintln!("{}", tool_turn_trace.summary("codex_aicodewith_tool_turn"));
 
     assert!(
         final_text.contains(&proof),
         "expected final codex aicodewith reply to contain proof token, got: {final_text}"
+    );
+    assert!(
+        !tool_turn_trace.tool_start_ids.is_empty(),
+        "expected file-read turn to emit ToolCallStart: {}",
+        tool_turn_trace.summary("codex_aicodewith_tool_turn")
+    );
+    assert!(
+        !tool_turn_trace.tool_result_ids.is_empty(),
+        "expected file-read turn to emit ToolCallResult: {}",
+        tool_turn_trace.summary("codex_aicodewith_tool_turn")
+    );
+    assert!(
+        tool_turn_trace.tool_failures.is_empty(),
+        "tool turn should not emit ToolCallFailed/Error: {}",
+        tool_turn_trace.summary("codex_aicodewith_tool_turn")
+    );
+    assert!(
+        tool_turn_trace
+            .tool_start_ids
+            .iter()
+            .all(|call_id| tool_turn_trace.tool_result_ids.contains(call_id)),
+        "every started tool call should resolve successfully: {}",
+        tool_turn_trace.summary("codex_aicodewith_tool_turn")
     );
 }
 
@@ -957,6 +1054,19 @@ fn native_team_fixture_bin() -> String {
     })
 }
 
+fn native_team_missing_completion_fixture_bin() -> String {
+    std::env::var("CARGO_BIN_EXE_qai_native_team_missing_completion_fixture").unwrap_or_else(|_| {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let candidate =
+            manifest_dir.join("../../target/debug/qai_native_team_missing_completion_fixture");
+        candidate
+            .canonicalize()
+            .unwrap_or(candidate)
+            .to_string_lossy()
+            .to_string()
+    })
+}
+
 fn team_cli_bin() -> String {
     std::env::var("CARGO_BIN_EXE_qai-team-cli").unwrap_or_else(|_| {
         let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -967,6 +1077,10 @@ fn team_cli_bin() -> String {
             .to_string_lossy()
             .to_string()
     })
+}
+
+fn team_id_for_scope(scope: &str) -> String {
+    qai_agent::team::session::stable_team_id("ws", scope)
 }
 
 fn openclaw_gateway_fixture_bin() -> String {
@@ -1495,6 +1609,133 @@ async fn test_gateway_e2e_native_team_pipeline() {
 
     assert!(saw_planned, "leader planning turn did not complete");
     assert!(saw_accepted, "leader acceptance turn did not complete");
+}
+
+#[tokio::test]
+async fn test_gateway_e2e_native_dm_team_pipeline() {
+    let fixture = native_team_fixture_bin();
+    let scope = format!("user:team-dm-e2e:{}", uuid::Uuid::new_v4());
+
+    let mut cfg = GatewayConfig::default();
+    cfg.agent.backend_id = "leader-main".to_string();
+    cfg.backends = vec![
+        BackendCatalogEntry {
+            acp_backend: None,
+            acp_auth_method: None,
+            codex: None,
+            provider_profile: None,
+            approval: Default::default(),
+            id: "leader-main".into(),
+            family: BackendFamilyConfig::QuickAiNative,
+            adapter_key: None,
+            external_mcp_servers: vec![],
+            launch: BackendLaunchConfig::Command {
+                command: fixture.clone(),
+                args: vec![],
+                env: Default::default(),
+            },
+        },
+        BackendCatalogEntry {
+            acp_backend: None,
+            acp_auth_method: None,
+            codex: None,
+            provider_profile: None,
+            approval: Default::default(),
+            id: "worker-main".into(),
+            family: BackendFamilyConfig::QuickAiNative,
+            adapter_key: None,
+            external_mcp_servers: vec![],
+            launch: BackendLaunchConfig::Command {
+                command: fixture,
+                args: vec![],
+                env: Default::default(),
+            },
+        },
+    ];
+    cfg.agent_roster = vec![
+        AgentEntry {
+            name: "leader".into(),
+            mentions: vec!["@leader".into()],
+            backend_id: "leader-main".into(),
+            persona_dir: None,
+            workspace_dir: None,
+            extra_skills_dirs: vec![],
+        },
+        AgentEntry {
+            name: "worker".into(),
+            mentions: vec!["@worker".into()],
+            backend_id: "worker-main".into(),
+            persona_dir: None,
+            workspace_dir: None,
+            extra_skills_dirs: vec![],
+        },
+    ];
+    cfg.team_scopes = vec![qai_server::config::TeamScopeConfig {
+        scope: scope.clone(),
+        name: Some("dm-team-e2e".into()),
+        mode: qai_server::config::GroupModeConfig {
+            interaction: qai_server::config::InteractionMode::Team,
+            auto_promote: false,
+            front_bot: Some("leader".into()),
+            channel: Some("ws".into()),
+        },
+        team: qai_server::config::GroupTeamConfig {
+            roster: vec!["worker".into()],
+            ..Default::default()
+        },
+    }];
+
+    let addr = start_test_gateway_with_config(cfg)
+        .await
+        .expect("failed to start native dm-team gateway");
+
+    let (mut ws_write, mut ws_read) = connect_ws(addr).await;
+    let session_key = SessionKey::new("ws", &scope);
+    subscribe_ws(&mut ws_write, &session_key).await;
+
+    let inbound = InboundMsg {
+        id: uuid::Uuid::new_v4().to_string(),
+        session_key: session_key.clone(),
+        content: MsgContent::text("start the dm team run"),
+        sender: "team-dm-e2e-user".to_string(),
+        channel: "ws".to_string(),
+        timestamp: chrono::Utc::now(),
+        thread_ts: None,
+        target_agent: None,
+        source: qai_protocol::MsgSource::Human,
+    };
+    send_inbound(&mut ws_write, &inbound).await;
+
+    let mut saw_planned = false;
+    let mut saw_accepted = false;
+    let mut saw_worker_visible = false;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        match next_event(&mut ws_read, 10).await {
+            AgentEvent::TurnComplete { full_text, .. } => {
+                if full_text == "leader:planned:T001" {
+                    saw_planned = true;
+                }
+                if full_text == "leader:accepted:T001" || full_text == "leader:done" {
+                    saw_accepted = true;
+                    break;
+                }
+                if full_text.starts_with("worker:") {
+                    saw_worker_visible = true;
+                }
+            }
+            AgentEvent::TextDelta { .. } | AgentEvent::Thinking { .. } => {}
+            other => panic!("unexpected native dm team event: {other:?}"),
+        }
+    }
+
+    assert!(saw_planned, "leader planning turn did not complete");
+    assert!(saw_accepted, "leader acceptance turn did not complete");
+    assert!(
+        !saw_worker_visible,
+        "dm team should not surface raw specialist chatter to the user session"
+    );
 }
 
 #[tokio::test]
@@ -2152,6 +2393,188 @@ async fn test_registry_mixed_team_native_leader_acp_specialist_pipeline() {
 
     assert!(saw_planned, "leader planning turn did not complete");
     assert!(saw_accepted, "leader acceptance turn did not complete");
+}
+
+#[tokio::test]
+async fn test_registry_team_missing_completion_resets_claim_and_specialist_session() {
+    let leader_fixture = native_team_fixture_bin();
+    let worker_fixture = native_team_missing_completion_fixture_bin();
+    let scope = format!("group:team-missing-completion:{}", uuid::Uuid::new_v4());
+
+    let mut cfg = GatewayConfig::default();
+    cfg.agent.backend_id = "leader-main".to_string();
+    cfg.backends = vec![
+        BackendCatalogEntry {
+            acp_backend: None,
+            acp_auth_method: None,
+            codex: None,
+            provider_profile: None,
+            approval: Default::default(),
+            id: "leader-main".into(),
+            family: BackendFamilyConfig::QuickAiNative,
+            adapter_key: None,
+            external_mcp_servers: vec![],
+            launch: BackendLaunchConfig::Command {
+                command: leader_fixture,
+                args: vec![],
+                env: Default::default(),
+            },
+        },
+        BackendCatalogEntry {
+            acp_backend: None,
+            acp_auth_method: None,
+            codex: None,
+            provider_profile: None,
+            approval: Default::default(),
+            id: "worker-main".into(),
+            family: BackendFamilyConfig::QuickAiNative,
+            adapter_key: None,
+            external_mcp_servers: vec![],
+            launch: BackendLaunchConfig::Command {
+                command: worker_fixture,
+                args: vec![],
+                env: Default::default(),
+            },
+        },
+    ];
+    cfg.agent_roster = vec![
+        AgentEntry {
+            name: "leader".into(),
+            mentions: vec!["@leader".into()],
+            backend_id: "leader-main".into(),
+            persona_dir: None,
+            workspace_dir: None,
+            extra_skills_dirs: vec![],
+        },
+        AgentEntry {
+            name: "worker".into(),
+            mentions: vec!["@worker".into()],
+            backend_id: "worker-main".into(),
+            persona_dir: None,
+            workspace_dir: None,
+            extra_skills_dirs: vec![],
+        },
+    ];
+    cfg.groups = vec![qai_server::config::GroupConfig {
+        scope: scope.clone(),
+        name: Some("team-missing-completion".into()),
+        mode: qai_server::config::GroupModeConfig {
+            interaction: qai_server::config::InteractionMode::Team,
+            auto_promote: false,
+            front_bot: Some("leader".into()),
+            channel: Some("ws".into()),
+        },
+        team: qai_server::config::GroupTeamConfig {
+            roster: vec!["worker".into()],
+            ..Default::default()
+        },
+    }];
+
+    let state = build_test_state_with_config(cfg)
+        .await
+        .expect("failed to build missing-completion app state");
+    let addr = gateway::server::start(state.clone(), "127.0.0.1", 0)
+        .await
+        .expect("failed to start gateway server");
+    state.registry.set_team_tool_url(format!(
+        "http://127.0.0.1:{}/runtime/team-tools?token={}",
+        addr.port(),
+        state.runtime_token
+    ));
+
+    let mut event_rx = state.event_tx.subscribe();
+    let inbound = InboundMsg {
+        id: uuid::Uuid::new_v4().to_string(),
+        session_key: SessionKey::new("ws", &scope),
+        content: MsgContent::text("start missing completion flow"),
+        sender: "team-missing-completion-user".to_string(),
+        channel: "ws".to_string(),
+        timestamp: chrono::Utc::now(),
+        thread_ts: None,
+        target_agent: None,
+        source: qai_protocol::MsgSource::Human,
+    };
+
+    let handle_result = state.registry.handle(inbound).await;
+    assert!(
+        handle_result.is_ok(),
+        "registry.handle failed: {handle_result:?}"
+    );
+
+    let mut saw_planned = false;
+    let mut saw_missing = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(2), event_rx.recv()).await {
+            Ok(Ok(AgentEvent::TurnComplete { full_text, .. })) => {
+                if full_text == "leader:planned:T001" {
+                    saw_planned = true;
+                }
+                if full_text == "leader:missing:T001" {
+                    saw_missing = true;
+                    break;
+                }
+            }
+            Ok(Ok(AgentEvent::Error { message, .. })) => {
+                panic!("unexpected runtime error: {message}");
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => panic!("event channel recv failed: {err}"),
+            Err(_) => {}
+        }
+    }
+
+    assert!(saw_planned, "leader planning turn did not complete");
+    assert!(
+        saw_missing,
+        "leader did not receive missing-completion notification turn"
+    );
+
+    let team_summary = state
+        .registry
+        .team_summaries()
+        .into_iter()
+        .find(|summary| summary.lead_session_key == Some(SessionKey::new("ws", &scope)))
+        .expect("expected team summary for missing completion scope");
+    assert_eq!(team_summary.task_counts.total, 1);
+    assert_eq!(team_summary.task_counts.pending, 1);
+    assert_eq!(team_summary.task_counts.claimed, 0);
+    assert_eq!(team_summary.task_counts.done, 0);
+    assert_eq!(team_summary.task_counts.submitted, 0);
+
+    let specialist_key = SessionKey::new(
+        "specialist",
+        format!("{}:worker", team_id_for_scope(&scope)),
+    );
+    let specialist_session_id = state
+        .registry
+        .session_manager_ref()
+        .get_or_create(&specialist_key)
+        .await
+        .expect("expected specialist session id");
+    let specialist_messages = state
+        .registry
+        .session_manager_ref()
+        .storage()
+        .load_recent_messages(specialist_session_id, 10)
+        .await
+        .expect("expected specialist messages to load");
+    assert!(
+        specialist_messages.is_empty(),
+        "specialist transcript should be reset after missing completion, got: {:?}",
+        specialist_messages
+    );
+    let specialist_meta = state
+        .registry
+        .session_manager_ref()
+        .load_meta(specialist_session_id)
+        .await
+        .expect("expected specialist meta to load")
+        .expect("specialist meta should exist");
+    assert!(
+        specialist_meta.backend_session_ids.is_empty(),
+        "specialist backend session bindings should be reset after missing completion"
+    );
 }
 
 #[tokio::test]

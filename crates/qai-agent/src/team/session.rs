@@ -12,8 +12,12 @@ use anyhow::{Context, Result};
 use qai_protocol::SessionKey;
 use serde::Serialize;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
+use super::completion_routing::TeamRoutingEnvelope;
 use super::registry::{Task, TaskRegistry, TaskStatus};
+
+const DELIVERY_DEDUPE_LEDGER_MAX_LINES: usize = 2_000;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TaskArtifactMeta {
@@ -35,6 +39,7 @@ impl TaskArtifactMeta {
     pub fn from_task(task: &Task) -> Self {
         let (claimed_by, submitted_by, accepted_by, updated_at) = match task.status_parsed() {
             TaskStatus::Claimed { agent, at } => (Some(agent), None, None, at.to_rfc3339()),
+            TaskStatus::Held { at, .. } => (None, None, None, at.to_rfc3339()),
             TaskStatus::Submitted { agent, at } => (None, Some(agent), None, at.to_rfc3339()),
             TaskStatus::Accepted { by, at } => (None, None, Some(by), at.to_rfc3339()),
             TaskStatus::Done => (
@@ -69,6 +74,7 @@ impl TaskArtifactMeta {
 pub struct TeamSession {
     pub team_id: String,
     pub dir: PathBuf,
+    delivery_dedupe_lock: Mutex<()>,
 }
 
 impl TeamSession {
@@ -101,6 +107,7 @@ impl TeamSession {
         Ok(Self {
             team_id: team_id.to_string(),
             dir: base,
+            delivery_dedupe_lock: Mutex::new(()),
         })
     }
 
@@ -109,6 +116,7 @@ impl TeamSession {
         Self {
             team_id: team_id.to_string(),
             dir,
+            delivery_dedupe_lock: Mutex::new(()),
         }
     }
 
@@ -222,6 +230,130 @@ impl TeamSession {
         self.append_event(&event)
     }
 
+    pub fn append_pending_completion(&self, envelope: &TeamRoutingEnvelope) -> Result<()> {
+        use std::io::Write;
+        let path = self.dir.join("pending-completions.jsonl");
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        writeln!(file, "{}", serde_json::to_string(envelope)?)?;
+        Ok(())
+    }
+
+    pub fn load_pending_completions(&self) -> Result<Vec<TeamRoutingEnvelope>> {
+        let path = self.dir.join("pending-completions.jsonl");
+        if !path.exists() {
+            return Ok(vec![]);
+        }
+        let content = std::fs::read_to_string(&path)?;
+        content
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(serde_json::from_str)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn clear_pending_completions(&self) -> Result<()> {
+        let path = self.dir.join("pending-completions.jsonl");
+        if path.exists() {
+            std::fs::remove_file(path)?;
+        }
+        Ok(())
+    }
+
+    pub fn replace_pending_completions(&self, envelopes: &[TeamRoutingEnvelope]) -> Result<()> {
+        let path = self.dir.join("pending-completions.jsonl");
+        if envelopes.is_empty() {
+            if path.exists() {
+                std::fs::remove_file(path)?;
+            }
+            return Ok(());
+        }
+
+        let tmp_path = self.dir.join("pending-completions.jsonl.tmp");
+        let body = envelopes
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .join("\n");
+        std::fs::write(&tmp_path, format!("{body}\n"))?;
+        std::fs::rename(tmp_path, path)?;
+        Ok(())
+    }
+
+    pub fn append_routing_outcome(&self, envelope: &TeamRoutingEnvelope) -> Result<()> {
+        use std::io::Write;
+        let path = self.dir.join("routing-events.jsonl");
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        writeln!(file, "{}", serde_json::to_string(envelope)?)?;
+        Ok(())
+    }
+
+    pub fn load_routing_outcomes(&self) -> Result<Vec<TeamRoutingEnvelope>> {
+        let path = self.dir.join("routing-events.jsonl");
+        if !path.exists() {
+            return Ok(vec![]);
+        }
+        let content = std::fs::read_to_string(&path)?;
+        content
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(serde_json::from_str)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn mark_delivery_dedupe(&self, target_scope: &str, dedupe_key: &str) -> Result<bool> {
+        let _guard = self.delivery_dedupe_lock.lock().unwrap();
+        let path = self.dir.join("delivered-milestones.jsonl");
+        let scoped_key = format!("{target_scope}:{dedupe_key}");
+
+        if path.exists() {
+            let content = std::fs::read_to_string(&path)?;
+            if content.lines().any(|line| line.trim() == scoped_key) {
+                return Ok(false);
+            }
+        }
+
+        append_bounded_line(&path, &scoped_key, DELIVERY_DEDUPE_LEDGER_MAX_LINES)?;
+        Ok(true)
+    }
+
+    pub fn record_delivery_dedupe_hit(&self, target_scope: &str, dedupe_key: &str) -> Result<()> {
+        let _guard = self.delivery_dedupe_lock.lock().unwrap();
+        let path = self.dir.join("delivery-dedupe-hits.jsonl");
+        let scoped_key = format!("{target_scope}:{dedupe_key}");
+        append_bounded_line(&path, &scoped_key, DELIVERY_DEDUPE_LEDGER_MAX_LINES)?;
+        Ok(())
+    }
+
+    pub fn delivery_dedupe_ledger_size(&self) -> Result<usize> {
+        let path = self.dir.join("delivered-milestones.jsonl");
+        if !path.exists() {
+            return Ok(0);
+        }
+        Ok(std::fs::read_to_string(&path)?
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count())
+    }
+
+    pub fn delivery_dedupe_hit_count(&self) -> Result<usize> {
+        let path = self.dir.join("delivery-dedupe-hits.jsonl");
+        if !path.exists() {
+            return Ok(0);
+        }
+        Ok(std::fs::read_to_string(&path)?
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count())
+    }
+
     // ── task_reminder 构建 ───────────────────────────────────────────────────
 
     /// 构建注入 Specialist system prompt Layer 0 的任务提醒文本
@@ -304,6 +436,7 @@ impl TeamSession {
              3. 遇到阻塞时调用 `block_task(task_id, reason)` 释放任务并上报；仅需协助时调用 `request_help(task_id, message)`，保留 claim\n\
              4. 兼容旧路径时仍可调用 `complete_task(task_id, note)`，但新语义优先使用 submit_task_result\n\
              5. 重要产出（文件路径、关键发现）写在 summary / note 参数中\n\
+             6. 在结束本轮前，必须至少调用一个 canonical team tool：`submit_task_result`、`complete_task`、`checkpoint_task`、`request_help` 或 `block_task`\n\
              ══════════════════════════════════════════{resume_note}{upstream_section}",
             id = task.id,
             title = task.title,
@@ -371,11 +504,51 @@ impl TeamSession {
     }
 }
 
+fn append_bounded_line(path: &std::path::Path, line: &str, max_lines: usize) -> Result<()> {
+    use std::io::Write;
+
+    let mut lines = if path.exists() {
+        std::fs::read_to_string(path)?
+            .lines()
+            .filter(|entry| !entry.trim().is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    lines.push(line.to_string());
+    if lines.len() > max_lines {
+        let drain_count = lines.len() - max_lines;
+        lines.drain(0..drain_count);
+    }
+
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)?;
+    for entry in lines {
+        writeln!(file, "{entry}")?;
+    }
+    Ok(())
+}
+
+pub fn stable_team_id(channel: &str, scope: &str) -> String {
+    let seed = format!("{channel}:{scope}");
+    format!(
+        "team-{}",
+        uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, seed.as_bytes()).simple()
+    )
+}
+
 // ─── 测试 ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::team::completion_routing::{
+        RoutingDeliveryStatus, TeamRoutingEnvelope, TeamRoutingEvent,
+    };
     use crate::team::registry::{CreateTask, TaskRegistry};
     use tempfile::tempdir;
 
@@ -391,6 +564,17 @@ mod tests {
         let key = session.specialist_session_key("codex");
         assert_eq!(key.channel, "specialist");
         assert_eq!(key.scope, "team-001:codex");
+    }
+
+    #[test]
+    fn test_stable_team_id_is_channel_aware_and_stable() {
+        let lark_dm = stable_team_id("lark", "user:ou_same");
+        let dingtalk_dm = stable_team_id("dingtalk", "user:ou_same");
+        let lark_variant = stable_team_id("lark", "user/ou_same");
+
+        assert_eq!(lark_dm, stable_team_id("lark", "user:ou_same"));
+        assert_ne!(lark_dm, dingtalk_dm);
+        assert_ne!(lark_dm, lark_variant);
     }
 
     #[test]
@@ -529,6 +713,99 @@ mod tests {
         // Text content must not introduce extra lines
         assert_eq!(contents.lines().count(), 1);
         assert!(contents.contains("\\n"));
+    }
+
+    #[test]
+    fn test_pending_completion_round_trip() {
+        let (session, _tmp) = make_session();
+        let envelope = TeamRoutingEnvelope {
+            run_id: "run-123".into(),
+            parent_run_id: None,
+            requester_session_key: Some(SessionKey::new("ws", "group:team")),
+            fallback_session_keys: vec![],
+            team_id: "team-001".into(),
+            delivery_status: RoutingDeliveryStatus::PersistedPending,
+            event: TeamRoutingEvent::failed("T999", "boom"),
+        };
+
+        session.append_pending_completion(&envelope).unwrap();
+        let loaded = session.load_pending_completions().unwrap();
+        assert_eq!(loaded, vec![envelope]);
+
+        session.clear_pending_completions().unwrap();
+        assert!(session.load_pending_completions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_delivery_dedupe_persists_across_reloads() {
+        let (session, tmp) = make_session();
+        assert!(session
+            .mark_delivery_dedupe("group:team", "all_tasks_done")
+            .unwrap());
+        assert!(!session
+            .mark_delivery_dedupe("group:team", "all_tasks_done")
+            .unwrap());
+        assert!(session
+            .mark_delivery_dedupe("group:other", "all_tasks_done")
+            .unwrap());
+
+        let reloaded = TeamSession::from_dir("team-001", tmp.path().to_path_buf());
+        assert!(!reloaded
+            .mark_delivery_dedupe("group:team", "all_tasks_done")
+            .unwrap());
+        assert!(reloaded
+            .mark_delivery_dedupe("group:team", "task_done:T001")
+            .unwrap());
+    }
+
+    #[test]
+    fn test_delivery_dedupe_hit_metrics_round_trip() {
+        let (session, _tmp) = make_session();
+        session
+            .record_delivery_dedupe_hit("group:team", "all_tasks_done")
+            .unwrap();
+        session
+            .record_delivery_dedupe_hit("group:team", "all_tasks_done")
+            .unwrap();
+        session
+            .mark_delivery_dedupe("group:team", "all_tasks_done")
+            .unwrap();
+
+        assert_eq!(session.delivery_dedupe_hit_count().unwrap(), 2);
+        assert_eq!(session.delivery_dedupe_ledger_size().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_delivery_dedupe_ledgers_retain_recent_window_only() {
+        let (session, tmp) = make_session();
+
+        for idx in 0..(DELIVERY_DEDUPE_LEDGER_MAX_LINES + 5) {
+            session
+                .record_delivery_dedupe_hit("group:team", &format!("hit-{idx}"))
+                .unwrap();
+            let _ = session
+                .mark_delivery_dedupe("group:team", &format!("ledger-{idx}"))
+                .unwrap();
+        }
+
+        assert_eq!(
+            session.delivery_dedupe_hit_count().unwrap(),
+            DELIVERY_DEDUPE_LEDGER_MAX_LINES
+        );
+        assert_eq!(
+            session.delivery_dedupe_ledger_size().unwrap(),
+            DELIVERY_DEDUPE_LEDGER_MAX_LINES
+        );
+
+        let hit_lines =
+            std::fs::read_to_string(tmp.path().join("delivery-dedupe-hits.jsonl")).unwrap();
+        assert!(!hit_lines.contains("hit-0"));
+        assert!(hit_lines.contains(&format!("hit-{}", DELIVERY_DEDUPE_LEDGER_MAX_LINES + 4)));
+
+        let ledger_lines =
+            std::fs::read_to_string(tmp.path().join("delivered-milestones.jsonl")).unwrap();
+        assert!(!ledger_lines.contains("ledger-0"));
+        assert!(ledger_lines.contains(&format!("ledger-{}", DELIVERY_DEDUPE_LEDGER_MAX_LINES + 4)));
     }
 
     #[test]

@@ -176,14 +176,22 @@ pub async fn execute_team_tool_call(
         TeamToolCall::SubmitTaskResult {
             task_id,
             summary,
+            result_markdown,
             agent,
         } => {
             let agent = resolve_claimed_agent(&team_orch, &task_id, agent.as_deref());
-            team_orch.handle_specialist_submitted(&task_id, &agent, &summary)?;
+            team_orch.handle_specialist_submitted(
+                &task_id,
+                &agent,
+                &summary,
+                result_markdown.as_deref(),
+            )?;
             TeamToolResponse {
                 ok: true,
                 message: format!("Task {} submitted for review.", task_id),
-                payload: None,
+                payload: Some(serde_json::json!({
+                    "artifacts": [format!("tasks/{task_id}/result.md")]
+                })),
             }
         }
         TeamToolCall::AcceptTask { task_id, by } => {
@@ -211,6 +219,7 @@ pub async fn execute_team_tool_call(
         TeamToolCall::CompleteTask {
             task_id,
             note,
+            result_markdown,
             agent,
         } => {
             let agent = resolve_claimed_agent(&team_orch, &task_id, agent.as_deref());
@@ -221,11 +230,18 @@ pub async fn execute_team_tool_call(
             {
                 anyhow::bail!("task '{}' is not currently claimed by '{}'", task_id, agent);
             }
-            team_orch.handle_specialist_done(&task_id, &agent, &note)?;
+            team_orch.handle_specialist_done(
+                &task_id,
+                &agent,
+                &note,
+                result_markdown.as_deref(),
+            )?;
             TeamToolResponse {
                 ok: true,
                 message: format!("Task {} marked done.", task_id),
-                payload: None,
+                payload: Some(serde_json::json!({
+                    "artifacts": [format!("tasks/{task_id}/result.md")]
+                })),
             }
         }
         TeamToolCall::BlockTask {

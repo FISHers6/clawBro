@@ -353,6 +353,41 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_heartbeat_does_not_redispatch_held_task() {
+        let registry = Arc::new(TaskRegistry::new_in_memory().unwrap());
+        registry
+            .create_task(CreateTask {
+                id: "T_HELD".into(),
+                title: "held".into(),
+                assignee_hint: Some("codex".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        registry.try_claim("T_HELD", "codex").unwrap();
+        registry
+            .hold_claim("T_HELD", "codex", "missing_completion")
+            .unwrap();
+
+        let dispatched = Arc::new(Mutex::new(vec![]));
+        let hb = make_heartbeat(
+            Arc::clone(&registry),
+            Arc::clone(&dispatched),
+            Duration::from_millis(50),
+        );
+
+        let hb_clone = Arc::clone(&hb);
+        let handle = tokio::spawn(async move { hb_clone.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        handle.abort();
+
+        let d = dispatched.lock().unwrap();
+        assert!(
+            d.iter().all(|(_, id)| id != "T_HELD"),
+            "held task must not be redispatched"
+        );
+    }
+
     /// 验证信号量确实限制并发派发数量：max_parallel=2 时，同时在飞行的 dispatch 不超过 2
     #[tokio::test]
     async fn test_heartbeat_semaphore_limits_concurrent_dispatches() {

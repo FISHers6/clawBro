@@ -358,11 +358,7 @@ mod tests {
             "reset_conversation must set status to Idle"
         );
         // messages.jsonl should be gone
-        let msgs = mgr
-            .storage()
-            .load_messages(session_id)
-            .await
-            .unwrap();
+        let msgs = mgr.storage().load_messages(session_id).await.unwrap();
         assert!(msgs.is_empty(), "reset_conversation must clear messages");
     }
 
@@ -386,7 +382,10 @@ mod tests {
         // session_b must be untouched
         let meta_b = mgr.load_meta(id_b).await.unwrap().unwrap();
         assert_eq!(
-            meta_b.backend_session_ids.get("claude-main").map(String::as_str),
+            meta_b
+                .backend_session_ids
+                .get("claude-main")
+                .map(String::as_str),
             Some("id-b"),
             "reset of session_a must not affect session_b backend_session_ids"
         );

@@ -410,6 +410,12 @@ impl SessionRegistry {
         self.team_orchestrators.insert(team_id, orch);
     }
 
+    pub fn get_team_orchestrator(&self, team_id: &str) -> Option<Arc<TeamOrchestrator>> {
+        self.team_orchestrators
+            .get(team_id)
+            .map(|entry| entry.value().clone())
+    }
+
     #[cfg(test)]
     pub(crate) fn memory_control(&self) -> MemoryControlContext<'_> {
         MemoryControlContext { registry: self }
@@ -445,6 +451,13 @@ impl SessionRegistry {
     /// treated as a Lead turn even if no orchestrator is currently registered for the scope.
     pub fn add_auto_promote_scope(&self, scope: String) {
         self.auto_promote_scopes.insert(scope);
+    }
+
+    pub fn is_session_busy(&self, key: &SessionKey) -> bool {
+        self.session_semaphores
+            .get(key)
+            .map(|sem| sem.available_permits() == 0)
+            .unwrap_or(false)
     }
 
     /// Get-or-create per-session cached backend selection (used when no roster match)
@@ -511,6 +524,20 @@ impl SessionRegistry {
     /// Register a deterministic scope -> agent binding from gateway config.
     pub fn register_scope_binding(&self, scope: String, agent_name: String) {
         self.register_binding(BindingRule::scope(scope, agent_name));
+    }
+
+    /// Register a deterministic (channel?, scope) -> agent binding from gateway config.
+    pub fn register_scope_binding_with_channel(
+        &self,
+        channel: Option<String>,
+        scope: String,
+        agent_name: String,
+    ) {
+        self.register_binding(BindingRule::Scope {
+            channel,
+            scope,
+            agent_name,
+        });
     }
 
     pub fn register_binding(&self, binding: BindingRule) {
@@ -589,10 +616,12 @@ impl SessionRegistry {
             TeamCallback::TaskSubmitted {
                 task_id,
                 summary,
+                result_markdown,
                 agent,
             } => TeamToolCall::SubmitTaskResult {
                 task_id,
                 summary,
+                result_markdown,
                 agent: Some(agent),
             },
             TeamCallback::TaskAccepted { task_id, by } => TeamToolCall::AcceptTask {
@@ -2190,6 +2219,7 @@ mod tests {
                 TeamToolCall::SubmitTaskResult {
                     task_id: "T100".into(),
                     summary: "auth implemented".into(),
+                    result_markdown: None,
                     agent: Some("codex".into()),
                 },
             )
@@ -2288,7 +2318,7 @@ mod tests {
             .recv()
             .await
             .expect("lead should receive blocked notification");
-        let text = notify.content.as_text().unwrap_or("");
+        let text = notify.envelope.event.render_for_parent();
         assert!(text.contains("T210"));
         assert!(text.contains("missing credential"));
     }
@@ -2329,6 +2359,7 @@ mod tests {
                 TeamToolCall::SubmitTaskResult {
                     task_id: "T402".into(),
                     summary: "illegal".into(),
+                    result_markdown: None,
                     agent: Some("codex".into()),
                 },
             )
@@ -2366,6 +2397,7 @@ mod tests {
                     events: vec![RuntimeEvent::ToolCallback(TeamCallback::TaskSubmitted {
                         task_id: "T300".into(),
                         summary: "bridge implemented".into(),
+                        result_markdown: None,
                         agent: "openclaw-main".into(),
                     })],
                     emitted_backend_session_id: None,

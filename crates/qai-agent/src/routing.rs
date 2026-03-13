@@ -436,4 +436,108 @@ mod tests {
         assert_eq!(decision.agent_role, AgentRole::Specialist);
         assert_eq!(decision.task_reminder.as_deref(), Some("task reminder"));
     }
+
+    // ── resolve_auto_promote_orchestrator 专项测试 ────────────────────────
+
+    fn make_orchestrator_for_scope(scope: &str) -> Arc<TeamOrchestrator> {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = Arc::new(TeamSession::from_dir(
+            "team-auto",
+            tmp.path().to_path_buf(),
+        ));
+        let registry = Arc::new(TaskRegistry::new_in_memory().unwrap());
+        let dispatch: DispatchFn = Arc::new(|_, _| Box::pin(async { Ok(()) }));
+        let orch = TeamOrchestrator::new(registry, session, dispatch, Duration::from_secs(60));
+        orch.set_lead_session_key(SessionKey::new("lark", scope));
+        orch.set_lead_agent_name("claude".to_string());
+        orch
+    }
+
+    fn team_trigger_inbound(scope: &str) -> InboundMsg {
+        InboundMsg {
+            id: "auto-1".into(),
+            session_key: SessionKey::new("lark", scope),
+            // "多agent" is a registered team trigger keyword
+            content: MsgContent::text("请帮我多agent完成这个任务"),
+            sender: "user".into(),
+            channel: "lark".into(),
+            timestamp: chrono::Utc::now(),
+            thread_ts: None,
+            target_agent: None,
+            source: MsgSource::Human,
+        }
+    }
+
+    #[test]
+    fn auto_promote_returns_orchestrator_when_keyword_matches_registered_scope() {
+        let scope = "group:trigger-test";
+        let orch = make_orchestrator_for_scope(scope);
+
+        let orchestrators: DashMap<String, Arc<TeamOrchestrator>> = DashMap::new();
+        orchestrators.insert("team-auto".to_string(), Arc::clone(&orch));
+
+        let auto_promote_scopes = DashSet::new();
+        auto_promote_scopes.insert(scope.to_string());
+
+        let result = resolve_auto_promote_orchestrator(
+            &team_trigger_inbound(scope),
+            &orchestrators,
+            &auto_promote_scopes,
+            true, // no_session_orchestrator = true (none found yet)
+        );
+        assert!(result.is_some(), "should find orchestrator for registered scope with trigger keyword");
+    }
+
+    #[test]
+    fn auto_promote_returns_none_for_non_trigger_text() {
+        let scope = "group:no-trigger";
+        let orch = make_orchestrator_for_scope(scope);
+
+        let orchestrators: DashMap<String, Arc<TeamOrchestrator>> = DashMap::new();
+        orchestrators.insert("team-auto-2".to_string(), Arc::clone(&orch));
+
+        let auto_promote_scopes = DashSet::new();
+        auto_promote_scopes.insert(scope.to_string());
+
+        let plain_inbound = InboundMsg {
+            id: "auto-2".into(),
+            session_key: SessionKey::new("lark", scope),
+            content: MsgContent::text("今天天气不错"), // not a team trigger
+            sender: "user".into(),
+            channel: "lark".into(),
+            timestamp: chrono::Utc::now(),
+            thread_ts: None,
+            target_agent: None,
+            source: MsgSource::Human,
+        };
+
+        let result = resolve_auto_promote_orchestrator(
+            &plain_inbound,
+            &orchestrators,
+            &auto_promote_scopes,
+            true,
+        );
+        assert!(result.is_none(), "non-trigger text should not auto-promote");
+    }
+
+    #[test]
+    fn auto_promote_returns_none_when_scope_has_no_orchestrator() {
+        // Scope is registered for auto-promote but no orchestrator covers it
+        let scope = "group:orphan-scope";
+        let auto_promote_scopes = DashSet::new();
+        auto_promote_scopes.insert(scope.to_string());
+
+        // Different orchestrator registered for a different scope
+        let other_orch = make_orchestrator_for_scope("group:other");
+        let orchestrators: DashMap<String, Arc<TeamOrchestrator>> = DashMap::new();
+        orchestrators.insert("team-other".to_string(), other_orch);
+
+        let result = resolve_auto_promote_orchestrator(
+            &team_trigger_inbound(scope),
+            &orchestrators,
+            &auto_promote_scopes,
+            true,
+        );
+        assert!(result.is_none(), "should return None and warn when no orchestrator covers the scope");
+    }
 }

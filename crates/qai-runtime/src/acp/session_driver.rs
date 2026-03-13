@@ -458,54 +458,55 @@ pub async fn run_command_turn(
 
     // Decide: resume via session/load or start a new session.
     let can_load = init_resp.agent_capabilities.load_session;
-    let (active_session_id, emitted_backend_session_id, transcript_ownership) = if policy.resume_strategy
-        == ResumeStrategy::AcpLoadSession
-        && can_load
-        && session.backend_session_id.is_some()
-    {
-        let prior_id = session.backend_session_id.as_ref().unwrap();
-        tracing::debug!(
-            session_id = %prior_id,
-            "Sending ACP load_session request (replay suppression active)"
-        );
-        // Suppress replay notifications for the duration of load_session.
-        // ACP protocol requires the agent to stream the entire conversation history
-        // as session/update notifications before responding to session/load.
-        // Without suppression these replayed chunks would appear as current-turn
-        // live output (sink emissions + accumulated text).
-        suppress_replay.set(true);
-        let load_result = conn.load_session(
-            acp::LoadSessionRequest::new(
+    let (active_session_id, emitted_backend_session_id, transcript_ownership) =
+        if policy.resume_strategy == ResumeStrategy::AcpLoadSession
+            && can_load
+            && session.backend_session_id.is_some()
+        {
+            let prior_id = session.backend_session_id.as_ref().unwrap();
+            tracing::debug!(
+                session_id = %prior_id,
+                "Sending ACP load_session request (replay suppression active)"
+            );
+            // Suppress replay notifications for the duration of load_session.
+            // ACP protocol requires the agent to stream the entire conversation history
+            // as session/update notifications before responding to session/load.
+            // Without suppression these replayed chunks would appear as current-turn
+            // live output (sink emissions + accumulated text).
+            suppress_replay.set(true);
+            let load_result = conn
+                .load_session(
+                    acp::LoadSessionRequest::new(
+                        acp::SessionId::new(prior_id.clone()),
+                        session_root.clone(),
+                    )
+                    .mcp_servers(mcp_servers),
+                )
+                .await;
+            // Clear suppression before error propagation so the flag is never left set.
+            suppress_replay.set(false);
+            load_result.map_err(|e| anyhow::anyhow!("ACP load_session failed: {e:?}"))?;
+            // LoadSessionResponse has no session_id field; reuse the passed-in prior_id.
+            tracing::debug!(session_id = %prior_id, "ACP session resumed via session/load");
+            (
                 acp::SessionId::new(prior_id.clone()),
-                session_root.clone(),
+                None,
+                ClaudeTranscriptOwnership::BackendResume,
             )
-            .mcp_servers(mcp_servers),
-        )
-        .await;
-        // Clear suppression before error propagation so the flag is never left set.
-        suppress_replay.set(false);
-        load_result.map_err(|e| anyhow::anyhow!("ACP load_session failed: {e:?}"))?;
-        // LoadSessionResponse has no session_id field; reuse the passed-in prior_id.
-        tracing::debug!(session_id = %prior_id, "ACP session resumed via session/load");
-        (
-            acp::SessionId::new(prior_id.clone()),
-            None,
-            ClaudeTranscriptOwnership::BackendResume,
-        )
-    } else {
-        tracing::debug!("Sending ACP new_session request");
-        let sess = conn
-            .new_session(acp::NewSessionRequest::new(session_root).mcp_servers(mcp_servers))
-            .await
-            .map_err(|e| anyhow::anyhow!("ACP new_session failed: {e:?}"))?;
-        let new_id = sess.session_id.to_string();
-        tracing::debug!(session_id = %new_id, "ACP new session created");
-        (
-            sess.session_id,
-            Some(new_id),
-            ClaudeTranscriptOwnership::HostReplay,
-        )
-    };
+        } else {
+            tracing::debug!("Sending ACP new_session request");
+            let sess = conn
+                .new_session(acp::NewSessionRequest::new(session_root).mcp_servers(mcp_servers))
+                .await
+                .map_err(|e| anyhow::anyhow!("ACP new_session failed: {e:?}"))?;
+            let new_id = sess.session_id.to_string();
+            tracing::debug!(session_id = %new_id, "ACP new session created");
+            (
+                sess.session_id,
+                Some(new_id),
+                ClaudeTranscriptOwnership::HostReplay,
+            )
+        };
 
     tracing::debug!(
         session_id = %active_session_id,

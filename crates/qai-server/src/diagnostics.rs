@@ -1,6 +1,6 @@
 use crate::{config, state::AppState};
 use qai_agent::team::orchestrator::{
-    TeamArtifactHealthSummary, TeamRuntimeSummary, TeamState, TeamTaskCounts,
+    TeamArtifactHealthSummary, TeamRoutingStats, TeamRuntimeSummary, TeamState, TeamTaskCounts,
 };
 use qai_runtime::{
     provider_profiles::ConfiguredProviderProtocol, AcpBackend, BackendFamily, CapabilityProfile,
@@ -104,6 +104,7 @@ pub struct TeamDiagnostic {
     pub mcp_port: Option<u16>,
     pub task_counts: TeamTaskCounts,
     pub artifact_health: TeamArtifactHealthSummary,
+    pub routing_stats: TeamRoutingStats,
     pub healthy: bool,
     pub notes: Vec<String>,
 }
@@ -401,6 +402,36 @@ fn team_diagnostic_from_summary(summary: TeamRuntimeSummary) -> TeamDiagnostic {
     if summary.task_counts.total > 0 && !summary.artifact_health.task_artifacts_present {
         notes.push("tasks/ artifact directory missing".to_string());
     }
+    if summary.routing_stats.pending_count > 0 {
+        notes.push(format!(
+            "{} pending completion routing event(s) waiting for delivery",
+            summary.routing_stats.pending_count
+        ));
+    }
+    if summary.routing_stats.fallback_redirected > 0 {
+        notes.push(format!(
+            "{} completion routing event(s) required fallback delivery",
+            summary.routing_stats.fallback_redirected
+        ));
+    }
+    if summary.routing_stats.missing_delivery_target > 0 {
+        notes.push(format!(
+            "{} completion routing event(s) have no live delivery target and remain pending",
+            summary.routing_stats.missing_delivery_target
+        ));
+    }
+    if summary.routing_stats.delivery_dedupe_ledger_size > 0 {
+        notes.push(format!(
+            "delivery dedupe ledger contains {} persisted key(s)",
+            summary.routing_stats.delivery_dedupe_ledger_size
+        ));
+    }
+    if summary.routing_stats.delivery_dedupe_hits > 0 {
+        notes.push(format!(
+            "{} duplicate user-visible milestone delivery attempt(s) were suppressed",
+            summary.routing_stats.delivery_dedupe_hits
+        ));
+    }
 
     let healthy = notes.is_empty();
 
@@ -412,6 +443,7 @@ fn team_diagnostic_from_summary(summary: TeamRuntimeSummary) -> TeamDiagnostic {
         mcp_port: summary.mcp_port,
         task_counts: summary.task_counts,
         artifact_health: summary.artifact_health,
+        routing_stats: summary.routing_stats,
         healthy,
         notes,
     }
@@ -480,6 +512,20 @@ fn doctor_findings(
                 message: "team artifact set is incomplete".to_string(),
                 suggested_action:
                     "inspect team session files and regenerate TEAM/CONTEXT/task artifacts"
+                        .to_string(),
+            });
+        }
+        if team.routing_stats.pending_count > 0 {
+            findings.push(DiagnosticFinding {
+                severity: DiagnosticSeverity::Warn,
+                scope: DiagnosticScope::Team,
+                subject: team.team_id.clone(),
+                message: format!(
+                    "team has {} pending completion routing event(s)",
+                    team.routing_stats.pending_count
+                ),
+                suggested_action:
+                    "restore requester delivery path or inspect pending-completions.jsonl"
                         .to_string(),
             });
         }
@@ -874,5 +920,64 @@ mod tests {
             .iter()
             .any(|note| note.contains("CONTEXT.md")));
         assert!(teams[0].notes.iter().any(|note| note.contains("TASKS.md")));
+    }
+
+    #[tokio::test]
+    async fn collect_team_diagnostics_includes_pending_routing_stats() {
+        let state = diagnostics_state(true).await;
+        let tmp = tempdir().unwrap();
+        let session = Arc::new(TeamSession::from_dir(
+            "team-routing",
+            tmp.path().to_path_buf(),
+        ));
+        let registry = Arc::new(TaskRegistry::new_in_memory().unwrap());
+        let dispatch_fn: DispatchFn = Arc::new(|_, _| Box::pin(async { Ok(()) }));
+        let orch = TeamOrchestrator::new(
+            registry,
+            Arc::clone(&session),
+            dispatch_fn,
+            std::time::Duration::from_secs(60),
+        );
+        session
+            .append_pending_completion(&qai_agent::team::completion_routing::TeamRoutingEnvelope {
+                run_id: "run-1".into(),
+                parent_run_id: None,
+                requester_session_key: Some(qai_protocol::SessionKey::new("ws", "group:routing")),
+                fallback_session_keys: vec![],
+                team_id: "team-routing".into(),
+                delivery_status:
+                    qai_agent::team::completion_routing::RoutingDeliveryStatus::PersistedPending,
+                event: qai_agent::team::completion_routing::TeamRoutingEvent::failed(
+                    "T001", "pending",
+                ),
+            })
+            .unwrap();
+        session
+            .mark_delivery_dedupe("group:routing", "all_tasks_done")
+            .unwrap();
+        session
+            .record_delivery_dedupe_hit("group:routing", "all_tasks_done")
+            .unwrap();
+        state
+            .registry
+            .register_team_orchestrator("team-routing".to_string(), Arc::clone(&orch));
+
+        let teams = collect_team_diagnostics(&state);
+        assert_eq!(teams.len(), 1);
+        assert_eq!(teams[0].routing_stats.pending_count, 1);
+        assert_eq!(teams[0].routing_stats.delivery_dedupe_ledger_size, 1);
+        assert_eq!(teams[0].routing_stats.delivery_dedupe_hits, 1);
+        assert!(teams[0]
+            .notes
+            .iter()
+            .any(|note| note.contains("pending completion routing event")));
+        assert!(teams[0]
+            .notes
+            .iter()
+            .any(|note| note.contains("delivery dedupe ledger contains 1 persisted key")));
+        assert!(teams[0]
+            .notes
+            .iter()
+            .any(|note| note.contains("duplicate user-visible milestone delivery attempt")));
     }
 }

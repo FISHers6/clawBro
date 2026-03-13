@@ -214,11 +214,28 @@ async fn build_team_harness(
     orchestrator.set_available_specialists(vec!["worker".into()]);
     let _ = orchestrator.mcp_server_port.set(32123);
 
-    let (team_notify_tx, mut team_notify_rx) = mpsc::channel::<InboundMsg>(32);
+    let (team_notify_tx, mut team_notify_rx) =
+        mpsc::channel::<qai_agent::team::completion_routing::TeamNotifyRequest>(32);
     orchestrator.set_team_notify_tx(team_notify_tx);
     let registry_for_notify = Arc::clone(&registry);
     tokio::spawn(async move {
-        while let Some(inbound) = team_notify_rx.recv().await {
+        while let Some(request) = team_notify_rx.recv().await {
+            let requester = request
+                .envelope
+                .requester_session_key
+                .clone()
+                .expect("team test expected requester session key");
+            let inbound = InboundMsg {
+                id: uuid::Uuid::new_v4().to_string(),
+                session_key: requester.clone(),
+                content: MsgContent::text(request.envelope.event.render_for_parent()),
+                sender: "gateway".to_string(),
+                channel: requester.channel.clone(),
+                timestamp: chrono::Utc::now(),
+                thread_ts: None,
+                target_agent: None,
+                source: MsgSource::TeamNotify,
+            };
             let _ = registry_for_notify.handle(inbound).await;
         }
     });
@@ -359,6 +376,7 @@ async fn mixed_backend_smoke_acp_lead_native_specialist_submit_and_accept() {
                 events: vec![RuntimeEvent::ToolCallback(TeamCallback::TaskSubmitted {
                     task_id: "T001".into(),
                     summary: "worker submitted result".into(),
+                    result_markdown: None,
                     agent: "worker".into(),
                 })],
             })
@@ -516,6 +534,7 @@ async fn mixed_backend_smoke_native_lead_acp_specialist_submit_and_accept() {
                 events: vec![RuntimeEvent::ToolCallback(TeamCallback::TaskSubmitted {
                     task_id: "T001".into(),
                     summary: "acp worker delivered".into(),
+                    result_markdown: None,
                     agent: "worker".into(),
                 })],
             })

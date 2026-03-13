@@ -710,6 +710,24 @@ public_updates = "minimal"
 max_parallel = 3
 ```
 
+如果你要在单聊里把一个用户视角的“个人工作台”挂成 Team，而不是群聊透明协作，可以用精确 scope 的 `[[team_scope]]`：
+
+```toml
+[[team_scope]]
+scope = "user:ou_a0af70fd8fc139a5d7a4bf2926810b6f"
+name = "dm-workbench"
+
+[team_scope.mode]
+interaction = "team"
+front_bot = "claude"
+channel = "lark"
+
+[team_scope.team]
+roster = ["codex", "researcher"]
+public_updates = "minimal"
+max_parallel = 2
+```
+
 ### Team 运行后会有什么
 
 team runtime 会建立：
@@ -728,6 +746,7 @@ team runtime 会建立：
 
 - `front_bot` 必须存在于 `[[agent_roster]]`
 - `group.team.roster` 中每个 specialist 名字都必须存在于 `[[agent_roster]]`
+- `team_scope.team.roster` 中每个 specialist 名字也必须存在于 `[[agent_roster]]`
 - backend 必须支持其被分配的 role
 - 如果 OpenClaw family 参与 Team，通常要配置 `team_helper_command`
 

@@ -63,6 +63,12 @@ async fn run_leader(session: &RuntimeSessionSpec) -> Result<()> {
         return Ok(());
     }
 
+    if user_input.contains("未调用任何 canonical team tool") {
+        let task_id = extract_task_id(user_input).unwrap_or_else(|| "T001".to_string());
+        emit_complete(&format!("leader:missing:{task_id}"))?;
+        return Ok(());
+    }
+
     if user_input.contains("所有任务已完成") || user_input.contains("已验收") {
         emit_complete("leader:done")?;
         return Ok(());
@@ -99,6 +105,7 @@ async fn run_specialist(session: &RuntimeSessionSpec) -> Result<()> {
         TeamToolCall::SubmitTaskResult {
             task_id: task_id.clone(),
             summary: "worker fixture result".to_string(),
+            result_markdown: None,
             agent: Some("worker".to_string()),
         },
     )

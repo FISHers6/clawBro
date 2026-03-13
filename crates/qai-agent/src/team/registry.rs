@@ -7,6 +7,7 @@
 //! 兼容旧路径：Pending → Claimed → Done / Failed
 //!   - Pending  → Claimed  : try_claim()（乐观锁，原子 UPDATE）
 //!   - Claimed  → Pending  : reset_claim()（超时后由 Heartbeat 重置）
+//!   - Claimed  → Held     : hold_claim()（等待 Lead 显式重派）
 //!   - Claimed  → Done     : mark_done()
 //!   - Claimed  → Submitted: submit_task_result()
 //!   - Submitted → Accepted: accept_task()
@@ -23,9 +24,23 @@ use std::sync::{Arc, Mutex};
 #[derive(Debug, Clone, PartialEq)]
 pub enum TaskStatus {
     Pending,
-    Claimed { agent: String, at: DateTime<Utc> },
-    Submitted { agent: String, at: DateTime<Utc> },
-    Accepted { by: String, at: DateTime<Utc> },
+    Held {
+        reason: String,
+        agent: String,
+        at: DateTime<Utc>,
+    },
+    Claimed {
+        agent: String,
+        at: DateTime<Utc>,
+    },
+    Submitted {
+        agent: String,
+        at: DateTime<Utc>,
+    },
+    Accepted {
+        by: String,
+        at: DateTime<Utc>,
+    },
     Done,
     Failed(String),
     Retrying(u32),
@@ -37,6 +52,7 @@ pub struct Task {
     pub title: String,
     /// 编码为字符串：
     /// "pending" |
+    /// "hold:{reason}:{agent}:{iso8601}" |
     /// "claimed:{agent}:{iso8601}" |
     /// "submitted:{agent}:{iso8601}" |
     /// "accepted:{by}:{iso8601}" |
@@ -63,6 +79,15 @@ impl Task {
             TaskStatus::Pending
         } else if s == "done" {
             TaskStatus::Done
+        } else if let Some(rest) = s.strip_prefix("hold:") {
+            let mut parts = rest.splitn(3, ':');
+            let reason = parts.next().unwrap_or("manual").to_string();
+            let agent = parts.next().unwrap_or("unknown").to_string();
+            let at = parts
+                .next()
+                .and_then(|ts| ts.parse::<DateTime<Utc>>().ok())
+                .unwrap_or_else(Utc::now);
+            TaskStatus::Held { reason, agent, at }
         } else if let Some(rest) = s.strip_prefix("submitted:") {
             let mut parts = rest.splitn(2, ':');
             let agent = parts.next().unwrap_or("unknown").to_string();
@@ -310,15 +335,21 @@ impl TaskRegistry {
         Self::rows_to_tasks(&mut stmt)
     }
 
-    /// Re-assign a task to a new agent. Only valid when status = 'pending'.
+    /// Re-assign a task to a new agent.
+    ///
+    /// Held tasks are released back to `pending` so heartbeat can redispatch them
+    /// only after the lead has made an explicit decision.
     pub fn reassign_task(&self, task_id: &str, new_assignee: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let rows_changed = conn.execute(
-            "UPDATE tasks SET assignee_hint = ?1 WHERE id = ?2 AND status = 'pending'",
+            "UPDATE tasks
+             SET assignee_hint = ?1,
+                 status = CASE WHEN status LIKE 'hold:%' THEN 'pending' ELSE status END
+             WHERE id = ?2 AND (status = 'pending' OR status LIKE 'hold:%')",
             rusqlite::params![new_assignee, task_id],
         )?;
         if rows_changed == 0 {
-            anyhow::bail!("Task {} not found or not in pending state", task_id);
+            anyhow::bail!("Task {} not found or not in pending/held state", task_id);
         }
         Ok(())
     }
@@ -358,6 +389,22 @@ impl TaskRegistry {
             "UPDATE tasks SET status = 'pending' WHERE id = ?1 AND status LIKE 'claimed%'",
             params![task_id],
         )?;
+        Ok(())
+    }
+
+    /// Hold a claimed task for explicit lead review instead of automatic redispatch.
+    pub fn hold_claim(&self, task_id: &str, agent: &str, reason: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let claimed_prefix = format!("claimed:{}:", agent);
+        let status = format!("hold:{}:{}:{}", reason, agent, now);
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "UPDATE tasks SET status = ?1 WHERE id = ?2 AND status LIKE ?3",
+            params![status, task_id, format!("{}%", claimed_prefix)],
+        )?;
+        if rows == 0 {
+            anyhow::bail!("hold_claim: task '{}' not claimed by '{}'", task_id, agent);
+        }
         Ok(())
     }
 
@@ -465,6 +512,8 @@ impl TaskRegistry {
                 "📨"
             } else if status.starts_with("failed") {
                 "❌"
+            } else if status.starts_with("hold:") {
+                "⚠️"
             } else if status.starts_with("claimed") {
                 "🔄"
             } else {
@@ -844,7 +893,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reassign_task_pending_only() {
+    fn test_reassign_task_pending_or_held() {
         let registry = TaskRegistry::new_in_memory().unwrap();
         registry
             .create_task(CreateTask {
@@ -857,10 +906,56 @@ mod tests {
         registry.reassign_task("T001", "claude").unwrap();
         let task = registry.get_task("T001").unwrap().unwrap();
         assert_eq!(task.assignee_hint.as_deref(), Some("claude"));
+
+        registry.try_claim("T001", "claude").unwrap();
+        registry
+            .hold_claim("T001", "claude", "missing_completion")
+            .unwrap();
+        registry.reassign_task("T001", "worker").unwrap();
+        let held_reassigned = registry.get_task("T001").unwrap().unwrap();
+        assert_eq!(held_reassigned.assignee_hint.as_deref(), Some("worker"));
+        assert!(matches!(
+            held_reassigned.status_parsed(),
+            TaskStatus::Pending
+        ));
+
         // Should fail for claimed task
-        registry.try_claim("T001", "codex").unwrap();
+        registry.try_claim("T001", "worker").unwrap();
         let result = registry.reassign_task("T001", "gemini");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_hold_claim_prevents_ready_dispatch_until_lead_reassigns() {
+        let registry = TaskRegistry::new_in_memory().unwrap();
+        registry
+            .create_task(CreateTask {
+                id: "T010".into(),
+                title: "needs lead review".into(),
+                assignee_hint: Some("worker".into()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        registry.try_claim("T010", "worker").unwrap();
+        registry
+            .hold_claim("T010", "worker", "missing_completion")
+            .unwrap();
+
+        let task = registry.get_task("T010").unwrap().unwrap();
+        assert!(matches!(
+            task.status_parsed(),
+            TaskStatus::Held {
+                ref reason,
+                ref agent,
+                ..
+            } if reason == "missing_completion" && agent == "worker"
+        ));
+        let ready = registry.find_ready_tasks().unwrap();
+        assert!(
+            ready.iter().all(|task| task.id != "T010"),
+            "held task must not be redispatched automatically"
+        );
     }
 
     #[test]

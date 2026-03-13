@@ -146,11 +146,13 @@ fn parse_call(mut args: Vec<String>) -> Result<TeamToolCall> {
         "submit-task-result" => Ok(TeamToolCall::SubmitTaskResult {
             task_id: take_flag(&mut args, "--task-id")?,
             summary: take_flag(&mut args, "--summary")?,
+            result_markdown: take_optional_flag(&mut args, "--result-markdown"),
             agent: take_optional_flag(&mut args, "--agent"),
         }),
         "complete-task" => Ok(TeamToolCall::CompleteTask {
             task_id: take_flag(&mut args, "--task-id")?,
             note: take_flag(&mut args, "--note")?,
+            result_markdown: take_optional_flag(&mut args, "--result-markdown"),
             agent: take_optional_flag(&mut args, "--agent"),
         }),
         "block-task" => Ok(TeamToolCall::BlockTask {
@@ -294,12 +296,22 @@ fn render_helper_output(call: &TeamToolCall, response: TeamToolResponse) -> Valu
             ]),
         ),
         TeamToolCall::SubmitTaskResult {
-            task_id, summary, ..
+            task_id,
+            summary,
+            result_markdown,
+            ..
         } => render_team_helper_success(
             "submit_task_result",
             Map::from_iter([
                 ("task_id".into(), Value::String(task_id.clone())),
                 ("summary".into(), Value::String(summary.clone())),
+                (
+                    "result_markdown".into(),
+                    result_markdown
+                        .as_ref()
+                        .map(|text| Value::String(text.clone()))
+                        .unwrap_or(Value::Null),
+                ),
                 ("message".into(), Value::String(response.message)),
                 (
                     "artifacts".into(),
@@ -324,11 +336,23 @@ fn render_helper_output(call: &TeamToolCall, response: TeamToolResponse) -> Valu
                 ("payload".into(), response.payload.unwrap_or(Value::Null)),
             ]),
         ),
-        TeamToolCall::CompleteTask { task_id, note, .. } => render_team_helper_success(
+        TeamToolCall::CompleteTask {
+            task_id,
+            note,
+            result_markdown,
+            ..
+        } => render_team_helper_success(
             "complete_task",
             Map::from_iter([
                 ("task_id".into(), Value::String(task_id.clone())),
                 ("note".into(), Value::String(note.clone())),
+                (
+                    "result_markdown".into(),
+                    result_markdown
+                        .as_ref()
+                        .map(|text| Value::String(text.clone()))
+                        .unwrap_or(Value::Null),
+                ),
                 ("message".into(), Value::String(response.message)),
                 ("payload".into(), response.payload.unwrap_or(Value::Null)),
             ]),
@@ -405,8 +429,11 @@ mod tests {
         assert_eq!(cli.session_scope, "scope");
         assert!(matches!(
             cli.call,
-            TeamToolCall::SubmitTaskResult { task_id, summary, agent }
-                if task_id == "T1" && summary == "done" && agent.as_deref() == Some("openclaw")
+            TeamToolCall::SubmitTaskResult { task_id, summary, result_markdown, agent }
+                if task_id == "T1"
+                    && summary == "done"
+                    && result_markdown.is_none()
+                    && agent.as_deref() == Some("openclaw")
         ));
     }
 
@@ -416,6 +443,7 @@ mod tests {
             &TeamToolCall::SubmitTaskResult {
                 task_id: "T1".into(),
                 summary: "done".into(),
+                result_markdown: Some("# Result\n\nfull body".into()),
                 agent: Some("openclaw".into()),
             },
             TeamToolResponse {

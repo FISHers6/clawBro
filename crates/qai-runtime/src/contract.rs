@@ -215,6 +215,7 @@ pub enum TeamCallback {
     TaskSubmitted {
         task_id: String,
         summary: String,
+        result_markdown: Option<String>,
         agent: String,
     },
     TaskAccepted {
