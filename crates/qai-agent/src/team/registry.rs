@@ -187,15 +187,34 @@ impl TaskRegistry {
         .context("task table migration failed")
     }
 
-    /// 创建任务（INSERT OR IGNORE，幂等）
+    /// 创建任务（幂等）。
+    ///
+    /// - 首次插入 → status = 'pending'。
+    /// - 任务已存在且处于终态（'done' / 'submitted_pending_lead'）→ 视为上一轮的残留，
+    ///   重置为 'pending' 以便本轮重新执行（防止旧 SQLite 记录污染新会话）。
+    /// - 任务已存在且仍在进行中（'pending' / 'claimed:...'）→ 保持不变（幂等）。
     pub fn create_task(&self, input: CreateTask) -> Result<String> {
         let deps_json = serde_json::to_string(&input.deps)?;
         let now = Utc::now().to_rfc3339();
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT OR IGNORE INTO tasks
+            "INSERT INTO tasks
              (id, title, status, deps_json, assignee_hint, timeout_secs, spec, success_criteria, created_at)
-             VALUES (?1, ?2, 'pending', ?3, ?4, ?5, ?6, ?7, ?8)",
+             VALUES (?1, ?2, 'pending', ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(id) DO UPDATE SET
+               title           = excluded.title,
+               status          = 'pending',
+               deps_json       = excluded.deps_json,
+               assignee_hint   = excluded.assignee_hint,
+               spec            = excluded.spec,
+               success_criteria = excluded.success_criteria,
+               created_at      = excluded.created_at,
+               completion_note = NULL,
+               done_at         = NULL,
+               retry_count     = 0
+             WHERE tasks.status IN ('done', 'submitted_pending_lead')
+                OR tasks.status LIKE 'claimed:%'
+                OR tasks.status LIKE 'accepted:%'",
             params![
                 input.id,
                 input.title,
@@ -324,6 +343,13 @@ impl TaskRegistry {
     }
 
     /// Return all tasks ordered by creation time (for get_task_status snapshot).
+    /// Delete all tasks from the database (used by /clear).
+    pub fn clear_all_tasks(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM tasks", [])?;
+        Ok(())
+    }
+
     pub fn all_tasks(&self) -> Result<Vec<Task>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(

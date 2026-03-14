@@ -444,9 +444,10 @@ pub async fn run_command_turn(
     let session_root = session
         .workspace_dir
         .clone()
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/")));
     let mcp_servers = build_mcp_servers(
         init_resp.agent_capabilities.mcp_capabilities.sse,
+        init_resp.agent_capabilities.mcp_capabilities.http,
         session.tool_bridge_url.as_deref(),
         &session.external_mcp_servers,
     );
@@ -688,33 +689,49 @@ fn outcome_from_decision(
 
 pub fn build_mcp_servers(
     supports_sse: bool,
-    team_tools_url: Option<&str>,
+    supports_http: bool,
+    team_tools_base_url: Option<&str>,
     external_mcp_servers: &[ExternalMcpServerSpec],
 ) -> Vec<acp::McpServer> {
-    if !supports_sse {
-        if team_tools_url.is_some() || !external_mcp_servers.is_empty() {
+    if !supports_sse && !supports_http {
+        if team_tools_base_url.is_some() || !external_mcp_servers.is_empty() {
             tracing::warn!(
                 configured_external = external_mcp_servers.len(),
-                has_team_tools = team_tools_url.is_some(),
-                "ACP agent does not report SSE MCP capability; skipping MCP server registration"
+                has_team_tools = team_tools_base_url.is_some(),
+                "ACP agent does not report SSE or HTTP MCP capability; skipping MCP server registration"
             );
         }
         return vec![];
     }
 
     let mut servers = Vec::new();
-    if let Some(u) = team_tools_url {
-        if !u.is_empty() {
-            servers.push(acp::McpServer::Sse(acp::McpServerSse::new("team-tools", u)));
+    if let Some(base) = team_tools_base_url {
+        if !base.is_empty() {
+            if supports_http {
+                // Streamable HTTP MCP (MCP 2025-03-26 spec) — preferred when available
+                let url = format!("{base}/mcp");
+                servers.push(acp::McpServer::Http(acp::McpServerHttp::new("team-tools", &url)));
+            } else {
+                // Legacy SSE MCP
+                let url = format!("{base}/sse");
+                servers.push(acp::McpServer::Sse(acp::McpServerSse::new("team-tools", &url)));
+            }
         }
     }
     for server in external_mcp_servers {
         match &server.transport {
             ExternalMcpTransport::Sse { url } if !url.is_empty() => {
-                servers.push(acp::McpServer::Sse(acp::McpServerSse::new(
-                    &server.name,
-                    url,
-                )));
+                if supports_http {
+                    servers.push(acp::McpServer::Http(acp::McpServerHttp::new(
+                        &server.name,
+                        url,
+                    )));
+                } else {
+                    servers.push(acp::McpServer::Sse(acp::McpServerSse::new(
+                        &server.name,
+                        url,
+                    )));
+                }
             }
             ExternalMcpTransport::Sse { .. } => {}
         }
@@ -963,25 +980,46 @@ mod tests {
 
     #[test]
     fn build_mcp_servers_empty_when_no_url() {
-        assert!(build_mcp_servers(true, None, &[]).is_empty());
+        assert!(build_mcp_servers(true, false, None, &[]).is_empty());
     }
 
     #[test]
-    fn build_mcp_servers_empty_when_no_sse_capability() {
-        assert!(build_mcp_servers(false, Some("http://127.0.0.1:9999"), &[]).is_empty());
+    fn build_mcp_servers_empty_when_no_capability() {
+        assert!(build_mcp_servers(false, false, Some("http://127.0.0.1:9999"), &[]).is_empty());
     }
 
     #[test]
-    fn build_mcp_servers_populated_when_url_and_capability() {
-        let servers = build_mcp_servers(true, Some("http://127.0.0.1:9999"), &[]);
+    fn build_mcp_servers_sse_when_sse_capability() {
+        let servers = build_mcp_servers(true, false, Some("http://127.0.0.1:9999"), &[]);
         assert_eq!(servers.len(), 1);
         match &servers[0] {
             acp::McpServer::Sse(sse) => {
                 assert_eq!(sse.name, "team-tools");
-                assert_eq!(sse.url, "http://127.0.0.1:9999");
+                assert_eq!(sse.url, "http://127.0.0.1:9999/sse");
             }
             other => panic!("unexpected mcp server: {other:?}"),
         }
+    }
+
+    #[test]
+    fn build_mcp_servers_http_when_http_capability() {
+        let servers = build_mcp_servers(false, true, Some("http://127.0.0.1:9999"), &[]);
+        assert_eq!(servers.len(), 1);
+        match &servers[0] {
+            acp::McpServer::Http(http) => {
+                assert_eq!(http.name, "team-tools");
+                assert_eq!(http.url, "http://127.0.0.1:9999/mcp");
+            }
+            other => panic!("unexpected mcp server: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_mcp_servers_http_preferred_when_both_capabilities() {
+        // When agent supports both, HTTP (streamable) is preferred
+        let servers = build_mcp_servers(true, true, Some("http://127.0.0.1:9999"), &[]);
+        assert_eq!(servers.len(), 1);
+        assert!(matches!(servers[0], acp::McpServer::Http(_)));
     }
 
     #[test]
@@ -1196,7 +1234,7 @@ mod tests {
             },
         ];
 
-        let servers = build_mcp_servers(true, Some("http://127.0.0.1:9999"), &external);
+        let servers = build_mcp_servers(true, false, Some("http://127.0.0.1:9999"), &external);
         assert_eq!(servers.len(), 3);
         let names: Vec<_> = servers
             .iter()

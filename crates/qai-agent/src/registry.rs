@@ -194,6 +194,17 @@ impl<'a> SlashControlContext<'a> {
         self.registry.session_workspaces.insert(key.clone(), path);
     }
 
+    /// Clear team workspace for /clear: stop heartbeat, wipe tasks + jsonl files, reset state.
+    pub(crate) async fn clear_team_workspace(self, session_key: &SessionKey) {
+        let orch_arc =
+            route_orchestrator_for_session(&self.registry.team_orchestrators, session_key);
+        if let Some(orch) = orch_arc {
+            if let Err(e) = orch.clear_workspace().await {
+                tracing::warn!(error = %e, "clear_team_workspace failed");
+            }
+        }
+    }
+
     pub(crate) fn render_team_status(self, session_key: &SessionKey) -> String {
         let orch_arc =
             route_orchestrator_for_session(&self.registry.team_orchestrators, session_key);
@@ -434,6 +445,74 @@ impl SessionRegistry {
         session_key: &SessionKey,
     ) -> Option<Arc<TeamOrchestrator>> {
         route_orchestrator_for_session(&self.team_orchestrators, session_key)
+    }
+
+    /// Returns true when the Lead's direct text reply should be suppressed by `spawn_im_turn`.
+    ///
+    /// Suppression rule:
+    /// - The session IS the active Team Lead for some orchestrator, AND
+    /// - The team is NOT currently in `AwaitingConfirm` state.
+    ///
+    /// Why the AwaitingConfirm carve-out: when the user replies to a confirmation prompt,
+    /// `handle()` short-circuits in the confirmation interceptor and returns a control-plane
+    /// reply ("收到，开始执行。任务队列已启动。") without running the engine.  That reply
+    /// IS user-visible and must reach IM.  In all other Lead states the Lead communicates
+    /// via `post_update` tool calls, so the final text reply is redundant and should be
+    /// suppressed to avoid duplicate messages.
+    ///
+    /// This flag must be captured **before** calling `handle()` so that the state snapshot
+    /// is consistent with the turn being dispatched (fixes TOCTOU).
+    pub fn should_suppress_lead_final_reply(&self, session_key: &SessionKey) -> bool {
+        let Some(orch) = self.get_orchestrator_for_session(session_key) else {
+            tracing::info!(
+                channel = %session_key.channel,
+                scope = %session_key.scope,
+                "suppress_check: no orchestrator found for session"
+            );
+            return false;
+        };
+        if orch.lead_session_key.get() != Some(session_key) {
+            tracing::info!(
+                channel = %session_key.channel,
+                scope = %session_key.scope,
+                lead_key = ?orch.lead_session_key.get(),
+                "suppress_check: session_key != lead_session_key"
+            );
+            return false;
+        }
+        let state = orch.team_state();
+        let suppress = !matches!(
+            state,
+            crate::team::orchestrator::TeamState::AwaitingConfirm
+        );
+        tracing::info!(
+            channel = %session_key.channel,
+            scope = %session_key.scope,
+            state = ?state,
+            suppress,
+            "suppress_check: result"
+        );
+        suppress
+    }
+
+    /// Returns true if the team was actually started (state = Running or Done).
+    /// Used post-handle to decide whether Lead's plain-text reply should be sent through
+    /// even when `should_suppress_lead_final_reply` pre-captured true (Planning state).
+    pub fn is_team_running_or_done(&self, session_key: &SessionKey) -> bool {
+        let Some(orch) = self.get_orchestrator_for_session(session_key) else {
+            return false;
+        };
+        if orch.lead_session_key.get() != Some(session_key) {
+            return false;
+        }
+        // Only suppress when beta is actively executing.
+        // Done state: team finished; post_update was (or should have been) sent.
+        // Allowing replies through in Done prevents silent blackhole when post_update
+        // failed (e.g. 402 error) and team remains stuck in Done/submitted on restart.
+        matches!(
+            orch.team_state(),
+            crate::team::orchestrator::TeamState::Running
+        )
     }
 
     /// Attach a RelayEngine — processes [RELAY: @agent <指令>] markers synchronously.

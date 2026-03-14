@@ -31,7 +31,14 @@ use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{ServerCapabilities, ServerInfo},
     schemars, tool, tool_handler, tool_router,
-    transport::{sse_server::SseServerConfig, SseServer},
+    transport::{
+        sse_server::SseServerConfig,
+        streamable_http_server::{
+            session::never::NeverSessionManager, tower::StreamableHttpService,
+            StreamableHttpServerConfig,
+        },
+        SseServer,
+    },
     ServerHandler,
 };
 use serde::Deserialize;
@@ -503,7 +510,9 @@ impl SharedMcpServerHandle {
 // ─── spawn() ─────────────────────────────────────────────────────────────────
 
 impl SharedTeamToolServer {
-    /// Start the unified MCP SSE server on a random loopback port.
+    /// Start the unified MCP server on a random loopback port.
+    /// Serves both SSE (`/sse` + `/message`) and Streamable HTTP (`/mcp`) transports
+    /// so that both Claude-ACP (SSE) and Codex-ACP (HTTP) can register team tools.
     pub async fn spawn(self) -> Result<SharedMcpServerHandle> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
@@ -517,12 +526,25 @@ impl SharedTeamToolServer {
             sse_keep_alive: None,
         };
 
+        let self_clone = self.clone();
         let (sse_server, sse_router) = SseServer::new(sse_config);
         let server_ct = sse_server.with_service(move || self.clone());
 
+        // Streamable HTTP MCP transport for agents that report mcp_capabilities.http=true (e.g. Codex-ACP).
+        let http_service = StreamableHttpService::<_, NeverSessionManager>::new(
+            move || Ok(self_clone.clone()),
+            Default::default(),
+            StreamableHttpServerConfig {
+                stateful_mode: false,
+                sse_keep_alive: None,
+            },
+        );
+
+        let router = sse_router.nest_service("/mcp", http_service);
+
         let shutdown_ct = server_ct.clone();
         let task = tokio::spawn(async move {
-            let server = axum::serve(listener, sse_router).with_graceful_shutdown(async move {
+            let server = axum::serve(listener, router).with_graceful_shutdown(async move {
                 shutdown_ct.cancelled().await;
                 tracing::info!("SharedTeamMcpServer shutting down");
             });
@@ -533,8 +555,8 @@ impl SharedTeamToolServer {
 
         tracing::info!(
             addr = %addr,
-            "SharedTeamMcpServer started — SSE endpoint: http://{}/sse",
-            addr
+            "SharedTeamMcpServer started — SSE: http://{}/sse  HTTP: http://{}/mcp",
+            addr, addr
         );
 
         Ok(SharedMcpServerHandle {

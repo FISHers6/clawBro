@@ -123,10 +123,12 @@ pub(crate) async fn assemble_context(request: ContextAssemblyRequest<'_>) -> Con
         team_dir.clone(),
         workspace_dir_resolved.clone(),
     );
+    // Base URL without path suffix; build_mcp_servers appends /sse or /mcp
+    // depending on what the ACP agent reports it supports.
     let mcp_server_url = request
         .session_team_orch
         .and_then(|o| o.mcp_server_port.get().copied())
-        .map(|port| format!("http://127.0.0.1:{port}/sse"));
+        .map(|port| format!("http://127.0.0.1:{port}"));
     let team_tool_url = request
         .session_team_orch
         .and_then(|_| request.team_tool_url.clone());

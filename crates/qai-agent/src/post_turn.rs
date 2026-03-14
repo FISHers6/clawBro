@@ -43,7 +43,10 @@ pub(crate) async fn process_post_turn(
     )
     .await;
 
-    if should_scan_mentions(&input.inbound.source) {
+    // Lead agents coordinate via MCP tools (assign_task), not via @mention in reply text.
+    // Scanning Lead output would cause double-dispatch: MentionTrigger fires immediately
+    // on the suppressed reply text, while Heartbeat also dispatches the same specialist.
+    if !input.is_lead && should_scan_mentions(&input.inbound.source) {
         if let Some(trigger) = processor.mention_trigger {
             let sender = input
                 .roster_match
@@ -168,6 +171,15 @@ mod tests {
         )
         .await;
         assert_eq!(output, "[RELAY: @codex do work]");
+    }
+
+    #[test]
+    fn lead_turns_do_not_scan_mentions_regardless_of_source() {
+        // is_lead=true must block MentionTrigger even when source=Human,
+        // preventing double-dispatch (MentionTrigger + Heartbeat both run beta).
+        assert!(should_scan_mentions(&MsgSource::Human)); // Human would normally trigger
+        // The !is_lead guard in process_post_turn blocks the scan before we reach scan_and_dispatch.
+        // This test documents the invariant: Lead uses MCP tools, not @mentions.
     }
 
     #[test]

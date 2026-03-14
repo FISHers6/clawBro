@@ -7,6 +7,19 @@ use qai_protocol::{InboundMsg, OutboundMsg, SessionKey};
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex};
 
+/// No-op sink used for Team Lead turns — all user-visible output goes through
+/// `post_update` tool calls (via milestone_fn → ch.send()), not the stream path.
+struct NullSink;
+
+#[async_trait]
+impl OutputSink for NullSink {
+    async fn send_thinking(&self) -> Option<String> {
+        None
+    }
+    async fn send_delta(&self, _: &str, _: Option<&str>) {}
+    async fn send_final(&self, _: &str, _: Option<&str>) {}
+}
+
 pub struct ImProgressSink {
     channel: Arc<dyn Channel>,
     reply_to: Option<String>,
@@ -107,6 +120,10 @@ pub fn spawn_im_turn(
     let event_rx = registry.global_sender().subscribe();
     let (control_tx, control_rx) = oneshot::channel::<StreamControl>();
 
+    // Capture before spawning tasks to snapshot state consistently (fixes TOCTOU).
+    // When true: Lead communicates only via post_update — stream path must be silent.
+    let suppress_lead_final = registry.should_suppress_lead_final_reply(&session_key);
+
     let registry_for_stream = registry.clone();
     let channel_for_stream = channel.clone();
     let session_key_for_stream = session_key.clone();
@@ -124,21 +141,51 @@ pub fn spawn_im_turn(
             }
         };
 
-        let sink = ImProgressSink::new(
-            channel_for_stream,
-            session_key_for_stream,
-            reply_to,
-            thread_ts,
-            presentation,
-        );
-        throttled_stream(event_rx, session_id, &sink, None, control_rx).await;
+        if suppress_lead_final {
+            // Lead in Team mode: all stream output suppressed; post_update is the only channel.
+            throttled_stream(event_rx, session_id, &NullSink, None, control_rx).await;
+        } else {
+            let sink = ImProgressSink::new(
+                channel_for_stream,
+                session_key_for_stream,
+                reply_to,
+                thread_ts,
+                presentation,
+            );
+            throttled_stream(event_rx, session_id, &sink, None, control_rx).await;
+        }
     });
 
     let channel_name_for_handle = channel_name.clone();
+    let channel_for_handle = channel.clone();
+    let session_key_for_handle = session_key.clone();
+    let reply_to_for_handle = Some(inbound.id.clone());
+    let thread_ts_for_handle = inbound.thread_ts.clone();
     tokio::spawn(async move {
         match registry.handle(inbound).await {
             Ok(Some(reply)) => {
-                let _ = control_tx.send(StreamControl::Final(reply));
+                if suppress_lead_final {
+                    // Post-handle check: only suppress if team was actually started.
+                    // If Lead just chatted without delegating (state stays Planning),
+                    // the stream uses NullSink so StreamControl::Final would be a no-op —
+                    // send directly to channel instead.
+                    if registry.is_team_running_or_done(&session_key_for_handle) {
+                        let _ = control_tx.send(StreamControl::Stop);
+                    } else {
+                        let _ = control_tx.send(StreamControl::Stop);
+                        let msg = OutboundMsg {
+                            session_key: session_key_for_handle.clone(),
+                            content: qai_protocol::MsgContent::text(&reply),
+                            reply_to: reply_to_for_handle,
+                            thread_ts: thread_ts_for_handle,
+                        };
+                        if let Err(e) = channel_for_handle.send(&msg).await {
+                            tracing::error!(channel = %channel_name_for_handle, "lead direct send failed: {e}");
+                        }
+                    }
+                } else {
+                    let _ = control_tx.send(StreamControl::Final(reply));
+                }
             }
             Ok(None) => {
                 let _ = control_tx.send(StreamControl::Stop);

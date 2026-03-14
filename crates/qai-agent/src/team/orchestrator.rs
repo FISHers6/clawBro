@@ -1174,6 +1174,45 @@ impl TeamOrchestrator {
 
     // ── 停止 ──────────────────────────────────────────────────────────────────
 
+    /// 清除团队工作区：停止 Heartbeat、清空 tasks.db + 所有 jsonl 文件、重置内存状态回 Planning。
+    /// 用于 /clear 命令，不归档目录（保留目录结构供下次复用）。
+    pub async fn clear_workspace(&self) -> Result<()> {
+        // Stop heartbeat
+        if let Some(handle) = self.heartbeat_handle.lock().unwrap().take() {
+            handle.abort();
+        }
+        // Stop MCP server
+        if let Some(handle) = self.mcp_server_handle.lock().await.take() {
+            handle.stop().await;
+        }
+        // Clear tasks.db
+        self.registry.clear_all_tasks()?;
+        // Clear all jsonl files
+        let dir = &self.session.dir;
+        for filename in &[
+            "events.jsonl",
+            "routing-events.jsonl",
+            "pending-completions.jsonl",
+            "delivered-milestones.jsonl",
+            "delivery-dedupe-hits.jsonl",
+        ] {
+            let path = dir.join(filename);
+            if path.exists() {
+                std::fs::write(&path, b"")?;
+            }
+        }
+        // Clear task artifacts directory
+        let tasks_dir = dir.join("tasks");
+        if tasks_dir.exists() {
+            std::fs::remove_dir_all(&tasks_dir)?;
+            std::fs::create_dir_all(&tasks_dir)?;
+        }
+        // Reset in-memory state to Planning
+        *self.team_state_inner.lock().unwrap() = TeamState::Planning;
+        tracing::info!(team_id = %self.session.team_id, "Team workspace cleared");
+        Ok(())
+    }
+
     /// 停止 Heartbeat、MCP Server 并归档 team-session
     pub async fn stop(&self) -> Result<()> {
         // Stop heartbeat

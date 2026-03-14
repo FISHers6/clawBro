@@ -25,8 +25,10 @@ pub async fn wire_team_runtime(
     let (team_notify_tx, mut team_notify_rx) = mpsc::channel::<TeamNotifyRequest>(256);
     let team_notify_tx_for_orch = team_notify_tx.clone();
     let team_scopes = cfg.normalized_team_scopes();
+    tracing::info!(count = team_scopes.len(), "wire_team_runtime: team scopes found");
 
     for team_scope in &team_scopes {
+        tracing::info!(scope = %team_scope.scope, name = ?team_scope.name, "wire_team_runtime: wiring team scope");
         let channel_name: String = if let Some(ref ch) = team_scope.mode.channel {
             ch.clone()
         } else if cfg

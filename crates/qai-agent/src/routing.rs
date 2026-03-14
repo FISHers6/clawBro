@@ -441,10 +441,7 @@ mod tests {
 
     fn make_orchestrator_for_scope(scope: &str) -> Arc<TeamOrchestrator> {
         let tmp = tempfile::tempdir().unwrap();
-        let session = Arc::new(TeamSession::from_dir(
-            "team-auto",
-            tmp.path().to_path_buf(),
-        ));
+        let session = Arc::new(TeamSession::from_dir("team-auto", tmp.path().to_path_buf()));
         let registry = Arc::new(TaskRegistry::new_in_memory().unwrap());
         let dispatch: DispatchFn = Arc::new(|_, _| Box::pin(async { Ok(()) }));
         let orch = TeamOrchestrator::new(registry, session, dispatch, Duration::from_secs(60));
@@ -485,7 +482,10 @@ mod tests {
             &auto_promote_scopes,
             true, // no_session_orchestrator = true (none found yet)
         );
-        assert!(result.is_some(), "should find orchestrator for registered scope with trigger keyword");
+        assert!(
+            result.is_some(),
+            "should find orchestrator for registered scope with trigger keyword"
+        );
     }
 
     #[test]
@@ -538,6 +538,9 @@ mod tests {
             &auto_promote_scopes,
             true,
         );
-        assert!(result.is_none(), "should return None and warn when no orchestrator covers the scope");
+        assert!(
+            result.is_none(),
+            "should return None and warn when no orchestrator covers the scope"
+        );
     }
 }

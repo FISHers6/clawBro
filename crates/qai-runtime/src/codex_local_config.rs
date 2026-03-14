@@ -4,7 +4,7 @@ use serde_json::json;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const MODEL_REASONING_EFFORT: &str = "high";
+const MODEL_REASONING_EFFORT: &str = "low";
 
 pub fn prepare_isolated_codex_home(
     home_dir: &Path,

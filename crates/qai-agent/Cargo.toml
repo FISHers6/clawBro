@@ -21,7 +21,7 @@ uuid.workspace       = true
 dashmap.workspace    = true
 agent-client-protocol = { path = "../../../acp/rust-sdk/src/agent-client-protocol" }
 tokio-util = { version = "0.7", features = ["compat"] }
-rmcp = { version = "=0.8.5", features = ["server", "transport-sse-server"] }
+rmcp = { version = "=0.8.5", features = ["server", "transport-sse-server", "transport-streamable-http-server"] }
 chrono.workspace     = true
 dirs = "5"
 rusqlite = { version = "0.31", features = ["bundled"] }
