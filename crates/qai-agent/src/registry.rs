@@ -451,14 +451,12 @@ impl SessionRegistry {
     ///
     /// Suppression rule:
     /// - The session IS the active Team Lead for some orchestrator, AND
-    /// - The team is NOT currently in `AwaitingConfirm` state.
+    /// - The team is currently in `Running` state.
     ///
-    /// Why the AwaitingConfirm carve-out: when the user replies to a confirmation prompt,
-    /// `handle()` short-circuits in the confirmation interceptor and returns a control-plane
-    /// reply ("收到，开始执行。任务队列已启动。") without running the engine.  That reply
-    /// IS user-visible and must reach IM.  In all other Lead states the Lead communicates
-    /// via `post_update` tool calls, so the final text reply is redundant and should be
-    /// suppressed to avoid duplicate messages.
+    /// `Planning`, `AwaitingConfirm`, and `Done` are still normal conversational states:
+    /// the Lead may answer directly, and any pre-tool text must remain visible as separate
+    /// IM messages. Only active task execution is silent, where user-visible updates are
+    /// expected to come from `post_update` milestones instead of the normal stream path.
     ///
     /// This flag must be captured **before** calling `handle()` so that the state snapshot
     /// is consistent with the turn being dispatched (fixes TOCTOU).
@@ -481,10 +479,7 @@ impl SessionRegistry {
             return false;
         }
         let state = orch.team_state();
-        let suppress = !matches!(
-            state,
-            crate::team::orchestrator::TeamState::AwaitingConfirm
-        );
+        let suppress = matches!(state, crate::team::orchestrator::TeamState::Running);
         tracing::info!(
             channel = %session_key.channel,
             scope = %session_key.scope,
@@ -495,9 +490,8 @@ impl SessionRegistry {
         suppress
     }
 
-    /// Returns true if the team was actually started (state = Running or Done).
-    /// Used post-handle to decide whether Lead's plain-text reply should be sent through
-    /// even when `should_suppress_lead_final_reply` pre-captured true (Planning state).
+    /// Returns true if the team is actively executing (state = Running).
+    /// Used post-handle to decide whether Lead's plain-text reply should stay suppressed.
     pub fn is_team_running_or_done(&self, session_key: &SessionKey) -> bool {
         let Some(orch) = self.get_orchestrator_for_session(session_key) else {
             return false;
@@ -505,10 +499,6 @@ impl SessionRegistry {
         if orch.lead_session_key.get() != Some(session_key) {
             return false;
         }
-        // Only suppress when beta is actively executing.
-        // Done state: team finished; post_update was (or should have been) sent.
-        // Allowing replies through in Done prevents silent blackhole when post_update
-        // failed (e.g. 402 error) and team remains stuck in Done/submitted on restart.
         matches!(
             orch.team_state(),
             crate::team::orchestrator::TeamState::Running
@@ -2272,6 +2262,35 @@ mod tests {
         orch.set_scope(lead_key);
         registry.register_team_orchestrator("team-test".to_string(), Arc::clone(&orch));
         (registry, orch)
+    }
+
+    #[test]
+    fn suppress_lead_final_reply_only_while_team_is_running() {
+        let (registry, orch) = make_registry_with_team_orchestrator();
+        let lead_key = SessionKey::new("lark", "group:team");
+
+        assert!(
+            !registry.should_suppress_lead_final_reply(&lead_key),
+            "Planning state must not suppress normal lead replies"
+        );
+
+        *orch.team_state_inner.lock().unwrap() = crate::team::orchestrator::TeamState::AwaitingConfirm;
+        assert!(
+            !registry.should_suppress_lead_final_reply(&lead_key),
+            "AwaitingConfirm state must not suppress confirmation replies"
+        );
+
+        *orch.team_state_inner.lock().unwrap() = crate::team::orchestrator::TeamState::Running;
+        assert!(
+            registry.should_suppress_lead_final_reply(&lead_key),
+            "Running state should suppress the normal stream path"
+        );
+
+        *orch.team_state_inner.lock().unwrap() = crate::team::orchestrator::TeamState::Done;
+        assert!(
+            !registry.should_suppress_lead_final_reply(&lead_key),
+            "Done state must not suppress direct lead replies"
+        );
     }
 
     #[tokio::test]

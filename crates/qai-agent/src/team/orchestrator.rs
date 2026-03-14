@@ -1181,10 +1181,8 @@ impl TeamOrchestrator {
         if let Some(handle) = self.heartbeat_handle.lock().unwrap().take() {
             handle.abort();
         }
-        // Stop MCP server
-        if let Some(handle) = self.mcp_server_handle.lock().await.take() {
-            handle.stop().await;
-        }
+        // Keep the shared MCP server alive across /clear so the next lead turn
+        // does not inherit a stale cached port with no listener behind it.
         // Clear tasks.db
         self.registry.clear_all_tasks()?;
         // Clear all jsonl files
@@ -1366,7 +1364,41 @@ mod tests {
     use super::*;
     use crate::team::registry::CreateTask;
     use tempfile::tempdir;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::time::{timeout, Duration};
+
+    async fn post_initialize_to_mcp(port: u16) -> String {
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect to shared team MCP server");
+        let body = r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test-client","version":"0.0.0"}}}"#;
+        let request = format!(
+            concat!(
+                "POST /mcp HTTP/1.1\r\n",
+                "Host: 127.0.0.1:{port}\r\n",
+                "Accept: application/json, text/event-stream\r\n",
+                "Content-Type: application/json\r\n",
+                "Content-Length: {content_length}\r\n",
+                "Connection: close\r\n",
+                "\r\n",
+                "{body}"
+            ),
+            port = port,
+            content_length = body.len(),
+            body = body,
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("write initialize request");
+
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+            .await
+            .expect("read initialize response timed out")
+            .expect("read initialize response");
+        String::from_utf8(response).expect("initialize response is utf-8")
+    }
 
     fn make_orchestrator() -> (Arc<TeamOrchestrator>, tempfile::TempDir) {
         let tmp = tempdir().unwrap();
@@ -1440,6 +1472,30 @@ mod tests {
         assert!(err.contains("synthetic mcp failure"));
         assert!(matches!(orch.team_state(), TeamState::Planning));
         assert!(orch.mcp_server_port.get().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_clear_workspace_keeps_shared_mcp_server_reachable() {
+        let (orch, _tmp) = make_orchestrator();
+        orch.start_mcp_server().await.unwrap();
+        let port = orch
+            .mcp_server_port
+            .get()
+            .copied()
+            .expect("shared MCP server port");
+
+        orch.clear_workspace().await.unwrap();
+
+        let response = post_initialize_to_mcp(port).await;
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK"),
+            "unexpected initialize status: {response}"
+        );
+        assert!(
+            response.to_ascii_lowercase().contains("content-type: text/event-stream"),
+            "missing SSE content type after /clear: {response}"
+        );
+        assert!(matches!(orch.team_state(), TeamState::Planning));
     }
 
     #[test]
