@@ -240,9 +240,10 @@ fn build_lead_task_reminder(team_orch: Option<&Arc<TeamOrchestrator>>) -> Option
                  1. 分析任务，调用 create_task() 定义所有子任务和依赖关系（assignee 填 Specialist 名称）\n\
                  2. 简单任务（≤3个、无复杂依赖）直接调用 start_execution()\n\
                  3. 复杂任务先调用 request_confirmation(plan_summary)，等用户确认后再执行\n\
-                 4. Specialist 完成后通常会先提交结果；你收到待验收通知后，用 accept_task() 验收或 reopen_task() 打回\n\
-                 5. 任务执行中你会收到 [团队通知] 消息，用 post_update() 向用户播报关键进度\n\
-                 6. 收到\"所有任务已完成\"通知后，合成最终结果并调用 post_update() 发给用户\n\n\
+                 4. Specialist 完成后通常会先提交结果；你收到待验收通知后，只做 accept_task() 验收或 reopen_task() 打回\n\
+                 5. 不要在 submitted 待验收这一轮直接 post_update 最终结果\n\
+                 6. 任务执行中你会收到 [团队通知] 消息，用 post_update() 向用户播报关键进度\n\
+                 7. 收到\"所有任务已完成\"或最终验收完成通知后，合成最终结果并调用 post_update() 发给用户\n\n\
                  可用工具：create_task, start_execution, request_confirmation, post_update, get_task_status, assign_task, accept_task, reopen_task",
             )
         }
@@ -253,7 +254,8 @@ fn build_lead_task_reminder(team_orch: Option<&Arc<TeamOrchestrator>>) -> Option
                  - 用 post_update(message) 向用户播报进度\n\
                  - 用 get_task_status() 查看全局状态\n\
                  - 用 assign_task(task_id, agent) 重新分配卡住的任务（agent 填 Specialist 名称）\n\
-                 - 对 submitted 结果用 accept_task(task_id) 验收，或用 reopen_task(task_id, reason) 打回\n\
+                 - 对 submitted 结果只用 accept_task(task_id) 验收，或用 reopen_task(task_id, reason) 打回\n\
+                 - submitted 待验收这一轮不要直接发最终汇总\n\
                  - 收到\"所有任务已完成\"通知后，合成最终汇总并 post_update",
             )
         }

@@ -24,6 +24,7 @@ const TEAM_NOTIFY_PROTOCOL: &str = "\
 **收到任务提交待验收通知时：**
 - 检查结果后调用 `accept_task(task_id)` 验收，或
 - 调用 `reopen_task(task_id, reason)` 退回给 Specialist 修正
+- 这一轮不要直接调用 `post_update` 给用户发送最终汇总；最终结果只在收到“已验收 / 所有任务现已完成”后再发
 
 **收到检查点或求助通知时：**
 - 可直接继续观察，不一定要立即发给用户
@@ -610,6 +611,10 @@ mod tests {
         assert!(
             prompt.contains("post_update"),
             "Lead prompt must mention post_update tool"
+        );
+        assert!(
+            prompt.contains("这一轮不要直接调用 `post_update`"),
+            "Lead prompt must forbid final post_update during submitted review"
         );
     }
 

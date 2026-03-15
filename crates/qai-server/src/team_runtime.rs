@@ -432,7 +432,7 @@ pub async fn wire_team_runtime(
                     registry_for_notify.get_team_orchestrator(&request.envelope.team_id)
                 {
                     if let Some(delivered) = delivered {
-                        let _ = team_orch.session.append_routing_outcome(&delivered);
+                        team_orch.mark_routing_event_delivered(&delivered);
                     } else {
                         let pending = request
                             .envelope

@@ -96,7 +96,7 @@ impl TeamRoutingEvent {
             task_id: task_id.to_string(),
             agent: Some(agent.to_string()),
             detail: format!(
-                "[团队通知] 任务 {} 已提交待验收（执行者：{}）\n\n提交摘要：\n{}\n\n请检查结果，并决定 accept 或 reopen。",
+                "[团队通知] 任务 {} 已提交待验收（执行者：{}）\n\n提交摘要：\n{}\n\n请检查结果，并决定 accept 或 reopen。本轮不要直接 post_update 最终汇总；只有在收到“已验收 / 所有任务现已完成”后，才向用户发送最终结果。",
                 task_id, agent, detail
             ),
             result_payload: None,

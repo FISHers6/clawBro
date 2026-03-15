@@ -118,10 +118,14 @@ pub async fn execute_team_tool_call(
             }
         }
         TeamToolCall::PostUpdate { message } => {
-            team_orch.post_message(&message);
+            let posted = team_orch.post_message(&message);
             TeamToolResponse {
                 ok: true,
-                message: "Posted.".to_string(),
+                message: if posted {
+                    "Posted.".to_string()
+                } else {
+                    "Skipped duplicate final update for completed team cycle.".to_string()
+                },
                 payload: None,
             }
         }

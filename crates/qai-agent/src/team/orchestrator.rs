@@ -162,6 +162,7 @@ pub struct TeamOrchestrator {
     recent_specialist_actions: std::sync::Mutex<VecDeque<SpecialistActionRecord>>,
     dispatch_contexts: std::sync::Mutex<HashMap<(String, String), DispatchContextRecord>>,
     pending_lead_fragments: std::sync::Mutex<Vec<PendingLeadFragment>>,
+    done_final_posted: std::sync::Mutex<bool>,
     #[cfg(test)]
     test_mcp_start_result: std::sync::Mutex<Option<std::result::Result<u16, String>>>,
 }
@@ -208,6 +209,7 @@ impl TeamOrchestrator {
             recent_specialist_actions: std::sync::Mutex::new(VecDeque::new()),
             dispatch_contexts: std::sync::Mutex::new(HashMap::new()),
             pending_lead_fragments: std::sync::Mutex::new(Vec::new()),
+            done_final_posted: std::sync::Mutex::new(false),
             #[cfg(test)]
             test_mcp_start_result: std::sync::Mutex::new(None),
         })
@@ -243,6 +245,7 @@ impl TeamOrchestrator {
             return false;
         }
         *state = TeamState::Planning;
+        *self.done_final_posted.lock().unwrap() = false;
         let event = serde_json::json!({
             "event": "REOPENED_FOR_PLANNING",
             "ts": Utc::now().to_rfc3339(),
@@ -302,12 +305,32 @@ impl TeamOrchestrator {
     }
 
     /// 向 IM 频道发布 Lead 的任意文字更新（post_update 工具调用时使用）
-    pub fn post_message(&self, message: &str) {
+    pub fn post_message(&self, message: &str) -> bool {
+        if !self.reserve_done_cycle_post_update() {
+            tracing::info!(
+                team_id = %self.session.team_id,
+                "Suppressing duplicate post_update after completed team cycle"
+            );
+            return false;
+        }
         self.record_leader_fragment(LeaderUpdateKind::PostUpdate, message);
         let event = TeamMilestoneEvent::LeadMessage {
             text: message.to_string(),
         };
         let _ = self.emit_milestone(event);
+        true
+    }
+
+    fn reserve_done_cycle_post_update(&self) -> bool {
+        if self.team_state() != TeamState::Done {
+            return true;
+        }
+        let mut posted = self.done_final_posted.lock().unwrap();
+        if *posted {
+            return false;
+        }
+        *posted = true;
+        true
     }
 
     pub fn record_leader_fragment(&self, kind: LeaderUpdateKind, text: &str) {
@@ -622,6 +645,7 @@ impl TeamOrchestrator {
             async move { hb.run().await }
         });
         *self.heartbeat_handle.lock().unwrap() = Some(handle);
+        *self.done_final_posted.lock().unwrap() = false;
         *self.team_state_inner.lock().unwrap() = TeamState::Running;
 
         tracing::info!(
@@ -1341,6 +1365,7 @@ impl TeamOrchestrator {
         }
         // Reset in-memory state to Planning
         *self.team_state_inner.lock().unwrap() = TeamState::Planning;
+        *self.done_final_posted.lock().unwrap() = false;
         self.pending_lead_fragments.lock().unwrap().clear();
         tracing::info!(team_id = %self.session.team_id, "Team workspace cleared");
         Ok(())
@@ -1467,6 +1492,29 @@ impl TeamOrchestrator {
                 task_id = %envelope.event.task_id,
                 error = %err,
                 "Failed to persist pending team routing event"
+            );
+        }
+    }
+
+    pub fn mark_routing_event_delivered(&self, delivered: &TeamRoutingEnvelope) {
+        let _guard = self.pending_store_lock.lock().unwrap();
+        if let Err(err) = self
+            .session
+            .remove_pending_completion_by_run_id(&delivered.run_id)
+        {
+            tracing::error!(
+                team_id = %self.session.team_id,
+                run_id = %delivered.run_id,
+                error = %err,
+                "Failed to clear delivered pending routing event"
+            );
+        }
+        if let Err(err) = self.session.append_routing_outcome(delivered) {
+            tracing::error!(
+                team_id = %self.session.team_id,
+                run_id = %delivered.run_id,
+                error = %err,
+                "Failed to append routing outcome"
             );
         }
     }
@@ -1939,6 +1987,31 @@ mod tests {
     }
 
     #[test]
+    fn mark_routing_event_delivered_clears_pending_entry() {
+        let (orch, _tmp) = make_orchestrator();
+        let pending = TeamRoutingEnvelope {
+            run_id: "run-pending".into(),
+            parent_run_id: None,
+            requester_session_key: Some(SessionKey::new("ws", "group:test-team")),
+            fallback_session_keys: vec![],
+            delivery_source: None,
+            team_id: orch.session.team_id.clone(),
+            delivery_status: RoutingDeliveryStatus::PersistedPending,
+            event: TeamRoutingEvent::failed("T404", "boom"),
+        };
+        orch.session.append_pending_completion(&pending).unwrap();
+
+        let delivered = pending
+            .clone()
+            .with_delivery_status(RoutingDeliveryStatus::DirectDelivered);
+        orch.mark_routing_event_delivered(&delivered);
+
+        assert!(orch.session.load_pending_completions().unwrap().is_empty());
+        let outcomes = orch.session.load_routing_outcomes().unwrap();
+        assert_eq!(outcomes, vec![delivered]);
+    }
+
+    #[test]
     fn build_routing_envelope_includes_distinct_fallback_targets() {
         let (orch, _tmp) = make_orchestrator();
         orch.set_lead_session_key(SessionKey::new("ws", "group:lead"));
@@ -2043,6 +2116,20 @@ mod tests {
             std::fs::read_to_string(tmp.path().join("tasks").join("T005").join("progress.md"))
                 .unwrap();
         assert!(progress.contains("claude accepted submission"));
+    }
+
+    #[test]
+    fn post_message_suppresses_duplicate_done_cycle_update() {
+        let (orch, _tmp) = make_orchestrator();
+        *orch.team_state_inner.lock().unwrap() = TeamState::Done;
+
+        assert!(orch.post_message("final one"));
+        assert!(!orch.post_message("final two"));
+
+        let updates =
+            std::fs::read_to_string(orch.session.dir.join("leader-updates.jsonl")).unwrap();
+        assert!(updates.contains("final one"));
+        assert!(!updates.contains("final two"));
     }
 
     #[tokio::test]

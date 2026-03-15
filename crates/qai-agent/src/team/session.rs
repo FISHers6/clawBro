@@ -376,6 +376,18 @@ impl TeamSession {
         Ok(())
     }
 
+    pub fn remove_pending_completion_by_run_id(&self, run_id: &str) -> Result<bool> {
+        let pending = self.load_pending_completions()?;
+        let original_len = pending.len();
+        let remaining = pending
+            .into_iter()
+            .filter(|envelope| envelope.run_id != run_id)
+            .collect::<Vec<_>>();
+        let removed = remaining.len() != original_len;
+        self.replace_pending_completions(&remaining)?;
+        Ok(removed)
+    }
+
     pub fn append_routing_outcome(&self, envelope: &TeamRoutingEnvelope) -> Result<()> {
         self.append_jsonl("routing-events.jsonl", envelope)
     }
@@ -1103,6 +1115,43 @@ mod tests {
 
         session.clear_pending_completions().unwrap();
         assert!(session.load_pending_completions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_remove_pending_completion_by_run_id() {
+        let (session, _tmp) = make_session();
+        let first = TeamRoutingEnvelope {
+            run_id: "run-1".into(),
+            parent_run_id: None,
+            requester_session_key: Some(SessionKey::new("ws", "group:team")),
+            fallback_session_keys: vec![],
+            team_id: "team-001".into(),
+            delivery_status: RoutingDeliveryStatus::PersistedPending,
+            event: TeamRoutingEvent::failed("T001", "boom"),
+            delivery_source: None,
+        };
+        let second = TeamRoutingEnvelope {
+            run_id: "run-2".into(),
+            parent_run_id: None,
+            requester_session_key: Some(SessionKey::new("ws", "group:team")),
+            fallback_session_keys: vec![],
+            team_id: "team-001".into(),
+            delivery_status: RoutingDeliveryStatus::PersistedPending,
+            event: TeamRoutingEvent::failed("T002", "boom"),
+            delivery_source: None,
+        };
+
+        session.append_pending_completion(&first).unwrap();
+        session.append_pending_completion(&second).unwrap();
+
+        assert!(session
+            .remove_pending_completion_by_run_id("run-1")
+            .unwrap());
+        let loaded = session.load_pending_completions().unwrap();
+        assert_eq!(loaded, vec![second]);
+        assert!(!session
+            .remove_pending_completion_by_run_id("missing-run")
+            .unwrap());
     }
 
     #[test]
