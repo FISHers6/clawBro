@@ -116,6 +116,7 @@ const FEISHU_BASE: &str = "https://open.feishu.cn/open-apis";
 const FEISHU_WS_ENDPOINT_URL: &str = "https://open.feishu.cn/callback/ws/endpoint";
 
 pub struct LarkChannel {
+    pub instance_id: String,
     pub app_id: String,
     pub app_secret: String,
     client: reqwest::Client,
@@ -129,7 +130,17 @@ pub struct LarkChannel {
 
 impl LarkChannel {
     pub fn new(app_id: String, app_secret: String, trigger_policy: LarkTriggerPolicy) -> Self {
+        Self::new_with_instance("default", app_id, app_secret, trigger_policy)
+    }
+
+    pub fn new_with_instance(
+        instance_id: impl Into<String>,
+        app_id: String,
+        app_secret: String,
+        trigger_policy: LarkTriggerPolicy,
+    ) -> Self {
         Self {
+            instance_id: instance_id.into(),
             app_id,
             app_secret,
             client: reqwest::Client::new(),
@@ -160,7 +171,8 @@ impl LarkChannel {
             std::env::var("LARK_APP_ID").map_err(|_| anyhow::anyhow!("LARK_APP_ID not set"))?;
         let app_secret = std::env::var("LARK_APP_SECRET")
             .map_err(|_| anyhow::anyhow!("LARK_APP_SECRET not set"))?;
-        Ok(Self::new(
+        Ok(Self::new_with_instance(
+            "default",
             app_id,
             app_secret,
             LarkTriggerPolicy::all_messages(),
@@ -699,7 +711,7 @@ async fn handle_event(
     // OutboundMsg.reply_to = message_id → reply API URL
     let inbound = InboundMsg {
         id: event.event.message.message_id,
-        session_key: SessionKey::new("lark", &scope),
+        session_key: SessionKey::with_instance("lark", channel.instance_id.clone(), &scope),
         content: MsgContent::text(&text),
         sender: open_id,
         channel: "lark".to_string(),
@@ -739,6 +751,7 @@ mod tests {
             std::env::set_var("LARK_APP_SECRET", "test_secret");
         }
         let ch = LarkChannel::from_env().unwrap();
+        assert_eq!(ch.instance_id, "default");
         assert_eq!(ch.app_id, "test_id");
         assert_eq!(ch.app_secret, "test_secret");
         assert_eq!(ch.name(), "lark");
@@ -916,6 +929,58 @@ mod tests {
         let p = policy(LarkTriggerMode::MentionOnly, LarkTriggerMode::AllMessages);
         let ch = LarkChannel::new("id".to_string(), "secret".to_string(), p);
         assert_eq!(ch.trigger_policy, p);
+        assert_eq!(ch.instance_id, "default");
+    }
+
+    #[test]
+    fn test_lark_channel_new_with_instance_stores_instance_id() {
+        let ch = LarkChannel::new_with_instance(
+            "beta",
+            "id".to_string(),
+            "secret".to_string(),
+            policy(LarkTriggerMode::AllMessages, LarkTriggerMode::AllMessages),
+        );
+        assert_eq!(ch.instance_id, "beta");
+    }
+
+    #[tokio::test]
+    async fn test_lark_inbound_session_key_carries_channel_instance() {
+        let channel = LarkChannel::new_with_instance(
+            "beta",
+            "id".to_string(),
+            "secret".to_string(),
+            policy(LarkTriggerMode::AllMessages, LarkTriggerMode::AllMessages),
+        );
+        let checker = crate::allowlist::AllowlistChecker::load();
+        let (tx, mut rx) = mpsc::channel(1);
+        let event = serde_json::json!({
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "sender": { "sender_id": { "open_id": "ou_beta" } },
+                "message": {
+                    "message_id": "om_beta_1",
+                    "message_type": "text",
+                    "content": "{\"text\":\"hello\"}",
+                    "chat_type": "p2p",
+                    "chat_id": ""
+                }
+            }
+        });
+
+        handle_event(
+            &channel,
+            event,
+            &tx,
+            &checker,
+            policy(LarkTriggerMode::AllMessages, LarkTriggerMode::AllMessages),
+        )
+        .await;
+
+        let inbound = rx.recv().await.expect("inbound");
+        assert_eq!(
+            inbound.session_key.channel_instance.as_deref(),
+            Some("beta")
+        );
     }
 
     #[test]

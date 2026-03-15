@@ -20,6 +20,7 @@ pub mod slash;
 pub mod slash_service;
 pub mod team;
 pub mod traits;
+pub mod turn_context;
 
 pub use approval::{ApprovalDecision, ApprovalResolver};
 pub use control_reply::ControlReply;
@@ -35,3 +36,4 @@ pub use runtime_dispatch::{
 };
 pub use slash::SlashCommand;
 pub use traits::{AgentCtx, HistoryMsg};
+pub use turn_context::{TurnDeliverySource, TurnExecutionContext};

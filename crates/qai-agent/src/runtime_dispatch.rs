@@ -1,7 +1,7 @@
 use crate::traits::AgentCtx;
 use anyhow::Result;
 use async_trait::async_trait;
-use qai_protocol::AgentEvent;
+use qai_protocol::{render_scope_storage_key, AgentEvent};
 use qai_runtime::contract::RuntimeToolCall;
 use qai_runtime::{
     acp::AcpBackendAdapter, ApprovalBroker, BackendRegistry, OpenClawBackendAdapter,
@@ -454,7 +454,7 @@ fn push_visible_relative_file(
 }
 
 fn scoped_memory_file_stem(session_key: &qai_protocol::SessionKey) -> String {
-    format!("{}_{}", session_key.channel, session_key.scope)
+    render_scope_storage_key(session_key)
 }
 
 fn forward_runtime_event(
@@ -896,7 +896,7 @@ mod tests {
         std::fs::write(persona.path().join("MEMORY.md"), "long term").unwrap();
         std::fs::create_dir_all(persona.path().join("memory")).unwrap();
         std::fs::write(
-            persona.path().join("memory").join("lark_group:test.md"),
+            persona.path().join("memory").join("c=lark#s=group:test.md"),
             "scoped",
         )
         .unwrap();
@@ -920,7 +920,7 @@ mod tests {
             vec![
                 "SOUL.md".to_string(),
                 "MEMORY.md".to_string(),
-                "memory/lark_group:test.md".to_string(),
+                "memory/c=lark#s=group:test.md".to_string(),
                 "AGENTS.md".to_string(),
                 "USER.md".to_string(),
                 "HEARTBEAT.md".to_string(),
@@ -942,7 +942,7 @@ mod tests {
             persona
                 .path()
                 .join("memory")
-                .join("specialist_team-1:coder.md"),
+                .join("c=specialist#s=team-1:coder.md"),
             "specialist scoped",
         )
         .unwrap();
@@ -958,7 +958,7 @@ mod tests {
         let files = collect_workspace_native_files(&ctx);
         assert!(files.contains(&"SOUL.md".to_string()));
         assert!(files.contains(&"IDENTITY.md".to_string()));
-        assert!(files.contains(&"memory/specialist_team-1:coder.md".to_string()));
+        assert!(files.contains(&"memory/c=specialist#s=team-1:coder.md".to_string()));
         assert!(!files.contains(&"MEMORY.md".to_string()));
         assert_eq!(
             files

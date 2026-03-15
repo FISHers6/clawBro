@@ -3,12 +3,12 @@ use crate::storage::{SessionMeta, SessionStatus, SessionStorage, StoredMessage};
 use anyhow::Result;
 use chrono::Utc;
 use dashmap::DashMap;
-use qai_protocol::SessionKey;
+use qai_protocol::{normalize_conversation_identity, SessionKey};
 use std::sync::Arc;
 
 pub struct SessionManager {
     storage: Arc<SessionStorage>,
-    /// 内存缓存: SessionKey → SessionId
+    /// 内存缓存: normalized SessionKey → SessionId
     active: DashMap<SessionKey, SessionId>,
 }
 
@@ -22,7 +22,8 @@ impl SessionManager {
 
     /// 获取或创建 Session（幂等，基于 UUID v5 确定性 ID）
     pub async fn get_or_create(&self, key: &SessionKey) -> Result<SessionId> {
-        if let Some(id) = self.active.get(key) {
+        let normalized = normalize_conversation_identity(key);
+        if let Some(id) = self.active.get(&normalized) {
             return Ok(*id);
         }
         let session_id = key_to_session_id(key);
@@ -33,13 +34,14 @@ impl SessionManager {
                 updated_at: Utc::now(),
                 channel: key.channel.clone(),
                 scope: key.scope.clone(),
+                channel_instance: key.channel_instance.clone(),
                 message_count: 0,
                 backend_session_ids: Default::default(),
                 session_status: SessionStatus::Idle,
             };
             self.storage.save_meta(&meta).await?;
         }
-        self.active.insert(key.clone(), session_id);
+        self.active.insert(normalized, session_id);
         Ok(session_id)
     }
 
@@ -74,6 +76,7 @@ impl SessionManager {
                 updated_at: Utc::now(),
                 channel: String::new(),
                 scope: String::new(),
+                channel_instance: None,
                 message_count: 0,
                 backend_session_ids: Default::default(),
                 session_status: SessionStatus::Idle,
@@ -105,6 +108,7 @@ impl SessionManager {
                 updated_at: Utc::now(),
                 channel: String::new(),
                 scope: String::new(),
+                channel_instance: None,
                 message_count: 0,
                 backend_session_ids: Default::default(),
                 session_status: SessionStatus::Idle,
@@ -136,6 +140,7 @@ impl SessionManager {
                 updated_at: Utc::now(),
                 channel: String::new(),
                 scope: String::new(),
+                channel_instance: None,
                 message_count: 0,
                 backend_session_ids: Default::default(),
                 session_status: SessionStatus::Idle,
@@ -419,5 +424,29 @@ mod tests {
             Some("prior-acp-id"),
             "backend_session_ids must not be cleared by recover_stuck_sessions"
         );
+    }
+
+    #[tokio::test]
+    async fn group_instances_share_session_record() {
+        let (mgr, _dir) = make_manager();
+        let key_a = SessionKey::with_instance("lark", "alpha", "group:oc_1");
+        let key_b = SessionKey::with_instance("lark", "beta", "group:oc_1");
+
+        let id_a = mgr.get_or_create(&key_a).await.unwrap();
+        let id_b = mgr.get_or_create(&key_b).await.unwrap();
+
+        assert_eq!(id_a, id_b);
+    }
+
+    #[tokio::test]
+    async fn dm_instances_do_not_share_session_record() {
+        let (mgr, _dir) = make_manager();
+        let key_a = SessionKey::with_instance("lark", "alpha", "user:ou_1");
+        let key_b = SessionKey::with_instance("lark", "beta", "user:ou_1");
+
+        let id_a = mgr.get_or_create(&key_a).await.unwrap();
+        let id_b = mgr.get_or_create(&key_b).await.unwrap();
+
+        assert_ne!(id_a, id_b);
     }
 }

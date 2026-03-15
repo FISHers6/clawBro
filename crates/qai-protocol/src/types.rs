@@ -42,6 +42,8 @@ pub struct InboundMsg {
 pub struct SessionKey {
     pub channel: String,
     pub scope: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_instance: Option<String>,
 }
 
 impl SessionKey {
@@ -49,6 +51,19 @@ impl SessionKey {
         Self {
             channel: channel.into(),
             scope: scope.into(),
+            channel_instance: None,
+        }
+    }
+
+    pub fn with_instance(
+        channel: impl Into<String>,
+        channel_instance: impl Into<String>,
+        scope: impl Into<String>,
+    ) -> Self {
+        Self {
+            channel: channel.into(),
+            scope: scope.into(),
+            channel_instance: Some(channel_instance.into()),
         }
     }
 }
@@ -101,6 +116,15 @@ mod tests {
         let k1 = SessionKey::new("dingtalk", "user_123");
         let k2 = SessionKey::new("dingtalk", "user_123");
         assert_eq!(k1, k2);
+    }
+
+    #[test]
+    fn test_session_key_legacy_json_defaults_channel_instance() {
+        let json = r#"{"channel":"lark","scope":"user:ou_1"}"#;
+        let key: SessionKey = serde_json::from_str(json).unwrap();
+        assert_eq!(key.channel, "lark");
+        assert_eq!(key.scope, "user:ou_1");
+        assert_eq!(key.channel_instance, None);
     }
 
     #[test]

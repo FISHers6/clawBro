@@ -410,8 +410,12 @@ mod tests {
         std::fs::write(persona_dir.path().join("IDENTITY.md"), "IDENTITY layer").unwrap();
         std::fs::create_dir_all(persona_dir.path().join("memory")).unwrap();
         let session_key = SessionKey::new("lark", "group:test");
+        let scope_key = qai_protocol::render_scope_storage_key(&session_key);
         std::fs::write(
-            persona_dir.path().join("memory").join("lark_group:test.md"),
+            persona_dir
+                .path()
+                .join("memory")
+                .join(format!("{scope_key}.md")),
             "scoped memory layer",
         )
         .unwrap();
@@ -446,8 +450,12 @@ mod tests {
         std::fs::write(persona_dir.path().join("IDENTITY.md"), "IDENTITY layer").unwrap();
         std::fs::create_dir_all(persona_dir.path().join("memory")).unwrap();
         let session_key = SessionKey::new("lark", "group:test");
+        let scope_key = qai_protocol::render_scope_storage_key(&session_key);
         std::fs::write(
-            persona_dir.path().join("memory").join("lark_group:test.md"),
+            persona_dir
+                .path()
+                .join("memory")
+                .join(format!("{scope_key}.md")),
             "scoped memory layer",
         )
         .unwrap();

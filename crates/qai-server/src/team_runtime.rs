@@ -1,20 +1,39 @@
+use crate::channel_registry::ChannelRegistry;
 use crate::config::{GatewayConfig, InteractionMode};
+use crate::delivery_resolver::resolve_delivery;
 use anyhow::Result;
 use qai_agent::team::completion_routing::{RoutingDeliveryStatus, TeamRoutingEnvelope};
 use qai_agent::team::milestone::TeamMilestoneEvent;
 use qai_agent::team::milestone_delivery::{milestone_dedupe_key, milestone_is_public};
 use qai_agent::team::session::{ChannelSendSourceKind, ChannelSendStatus};
-use qai_agent::SessionRegistry;
+use qai_agent::{SessionRegistry, TurnExecutionContext};
 use qai_protocol::{InboundMsg, MsgContent, MsgSource, SessionKey};
-use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+fn default_channel_instance_for_scope(
+    cfg: &GatewayConfig,
+    channel_name: &str,
+    scope: &str,
+) -> Option<String> {
+    if !scope.starts_with("user:") {
+        return None;
+    }
+    match channel_name {
+        "lark" => cfg
+            .channels
+            .lark
+            .as_ref()
+            .map(|lark| lark.default_instance_id().to_string()),
+        _ => None,
+    }
+}
+
 pub async fn wire_team_runtime(
     registry: Arc<SessionRegistry>,
     cfg: &GatewayConfig,
-    channel_map: Arc<HashMap<String, Arc<dyn qai_channels::Channel>>>,
+    channel_map: Arc<ChannelRegistry>,
     heartbeat_interval: Duration,
 ) -> Result<()> {
     use qai_agent::team::{
@@ -22,12 +41,13 @@ pub async fn wire_team_runtime(
         heartbeat::DispatchFn,
         orchestrator::TeamOrchestrator,
         registry::TaskRegistry,
-        session::{stable_team_id, TeamSession},
+        session::{stable_team_id_for_session_key, TeamSession},
     };
 
     let (team_notify_tx, mut team_notify_rx) = mpsc::channel::<TeamNotifyRequest>(256);
     let team_notify_tx_for_orch = team_notify_tx.clone();
     let team_scopes = cfg.normalized_team_scopes();
+    let cfg_for_delivery = Arc::new(cfg.clone());
     tracing::info!(
         count = team_scopes.len(),
         "wire_team_runtime: team scopes found"
@@ -56,7 +76,14 @@ pub async fn wire_team_runtime(
         } else {
             "ws".to_string()
         };
-        let team_id = stable_team_id(&channel_name, &team_scope.scope);
+        let lead_channel_instance =
+            default_channel_instance_for_scope(cfg, &channel_name, &team_scope.scope);
+        let lead_key = qai_protocol::SessionKey {
+            channel: channel_name.clone(),
+            channel_instance: lead_channel_instance.clone(),
+            scope: team_scope.scope.clone(),
+        };
+        let team_id = stable_team_id_for_session_key(&lead_key);
         let session = match TeamSession::new(&team_scope.scope, &team_id) {
             Ok(s) => Arc::new(s),
             Err(e) => {
@@ -72,10 +99,6 @@ pub async fn wire_team_runtime(
                 continue;
             }
         };
-
-        // ── Compute lead_key before dispatch_fn so it can be captured ────────────
-        let lead_key = qai_protocol::SessionKey::new(&channel_name, &team_scope.scope);
-
         let registry_for_dispatch = Arc::clone(&registry);
         let task_reg_for_dispatch = Arc::clone(&task_registry);
         let team_session_for_dispatch = Arc::clone(&session);
@@ -83,6 +106,8 @@ pub async fn wire_team_runtime(
         let team_orch_for_dispatch: Arc<OnceLock<Arc<TeamOrchestrator>>> =
             Arc::new(OnceLock::new());
         let team_orch_for_dispatch_in_closure = Arc::clone(&team_orch_for_dispatch);
+        let team_orch_for_milestone: Arc<OnceLock<Arc<TeamOrchestrator>>> =
+            Arc::new(OnceLock::new());
         let dispatch_fn: DispatchFn = Arc::new(move |agent: String, task| {
             let registry = Arc::clone(&registry_for_dispatch);
             let task_reg = Arc::clone(&task_reg_for_dispatch);
@@ -96,7 +121,13 @@ pub async fn wire_team_runtime(
                 registry.set_task_reminder(specialist_key.clone(), reminder);
                 let dispatch_started_at = chrono::Utc::now();
                 if let Some(team_orch) = team_orch_cell.get() {
-                    team_orch.record_dispatch_start(&task.id, &agent, requester_key.clone(), None);
+                    team_orch.record_dispatch_start(
+                        &task.id,
+                        &agent,
+                        requester_key.clone(),
+                        None,
+                        team_orch.lead_delivery_source(),
+                    );
                 }
                 let msg = qai_protocol::InboundMsg {
                     id: uuid::Uuid::new_v4().to_string(),
@@ -111,7 +142,9 @@ pub async fn wire_team_runtime(
                     target_agent: Some(format!("@{}", agent)),
                     source: qai_protocol::MsgSource::Heartbeat,
                 };
-                let result = registry.handle(msg).await;
+                let result = registry
+                    .handle_with_context(msg, TurnExecutionContext::default())
+                    .await;
                 let reply_excerpt = result.as_ref().ok().and_then(|reply| {
                     reply
                         .as_ref()
@@ -158,11 +191,14 @@ pub async fn wire_team_runtime(
             heartbeat_interval,
         );
         let _ = team_orch_for_dispatch.set(Arc::clone(&team_orch));
+        let _ = team_orch_for_milestone.set(Arc::clone(&team_orch));
 
         let channels_for_notify = Arc::clone(&channel_map);
         let session_for_notify = Arc::clone(&session);
         let public_updates_mode = team_scope.team.public_updates;
         let lead_agent_name_for_notify = team_scope.mode.front_bot.clone();
+        let cfg_for_milestone = Arc::clone(&cfg_for_delivery);
+        let team_orch_for_milestone_in_closure = Arc::clone(&team_orch_for_milestone);
         team_orch.set_milestone_fn(Arc::new(move |scope: qai_protocol::SessionKey, event| {
             use qai_agent::team::milestone::render_for_im;
             if !milestone_is_public(&event, public_updates_mode) {
@@ -201,44 +237,76 @@ pub async fn wire_team_runtime(
             let session_for_record = Arc::clone(&session_for_notify);
             let lead_agent_name = lead_agent_name_for_notify.clone();
             let dedupe_key_for_record = milestone_dedupe_key(&event);
+            let cfg = Arc::clone(&cfg_for_milestone);
+            let team_orch_cell = Arc::clone(&team_orch_for_milestone_in_closure);
             tokio::spawn(async move {
-                if let Some(ch) = channels.get(&scope.channel) {
-                    let outbound = qai_protocol::OutboundMsg {
-                        session_key: scope.clone(),
-                        content: qai_protocol::MsgContent::text(msg),
-                        reply_to: None,
-                        thread_ts: None,
+                let stored_source = team_orch_cell
+                    .get()
+                    .and_then(|team_orch| team_orch.lead_delivery_source());
+                let (source_kind, source_agent) =
+                    milestone_channel_origin(&event, lead_agent_name.as_deref());
+                let resolved = resolve_delivery(
+                    cfg.as_ref(),
+                    channels.as_ref(),
+                    milestone_delivery_purpose(&event),
+                    &scope,
+                    None,
+                    stored_source.as_ref(),
+                    Some(&source_agent),
+                    None,
+                    None,
+                );
+                let (outbound, send_result, sender_channel_instance) =
+                    if let Some(resolved) = resolved {
+                        let sender_channel_instance = resolved.sender_channel_instance.clone();
+                        let outbound = resolved.outbound_text(&msg);
+                        let send_result = resolved.sender.send(&outbound).await;
+                        (outbound, send_result, sender_channel_instance)
+                    } else if let Some(ch) = channels.resolve_for_session(&scope) {
+                        let outbound = qai_protocol::OutboundMsg {
+                            session_key: scope.clone(),
+                            content: qai_protocol::MsgContent::text(msg),
+                            reply_to: stored_source
+                                .as_ref()
+                                .and_then(|source| source.reply_to.clone()),
+                            thread_ts: stored_source
+                                .as_ref()
+                                .and_then(|source| source.thread_ts.clone()),
+                        };
+                        let send_result = ch.send(&outbound).await;
+                        (outbound, send_result, None)
+                    } else {
+                        return;
                     };
-                    let send_result = ch.send(&outbound).await;
-                    if let Err(e) = &send_result {
-                        tracing::error!("Milestone notify send error: {e}");
-                    }
-                    let (source_kind, source_agent) =
-                        milestone_channel_origin(&event, lead_agent_name.as_deref());
-                    let (status, error) = match send_result {
-                        Ok(()) => (ChannelSendStatus::Sent, None),
-                        Err(err) => (ChannelSendStatus::SendFailed, Some(err.to_string())),
-                    };
-                    if let Err(err) = session_for_record.record_channel_send(
-                        &scope.channel,
-                        &scope.scope,
-                        None,
-                        None,
-                        None,
-                        source_kind,
-                        &source_agent,
-                        milestone_task_id(&event),
-                        dedupe_key_for_record.as_deref(),
-                        outbound.content.as_text().unwrap_or_default(),
-                        status,
-                        error.as_deref(),
-                    ) {
-                        tracing::warn!(
-                            team_id = %session_for_record.team_id,
-                            error = %err,
-                            "Failed to append milestone channel send ledger entry"
-                        );
-                    }
+                if let Err(e) = &send_result {
+                    tracing::error!("Milestone notify send error: {e}");
+                }
+                let (status, error) = match send_result {
+                    Ok(()) => (ChannelSendStatus::Sent, None),
+                    Err(err) => (ChannelSendStatus::SendFailed, Some(err.to_string())),
+                };
+                if let Err(err) = session_for_record.record_channel_send(
+                    &outbound.session_key.channel,
+                    sender_channel_instance.as_deref(),
+                    outbound.session_key.channel_instance.as_deref(),
+                    &outbound.session_key.scope,
+                    None,
+                    stored_source.as_ref(),
+                    outbound.reply_to.as_deref(),
+                    outbound.thread_ts.as_deref(),
+                    source_kind,
+                    &source_agent,
+                    milestone_task_id(&event),
+                    dedupe_key_for_record.as_deref(),
+                    outbound.content.as_text().unwrap_or_default(),
+                    status,
+                    error.as_deref(),
+                ) {
+                    tracing::warn!(
+                        team_id = %session_for_record.team_id,
+                        error = %err,
+                        "Failed to append milestone channel send ledger entry"
+                    );
                 }
             });
         }));
@@ -323,8 +391,19 @@ pub async fn wire_team_runtime(
                     .enumerate()
                 {
                     let busy = registry_for_notify.is_session_busy(&target);
-                    let inbound = team_notify_inbound(&target, &text);
-                    match registry_for_notify.handle(inbound).await {
+                    let turn_ctx = team_notify_turn_context(&request.envelope, &target);
+                    let inbound = team_notify_inbound(
+                        &target,
+                        &text,
+                        turn_ctx
+                            .delivery_source
+                            .as_ref()
+                            .and_then(|source| source.thread_ts.clone()),
+                    );
+                    match registry_for_notify
+                        .handle_with_context(inbound, turn_ctx)
+                        .await
+                    {
                         Ok(Some(_)) | Ok(None) => {
                             delivered = Some(request.envelope.clone().with_delivery_status(
                                 delivery_status_for_attempt(attempt_index, busy),
@@ -386,14 +465,19 @@ fn milestone_channel_origin(
         | TeamMilestoneEvent::TaskDone { agent, .. } => {
             (ChannelSendSourceKind::Milestone, agent.clone())
         }
-        TeamMilestoneEvent::TaskFailed { agent, .. }
-        => {
+        TeamMilestoneEvent::TaskFailed { agent, .. } => {
             (ChannelSendSourceKind::Milestone, agent.clone())
         }
-        TeamMilestoneEvent::TasksUnlocked { .. }
-        | TeamMilestoneEvent::AllTasksDone => {
+        TeamMilestoneEvent::TasksUnlocked { .. } | TeamMilestoneEvent::AllTasksDone => {
             (ChannelSendSourceKind::Milestone, "team-runtime".to_string())
         }
+    }
+}
+
+fn milestone_delivery_purpose(event: &TeamMilestoneEvent) -> crate::config::DeliveryPurposeConfig {
+    match event {
+        TeamMilestoneEvent::LeadMessage { .. } => crate::config::DeliveryPurposeConfig::LeadMessage,
+        _ => crate::config::DeliveryPurposeConfig::Milestone,
     }
 }
 
@@ -442,7 +526,7 @@ fn delivery_status_for_attempt(attempt_index: usize, busy: bool) -> RoutingDeliv
     }
 }
 
-fn team_notify_inbound(target: &SessionKey, text: &str) -> InboundMsg {
+fn team_notify_inbound(target: &SessionKey, text: &str, thread_ts: Option<String>) -> InboundMsg {
     InboundMsg {
         id: uuid::Uuid::new_v4().to_string(),
         session_key: target.clone(),
@@ -450,18 +534,32 @@ fn team_notify_inbound(target: &SessionKey, text: &str) -> InboundMsg {
         sender: "gateway".to_string(),
         channel: target.channel.clone(),
         timestamp: chrono::Utc::now(),
-        thread_ts: None,
+        thread_ts,
         target_agent: None,
         source: MsgSource::TeamNotify,
     }
 }
 
+fn team_notify_turn_context(
+    envelope: &TeamRoutingEnvelope,
+    target: &SessionKey,
+) -> TurnExecutionContext {
+    let delivery_source = envelope
+        .delivery_source
+        .as_ref()
+        .filter(|source| source.session_key() == *target)
+        .cloned();
+    TurnExecutionContext { delivery_source }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{ChannelsSection, GatewayConfig, LarkSection, ProgressPresentationMode};
     use qai_agent::team::completion_routing::{RoutingDeliveryStatus, TeamRoutingEvent};
     use qai_agent::team::milestone::TeamMilestoneEvent;
     use qai_agent::team::milestone_delivery::{milestone_is_public, TeamPublicUpdatesMode};
+    use qai_agent::team::session::stable_team_id_for_session_key;
 
     #[test]
     fn routing_attempt_targets_dedupes_requester_and_fallbacks() {
@@ -475,6 +573,7 @@ mod tests {
             team_id: "team-1".into(),
             delivery_status: RoutingDeliveryStatus::NotRouted,
             event: TeamRoutingEvent::failed("T001", "boom"),
+            delivery_source: None,
         };
 
         let targets = routing_attempt_targets(&envelope);
@@ -492,6 +591,7 @@ mod tests {
             team_id: "team-1".into(),
             delivery_status: RoutingDeliveryStatus::NotRouted,
             event: TeamRoutingEvent::failed("T001", "boom"),
+            delivery_source: None,
         };
 
         let targets = routing_attempt_targets(&envelope);
@@ -548,5 +648,54 @@ mod tests {
             },
             TeamPublicUpdatesMode::Normal
         ));
+    }
+
+    #[test]
+    fn dm_team_identity_uses_default_lark_instance() {
+        let cfg = GatewayConfig {
+            channels: ChannelsSection {
+                lark: Some(LarkSection {
+                    enabled: true,
+                    presentation: ProgressPresentationMode::FinalOnly,
+                    trigger_policy: None,
+                    default_instance: Some("default".into()),
+                    instances: vec![],
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let lead_instance =
+            default_channel_instance_for_scope(&cfg, "lark", "user:ou_test").expect("instance");
+        let registered = SessionKey::with_instance("lark", &lead_instance, "user:ou_test");
+        let inbound = SessionKey::with_instance("lark", "default", "user:ou_test");
+
+        assert_eq!(
+            stable_team_id_for_session_key(&registered),
+            stable_team_id_for_session_key(&inbound)
+        );
+    }
+
+    #[test]
+    fn group_team_identity_does_not_force_default_lark_instance() {
+        let cfg = GatewayConfig {
+            channels: ChannelsSection {
+                lark: Some(LarkSection {
+                    enabled: true,
+                    presentation: ProgressPresentationMode::FinalOnly,
+                    trigger_policy: None,
+                    default_instance: Some("default".into()),
+                    instances: vec![],
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert_eq!(
+            default_channel_instance_for_scope(&cfg, "lark", "group:oc_test"),
+            None
+        );
     }
 }

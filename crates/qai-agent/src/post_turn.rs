@@ -3,7 +3,7 @@ use crate::relay::RelayEngine;
 use crate::routing::RosterMatchData;
 use dashmap::DashMap;
 use qai_channels::mention_trigger::MentionTrigger;
-use qai_protocol::{InboundMsg, MsgSource, SessionKey};
+use qai_protocol::{normalize_conversation_identity, InboundMsg, MsgSource, SessionKey};
 use qai_session::{SessionStorage, StoredMessage};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -126,9 +126,10 @@ pub(crate) async fn process_post_turn(
             .await?;
     }
 
-    processor
-        .last_activity
-        .insert(input.session_key.clone(), std::time::Instant::now());
+    processor.last_activity.insert(
+        normalize_conversation_identity(input.session_key),
+        std::time::Instant::now(),
+    );
 
     if let (Some(ms), Some(persona_dir)) = (processor.memory_system, input.persona_dir) {
         let agent_name = input
@@ -146,7 +147,10 @@ pub(crate) async fn process_post_turn(
             store.append_daily_log(&pd, &sk, &log_entry).await.ok();
         });
 
-        let count_key = (input.session_key.clone(), agent_name.clone());
+        let count_key = (
+            normalize_conversation_identity(input.session_key),
+            agent_name.clone(),
+        );
         let new_count = {
             let mut count = processor.turn_counts.entry(count_key).or_insert(0);
             *count += 1;

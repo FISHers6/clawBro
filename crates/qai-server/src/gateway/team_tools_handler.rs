@@ -97,7 +97,10 @@ mod tests {
         let lead_key = qai_protocol::SessionKey::new("lark", "group:server");
         orch.set_lead_session_key(lead_key.clone());
         orch.set_scope(lead_key.clone());
-        registry.register_team_orchestrator("server-team".to_string(), Arc::clone(&orch));
+        registry.register_team_orchestrator(
+            qai_agent::team::session::stable_team_id_for_session_key(&lead_key),
+            Arc::clone(&orch),
+        );
 
         let state = AppState {
             registry: Arc::clone(&registry),

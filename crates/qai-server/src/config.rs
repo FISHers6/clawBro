@@ -111,6 +111,10 @@ pub struct GatewayConfig {
     /// Deterministic routing bindings (`[[binding]]`).
     #[serde(default, rename = "binding")]
     pub bindings: Vec<BindingConfig>,
+    #[serde(default, rename = "delivery_sender_binding")]
+    pub delivery_sender_bindings: Vec<DeliverySenderBindingConfig>,
+    #[serde(default, rename = "delivery_target_override")]
+    pub delivery_target_overrides: Vec<DeliveryTargetOverrideConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -410,6 +414,28 @@ impl GatewayConfig {
                     "binding references agent `{}` which is not present in [[agent_roster]]",
                     agent_name
                 );
+            }
+        }
+
+        for binding in &self.delivery_sender_bindings {
+            if let Some(agent_name) = binding.agent.as_deref() {
+                if !roster_names.contains(agent_name) {
+                    anyhow::bail!(
+                        "delivery_sender_binding references agent `{}` which is not present in [[agent_roster]]",
+                        agent_name
+                    );
+                }
+            }
+        }
+
+        for override_cfg in &self.delivery_target_overrides {
+            if let Some(agent_name) = override_cfg.agent.as_deref() {
+                if !roster_names.contains(agent_name) {
+                    anyhow::bail!(
+                        "delivery_target_override references agent `{}` which is not present in [[agent_roster]]",
+                        agent_name
+                    );
+                }
             }
         }
 
@@ -740,6 +766,19 @@ pub struct LarkSection {
     pub presentation: ProgressPresentationMode,
     #[serde(default)]
     pub trigger_policy: Option<LarkTriggerPolicyConfig>,
+    #[serde(default)]
+    pub default_instance: Option<String>,
+    #[serde(default)]
+    pub instances: Vec<LarkInstanceConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LarkInstanceConfig {
+    pub id: String,
+    pub app_id: String,
+    pub app_secret: String,
+    #[serde(default)]
+    pub bot_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -765,6 +804,10 @@ pub struct LarkTriggerPolicyConfig {
 }
 
 impl LarkSection {
+    pub fn default_instance_id(&self) -> &str {
+        self.default_instance.as_deref().unwrap_or("default")
+    }
+
     pub fn resolved_trigger_policy(
         &self,
         gateway: &GatewaySection,
@@ -982,6 +1025,11 @@ pub enum BindingConfig {
         agent: String,
         team_id: String,
     },
+    ChannelInstance {
+        agent: String,
+        channel: String,
+        channel_instance: String,
+    },
     Channel {
         agent: String,
         channel: String,
@@ -991,6 +1039,43 @@ pub enum BindingConfig {
     },
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryPurposeConfig {
+    LeadFinal,
+    LeadMessage,
+    Milestone,
+    Approval,
+    BotMention,
+    Cron,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeliverySenderBindingConfig {
+    pub purpose: DeliveryPurposeConfig,
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub channel: Option<String>,
+    pub channel_instance: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeliveryTargetOverrideConfig {
+    pub purpose: DeliveryPurposeConfig,
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub channel: Option<String>,
+    #[serde(default)]
+    pub channel_instance: Option<String>,
+    pub scope: String,
+    #[serde(default)]
+    pub reply_to: Option<String>,
+    #[serde(default)]
+    pub thread_ts: Option<String>,
+}
+
 impl BindingConfig {
     pub fn agent_name(&self) -> &str {
         match self {
@@ -998,6 +1083,7 @@ impl BindingConfig {
             | Self::Scope { agent, .. }
             | Self::Peer { agent, .. }
             | Self::Team { agent, .. }
+            | Self::ChannelInstance { agent, .. }
             | Self::Channel { agent, .. }
             | Self::Default { agent } => agent,
         }
@@ -1038,6 +1124,15 @@ impl BindingConfig {
             },
             Self::Team { agent, team_id } => BindingRule::Team {
                 team_id: team_id.clone(),
+                agent_name: agent.clone(),
+            },
+            Self::ChannelInstance {
+                agent,
+                channel,
+                channel_instance,
+            } => BindingRule::ChannelInstance {
+                channel: channel.clone(),
+                channel_instance: channel_instance.clone(),
                 agent_name: agent.clone(),
             },
             Self::Channel { agent, channel } => BindingRule::Channel {
@@ -1658,6 +1753,81 @@ mode = "all_messages"
     }
 
     #[test]
+    fn lark_config_parses_default_instance_and_instances() {
+        let toml = r#"
+[channels.lark]
+enabled = true
+default_instance = "beta"
+
+[[channels.lark.instances]]
+id = "alpha"
+app_id = "app-alpha"
+app_secret = "secret-alpha"
+
+[[channels.lark.instances]]
+id = "beta"
+app_id = "app-beta"
+app_secret = "secret-beta"
+bot_name = "beta-bot"
+"#;
+        let cfg: GatewayConfig = toml::from_str(toml).unwrap();
+        let lark = cfg.channels.lark.unwrap();
+        assert_eq!(lark.default_instance_id(), "beta");
+        assert_eq!(lark.instances.len(), 2);
+        assert_eq!(lark.instances[0].id, "alpha");
+        assert_eq!(lark.instances[1].bot_name.as_deref(), Some("beta-bot"));
+    }
+
+    #[test]
+    fn lark_config_defaults_to_default_instance_when_not_configured() {
+        let toml = r#"
+[channels.lark]
+enabled = true
+"#;
+        let cfg: GatewayConfig = toml::from_str(toml).unwrap();
+        let lark = cfg.channels.lark.unwrap();
+        assert_eq!(lark.default_instance_id(), "default");
+        assert!(lark.instances.is_empty());
+    }
+
+    #[test]
+    fn lark_legacy_config_without_instances_still_parses() {
+        let toml = r#"
+[channels.lark]
+enabled = true
+presentation = "progress_compact"
+"#;
+        let cfg: GatewayConfig = toml::from_str(toml).unwrap();
+        let lark = cfg.channels.lark.unwrap();
+        assert!(lark.instances.is_empty());
+        assert_eq!(lark.presentation, ProgressPresentationMode::ProgressCompact);
+    }
+
+    #[test]
+    fn delivery_configs_deserialize() {
+        let toml = r#"
+[[delivery_sender_binding]]
+purpose = "milestone"
+agent = "beta"
+channel = "lark"
+channel_instance = "beta-main"
+
+[[delivery_target_override]]
+purpose = "approval"
+channel = "lark"
+scope = "user:ou_owner"
+"#;
+        let cfg: GatewayConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.delivery_sender_bindings.len(), 1);
+        assert_eq!(cfg.delivery_target_overrides.len(), 1);
+        assert_eq!(
+            cfg.delivery_sender_bindings[0].purpose,
+            DeliveryPurposeConfig::Milestone
+        );
+        assert_eq!(cfg.delivery_target_overrides[0].scope, "user:ou_owner");
+    }
+
+    #[test]
     fn test_group_config_deserializes() {
         let toml_str = r#"
 [[group]]
@@ -2106,16 +2276,26 @@ peer_kind = "user"
 peer_id = "ou_123"
 
 [[binding]]
+kind = "channel_instance"
+agent = "planner"
+channel = "lark"
+channel_instance = "beta"
+
+[[binding]]
 kind = "default"
 agent = "claude"
 "#,
         )
         .unwrap();
 
-        assert_eq!(cfg.bindings.len(), 3);
+        assert_eq!(cfg.bindings.len(), 4);
         assert!(matches!(cfg.bindings[0], BindingConfig::Thread { .. }));
         assert!(matches!(cfg.bindings[1], BindingConfig::Peer { .. }));
-        assert!(matches!(cfg.bindings[2], BindingConfig::Default { .. }));
+        assert!(matches!(
+            cfg.bindings[2],
+            BindingConfig::ChannelInstance { .. }
+        ));
+        assert!(matches!(cfg.bindings[3], BindingConfig::Default { .. }));
     }
 
     #[test]

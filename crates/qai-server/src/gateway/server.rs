@@ -125,6 +125,8 @@ mod tests {
                     enabled: true,
                     presentation: config::ProgressPresentationMode::FinalOnly,
                     trigger_policy: None,
+                    default_instance: None,
+                    instances: vec![],
                 }),
                 dingtalk: Some(config::DingTalkSection {
                     enabled: false,

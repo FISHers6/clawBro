@@ -20,11 +20,14 @@ use crate::slash_service::{execute_slash_request, SlashRequest};
 use crate::team::orchestrator::TeamOrchestrator;
 use crate::team::orchestrator::TeamRuntimeSummary;
 use crate::team::tool_executor::{execute_team_tool_call, resolve_team_tool_role};
+use crate::turn_context::{TurnDeliverySource, TurnExecutionContext};
 use crate::ApprovalResolver;
 use anyhow::Result;
 use dashmap::DashMap;
 use qai_channels::mention_trigger::MentionTrigger;
-use qai_protocol::{AgentEvent, InboundMsg, SessionKey};
+use qai_protocol::{
+    normalize_conversation_identity, parse_session_key_text, AgentEvent, InboundMsg, SessionKey,
+};
 use qai_runtime::contract::{TeamCallback, TurnResult};
 use qai_runtime::{RuntimeEvent, TeamToolCall, TeamToolResponse};
 use qai_session::{SessionManager, SessionMeta, StoredMessage};
@@ -36,6 +39,10 @@ use uuid::Uuid;
 pub struct Session {
     pub key: SessionKey,
     pub backend_id: Option<String>,
+}
+
+fn normalized_session_key(session_key: &SessionKey) -> SessionKey {
+    normalize_conversation_identity(session_key)
 }
 
 #[derive(Clone, Copy)]
@@ -98,14 +105,15 @@ impl<'a> MemoryControlContext<'a> {
         session_key: &SessionKey,
         now: std::time::Instant,
     ) -> bool {
+        let normalized = normalized_session_key(session_key);
         let confirmed = self
             .registry
             .pending_resets
-            .get(session_key)
+            .get(&normalized)
             .map(|t| now.duration_since(*t).as_secs() < 60)
             .unwrap_or(false);
         if confirmed {
-            self.registry.pending_resets.remove(session_key);
+            self.registry.pending_resets.remove(&normalized);
         }
         confirmed
     }
@@ -113,7 +121,7 @@ impl<'a> MemoryControlContext<'a> {
     pub(crate) fn arm_pending_reset(self, session_key: &SessionKey, now: std::time::Instant) {
         self.registry
             .pending_resets
-            .insert(session_key.clone(), now);
+            .insert(normalized_session_key(session_key), now);
     }
 }
 
@@ -191,7 +199,9 @@ impl<'a> SlashControlContext<'a> {
     }
 
     pub(crate) fn set_session_workspace(self, key: &SessionKey, path: std::path::PathBuf) {
-        self.registry.session_workspaces.insert(key.clone(), path);
+        self.registry
+            .session_workspaces
+            .insert(normalized_session_key(key), path);
     }
 
     /// Clear team workspace for /clear: stop heartbeat, wipe tasks + jsonl files, reset state.
@@ -412,7 +422,8 @@ impl SessionRegistry {
 
     /// Pre-register a task_reminder for a Specialist session (called by DispatchFn before handle()).
     pub fn set_task_reminder(&self, key: SessionKey, reminder: String) {
-        self.team_task_reminders.insert(key, reminder);
+        self.team_task_reminders
+            .insert(normalized_session_key(&key), reminder);
     }
 
     /// Register a TeamOrchestrator for a given team_id.
@@ -476,12 +487,11 @@ impl SessionRegistry {
             );
             return false;
         };
-        if orch.lead_session_key.get() != Some(session_key) {
+        if session_key.channel == "specialist" {
             tracing::info!(
                 channel = %session_key.channel,
                 scope = %session_key.scope,
-                lead_key = ?orch.lead_session_key.get(),
-                "suppress_check: session_key != lead_session_key"
+                "suppress_check: specialist session is never a lead stream"
             );
             return false;
         }
@@ -503,7 +513,7 @@ impl SessionRegistry {
         let Some(orch) = self.get_orchestrator_for_session(session_key) else {
             return false;
         };
-        if orch.lead_session_key.get() != Some(session_key) {
+        if session_key.channel == "specialist" {
             return false;
         }
         matches!(
@@ -531,18 +541,19 @@ impl SessionRegistry {
 
     pub fn is_session_busy(&self, key: &SessionKey) -> bool {
         self.session_semaphores
-            .get(key)
+            .get(&normalized_session_key(key))
             .map(|sem| sem.available_permits() == 0)
             .unwrap_or(false)
     }
 
     /// Get-or-create per-session cached backend selection (used when no roster match)
     pub fn get_or_create_session(&self, key: &SessionKey) -> Arc<Session> {
+        let normalized = normalized_session_key(key);
         self.sessions
-            .entry(key.clone())
+            .entry(normalized.clone())
             .or_insert_with(|| {
                 Arc::new(Session {
-                    key: key.clone(),
+                    key: normalized,
                     backend_id: self.default_backend_id.clone(),
                 })
             })
@@ -551,16 +562,19 @@ impl SessionRegistry {
 
     /// Override runtime backend for a session (/backend slash command)
     pub fn set_session_backend(&self, key: &SessionKey, backend_id: impl Into<String>) {
+        let normalized = normalized_session_key(key);
         let session = Arc::new(Session {
-            key: key.clone(),
+            key: normalized.clone(),
             backend_id: Some(backend_id.into()),
         });
-        self.sessions.insert(key.clone(), session);
+        self.sessions.insert(normalized, session);
     }
 
     /// Get per-session workspace override (set via /workspace command).
     pub fn session_workspace(&self, key: &SessionKey) -> Option<std::path::PathBuf> {
-        self.session_workspaces.get(key).map(|v| v.clone())
+        self.session_workspaces
+            .get(&normalized_session_key(key))
+            .map(|v| v.clone())
     }
     /// All session scopes that have had activity (used by nightly consolidation scheduler).
     pub fn all_active_scopes(&self) -> Vec<SessionKey> {
@@ -574,13 +588,14 @@ impl SessionRegistry {
         // session_key may be in "channel:scope" format or just a plain scope string.
         // Parse into a SessionKey with a single lookup: "channel:scope" splits on the first ':',
         // bare strings are treated as scope under a synthetic "cron" channel.
-        let key_parsed = if let Some(pos) = session_key.find(':') {
-            SessionKey::new(&session_key[..pos], &session_key[pos + 1..])
+        let key_parsed = if session_key.contains(':') {
+            parse_session_key_text(session_key)
+                .unwrap_or_else(|_| SessionKey::new("cron", session_key))
         } else {
             SessionKey::new("cron", session_key)
         };
         self.last_activity
-            .get(&key_parsed)
+            .get(&normalized_session_key(&key_parsed))
             .map(|t| t.elapsed().as_secs())
     }
 
@@ -752,6 +767,15 @@ impl SessionRegistry {
 
     /// Process one inbound message. Generic: works for any channel.
     pub async fn handle(&self, inbound: InboundMsg) -> Result<Option<String>> {
+        self.handle_with_context(inbound, TurnExecutionContext::default())
+            .await
+    }
+
+    pub async fn handle_with_context(
+        &self,
+        inbound: InboundMsg,
+        turn_ctx: TurnExecutionContext,
+    ) -> Result<Option<String>> {
         // Idempotent dedup
         if !self.dedup.check_and_insert(&inbound.id) {
             tracing::debug!("Dedup: skipping duplicate msg {}", inbound.id);
@@ -759,6 +783,7 @@ impl SessionRegistry {
         }
 
         let session_key = inbound.session_key.clone();
+        let normalized_session_key = normalized_session_key(&session_key);
         let user_text = inbound.content.as_text().unwrap_or("").to_string();
 
         // Slash commands are control-plane actions and must not wait behind the
@@ -777,7 +802,7 @@ impl SessionRegistry {
         let _session_permit = {
             let sem = self
                 .session_semaphores
-                .entry(session_key.clone())
+                .entry(normalized_session_key.clone())
                 .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(1)))
                 .clone();
             sem.acquire_owned()
@@ -796,8 +821,8 @@ impl SessionRegistry {
         if inbound.source == qai_protocol::MsgSource::Human {
             if let Some(team_orch) = session_team_orch.as_ref() {
                 if team_orch.team_state() == crate::team::orchestrator::TeamState::AwaitingConfirm {
-                    if let Some(lead_key) = team_orch.lead_session_key.get() {
-                        if &session_key == lead_key {
+                    if let Some(lead_key) = team_orch.lead_session_key() {
+                        if session_key == lead_key {
                             let text_lower = user_text.to_lowercase();
                             let confirmed = ["yes", "是", "确认", "ok", "好的", "开始"]
                                 .iter()
@@ -829,7 +854,7 @@ impl SessionRegistry {
 
         let specialist_task_reminder = self
             .team_task_reminders
-            .get(&session_key)
+            .get(&normalized_session_key)
             .map(|v| v.clone());
         let session_backend_id = self.get_or_create_session(&session_key).backend_id.clone();
         let bindings = self.bindings.read().unwrap().clone();
@@ -843,7 +868,12 @@ impl SessionRegistry {
             specialist_task_reminder,
         );
         if !routing.is_lead {
-            self.team_task_reminders.remove(&session_key);
+            self.team_task_reminders.remove(&normalized_session_key);
+        }
+        if inbound.source == qai_protocol::MsgSource::Human && routing.is_lead {
+            if let Some(team_orchestrator) = routing.team_orchestrator.as_ref() {
+                team_orchestrator.reopen_for_new_planning_cycle_if_done();
+            }
         }
         tracing::debug!(
             session = ?routing.intent.session_key,
@@ -852,6 +882,18 @@ impl SessionRegistry {
             target_backend = ?routing.intent.target_backend,
             "built turn intent"
         );
+
+        self.refresh_team_delivery_context(
+            routing.team_orchestrator.as_ref(),
+            routing.is_lead,
+            &session_key,
+            turn_ctx.delivery_source.as_ref(),
+        );
+        if routing.is_lead {
+            if let Some(team_orchestrator) = routing.team_orchestrator.as_ref() {
+                team_orchestrator.clear_pending_lead_fragments();
+            }
+        }
 
         // Get-or-create persistent session record
         let session_id = self.session_manager.get_or_create(&session_key).await?;
@@ -938,7 +980,7 @@ impl SessionRegistry {
         let (session_tx, _) = broadcast::channel::<AgentEvent>(1024);
         let global_tx = self.global_tx.clone();
         let ws_subs_clone = Arc::clone(&self.ws_subs);
-        let sk_for_fwd = session_key.clone();
+        let normalized_sk_for_fwd = normalized_session_key.clone();
         let sender_for_fwd = sender_name.clone();
         let prefix_for_fwd = persona_prefix.clone();
         {
@@ -962,7 +1004,7 @@ impl SessionRegistry {
                         other => other,
                     };
                     let _ = global_tx.send(event.clone());
-                    ws_subs_clone.alter(&sk_for_fwd, |_, mut vec| {
+                    ws_subs_clone.alter(&normalized_sk_for_fwd, |_, mut vec| {
                         vec.retain(|tx| tx.send(event.clone()).is_ok());
                         vec
                     });
@@ -1049,6 +1091,25 @@ impl SessionRegistry {
         Ok(Some(reply_text))
     }
 
+    fn refresh_team_delivery_context(
+        &self,
+        team_orchestrator: Option<&Arc<TeamOrchestrator>>,
+        is_lead: bool,
+        session_key: &SessionKey,
+        delivery_source: Option<&TurnDeliverySource>,
+    ) {
+        let Some(team_orchestrator) = team_orchestrator else {
+            return;
+        };
+        if !is_lead {
+            return;
+        }
+        team_orchestrator.set_lead_session_key(session_key.clone());
+        if let Some(source) = delivery_source {
+            team_orchestrator.update_lead_delivery_source(source.clone());
+        }
+    }
+
     /// Handle slash commands
     async fn handle_slash(
         &self,
@@ -1069,7 +1130,8 @@ impl SessionRegistry {
     /// Test helper: inject an instant into pending_resets directly (bypasses 60s window).
     #[cfg(test)]
     pub fn inject_pending_reset_at(&self, key: SessionKey, instant: std::time::Instant) {
-        self.pending_resets.insert(key, instant);
+        self.pending_resets
+            .insert(normalized_session_key(&key), instant);
     }
 }
 
@@ -1877,7 +1939,10 @@ mod tests {
         let lead_key = qai_protocol::SessionKey::new("lark", "group:123");
         orch.set_lead_session_key(lead_key.clone());
         orch.set_lead_agent_name("mybot".to_string());
-        registry.register_team_orchestrator("t".to_string(), orch);
+        registry.register_team_orchestrator(
+            crate::team::session::stable_team_id_for_session_key(&lead_key),
+            orch,
+        );
 
         // Confirm roster has "mybot"
         let entry = registry
@@ -2251,15 +2316,19 @@ mod tests {
 
     fn make_registry_with_team_orchestrator() -> (Arc<SessionRegistry>, Arc<TeamOrchestrator>) {
         use crate::team::{
-            heartbeat::DispatchFn, orchestrator::TeamOrchestrator, registry::TaskRegistry,
-            session::TeamSession,
+            heartbeat::DispatchFn,
+            orchestrator::TeamOrchestrator,
+            registry::TaskRegistry,
+            session::{stable_team_id_for_session_key, TeamSession},
         };
         use tempfile::tempdir;
 
         let (registry, _rx) = make_registry();
         let tmp = tempdir().unwrap();
         let task_registry = Arc::new(TaskRegistry::new_in_memory().unwrap());
-        let session = Arc::new(TeamSession::from_dir("team-test", tmp.path().to_path_buf()));
+        let lead_key = SessionKey::new("lark", "group:team");
+        let team_id = stable_team_id_for_session_key(&lead_key);
+        let session = Arc::new(TeamSession::from_dir(&team_id, tmp.path().to_path_buf()));
         let dispatch_fn: DispatchFn = Arc::new(|_, _| Box::pin(async { Ok(()) }));
         let orch = TeamOrchestrator::new(
             task_registry,
@@ -2267,11 +2336,64 @@ mod tests {
             dispatch_fn,
             std::time::Duration::from_secs(60),
         );
-        let lead_key = SessionKey::new("lark", "group:team");
         orch.set_lead_session_key(lead_key.clone());
         orch.set_scope(lead_key);
-        registry.register_team_orchestrator("team-test".to_string(), Arc::clone(&orch));
+        registry.register_team_orchestrator(team_id, Arc::clone(&orch));
         (registry, orch)
+    }
+
+    fn make_registry_with_runtime_dispatch_and_team_orchestrator() -> (
+        Arc<SessionRegistry>,
+        Arc<TeamOrchestrator>,
+        Arc<AtomicUsize>,
+    ) {
+        use crate::team::{
+            heartbeat::DispatchFn,
+            orchestrator::TeamOrchestrator,
+            registry::TaskRegistry,
+            session::{stable_team_id_for_session_key, TeamSession},
+        };
+        use tempfile::tempdir;
+
+        let dir =
+            std::env::temp_dir().join(format!("test-registry-team-turn-{}", uuid::Uuid::new_v4()));
+        let storage = SessionStorage::new(dir);
+        let session_manager = Arc::new(SessionManager::new(storage));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let last_backend = Arc::new(std::sync::Mutex::new(None));
+        let history_snapshots = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (registry, _rx) = SessionRegistry::with_runtime_dispatch(
+            Some("native-main".to_string()),
+            session_manager,
+            String::new(),
+            None,
+            None,
+            None,
+            None,
+            vec![],
+            Arc::new(FakeRuntimeDispatch {
+                calls: Arc::clone(&calls),
+                last_backend,
+                history_snapshots,
+            }),
+        );
+
+        let tmp = tempdir().unwrap();
+        let task_registry = Arc::new(TaskRegistry::new_in_memory().unwrap());
+        let lead_key = SessionKey::new("lark", "group:team");
+        let team_id = stable_team_id_for_session_key(&lead_key);
+        let session = Arc::new(TeamSession::from_dir(&team_id, tmp.keep()));
+        let dispatch_fn: DispatchFn = Arc::new(|_, _| Box::pin(async { Ok(()) }));
+        let orch = TeamOrchestrator::new(
+            task_registry,
+            session,
+            dispatch_fn,
+            std::time::Duration::from_secs(60),
+        );
+        orch.set_lead_session_key(lead_key.clone());
+        orch.set_scope(lead_key);
+        registry.register_team_orchestrator(team_id, Arc::clone(&orch));
+        (registry, orch, calls)
     }
 
     #[test]
@@ -2305,9 +2427,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_new_human_lead_turn_reopens_done_team_for_new_planning_cycle() {
+        let (registry, orch, calls) = make_registry_with_runtime_dispatch_and_team_orchestrator();
+        *orch.team_state_inner.lock().unwrap() = crate::team::orchestrator::TeamState::Done;
+
+        let inbound = InboundMsg {
+            id: "team-reopen-1".to_string(),
+            session_key: SessionKey::new("lark", "group:team"),
+            content: MsgContent::text("给我再新建一轮任务"),
+            sender: "user".to_string(),
+            channel: "lark".to_string(),
+            timestamp: chrono::Utc::now(),
+            thread_ts: None,
+            target_agent: None,
+            source: qai_protocol::MsgSource::Human,
+        };
+
+        let reply = registry.handle(inbound).await.unwrap();
+
+        assert_eq!(reply.as_deref(), Some("fake-dispatch: 给我再新建一轮任务"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            orch.team_state(),
+            crate::team::orchestrator::TeamState::Planning
+        );
+        assert!(orch
+            .register_task(crate::team::registry::CreateTask {
+                id: "T200".into(),
+                title: "Follow-up task".into(),
+                ..Default::default()
+            })
+            .is_ok());
+    }
+
+    #[tokio::test]
     async fn test_invoke_team_tool_submit_and_accept_updates_registry() {
         let (registry, orch) = make_registry_with_team_orchestrator();
-        let specialist_key = SessionKey::new("specialist", "team-test:codex");
+        let specialist_key = orch.session.specialist_session_key("codex");
 
         orch.registry
             .create_task(crate::team::registry::CreateTask {
@@ -2387,7 +2543,7 @@ mod tests {
     #[tokio::test]
     async fn test_invoke_team_tool_block_task_notifies_lead_and_resets_claim() {
         let (registry, orch) = make_registry_with_team_orchestrator();
-        let specialist_key = SessionKey::new("specialist", "team-test:codex");
+        let specialist_key = orch.session.specialist_session_key("codex");
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         orch.set_team_notify_tx(tx);
 
@@ -2434,8 +2590,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_invoke_team_tool_rejects_lead_only_tool_from_specialist_session() {
-        let (registry, _orch) = make_registry_with_team_orchestrator();
-        let specialist_key = SessionKey::new("specialist", "team-test:codex");
+        let (registry, orch) = make_registry_with_team_orchestrator();
+        let specialist_key = orch.session.specialist_session_key("codex");
 
         let err = registry
             .invoke_team_tool(
@@ -2483,7 +2639,7 @@ mod tests {
     #[tokio::test]
     async fn test_apply_runtime_events_submits_task_into_existing_registry() {
         let (registry, orch) = make_registry_with_team_orchestrator();
-        let specialist_key = SessionKey::new("specialist", "team-test:openclaw-main");
+        let specialist_key = orch.session.specialist_session_key("openclaw-main");
 
         orch.registry
             .create_task(crate::team::registry::CreateTask {

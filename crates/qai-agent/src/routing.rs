@@ -4,6 +4,7 @@ use crate::control::session_router::get_orchestrator_for_session as route_orches
 use crate::control::turn_intent::build_turn_intent;
 use crate::roster::{AgentEntry, AgentRoster};
 use crate::team::orchestrator::{TeamOrchestrator, TeamState};
+use crate::team::session::stable_team_id_for_session_key;
 use crate::traits::AgentRole;
 use dashmap::{DashMap, DashSet};
 use qai_protocol::{InboundMsg, MsgSource, SessionKey};
@@ -211,15 +212,7 @@ fn resolve_auto_promote_orchestrator(
         return None;
     }
     let found = team_orchestrators
-        .iter()
-        .find(|entry| {
-            entry
-                .value()
-                .lead_session_key
-                .get()
-                .map(|key| key.scope == inbound.session_key.scope)
-                .unwrap_or(false)
-        })
+        .get(&stable_team_id_for_session_key(&inbound.session_key))
         .map(|entry| Arc::clone(entry.value()));
     if found.is_none() {
         tracing::warn!(
@@ -360,7 +353,10 @@ mod tests {
         let roster = make_roster();
         let orch = make_orchestrator();
         let orchestrators = DashMap::new();
-        orchestrators.insert("team-routing".to_string(), orch);
+        orchestrators.insert(
+            stable_team_id_for_session_key(&SessionKey::new("lark", "group:route")),
+            orch,
+        );
 
         let decision = resolve_turn_routing(
             &inbound("group:route", None),
@@ -471,7 +467,10 @@ mod tests {
         let orch = make_orchestrator_for_scope(scope);
 
         let orchestrators: DashMap<String, Arc<TeamOrchestrator>> = DashMap::new();
-        orchestrators.insert("team-auto".to_string(), Arc::clone(&orch));
+        orchestrators.insert(
+            stable_team_id_for_session_key(&SessionKey::new("lark", scope)),
+            Arc::clone(&orch),
+        );
 
         let auto_promote_scopes = DashSet::new();
         auto_promote_scopes.insert(scope.to_string());
@@ -494,7 +493,10 @@ mod tests {
         let orch = make_orchestrator_for_scope(scope);
 
         let orchestrators: DashMap<String, Arc<TeamOrchestrator>> = DashMap::new();
-        orchestrators.insert("team-auto-2".to_string(), Arc::clone(&orch));
+        orchestrators.insert(
+            stable_team_id_for_session_key(&SessionKey::new("lark", scope)),
+            Arc::clone(&orch),
+        );
 
         let auto_promote_scopes = DashSet::new();
         auto_promote_scopes.insert(scope.to_string());
@@ -528,9 +530,13 @@ mod tests {
         auto_promote_scopes.insert(scope.to_string());
 
         // Different orchestrator registered for a different scope
-        let other_orch = make_orchestrator_for_scope("group:other");
+        let other_scope = "group:other";
+        let other_orch = make_orchestrator_for_scope(other_scope);
         let orchestrators: DashMap<String, Arc<TeamOrchestrator>> = DashMap::new();
-        orchestrators.insert("team-other".to_string(), other_orch);
+        orchestrators.insert(
+            stable_team_id_for_session_key(&SessionKey::new("lark", other_scope)),
+            other_orch,
+        );
 
         let result = resolve_auto_promote_orchestrator(
             &team_trigger_inbound(scope),

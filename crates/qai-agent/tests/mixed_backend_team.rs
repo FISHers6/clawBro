@@ -1,11 +1,13 @@
 use qai_agent::{
     team::{
-        heartbeat::DispatchFn, orchestrator::TeamOrchestrator, registry::TaskRegistry,
-        session::TeamSession,
+        heartbeat::DispatchFn,
+        orchestrator::TeamOrchestrator,
+        registry::TaskRegistry,
+        session::{stable_team_id_for_session_key, TeamSession},
     },
     AgentEntry, AgentRoster, ConductorRuntimeDispatch, SessionRegistry,
 };
-use qai_protocol::{InboundMsg, MsgContent, MsgSource, SessionKey};
+use qai_protocol::{render_scope_storage_key, InboundMsg, MsgContent, MsgSource, SessionKey};
 use qai_runtime::{
     BackendFamily, BackendRegistry, BackendSpec, CapabilityProfile, LaunchSpec,
     NativeTeamCapability, RoleEligibility, RuntimeEvent, ScriptedAdapter, ScriptedTurn,
@@ -55,7 +57,7 @@ fn family_profile(family: BackendFamily, lead: bool, specialist: bool) -> Capabi
 fn write_scoped_memory(dir: &Path, session_key: &SessionKey, content: &str) {
     let memory_dir = dir.join("memory");
     std::fs::create_dir_all(&memory_dir).unwrap();
-    let scope_key = format!("{}_{}", session_key.channel, session_key.scope);
+    let scope_key = render_scope_storage_key(session_key);
     std::fs::write(memory_dir.join(format!("{scope_key}.md")), content).unwrap();
 }
 
@@ -69,8 +71,8 @@ async fn build_team_harness(
 ) -> TeamHarness {
     let root = tempfile::tempdir().unwrap();
     let scope = format!("group:mixed-team:{}", uuid::Uuid::new_v4());
-    let team_id = format!("team-{}", uuid::Uuid::new_v4());
     let lead_key = SessionKey::new("ws", &scope);
+    let team_id = stable_team_id_for_session_key(&lead_key);
     let specialist_key = SessionKey::new("specialist", format!("{team_id}:worker"));
 
     let leader_persona = root.path().join("leader-persona");
@@ -308,7 +310,7 @@ fn has_all_files(capture: &qai_runtime::CapturedTurn, names: &[&str]) -> bool {
 }
 
 fn has_scoped_memory_file(capture: &qai_runtime::CapturedTurn, channel: &str) -> bool {
-    let prefix = format!("memory/{channel}_");
+    let prefix = format!("memory/c={channel}");
     capture
         .session
         .context

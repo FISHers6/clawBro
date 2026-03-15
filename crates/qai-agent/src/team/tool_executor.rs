@@ -11,13 +11,12 @@ pub fn resolve_team_tool_role(
     session_key: &SessionKey,
     team_orch: &Arc<TeamOrchestrator>,
 ) -> Result<RuntimeRole> {
-    if team_orch.lead_session_key.get() == Some(session_key) {
+    if session_key.channel != "specialist" {
         return Ok(RuntimeRole::Leader);
     }
     if session_key.channel == "specialist"
-        && session_key
-            .scope
-            .starts_with(&format!("{}:", team_orch.session.team_id))
+        && super::session::parse_specialist_session_scope(&session_key.scope)
+            .is_some_and(|(team_id, _)| team_id == team_orch.session.team_id)
     {
         return Ok(RuntimeRole::Specialist);
     }

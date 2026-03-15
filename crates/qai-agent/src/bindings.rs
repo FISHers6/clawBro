@@ -23,6 +23,11 @@ pub enum BindingRule {
         team_id: String,
         agent_name: String,
     },
+    ChannelInstance {
+        channel: String,
+        channel_instance: String,
+        agent_name: String,
+    },
     Channel {
         channel: String,
         agent_name: String,
@@ -45,6 +50,7 @@ impl BindingRule {
             | Self::Scope { agent_name, .. }
             | Self::Peer { agent_name, .. }
             | Self::Team { agent_name, .. }
+            | Self::ChannelInstance { agent_name, .. }
             | Self::Channel { agent_name, .. }
             | Self::Default { agent_name } => agent_name,
         }
@@ -85,6 +91,12 @@ pub fn resolve_binding<'a>(
                 .iter()
                 .rev()
                 .find(|binding| matches_team(binding, session_key))
+        })
+        .or_else(|| {
+            bindings
+                .iter()
+                .rev()
+                .find(|binding| matches_channel_instance(binding, session_key))
         })
         .or_else(|| {
             bindings
@@ -158,6 +170,19 @@ fn matches_channel(binding: &BindingRule, session_key: &SessionKey) -> bool {
     channel == &session_key.channel
 }
 
+fn matches_channel_instance(binding: &BindingRule, session_key: &SessionKey) -> bool {
+    let BindingRule::ChannelInstance {
+        channel,
+        channel_instance,
+        ..
+    } = binding
+    else {
+        return false;
+    };
+    channel == &session_key.channel
+        && session_key.channel_instance.as_deref() == Some(channel_instance.as_str())
+}
+
 pub fn extract_peer_kind_and_id(session_key: &SessionKey) -> Option<(BindingPeerKind, &str)> {
     let (kind, id) = session_key.scope.split_once(':')?;
     match kind {
@@ -171,7 +196,8 @@ pub fn extract_team_id(session_key: &SessionKey) -> Option<&str> {
     if session_key.channel != "specialist" {
         return None;
     }
-    session_key.scope.split(':').next()
+    crate::team::session::parse_specialist_session_scope(&session_key.scope)
+        .map(|(team_id, _)| team_id)
 }
 
 #[cfg(test)]
@@ -232,6 +258,47 @@ mod tests {
                 kind: BindingPeerKind::Group,
                 id: "oc_123".into(),
                 agent_name: "peer-agent".into(),
+            },
+            BindingRule::Scope {
+                channel: Some("lark".into()),
+                scope: "group:oc_123".into(),
+                agent_name: "scope-agent".into(),
+            },
+        ];
+
+        let matched = resolve_binding(&inbound, &inbound.session_key, &bindings).unwrap();
+        assert_eq!(matched.agent_name(), "scope-agent");
+    }
+
+    #[test]
+    fn binding_resolution_prefers_channel_instance_over_channel() {
+        let mut inbound = inbound("lark", "group:oc_123", None, None);
+        inbound.session_key.channel_instance = Some("beta".into());
+        let bindings = vec![
+            BindingRule::Channel {
+                channel: "lark".into(),
+                agent_name: "channel-agent".into(),
+            },
+            BindingRule::ChannelInstance {
+                channel: "lark".into(),
+                channel_instance: "beta".into(),
+                agent_name: "instance-agent".into(),
+            },
+        ];
+
+        let matched = resolve_binding(&inbound, &inbound.session_key, &bindings).unwrap();
+        assert_eq!(matched.agent_name(), "instance-agent");
+    }
+
+    #[test]
+    fn binding_resolution_keeps_scope_above_channel_instance() {
+        let mut inbound = inbound("lark", "group:oc_123", None, None);
+        inbound.session_key.channel_instance = Some("beta".into());
+        let bindings = vec![
+            BindingRule::ChannelInstance {
+                channel: "lark".into(),
+                channel_instance: "beta".into(),
+                agent_name: "instance-agent".into(),
             },
             BindingRule::Scope {
                 channel: Some("lark".into()),

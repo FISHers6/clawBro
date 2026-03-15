@@ -1,12 +1,12 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use dashmap::DashMap;
-use qai_protocol::SessionKey;
+use qai_protocol::{render_scope_storage_key, SessionKey};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 fn scope_key(scope: &SessionKey) -> String {
-    format!("{}_{}", scope.channel, scope.scope)
+    render_scope_storage_key(scope)
 }
 
 #[async_trait]
@@ -202,7 +202,7 @@ impl MemoryStore for FileMemoryStore {
         days: u64,
     ) -> Result<String> {
         let logs_dir = persona_dir.join("logs");
-        let sk = scope_key(scope);
+        let prefix = scope_key(scope);
         let cutoff_date = (chrono::Local::now() - chrono::Duration::days(days as i64)).date_naive();
         let mut out = String::new();
 
@@ -215,10 +215,10 @@ impl MemoryStore for FileMemoryStore {
             match read_dir.next_entry().await {
                 Ok(Some(e)) => {
                     let name = e.file_name().to_string_lossy().to_string();
-                    if name.starts_with(&sk) && name.ends_with(".md") {
+                    if name.ends_with(".md") {
                         // filename: {scope_key}_{YYYY-MM-DD}.md
                         if let Some(date_str) = name
-                            .strip_prefix(&format!("{sk}_"))
+                            .strip_prefix(&format!("{prefix}_"))
                             .and_then(|s| s.strip_suffix(".md"))
                         {
                             if let Ok(date) =
@@ -258,6 +258,18 @@ mod tests {
 
     fn scope() -> SessionKey {
         SessionKey::new("dingtalk", "group_C123")
+    }
+
+    #[test]
+    fn group_scope_storage_key_ignores_channel_instance() {
+        let scope = SessionKey::with_instance("lark", "beta", "group:oc_1");
+        assert_eq!(scope_key(&scope), "c=lark#s=group:oc_1");
+    }
+
+    #[test]
+    fn dm_scope_storage_key_keeps_channel_instance() {
+        let scope = SessionKey::with_instance("lark", "beta", "user:ou_1");
+        assert_eq!(scope_key(&scope), "c=lark#i=beta#s=user:ou_1");
     }
 
     #[tokio::test]
@@ -327,7 +339,7 @@ mod tests {
         let store = FileMemoryStore::new(dir.path().to_path_buf());
         let persona = tempdir().unwrap();
         let scope = scope();
-        let scope_key = format!("{}_{}", scope.channel, scope.scope);
+        let scope_key = render_scope_storage_key(&scope);
         let old_file = persona
             .path()
             .join("logs")

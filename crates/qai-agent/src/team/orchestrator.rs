@@ -32,6 +32,7 @@ use super::session::{LeaderUpdateKind, TaskArtifactMeta, TeamSession};
 use super::specialist_turn::{
     classify_specialist_turn, SpecialistActionKind, SpecialistActionRecord, SpecialistTurnOutcome,
 };
+use crate::turn_context::TurnDeliverySource;
 
 // ─── TeamState ────────────────────────────────────────────────────────────────
 
@@ -86,6 +87,8 @@ pub struct TeamRuntimeSummary {
     pub state: TeamState,
     pub lead_session_key: Option<qai_protocol::SessionKey>,
     pub lead_agent_name: Option<String>,
+    pub latest_leader_update: Option<crate::team::session::LeaderUpdateRecord>,
+    pub latest_channel_send: Option<crate::team::session::ChannelSendRecord>,
     pub specialists: Vec<String>,
     pub tool_surface_ready: bool,
     pub mcp_port: Option<u16>,
@@ -144,8 +147,10 @@ pub struct TeamOrchestrator {
     pub mcp_server_port: std::sync::OnceLock<u16>,
     /// 当前 Team 执行状态（Planning / AwaitingConfirm / Running / Done）
     pub team_state_inner: std::sync::Mutex<TeamState>,
-    /// Lead Agent 的 IM session key（设置后用于 TeamNotify 路由）
-    pub lead_session_key: std::sync::OnceLock<qai_protocol::SessionKey>,
+    /// Lead Agent 的最近一次真实 ingress session key 诊断快照。
+    lead_session_key: std::sync::Mutex<Option<qai_protocol::SessionKey>>,
+    /// Lead Agent 的最近一次真实 turn delivery source。
+    lead_delivery_source: std::sync::Mutex<Option<TurnDeliverySource>>,
     /// Configured Lead agent name from `front_bot` in config.toml.
     pub lead_agent_name: std::sync::OnceLock<String>,
     /// List of Specialist agent names (from `team.roster` in config.toml).
@@ -166,6 +171,7 @@ struct DispatchContextRecord {
     run_id: String,
     requester_session_key: SessionKey,
     parent_run_id: Option<String>,
+    delivery_source: Option<TurnDeliverySource>,
 }
 
 #[derive(Debug, Clone)]
@@ -193,7 +199,8 @@ impl TeamOrchestrator {
             mcp_server_handle: tokio::sync::Mutex::new(None),
             mcp_server_port: std::sync::OnceLock::new(),
             team_state_inner: std::sync::Mutex::new(TeamState::Planning),
-            lead_session_key: std::sync::OnceLock::new(),
+            lead_session_key: std::sync::Mutex::new(None),
+            lead_delivery_source: std::sync::Mutex::new(None),
             lead_agent_name: std::sync::OnceLock::new(),
             available_specialists: std::sync::OnceLock::new(),
             team_notify_tx: std::sync::OnceLock::new(),
@@ -228,10 +235,41 @@ impl TeamOrchestrator {
         self.team_state_inner.lock().unwrap().clone()
     }
 
+    /// Reopen a completed team when a new human lead turn starts a fresh planning cycle.
+    /// This is intentionally non-destructive: task ledgers and artifacts are preserved.
+    pub fn reopen_for_new_planning_cycle_if_done(&self) -> bool {
+        let mut state = self.team_state_inner.lock().unwrap();
+        if *state != TeamState::Done {
+            return false;
+        }
+        *state = TeamState::Planning;
+        let event = serde_json::json!({
+            "event": "REOPENED_FOR_PLANNING",
+            "ts": Utc::now().to_rfc3339(),
+        })
+        .to_string();
+        let _ = self.session.append_event(&event);
+        true
+    }
+
     /// 设置 Lead 的 IM session key（由 main.rs 在启动时调用）
     pub fn set_lead_session_key(&self, key: qai_protocol::SessionKey) {
-        let _ = self.lead_session_key.set(key);
+        *self.lead_session_key.lock().unwrap() = Some(key);
         self.flush_pending_routing_events();
+    }
+
+    pub fn lead_session_key(&self) -> Option<qai_protocol::SessionKey> {
+        self.lead_session_key.lock().unwrap().clone()
+    }
+
+    pub fn update_lead_delivery_source(&self, source: TurnDeliverySource) {
+        let lead_key = source.session_key();
+        *self.lead_delivery_source.lock().unwrap() = Some(source);
+        self.set_lead_session_key(lead_key);
+    }
+
+    pub fn lead_delivery_source(&self) -> Option<TurnDeliverySource> {
+        self.lead_delivery_source.lock().unwrap().clone()
     }
 
     /// 注入 TeamNotify MPSC sender（main.rs 在启动时调用）。
@@ -279,7 +317,8 @@ impl TeamOrchestrator {
             .cloned()
             .unwrap_or_else(|| "leader".to_string());
         match self.session.record_leader_update(
-            self.lead_session_key.get(),
+            self.lead_session_key().as_ref(),
+            self.lead_delivery_source().as_ref(),
             &source_agent,
             kind,
             text,
@@ -308,6 +347,10 @@ impl TeamOrchestrator {
         std::mem::take(&mut *refs)
     }
 
+    pub fn clear_pending_lead_fragments(&self) {
+        self.pending_lead_fragments.lock().unwrap().clear();
+    }
+
     pub fn notify_task_dispatched(&self, task_id: &str, task_title: &str, agent: &str) {
         let _ = self.emit_milestone(TeamMilestoneEvent::TaskDispatched {
             task_id: task_id.to_string(),
@@ -322,6 +365,7 @@ impl TeamOrchestrator {
         agent: &str,
         requester_session_key: SessionKey,
         parent_run_id: Option<String>,
+        delivery_source: Option<TurnDeliverySource>,
     ) -> String {
         let run_id = uuid::Uuid::new_v4().to_string();
         let mut contexts = self.dispatch_contexts.lock().unwrap();
@@ -331,6 +375,7 @@ impl TeamOrchestrator {
                 run_id: run_id.clone(),
                 requester_session_key,
                 parent_run_id,
+                delivery_source,
             },
         );
         run_id
@@ -366,12 +411,16 @@ impl TeamOrchestrator {
             task_artifacts_present: self.session.dir.join("tasks").is_dir(),
         };
         let routing_stats = self.routing_stats();
+        let latest_leader_update = self.session.load_latest_leader_update().unwrap_or(None);
+        let latest_channel_send = self.session.load_latest_channel_send().unwrap_or(None);
 
         TeamRuntimeSummary {
             team_id: self.session.team_id.clone(),
             state: self.team_state(),
-            lead_session_key: self.lead_session_key.get().cloned(),
+            lead_session_key: self.lead_session_key(),
             lead_agent_name: self.lead_agent_name.get().cloned(),
+            latest_leader_update,
+            latest_channel_send,
             specialists: self
                 .available_specialists
                 .get()
@@ -944,12 +993,16 @@ impl TeamOrchestrator {
         let requester_session_key = context
             .as_ref()
             .map(|record| record.requester_session_key.clone())
-            .or_else(|| self.lead_session_key.get().cloned())
+            .or_else(|| self.lead_session_key())
             .or_else(|| self.scope.get().cloned());
+        let delivery_source = context
+            .as_ref()
+            .and_then(|record| record.delivery_source.clone())
+            .or_else(|| self.lead_delivery_source());
         let mut fallback_session_keys = Vec::new();
-        if let Some(lead_key) = self.lead_session_key.get() {
-            if requester_session_key.as_ref() != Some(lead_key)
-                && !fallback_session_keys.contains(lead_key)
+        if let Some(lead_key) = self.lead_session_key() {
+            if requester_session_key.as_ref() != Some(&lead_key)
+                && !fallback_session_keys.contains(&lead_key)
             {
                 fallback_session_keys.push(lead_key.clone());
             }
@@ -971,6 +1024,7 @@ impl TeamOrchestrator {
                 .and_then(|record| record.parent_run_id.clone()),
             requester_session_key,
             fallback_session_keys,
+            delivery_source,
             team_id: self.session.team_id.clone(),
             delivery_status: RoutingDeliveryStatus::NotRouted,
             event,
@@ -1523,6 +1577,25 @@ mod tests {
         assert!(matches!(orch.team_state(), TeamState::Planning));
     }
 
+    #[test]
+    fn test_reopen_for_new_planning_cycle_allows_new_tasks_after_done() {
+        let (orch, _tmp) = make_orchestrator();
+        *orch.team_state_inner.lock().unwrap() = TeamState::Done;
+
+        assert!(
+            orch.reopen_for_new_planning_cycle_if_done(),
+            "Done team should reopen for a new planning cycle"
+        );
+        assert!(matches!(orch.team_state(), TeamState::Planning));
+
+        let result = orch.register_task(CreateTask {
+            id: "T002".into(),
+            title: "Plan follow-up work".into(),
+            ..Default::default()
+        });
+        assert!(result.is_ok(), "reopened team must accept new tasks");
+    }
+
     #[tokio::test]
     async fn test_activate_starts_mcp_and_sets_running() {
         let (orch, _tmp) = make_orchestrator();
@@ -1948,12 +2021,11 @@ mod tests {
 
         let evs = events.lock().unwrap();
         assert!(
-            evs.iter()
-                .any(|e| matches!(
-                    e,
-                    TeamMilestoneEvent::TaskDone { task_id, agent, done_count, total, .. }
-                    if task_id == "T005" && agent == "codex" && *done_count == 1 && *total == 1
-                )),
+            evs.iter().any(|e| matches!(
+                e,
+                TeamMilestoneEvent::TaskDone { task_id, agent, done_count, total, .. }
+                if task_id == "T005" && agent == "codex" && *done_count == 1 && *total == 1
+            )),
             "TaskDone event must fire after accept; got: {:?}",
             evs
         );

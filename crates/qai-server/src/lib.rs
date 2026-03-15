@@ -1,7 +1,9 @@
 //! qai-server library target.
 //! Exposes modules and test helpers for integration tests.
 
+pub mod channel_registry;
 pub mod config;
+pub mod delivery_resolver;
 pub mod diagnostics;
 pub mod gateway;
 pub mod im_sink;
@@ -135,7 +137,7 @@ pub async fn build_test_state_with_config(cfg: GatewayConfig) -> Result<AppState
     team_runtime::wire_team_runtime(
         Arc::clone(&state.registry),
         state.cfg.as_ref(),
-        Arc::new(std::collections::HashMap::new()),
+        Arc::new(channel_registry::ChannelRegistry::new()),
         Duration::from_millis(50),
     )
     .await?;

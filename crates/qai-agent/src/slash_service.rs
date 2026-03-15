@@ -255,7 +255,10 @@ mod tests {
             std::time::Duration::from_secs(60),
         );
         orchestrator.set_lead_session_key(lead.clone());
-        registry.register_team_orchestrator("team-1".to_string(), orchestrator);
+        registry.register_team_orchestrator(
+            crate::team::session::stable_team_id_for_session_key(&lead),
+            orchestrator,
+        );
         let command = SlashCommand::TeamStatus;
         let reply = execute_slash_request(SlashRequest {
             session_key: &lead,

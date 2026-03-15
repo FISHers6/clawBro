@@ -1,10 +1,15 @@
 use anyhow::Result;
-use qai_agent::{ConductorRuntimeDispatch, SessionRegistry};
+use qai_agent::{
+    ConductorRuntimeDispatch, SessionRegistry, TurnDeliverySource, TurnExecutionContext,
+};
+use qai_protocol::parse_session_key_text;
 use qai_runtime::{
     acp::AcpBackendAdapter, ApprovalBroker, BackendRegistry, OpenClawBackendAdapter,
     QuickAiNativeBackendAdapter,
 };
+use qai_server::channel_registry::ChannelRegistry;
 use qai_server::config;
+use qai_server::delivery_resolver::resolve_delivery;
 use qai_server::gateway;
 use qai_server::im_sink::spawn_im_turn;
 use qai_server::state::{AppState, BrokerApprovalResolver};
@@ -129,9 +134,8 @@ async fn main() -> Result<()> {
         approvals,
     };
 
-    // Channel registry for cron output: maps channel name → channel Arc
-    let mut cron_channel_map: std::collections::HashMap<String, Arc<dyn qai_channels::Channel>> =
-        std::collections::HashMap::new();
+    // Channel registry for server-owned outbound sends.
+    let mut cron_channel_map = ChannelRegistry::new();
 
     // 启动 Channel 监听（DingTalk）
     if let Some(dt_cfg) = &cfg.channels.dingtalk {
@@ -142,12 +146,16 @@ async fn main() -> Result<()> {
                     dt_config,
                     cfg.gateway.require_mention_in_groups,
                 ));
-                cron_channel_map.insert(
-                    "dingtalk".to_string(),
+                cron_channel_map.register(
+                    "dingtalk",
+                    Option::<String>::None,
                     channel.clone() as Arc<dyn qai_channels::Channel>,
+                    true,
                 );
                 let registry_clone = registry.clone();
                 let channel_clone = channel.clone();
+                let delivery_channels = Arc::new(cron_channel_map.clone());
+                let delivery_cfg = state.cfg.clone();
                 let (tx, mut rx) = tokio::sync::mpsc::channel(64);
 
                 // 监听线程：接收 DingTalk 消息 → tx（带断线重连）
@@ -180,6 +188,8 @@ async fn main() -> Result<()> {
                         spawn_im_turn(
                             registry_clone.clone(),
                             channel_clone.clone() as Arc<dyn qai_channels::Channel>,
+                            delivery_channels.clone(),
+                            delivery_cfg.clone(),
                             inbound,
                             dt_presentation,
                         );
@@ -197,65 +207,111 @@ async fn main() -> Result<()> {
     if let Some(lark_cfg) = &cfg.channels.lark {
         if lark_cfg.enabled {
             let lark_presentation = lark_cfg.presentation;
-            let lark_channel_result = {
-                let app_id = std::env::var("LARK_APP_ID");
-                let app_secret = std::env::var("LARK_APP_SECRET");
-                match (app_id, app_secret) {
-                    (Ok(id), Ok(secret)) => Ok(qai_channels::LarkChannel::new(
-                        id,
-                        secret,
-                        lark_cfg.resolved_trigger_policy(&cfg.gateway),
-                    )),
-                    _ => Err(anyhow::anyhow!("LARK_APP_ID or LARK_APP_SECRET not set")),
-                }
-            };
-            match lark_channel_result {
-                Ok(channel) => {
-                    let channel = Arc::new(channel);
-                    cron_channel_map.insert(
-                        "lark".to_string(),
-                        channel.clone() as Arc<dyn qai_channels::Channel>,
-                    );
-                    let registry_clone = registry.clone();
-                    let channel_clone = channel.clone();
-                    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+            let lark_trigger_policy = lark_cfg.resolved_trigger_policy(&cfg.gateway);
+            let lark_instances: anyhow::Result<Vec<config::LarkInstanceConfig>> =
+                if !lark_cfg.instances.is_empty() {
+                    Ok(lark_cfg.instances.clone())
+                } else {
+                    let app_id = std::env::var("LARK_APP_ID");
+                    let app_secret = std::env::var("LARK_APP_SECRET");
+                    match (app_id, app_secret) {
+                        (Ok(id), Ok(secret)) => Ok(vec![config::LarkInstanceConfig {
+                            id: lark_cfg.default_instance_id().to_string(),
+                            app_id: id,
+                            app_secret: secret,
+                            bot_name: None,
+                        }]),
+                        _ => Err(anyhow::anyhow!("LARK_APP_ID or LARK_APP_SECRET not set")),
+                    }
+                };
+            match lark_instances {
+                Ok(instances) => {
+                    let requested_default = lark_cfg.default_instance_id().to_string();
+                    let has_requested_default = instances
+                        .iter()
+                        .any(|instance| instance.id == requested_default);
+                    if !has_requested_default && instances.len() > 1 {
+                        tracing::warn!(
+                            default_instance = %requested_default,
+                            "configured Lark default_instance not found; falling back to first instance"
+                        );
+                    }
 
-                    tokio::spawn(async move {
-                        let mut delay = Duration::from_secs(5);
-                        loop {
-                            match qai_channels::Channel::listen(channel.as_ref(), tx.clone()).await
-                            {
-                                Err(e) => {
-                                    delay = next_delay(delay);
-                                    tracing::error!(
-                                        "Lark listen error (retry in {:?}): {e}",
-                                        delay
-                                    );
+                    let mut listeners = Vec::new();
+                    for (index, instance) in instances.into_iter().enumerate() {
+                        let is_default = (has_requested_default
+                            && instance.id == requested_default)
+                            || (!has_requested_default && index == 0);
+                        let channel = Arc::new(qai_channels::LarkChannel::new_with_instance(
+                            instance.id.clone(),
+                            instance.app_id,
+                            instance.app_secret,
+                            lark_trigger_policy,
+                        ));
+                        cron_channel_map.register(
+                            "lark",
+                            Some(instance.id.clone()),
+                            channel.clone() as Arc<dyn qai_channels::Channel>,
+                            is_default,
+                        );
+                        listeners.push((instance.id.clone(), channel, is_default));
+                    }
+
+                    let delivery_channels = Arc::new(cron_channel_map.clone());
+                    for (instance_id, channel, is_default) in listeners {
+                        let registry_clone = registry.clone();
+                        let channel_clone = channel.clone();
+                        let delivery_channels = delivery_channels.clone();
+                        let delivery_cfg = state.cfg.clone();
+                        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+                        let listen_instance_id = instance_id.clone();
+
+                        tokio::spawn(async move {
+                            let mut delay = Duration::from_secs(5);
+                            loop {
+                                match qai_channels::Channel::listen(channel.as_ref(), tx.clone())
+                                    .await
+                                {
+                                    Err(e) => {
+                                        delay = next_delay(delay);
+                                        tracing::error!(
+                                            instance = %listen_instance_id,
+                                            "Lark listen error (retry in {:?}): {e}",
+                                            delay
+                                        );
+                                    }
+                                    Ok(()) => {
+                                        delay = Duration::from_secs(5);
+                                        tracing::info!(
+                                            instance = %listen_instance_id,
+                                            "Lark WS closed normally, reconnecting in {:?}",
+                                            delay
+                                        );
+                                    }
                                 }
-                                Ok(()) => {
-                                    delay = Duration::from_secs(5);
-                                    tracing::info!(
-                                        "Lark WS closed normally, reconnecting in {:?}",
-                                        delay
-                                    );
-                                }
+                                tokio::time::sleep(delay).await;
                             }
-                            tokio::time::sleep(delay).await;
-                        }
-                    });
+                        });
 
-                    tokio::spawn(async move {
-                        while let Some(inbound) = rx.recv().await {
-                            spawn_im_turn(
-                                registry_clone.clone(),
-                                channel_clone.clone() as Arc<dyn qai_channels::Channel>,
-                                inbound,
-                                lark_presentation,
-                            );
-                        }
-                    });
+                        tokio::spawn(async move {
+                            while let Some(inbound) = rx.recv().await {
+                                spawn_im_turn(
+                                    registry_clone.clone(),
+                                    channel_clone.clone() as Arc<dyn qai_channels::Channel>,
+                                    delivery_channels.clone(),
+                                    delivery_cfg.clone(),
+                                    inbound,
+                                    lark_presentation,
+                                );
+                            }
+                        });
 
-                    tracing::info!("Lark channel started");
+                        tracing::info!(
+                            instance = %instance_id,
+                            default = is_default,
+                            "Lark channel instance started"
+                        );
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("Lark enabled but credentials not set: {e}");
@@ -302,6 +358,7 @@ async fn main() -> Result<()> {
     {
         let mut approval_rx = event_tx.subscribe();
         let channels_for_approval = cron_channel_map.clone();
+        let cfg_for_approval = state.cfg.clone();
         tokio::spawn(async move {
             while let Ok(event) = approval_rx.recv().await {
                 let qai_protocol::AgentEvent::ApprovalRequest {
@@ -317,7 +374,18 @@ async fn main() -> Result<()> {
                 if session_key.channel == "ws" {
                     continue;
                 }
-                let Some(ch) = channels_for_approval.get(&session_key.channel) else {
+                let resolved = resolve_delivery(
+                    cfg_for_approval.as_ref(),
+                    channels_for_approval.as_ref(),
+                    config::DeliveryPurposeConfig::Approval,
+                    &session_key,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+                let Some(resolved) = resolved else {
                     continue;
                 };
                 let header = command
@@ -327,13 +395,8 @@ async fn main() -> Result<()> {
                 let body = format!(
                     "{header}\n{prompt}\n\n审批 ID: `{approval_id}`\n回复命令：`/approve {approval_id} allow-once`\n或：`/approve {approval_id} allow-always`\n或：`/approve {approval_id} deny`"
                 );
-                let outbound = qai_protocol::OutboundMsg {
-                    session_key: session_key.clone(),
-                    content: qai_protocol::MsgContent::text(body),
-                    reply_to: None,
-                    thread_ts: None,
-                };
-                if let Err(e) = ch.send(&outbound).await {
+                let outbound = resolved.outbound_text(body);
+                if let Err(e) = resolved.sender.send(&outbound).await {
                     tracing::error!(
                         channel = %session_key.channel,
                         scope = %session_key.scope,
@@ -384,7 +447,9 @@ async fn main() -> Result<()> {
                         target_agent: Some(target_agent),
                         source: qai_protocol::MsgSource::Relay,
                     };
-                    registry.handle(msg).await
+                    registry
+                        .handle_with_context(msg, TurnExecutionContext::default())
+                        .await
                 })
             });
         registry.set_relay_engine(std::sync::Arc::new(qai_agent::relay::RelayEngine::new(
@@ -420,22 +485,39 @@ async fn main() -> Result<()> {
     {
         let registry_for_redispatch = registry.clone();
         let channels_for_redispatch = cron_channel_map.clone();
+        let cfg_for_redispatch = state.cfg.clone();
         tokio::spawn(async move {
             while let Some(inbound) = redispatch_rx.recv().await {
-                let channel_name = inbound.session_key.channel.clone();
                 let session_key = inbound.session_key.clone();
                 let thread_ts = inbound.thread_ts.clone();
                 let reply_to = Some(inbound.id.clone());
-                match registry_for_redispatch.handle(inbound).await {
+                let turn_ctx = TurnExecutionContext {
+                    delivery_source: Some(
+                        TurnDeliverySource::from_session_key(&session_key)
+                            .with_reply_context(reply_to.clone(), thread_ts.clone()),
+                    ),
+                };
+                match registry_for_redispatch
+                    .handle_with_context(inbound, turn_ctx)
+                    .await
+                {
                     Ok(Some(reply)) => {
-                        if let Some(ch) = channels_for_redispatch.get(&channel_name) {
-                            let outbound = qai_protocol::OutboundMsg {
-                                session_key,
-                                content: qai_protocol::MsgContent::text(reply),
-                                reply_to,
-                                thread_ts,
-                            };
-                            if let Err(e) = ch.send(&outbound).await {
+                        if let Some(resolved) = resolve_delivery(
+                            cfg_for_redispatch.as_ref(),
+                            channels_for_redispatch.as_ref(),
+                            config::DeliveryPurposeConfig::BotMention,
+                            &session_key,
+                            Some(
+                                &TurnDeliverySource::from_session_key(&session_key)
+                                    .with_reply_context(reply_to.clone(), thread_ts.clone()),
+                            ),
+                            None,
+                            None,
+                            reply_to.as_deref(),
+                            thread_ts.as_deref(),
+                        ) {
+                            let outbound = resolved.outbound_text(reply);
+                            if let Err(e) = resolved.sender.send(&outbound).await {
                                 tracing::error!("BotMention redispatch send error: {e}");
                             }
                         }
@@ -457,6 +539,7 @@ async fn main() -> Result<()> {
         let cron_registry = registry.clone();
         let cron_memory = memory_system_ref.clone();
         let cron_channels = cron_channel_map.clone();
+        let cfg_for_cron = state.cfg.clone();
         let cron_trigger: qai_cron::TriggerFn = Arc::new(
             move |session_key_str: String,
                   prompt: String,
@@ -465,6 +548,7 @@ async fn main() -> Result<()> {
                 let registry = cron_registry.clone();
                 let memory = cron_memory.clone();
                 let channels = cron_channels.clone();
+                let cfg = cfg_for_cron.clone();
                 tokio::spawn(async move {
                     // Check condition before firing
                     if let Some(ref cond_str) = condition {
@@ -490,11 +574,10 @@ async fn main() -> Result<()> {
 
                     // Parse "channel:scope" into SessionKey.
                     // Fall back to channel="cron", scope=full string if no colon.
-                    let session_key = if let Some(pos) = session_key_str.find(':') {
-                        qai_protocol::SessionKey::new(
-                            &session_key_str[..pos],
-                            &session_key_str[pos + 1..],
-                        )
+                    let session_key = if session_key_str.contains(':') {
+                        parse_session_key_text(&session_key_str).unwrap_or_else(|_| {
+                            qai_protocol::SessionKey::new("cron", session_key_str.as_str())
+                        })
                     } else {
                         qai_protocol::SessionKey::new("cron", session_key_str.as_str())
                     };
@@ -509,17 +592,25 @@ async fn main() -> Result<()> {
                         target_agent: agent_opt,
                         source: qai_protocol::MsgSource::Cron,
                     };
-                    match registry.handle(msg).await {
+                    match registry
+                        .handle_with_context(msg, TurnExecutionContext::default())
+                        .await
+                    {
                         Ok(Some(result)) => {
                             // Send result to IM channel if one is registered for this session's channel
-                            if let Some(ch) = channels.get(&session_key.channel) {
-                                let outbound = qai_protocol::OutboundMsg {
-                                    session_key: session_key.clone(),
-                                    content: qai_protocol::MsgContent::text(&result),
-                                    reply_to: None,
-                                    thread_ts: None,
-                                };
-                                if let Err(e) = ch.send(&outbound).await {
+                            if let Some(resolved) = resolve_delivery(
+                                cfg.as_ref(),
+                                channels.as_ref(),
+                                config::DeliveryPurposeConfig::Cron,
+                                &session_key,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                            ) {
+                                let outbound = resolved.outbound_text(&result);
+                                if let Err(e) = resolved.sender.send(&outbound).await {
                                     tracing::error!(
                                         "Cron output send to channel '{}' failed: {e}",
                                         session_key.channel

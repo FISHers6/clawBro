@@ -1,4 +1,5 @@
 use crate::team::orchestrator::TeamOrchestrator;
+use crate::team::session::{parse_specialist_session_scope, stable_team_id_for_session_key};
 use dashmap::DashMap;
 use qai_protocol::SessionKey;
 use std::sync::Arc;
@@ -8,14 +9,13 @@ pub(crate) fn get_orchestrator_for_session(
     session_key: &SessionKey,
 ) -> Option<Arc<TeamOrchestrator>> {
     if session_key.channel.as_str() == "specialist" {
-        let team_id = session_key.scope.split(':').next()?;
+        let (team_id, _) = parse_specialist_session_scope(&session_key.scope)?;
         team_orchestrators
             .get(team_id)
             .map(|r| Arc::clone(r.value()))
     } else {
         team_orchestrators
-            .iter()
-            .find(|entry| entry.value().lead_session_key.get() == Some(session_key))
+            .get(&stable_team_id_for_session_key(session_key))
             .map(|entry| Arc::clone(entry.value()))
     }
 }
@@ -49,6 +49,26 @@ mod tests {
 
         let key = SessionKey::new("specialist", "team-001:codex");
         let found = get_orchestrator_for_session(&orchestrators, &key);
+        assert!(found.is_some());
+    }
+
+    #[test]
+    fn group_lead_session_routes_by_normalized_team_identity() {
+        let orchestrators = DashMap::new();
+        let orch = make_orchestrator();
+        orch.set_lead_session_key(SessionKey::with_instance("lark", "alpha", "group:oc_1"));
+        orchestrators.insert(
+            crate::team::session::stable_team_id_for_session_key(&SessionKey::new(
+                "lark",
+                "group:oc_1",
+            )),
+            Arc::clone(&orch),
+        );
+
+        let found = get_orchestrator_for_session(
+            &orchestrators,
+            &SessionKey::with_instance("lark", "beta", "group:oc_1"),
+        );
         assert!(found.is_some());
     }
 }

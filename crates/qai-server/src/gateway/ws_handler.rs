@@ -7,7 +7,8 @@ use axum::{
     http::{header::AUTHORIZATION, HeaderMap, StatusCode},
     response::IntoResponse,
 };
-use qai_protocol::{AgentEvent, InboundMsg, SessionKey};
+use qai_agent::TurnExecutionContext;
+use qai_protocol::{normalize_conversation_identity, AgentEvent, InboundMsg, SessionKey};
 use qai_runtime::ApprovalDecision;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -77,7 +78,8 @@ fn ensure_subscription(
     local_subscriptions: &mut HashMap<SessionKey, mpsc::UnboundedSender<AgentEvent>>,
     session_key: &SessionKey,
 ) {
-    if local_subscriptions.contains_key(session_key) {
+    let normalized = normalize_conversation_identity(session_key);
+    if local_subscriptions.contains_key(&normalized) {
         return;
     }
     let (sub_tx, mut sub_rx) = mpsc::unbounded_channel::<AgentEvent>();
@@ -92,11 +94,11 @@ fn ensure_subscription(
     state
         .registry
         .ws_subs
-        .entry(session_key.clone())
+        .entry(normalized.clone())
         .or_default()
         .push(sub_tx.clone());
-    local_subscriptions.insert(session_key.clone(), sub_tx);
-    tracing::debug!(?session_key, "WS client subscribed to session");
+    local_subscriptions.insert(normalized.clone(), sub_tx);
+    tracing::debug!(session_key = ?normalized, "WS client subscribed to session");
 }
 
 async fn handle_socket(mut socket: WebSocket, state: AppState) {
@@ -122,16 +124,17 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                                 );
                             }
                             Ok(WsClientMsg::Unsubscribe { session_key }) => {
+                                let normalized = normalize_conversation_identity(&session_key);
                                 // Dropping the per-subscription sub_tx closes its channel.
                                 // The registry's retain(!tx.is_closed()) will remove the
                                 // dead entry on the next event delivery pass.
-                                if let Some(_sub_tx) = local_subscriptions.remove(&session_key) {
+                                if let Some(_sub_tx) = local_subscriptions.remove(&normalized) {
                                     // Eagerly prune now-closed entries to keep ws_subs compact.
-                                    state.registry.ws_subs.alter(&session_key, |_, mut vec| {
+                                    state.registry.ws_subs.alter(&normalized, |_, mut vec| {
                                         vec.retain(|tx| !tx.is_closed());
                                         vec
                                     });
-                                    tracing::debug!(?session_key, "WS client unsubscribed from session");
+                                    tracing::debug!(session_key = ?normalized, "WS client unsubscribed from session");
                                 }
                             }
                             Ok(WsClientMsg::ResolveApproval {
@@ -168,7 +171,10 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                                 );
                                 let registry = state.registry.clone();
                                 tokio::spawn(async move {
-                                    if let Err(e) = registry.handle(inbound).await {
+                                    if let Err(e) = registry
+                                        .handle_with_context(inbound, TurnExecutionContext::default())
+                                        .await
+                                    {
                                         tracing::error!("Registry handle error: {e}");
                                     }
                                 });

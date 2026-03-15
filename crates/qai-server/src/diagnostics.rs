@@ -2,6 +2,7 @@ use crate::{config, state::AppState};
 use qai_agent::team::orchestrator::{
     TeamArtifactHealthSummary, TeamRoutingStats, TeamRuntimeSummary, TeamState, TeamTaskCounts,
 };
+use qai_agent::team::session::{ChannelSendRecord, LeaderUpdateRecord};
 use qai_runtime::{
     provider_profiles::ConfiguredProviderProtocol, AcpBackend, BackendFamily, CapabilityProfile,
 };
@@ -100,6 +101,8 @@ pub struct TeamDiagnostic {
     pub team_id: String,
     pub state: TeamState,
     pub lead_agent_name: Option<String>,
+    pub latest_leader_update: Option<LeaderUpdateRecord>,
+    pub latest_channel_send: Option<ChannelSendRecord>,
     pub tool_surface_ready: bool,
     pub mcp_port: Option<u16>,
     pub task_counts: TeamTaskCounts,
@@ -439,6 +442,8 @@ fn team_diagnostic_from_summary(summary: TeamRuntimeSummary) -> TeamDiagnostic {
         team_id: summary.team_id,
         state: summary.state,
         lead_agent_name: summary.lead_agent_name,
+        latest_leader_update: summary.latest_leader_update,
+        latest_channel_send: summary.latest_channel_send,
         tool_surface_ready: summary.tool_surface_ready,
         mcp_port: summary.mcp_port,
         task_counts: summary.task_counts,
@@ -591,7 +596,8 @@ fn inferred_channels(cfg: &config::GatewayConfig) -> Vec<String> {
                     channels.insert(channel.to_string());
                 }
             }
-            config::BindingConfig::Channel { channel, .. } => {
+            config::BindingConfig::ChannelInstance { channel, .. }
+            | config::BindingConfig::Channel { channel, .. } => {
                 channels.insert(channel.clone());
             }
             config::BindingConfig::Team { .. } | config::BindingConfig::Default { .. } => {}
@@ -621,7 +627,11 @@ fn channel_has_routing(cfg: &config::GatewayConfig, channel: &str) -> bool {
             channel: binding_channel,
             ..
         } => binding_channel.as_deref() == Some(channel),
-        config::BindingConfig::Channel {
+        config::BindingConfig::ChannelInstance {
+            channel: binding_channel,
+            ..
+        }
+        | config::BindingConfig::Channel {
             channel: binding_channel,
             ..
         } => binding_channel == channel,
@@ -679,6 +689,17 @@ fn binding_summary(binding: &config::BindingConfig) -> BindingSummary {
             scope: None,
             target: Some(team_id.clone()),
         },
+        config::BindingConfig::ChannelInstance {
+            agent,
+            channel,
+            channel_instance,
+        } => BindingSummary {
+            kind: "channel_instance".to_string(),
+            agent: agent.clone(),
+            channel: Some(channel.clone()),
+            scope: None,
+            target: Some(channel_instance.clone()),
+        },
         config::BindingConfig::Channel { agent, channel } => BindingSummary {
             kind: "channel".to_string(),
             agent: agent.clone(),
@@ -702,10 +723,12 @@ mod tests {
     use crate::{config, state::AppState};
     use qai_agent::{
         team::{
-            heartbeat::DispatchFn, orchestrator::TeamOrchestrator, registry::TaskRegistry,
-            session::TeamSession,
+            heartbeat::DispatchFn,
+            orchestrator::TeamOrchestrator,
+            registry::TaskRegistry,
+            session::{ChannelSendSourceKind, ChannelSendStatus, LeaderUpdateKind, TeamSession},
         },
-        SessionRegistry,
+        SessionRegistry, TurnDeliverySource,
     };
     use qai_runtime::{ApprovalBroker, BackendRegistry, BackendSpec, LaunchSpec};
     use qai_session::{SessionManager, SessionStorage};
@@ -731,6 +754,8 @@ mod tests {
                     enabled: true,
                     presentation: config::ProgressPresentationMode::FinalOnly,
                     trigger_policy: None,
+                    default_instance: None,
+                    instances: vec![],
                 }),
                 dingtalk: Some(config::DingTalkSection {
                     enabled: false,
@@ -950,6 +975,7 @@ mod tests {
                 event: qai_agent::team::completion_routing::TeamRoutingEvent::failed(
                     "T001", "pending",
                 ),
+                delivery_source: None,
             })
             .unwrap();
         session
@@ -979,5 +1005,80 @@ mod tests {
             .notes
             .iter()
             .any(|note| note.contains("duplicate user-visible milestone delivery attempt")));
+    }
+
+    #[tokio::test]
+    async fn collect_team_diagnostics_surfaces_latest_delivery_records() {
+        let state = diagnostics_state(true).await;
+        let tmp = tempdir().unwrap();
+        let session = Arc::new(TeamSession::from_dir(
+            "team-observability",
+            tmp.path().to_path_buf(),
+        ));
+        let registry = Arc::new(TaskRegistry::new_in_memory().unwrap());
+        let dispatch_fn: DispatchFn = Arc::new(|_, _| Box::pin(async { Ok(()) }));
+        let orch = TeamOrchestrator::new(
+            registry,
+            Arc::clone(&session),
+            dispatch_fn,
+            std::time::Duration::from_secs(60),
+        );
+        let lead_key = qai_protocol::SessionKey::with_instance("lark", "alpha", "group:diag");
+        let lead_source = TurnDeliverySource::from_session_key(&lead_key)
+            .with_reply_context(Some("om_1".into()), Some("th_1".into()));
+        session
+            .record_leader_update(
+                Some(&lead_key),
+                Some(&lead_source),
+                "codex-alpha",
+                LeaderUpdateKind::PostUpdate,
+                "working",
+                Some("T001"),
+            )
+            .unwrap();
+        session
+            .record_channel_send(
+                "lark",
+                Some("beta"),
+                Some("gamma"),
+                "group:target",
+                Some(&lead_key),
+                Some(&lead_source),
+                Some("om_2"),
+                Some("th_2"),
+                ChannelSendSourceKind::Milestone,
+                "codex-beta",
+                Some("T002"),
+                Some("dedupe-1"),
+                "finished",
+                ChannelSendStatus::Sent,
+                None,
+            )
+            .unwrap();
+        state
+            .registry
+            .register_team_orchestrator("team-observability".to_string(), Arc::clone(&orch));
+
+        let teams = collect_team_diagnostics(&state);
+        assert_eq!(teams.len(), 1);
+        let latest_leader = teams[0]
+            .latest_leader_update
+            .as_ref()
+            .expect("leader update");
+        assert_eq!(
+            latest_leader.lead_session_channel_instance.as_deref(),
+            Some("alpha")
+        );
+        assert_eq!(latest_leader.lead_reply_to.as_deref(), Some("om_1"));
+
+        let latest_send = teams[0].latest_channel_send.as_ref().expect("channel send");
+        assert_eq!(latest_send.sender_channel_instance.as_deref(), Some("beta"));
+        assert_eq!(
+            latest_send.target_channel_instance.as_deref(),
+            Some("gamma")
+        );
+        assert_eq!(latest_send.target_scope, "group:target");
+        assert_eq!(latest_send.reply_to.as_deref(), Some("om_2"));
+        assert_eq!(latest_send.thread_ts.as_deref(), Some("th_2"));
     }
 }

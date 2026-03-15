@@ -9,7 +9,8 @@
 //!     events.jsonl   — 事件日志（调试用）
 
 use anyhow::{Context, Result};
-use qai_protocol::SessionKey;
+use qai_protocol::{normalize_conversation_identity, SessionKey};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -87,7 +88,13 @@ pub struct LeaderUpdateRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lead_session_channel: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lead_session_channel_instance: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lead_session_scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lead_reply_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lead_thread_ts: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lead_turn_id: Option<String>,
     pub source_agent: String,
@@ -123,12 +130,22 @@ pub struct ChannelSendRecord {
     pub event_id: String,
     pub ts: String,
     pub channel: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_channel_instance: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_channel_instance: Option<String>,
     pub target_scope: String,
     pub team_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lead_session_channel: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lead_session_channel_instance: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lead_session_scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lead_reply_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lead_thread_ts: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -426,6 +443,7 @@ impl TeamSession {
     pub fn record_leader_update(
         &self,
         lead_session_key: Option<&SessionKey>,
+        lead_delivery_source: Option<&crate::turn_context::TurnDeliverySource>,
         source_agent: &str,
         kind: LeaderUpdateKind,
         text: &str,
@@ -437,7 +455,11 @@ impl TeamSession {
             ts: chrono::Utc::now().to_rfc3339(),
             team_id: self.team_id.clone(),
             lead_session_channel: lead_session_key.map(|key| key.channel.clone()),
+            lead_session_channel_instance: lead_session_key
+                .and_then(|key| key.channel_instance.clone()),
             lead_session_scope: lead_session_key.map(|key| key.scope.clone()),
+            lead_reply_to: lead_delivery_source.and_then(|source| source.reply_to.clone()),
+            lead_thread_ts: lead_delivery_source.and_then(|source| source.thread_ts.clone()),
             lead_turn_id: None,
             source_agent: source_agent.to_string(),
             kind,
@@ -454,8 +476,11 @@ impl TeamSession {
     pub fn record_channel_send(
         &self,
         channel: &str,
+        sender_channel_instance: Option<&str>,
+        target_channel_instance: Option<&str>,
         target_scope: &str,
         lead_session_key: Option<&SessionKey>,
+        lead_delivery_source: Option<&crate::turn_context::TurnDeliverySource>,
         reply_to: Option<&str>,
         thread_ts: Option<&str>,
         source_kind: ChannelSendSourceKind,
@@ -471,10 +496,16 @@ impl TeamSession {
             event_id: event_id.clone(),
             ts: chrono::Utc::now().to_rfc3339(),
             channel: channel.to_string(),
+            sender_channel_instance: sender_channel_instance.map(ToOwned::to_owned),
+            target_channel_instance: target_channel_instance.map(ToOwned::to_owned),
             target_scope: target_scope.to_string(),
             team_id: self.team_id.clone(),
             lead_session_channel: lead_session_key.map(|key| key.channel.clone()),
+            lead_session_channel_instance: lead_session_key
+                .and_then(|key| key.channel_instance.clone()),
             lead_session_scope: lead_session_key.map(|key| key.scope.clone()),
+            lead_reply_to: lead_delivery_source.and_then(|source| source.reply_to.clone()),
+            lead_thread_ts: lead_delivery_source.and_then(|source| source.thread_ts.clone()),
             reply_to: reply_to.map(ToOwned::to_owned),
             thread_ts: thread_ts.map(ToOwned::to_owned),
             source_kind,
@@ -488,6 +519,14 @@ impl TeamSession {
         };
         self.append_jsonl("channel-sends.jsonl", &record)?;
         Ok(event_id)
+    }
+
+    pub fn load_latest_leader_update(&self) -> Result<Option<LeaderUpdateRecord>> {
+        self.load_latest_jsonl("leader-updates.jsonl")
+    }
+
+    pub fn load_latest_channel_send(&self) -> Result<Option<ChannelSendRecord>> {
+        self.load_latest_jsonl("channel-sends.jsonl")
     }
 
     // ── task_reminder 构建 ───────────────────────────────────────────────────
@@ -650,6 +689,18 @@ impl TeamSession {
         writeln!(file, "{}", serde_json::to_string(value)?)?;
         Ok(())
     }
+
+    fn load_latest_jsonl<T: DeserializeOwned>(&self, name: &str) -> Result<Option<T>> {
+        let path = self.dir.join(name);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let content = std::fs::read_to_string(&path)?;
+        let Some(line) = content.lines().rev().find(|line| !line.trim().is_empty()) else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::from_str(line)?))
+    }
 }
 
 fn append_bounded_line(path: &std::path::Path, line: &str, max_lines: usize) -> Result<()> {
@@ -689,6 +740,22 @@ pub fn stable_team_id(channel: &str, scope: &str) -> String {
     )
 }
 
+pub fn stable_team_id_for_session_key(session_key: &SessionKey) -> String {
+    let normalized = normalize_conversation_identity(session_key);
+    let seed = match normalized.channel_instance.as_deref() {
+        Some(instance) => format!("{}@{}:{}", normalized.channel, instance, normalized.scope),
+        None => format!("{}:{}", normalized.channel, normalized.scope),
+    };
+    format!(
+        "team-{}",
+        uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, seed.as_bytes()).simple()
+    )
+}
+
+pub fn parse_specialist_session_scope(scope: &str) -> Option<(&str, &str)> {
+    scope.rsplit_once(':')
+}
+
 // ─── 测试 ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -723,6 +790,34 @@ mod tests {
         assert_eq!(lark_dm, stable_team_id("lark", "user:ou_same"));
         assert_ne!(lark_dm, dingtalk_dm);
         assert_ne!(lark_dm, lark_variant);
+    }
+
+    #[test]
+    fn test_stable_team_id_for_session_key_shares_group_across_instances() {
+        let alpha = SessionKey::with_instance("lark", "alpha", "group:oc_1");
+        let beta = SessionKey::with_instance("lark", "beta", "group:oc_1");
+        assert_eq!(
+            stable_team_id_for_session_key(&alpha),
+            stable_team_id_for_session_key(&beta)
+        );
+    }
+
+    #[test]
+    fn test_stable_team_id_for_session_key_isolates_dm_by_instance() {
+        let alpha = SessionKey::with_instance("lark", "alpha", "user:ou_1");
+        let beta = SessionKey::with_instance("lark", "beta", "user:ou_1");
+        assert_ne!(
+            stable_team_id_for_session_key(&alpha),
+            stable_team_id_for_session_key(&beta)
+        );
+    }
+
+    #[test]
+    fn test_parse_specialist_session_scope_supports_colons_inside_team_id() {
+        let (team_id, agent) =
+            parse_specialist_session_scope("team-abc:with:colons:codex").expect("valid scope");
+        assert_eq!(team_id, "team-abc:with:colons");
+        assert_eq!(agent, "codex");
     }
 
     #[test]
@@ -763,6 +858,7 @@ mod tests {
         let event_id = session
             .record_leader_update(
                 Some(&lead_key),
+                None,
                 "codex-alpha",
                 LeaderUpdateKind::PostUpdate,
                 "正在处理",
@@ -788,8 +884,11 @@ mod tests {
         let event_id = session
             .record_channel_send(
                 "lark",
+                None,
+                None,
                 "user:test",
                 Some(&lead_key),
+                None,
                 Some("msg-1"),
                 None,
                 ChannelSendSourceKind::LeadText,
@@ -812,6 +911,69 @@ mod tests {
         assert_eq!(row.dedupe_key.as_deref(), Some("dedupe-1"));
         assert_eq!(row.text, "任务已认领");
         assert_eq!(row.status, ChannelSendStatus::Sent);
+    }
+
+    #[test]
+    fn test_latest_delivery_ledgers_return_last_record() {
+        let (session, _tmp) = make_session();
+        let lead_key = SessionKey::with_instance("lark", "alpha", "group:test");
+        let lead_source = crate::turn_context::TurnDeliverySource::from_session_key(&lead_key)
+            .with_reply_context(Some("msg-2".into()), Some("thread-9".into()));
+
+        session
+            .record_leader_update(
+                Some(&lead_key),
+                Some(&lead_source),
+                "codex-alpha",
+                LeaderUpdateKind::PostUpdate,
+                "first",
+                None,
+            )
+            .unwrap();
+        session
+            .record_leader_update(
+                Some(&lead_key),
+                Some(&lead_source),
+                "codex-beta",
+                LeaderUpdateKind::SystemForward,
+                "second",
+                Some("T002"),
+            )
+            .unwrap();
+
+        session
+            .record_channel_send(
+                "lark",
+                Some("beta"),
+                Some("gamma"),
+                "group:test",
+                Some(&lead_key),
+                Some(&lead_source),
+                Some("msg-2"),
+                Some("thread-9"),
+                ChannelSendSourceKind::Milestone,
+                "codex-beta",
+                Some("T002"),
+                None,
+                "done",
+                ChannelSendStatus::Sent,
+                None,
+            )
+            .unwrap();
+
+        let leader = session.load_latest_leader_update().unwrap().unwrap();
+        assert_eq!(leader.source_agent, "codex-beta");
+        assert_eq!(
+            leader.lead_session_channel_instance.as_deref(),
+            Some("alpha")
+        );
+        assert_eq!(leader.lead_reply_to.as_deref(), Some("msg-2"));
+
+        let send = session.load_latest_channel_send().unwrap().unwrap();
+        assert_eq!(send.sender_channel_instance.as_deref(), Some("beta"));
+        assert_eq!(send.target_channel_instance.as_deref(), Some("gamma"));
+        assert_eq!(send.reply_to.as_deref(), Some("msg-2"));
+        assert_eq!(send.thread_ts.as_deref(), Some("thread-9"));
     }
 
     #[test]
@@ -932,6 +1094,7 @@ mod tests {
             team_id: "team-001".into(),
             delivery_status: RoutingDeliveryStatus::PersistedPending,
             event: TeamRoutingEvent::failed("T999", "boom"),
+            delivery_source: None,
         };
 
         session.append_pending_completion(&envelope).unwrap();

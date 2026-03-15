@@ -63,6 +63,8 @@ pub struct SessionMeta {
     pub updated_at: DateTime<Utc>,
     pub channel: String,
     pub scope: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_instance: Option<String>,
     pub message_count: usize,
     /// Per-backend 的后端侧 ACP session ID（backend_id → acp_session_id）。
     /// 用于下次 turn 时通过 ACP session/load 恢复后端 session 状态。
@@ -234,6 +236,7 @@ mod tests {
             updated_at: Utc::now(),
             channel: "dingtalk".to_string(),
             scope: "user_123".to_string(),
+            channel_instance: Some("default".to_string()),
             message_count: 0,
             backend_session_ids: Default::default(),
             session_status: SessionStatus::Idle,
@@ -242,6 +245,7 @@ mod tests {
         let loaded = storage.load_meta(session_id).await.unwrap().unwrap();
         assert_eq!(loaded.channel, "dingtalk");
         assert_eq!(loaded.scope, "user_123");
+        assert_eq!(loaded.channel_instance.as_deref(), Some("default"));
     }
 
     #[tokio::test]

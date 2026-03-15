@@ -8,9 +8,10 @@
 //!     IDENTITY.md  — name, communication style
 //!     MEMORY.md    — long-term memory (auto-updated in future)
 //!     memory/
-//!       {channel}_{scope}.md  — scoped per-session memory (V2)
+//!       c=<channel>#s=<scope>.md / c=<channel>#i=<instance>#s=<scope>.md
+//!         — scoped per-session memory
 
-use qai_protocol::SessionKey;
+use qai_protocol::{render_scope_storage_key, SessionKey};
 use std::path::Path;
 
 /// Per-agent persona loaded from a user-configured directory.
@@ -32,10 +33,11 @@ impl AgentPersona {
     }
 
     /// 新接口：按 session_key 加载 scoped 记忆文件
-    /// 路径：{dir}/memory/{channel}_{scope}.md
+    /// 路径：{dir}/memory/{canonical_scope_key}.md
     pub fn load_from_dir_scoped(dir: &Path, scope: &SessionKey) -> Self {
-        let scope_key = format!("{}_{}", scope.channel, scope.scope);
-        let memory_path = dir.join("memory").join(format!("{scope_key}.md"));
+        let scope_key = render_scope_storage_key(scope);
+        let memory_dir = dir.join("memory");
+        let memory_path = memory_dir.join(format!("{scope_key}.md"));
         Self {
             soul: read_optional(&dir.join("SOUL.md")),
             identity: read_optional(&dir.join("IDENTITY.md")),
@@ -248,7 +250,7 @@ mod tests {
         let scope = SessionKey::new("dingtalk", "group_C123");
         std::fs::create_dir_all(dir.path().join("memory")).unwrap();
         std::fs::write(
-            dir.path().join("memory").join("dingtalk_group_C123.md"),
+            dir.path().join("memory").join("c=dingtalk#s=group_C123.md"),
             "scoped memory content",
         )
         .unwrap();
@@ -263,6 +265,38 @@ mod tests {
     fn test_load_scoped_memory_falls_back_empty_when_no_file() {
         let dir = tempdir().unwrap();
         let scope = SessionKey::new("lark", "user_alice");
+        let persona = AgentPersona::load_from_dir_scoped(dir.path(), &scope);
+        assert!(persona.memory.is_empty());
+    }
+
+    #[test]
+    fn test_load_scoped_memory_shares_group_file_across_instances() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("memory")).unwrap();
+        std::fs::write(
+            dir.path().join("memory").join("c=lark#s=group:oc_1.md"),
+            "shared",
+        )
+        .unwrap();
+
+        let scope = SessionKey::with_instance("lark", "beta", "group:oc_1");
+        let persona = AgentPersona::load_from_dir_scoped(dir.path(), &scope);
+        assert_eq!(persona.memory, "shared");
+    }
+
+    #[test]
+    fn test_load_scoped_memory_isolates_dm_file_by_instance() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("memory")).unwrap();
+        std::fs::write(
+            dir.path()
+                .join("memory")
+                .join("c=lark#i=alpha#s=user:ou_1.md"),
+            "alpha",
+        )
+        .unwrap();
+
+        let scope = SessionKey::with_instance("lark", "beta", "user:ou_1");
         let persona = AgentPersona::load_from_dir_scoped(dir.path(), &scope);
         assert!(persona.memory.is_empty());
     }

@@ -1,3 +1,4 @@
+use crate::turn_context::TurnDeliverySource;
 use qai_protocol::SessionKey;
 use serde::{Deserialize, Serialize};
 
@@ -275,6 +276,8 @@ pub struct TeamRoutingEnvelope {
     pub parent_run_id: Option<String>,
     pub requester_session_key: Option<SessionKey>,
     pub fallback_session_keys: Vec<SessionKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_source: Option<TurnDeliverySource>,
     pub team_id: String,
     pub delivery_status: RoutingDeliveryStatus,
     pub event: TeamRoutingEvent,
@@ -305,6 +308,7 @@ mod tests {
             parent_run_id: None,
             requester_session_key: Some(SessionKey::new("ws", "group:demo")),
             fallback_session_keys: vec![SessionKey::new("ws", "group:fallback")],
+            delivery_source: None,
             team_id: "team-1".to_string(),
             delivery_status: RoutingDeliveryStatus::NotRouted,
             event: TeamRoutingEvent::failed("T1", "boom"),

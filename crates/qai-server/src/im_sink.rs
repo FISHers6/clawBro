@@ -1,9 +1,14 @@
-use crate::config::ProgressPresentationMode;
+use crate::channel_registry::ChannelRegistry;
+use crate::config::{DeliveryPurposeConfig, GatewayConfig, ProgressPresentationMode};
+use crate::delivery_resolver::{resolve_delivery, ResolvedDelivery};
 use crate::progress_presentation;
 use async_trait::async_trait;
 use qai_agent::team::orchestrator::TeamOrchestrator;
 use qai_agent::team::session::{ChannelSendSourceKind, ChannelSendStatus};
-use qai_agent::{throttled_stream, OutputSink, SessionRegistry, StreamControl};
+use qai_agent::{
+    throttled_stream, OutputSink, SessionRegistry, StreamControl, TurnDeliverySource,
+    TurnExecutionContext,
+};
 use qai_channels::Channel;
 use qai_protocol::{InboundMsg, OutboundMsg, SessionKey};
 use std::collections::HashMap;
@@ -26,6 +31,7 @@ impl OutputSink for NullSink {
 
 pub struct ImProgressSink {
     channel: Arc<dyn Channel>,
+    sender_channel_instance: Option<String>,
     reply_to: Option<String>,
     thread_ts: Option<String>,
     session_key: SessionKey,
@@ -39,6 +45,7 @@ impl ImProgressSink {
 
     pub fn new(
         channel: Arc<dyn Channel>,
+        sender_channel_instance: Option<String>,
         session_key: SessionKey,
         reply_to: Option<String>,
         thread_ts: Option<String>,
@@ -47,6 +54,7 @@ impl ImProgressSink {
     ) -> Self {
         Self {
             channel,
+            sender_channel_instance,
             reply_to,
             thread_ts,
             session_key,
@@ -92,6 +100,7 @@ impl OutputSink for ImProgressSink {
         record_team_channel_send(
             self.team_orchestrator.as_ref(),
             &self.session_key,
+            self.sender_channel_instance.as_deref(),
             self.reply_to.as_deref(),
             self.thread_ts.as_deref(),
             ChannelSendSourceKind::ToolPlaceholder,
@@ -121,11 +130,12 @@ impl OutputSink for ImProgressSink {
         record_team_channel_send(
             self.team_orchestrator.as_ref(),
             &self.session_key,
+            self.sender_channel_instance.as_deref(),
             self.reply_to.as_deref(),
             self.thread_ts.as_deref(),
             ChannelSendSourceKind::LeadText,
             text,
-            true,
+            false,
             send_result.as_ref().map(|_| ()).map_err(|e| e.to_string()),
         );
     }
@@ -164,6 +174,7 @@ fn decide_final_delivery(
 fn record_team_channel_send(
     team_orchestrator: Option<&Arc<TeamOrchestrator>>,
     session_key: &SessionKey,
+    sender_channel_instance: Option<&str>,
     reply_to: Option<&str>,
     thread_ts: Option<&str>,
     source_kind: ChannelSendSourceKind,
@@ -191,8 +202,11 @@ fn record_team_channel_send(
     };
     if let Err(err) = team_orchestrator.session.record_channel_send(
         &session_key.channel,
+        sender_channel_instance,
+        session_key.channel_instance.as_deref(),
         &session_key.scope,
-        team_orchestrator.lead_session_key.get(),
+        team_orchestrator.lead_session_key().as_ref(),
+        team_orchestrator.lead_delivery_source().as_ref(),
         reply_to,
         thread_ts,
         source_kind,
@@ -211,9 +225,43 @@ fn record_team_channel_send(
     }
 }
 
+fn delivery_parts_or_fallback(
+    resolved: Option<ResolvedDelivery>,
+    fallback_channel: Arc<dyn Channel>,
+    fallback_session_key: SessionKey,
+    fallback_reply_to: Option<String>,
+    fallback_thread_ts: Option<String>,
+) -> (
+    Arc<dyn Channel>,
+    SessionKey,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
+    if let Some(resolved) = resolved {
+        (
+            resolved.sender,
+            resolved.session_key,
+            resolved.reply_to,
+            resolved.thread_ts,
+            resolved.sender_channel_instance,
+        )
+    } else {
+        (
+            fallback_channel,
+            fallback_session_key,
+            fallback_reply_to,
+            fallback_thread_ts,
+            None,
+        )
+    }
+}
+
 pub fn spawn_im_turn(
     registry: Arc<SessionRegistry>,
     channel: Arc<dyn Channel>,
+    channel_registry: Arc<ChannelRegistry>,
+    cfg: Arc<GatewayConfig>,
     inbound: InboundMsg,
     presentation: ProgressPresentationMode,
 ) {
@@ -228,12 +276,37 @@ pub fn spawn_im_turn(
     // When true: Lead communicates only via post_update — stream path must be silent.
     let suppress_lead_final = registry.should_suppress_lead_final_reply(&session_key);
     let team_orchestrator_for_session = registry.team_orchestrator_for_session(&session_key);
+    let lead_agent_name = team_orchestrator_for_session
+        .as_ref()
+        .and_then(|orch| orch.lead_agent_name.get().cloned());
+    let stored_delivery_source = team_orchestrator_for_session
+        .as_ref()
+        .and_then(|orch| orch.lead_delivery_source());
+    let active_delivery_source = TurnDeliverySource::from_session_key(&session_key)
+        .with_reply_context(Some(inbound.id.clone()), inbound.thread_ts.clone());
+    let resolved_delivery = resolve_delivery(
+        cfg.as_ref(),
+        channel_registry.as_ref(),
+        DeliveryPurposeConfig::LeadFinal,
+        &session_key,
+        Some(&active_delivery_source),
+        stored_delivery_source.as_ref(),
+        lead_agent_name.as_deref(),
+        Some(inbound.id.as_str()),
+        inbound.thread_ts.as_deref(),
+    );
+    let turn_ctx = TurnExecutionContext {
+        delivery_source: Some(active_delivery_source),
+    };
 
     let registry_for_stream = registry.clone();
-    let channel_for_stream = channel.clone();
     let session_key_for_stream = session_key.clone();
     let channel_name_for_stream = channel_name.clone();
     let team_orchestrator_for_stream = team_orchestrator_for_session.clone();
+    let resolved_delivery_for_stream = resolved_delivery.clone();
+    let reply_to_for_stream = reply_to.clone();
+    let thread_ts_for_stream = thread_ts.clone();
+    let fallback_channel_for_stream = channel.clone();
     tokio::spawn(async move {
         let session_id = match registry_for_stream
             .session_manager_ref()
@@ -251,11 +324,25 @@ pub fn spawn_im_turn(
             // Lead in Team mode: all stream output suppressed; post_update is the only channel.
             throttled_stream(event_rx, session_id, &NullSink, None, control_rx).await;
         } else {
+            let (
+                stream_channel,
+                stream_session_key,
+                stream_reply_to,
+                stream_thread_ts,
+                stream_sender_channel_instance,
+            ) = delivery_parts_or_fallback(
+                resolved_delivery_for_stream,
+                fallback_channel_for_stream,
+                session_key_for_stream.clone(),
+                reply_to_for_stream,
+                thread_ts_for_stream,
+            );
             let sink = ImProgressSink::new(
-                channel_for_stream,
-                session_key_for_stream,
-                reply_to,
-                thread_ts,
+                stream_channel,
+                stream_sender_channel_instance,
+                stream_session_key,
+                stream_reply_to,
+                stream_thread_ts,
                 presentation,
                 team_orchestrator_for_stream,
             );
@@ -264,13 +351,14 @@ pub fn spawn_im_turn(
     });
 
     let channel_name_for_handle = channel_name.clone();
-    let channel_for_handle = channel.clone();
     let session_key_for_handle = session_key.clone();
     let reply_to_for_handle = Some(inbound.id.clone());
     let thread_ts_for_handle = inbound.thread_ts.clone();
     let team_orchestrator_for_handle = team_orchestrator_for_session;
+    let resolved_delivery_for_handle = resolved_delivery;
+    let fallback_channel_for_handle = channel.clone();
     tokio::spawn(async move {
-        match registry.handle(inbound).await {
+        match registry.handle_with_context(inbound, turn_ctx).await {
             Ok(Some(reply)) => {
                 match decide_final_delivery(
                     suppress_lead_final,
@@ -283,19 +371,33 @@ pub fn spawn_im_turn(
                         // The stream used NullSink because the turn started in Running.
                         // If Team is no longer running post-handle, send directly.
                         let _ = control_tx.send(StreamControl::Stop);
+                        let (
+                            send_channel,
+                            send_session_key,
+                            send_reply_to,
+                            send_thread_ts,
+                            send_sender_channel_instance,
+                        ) = delivery_parts_or_fallback(
+                            resolved_delivery_for_handle,
+                            fallback_channel_for_handle,
+                            session_key_for_handle.clone(),
+                            reply_to_for_handle,
+                            thread_ts_for_handle,
+                        );
                         let msg = OutboundMsg {
-                            session_key: session_key_for_handle.clone(),
+                            session_key: send_session_key.clone(),
                             content: qai_protocol::MsgContent::text(&reply),
-                            reply_to: reply_to_for_handle,
-                            thread_ts: thread_ts_for_handle,
+                            reply_to: send_reply_to,
+                            thread_ts: send_thread_ts,
                         };
-                        let send_result = channel_for_handle.send(&msg).await;
+                        let send_result = send_channel.send(&msg).await;
                         if let Err(e) = &send_result {
                             tracing::error!(channel = %channel_name_for_handle, "lead direct send failed: {e}");
                         }
                         record_team_channel_send(
                             team_orchestrator_for_handle.as_ref(),
-                            &session_key_for_handle,
+                            &send_session_key,
+                            send_sender_channel_instance.as_deref(),
                             msg.reply_to.as_deref(),
                             msg.thread_ts.as_deref(),
                             ChannelSendSourceKind::LeadText,
@@ -324,8 +426,13 @@ pub fn spawn_im_turn(
 mod tests {
     use super::*;
     use anyhow::Result;
+    use qai_agent::team::heartbeat::DispatchFn;
+    use qai_agent::team::orchestrator::TeamOrchestrator;
+    use qai_agent::team::registry::TaskRegistry;
+    use qai_agent::team::session::TeamSession;
     use qai_protocol::MsgContent;
     use std::sync::{Arc, Mutex as StdMutex};
+    use tempfile::tempdir;
     use tokio::sync::mpsc;
 
     struct MockChannel {
@@ -357,9 +464,11 @@ mod tests {
         });
         let sink = ImProgressSink::new(
             channel.clone(),
+            None,
             SessionKey {
                 channel: "mock".to_string(),
                 scope: "user:test".to_string(),
+                channel_instance: None,
             },
             Some("reply-id".to_string()),
             None,
@@ -367,6 +476,16 @@ mod tests {
             None,
         );
         (sink, channel)
+    }
+
+    fn make_team_orchestrator() -> (Arc<TeamOrchestrator>, tempfile::TempDir) {
+        let tmp = tempdir().unwrap();
+        let registry = Arc::new(TaskRegistry::new_in_memory().unwrap());
+        let session = Arc::new(TeamSession::from_dir("test-team", tmp.path().to_path_buf()));
+        let dispatch_fn: DispatchFn = Arc::new(|_agent, _task| Box::pin(async { Ok(()) }));
+        let orchestrator =
+            TeamOrchestrator::new(registry, session, dispatch_fn, Duration::from_secs(3600));
+        (orchestrator, tmp)
     }
 
     #[tokio::test]
@@ -414,6 +533,31 @@ mod tests {
             sent,
             vec!["⏳ 正在搜索代码".to_string(), "⏳ 正在搜索代码".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn send_final_does_not_leave_pending_lead_fragments() {
+        let (team_orchestrator, _tmp) = make_team_orchestrator();
+        let channel = Arc::new(MockChannel {
+            sent: StdMutex::new(Vec::new()),
+        });
+        let sink = ImProgressSink::new(
+            channel,
+            None,
+            SessionKey {
+                channel: "mock".to_string(),
+                scope: "user:test".to_string(),
+                channel_instance: None,
+            },
+            Some("reply-id".to_string()),
+            None,
+            ProgressPresentationMode::FinalOnly,
+            Some(team_orchestrator.clone()),
+        );
+
+        sink.send_final("hello", None).await;
+
+        assert!(team_orchestrator.take_pending_lead_fragments().is_empty());
     }
 
     #[test]
