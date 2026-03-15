@@ -26,8 +26,8 @@ pub type DispatchFn = Arc<
 
 // ─── OrchestratorHeartbeat ───────────────────────────────────────────────────
 
-/// 永久失败通知回调：(task_id, reason) → fire-and-forget
-pub type FailureNotifyFn = Arc<dyn Fn(String, String) + Send + Sync>;
+/// 永久失败通知回调：(task_id, agent, reason) → fire-and-forget
+pub type FailureNotifyFn = Arc<dyn Fn(String, String, String) + Send + Sync>;
 
 pub struct OrchestratorHeartbeat {
     registry: Arc<TaskRegistry>,
@@ -108,7 +108,14 @@ impl OrchestratorHeartbeat {
                     "Task failed after {} retries", self.max_retries
                 );
                 if let Some(ref f) = self.on_permanent_failure {
-                    f(task.id.clone(), reason.to_string());
+                    let agent = match task.status_parsed() {
+                        super::registry::TaskStatus::Claimed { agent, .. } => agent,
+                        _ => task
+                            .assignee_hint
+                            .clone()
+                            .unwrap_or_else(|| "unknown".to_string()),
+                    };
+                    f(task.id.clone(), agent, reason.to_string());
                 }
             }
         }
@@ -500,7 +507,7 @@ mod tests {
                 Duration::from_millis(50),
                 4,
             )
-            .with_failure_notify(Arc::new(move |task_id, _reason| {
+            .with_failure_notify(Arc::new(move |task_id, _agent, _reason| {
                 notified_clone.lock().unwrap().push(task_id);
             })),
         );

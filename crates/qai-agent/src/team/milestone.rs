@@ -46,6 +46,12 @@ pub enum TeamMilestoneEvent {
         agent: String,
         reason: String,
     },
+    /// 任务永久失败（超过重试次数）
+    TaskFailed {
+        task_id: String,
+        agent: String,
+        reason: String,
+    },
     /// 单个任务完成（不是所有任务）
     TaskDone {
         task_id: String,
@@ -72,6 +78,7 @@ impl TeamMilestoneEvent {
             Self::TaskCheckpoint { .. } => "task_checkpoint",
             Self::TaskSubmitted { .. } => "task_submitted",
             Self::TaskBlocked { .. } => "task_blocked",
+            Self::TaskFailed { .. } => "task_failed",
             Self::TaskDone { .. } => "task_done",
             Self::TasksUnlocked { .. } => "tasks_unlocked",
             Self::AllTasksDone => "all_tasks_done",
@@ -112,6 +119,14 @@ pub fn render_for_im(event: &TeamMilestoneEvent) -> String {
             agent,
             reason,
         } => format!("🚧 任务 {task_id}「{task_title}」@{agent} 阻塞：{reason}"),
+
+        TeamMilestoneEvent::TaskFailed {
+            task_id,
+            agent,
+            reason,
+        } => {
+            format!("❌ 任务 {task_id} @{agent} 永久失败：{reason}")
+        }
 
         TeamMilestoneEvent::TaskDone {
             task_id,
@@ -187,5 +202,18 @@ mod tests {
         let json = serde_json::to_string(&ev).unwrap();
         let back: TeamMilestoneEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(ev, back);
+    }
+
+    #[test]
+    fn task_failed_kind_is_stable() {
+        assert_eq!(
+            TeamMilestoneEvent::TaskFailed {
+                task_id: "T9".into(),
+                agent: "codex".into(),
+                reason: "boom".into(),
+            }
+            .kind_str(),
+            "task_failed"
+        );
     }
 }

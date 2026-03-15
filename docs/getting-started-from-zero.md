@@ -728,6 +728,28 @@ public_updates = "minimal"
 max_parallel = 2
 ```
 
+`public_updates` 现在是 Team 生命周期通知的唯一外发开关：
+
+- `minimal`
+  - 只发 lead 显式 `post_update` / 最终答复
+- `normal`
+  - 在 `minimal` 基础上，再发关键自动通知：
+    - `TaskBlocked`
+    - `TaskFailed`
+    - `AllTasksDone`
+- `verbose`
+  - 再额外发详细 Team 生命周期通知：
+    - `TaskDispatched`
+    - `TaskSubmitted`
+    - `TaskDone`
+    - `TasksUnlocked`
+    - `TaskCheckpoint`
+
+它和 channel 的 `presentation` 是独立的：
+
+- `public_updates` 控制 Team 里程碑是否对外可见
+- `presentation` 控制工具/进度提示是否发送
+
 ### Team 运行后会有什么
 
 team runtime 会建立：
@@ -805,6 +827,7 @@ export LARK_APP_SECRET=xxx
 - 使用长连接 WebSocket 模式
 - 默认 `presentation = "final_only"`，只发送最终结果
 - 可选 `presentation = "progress_compact"`，先发送简化进度，再发送最终结果
+- `presentation` 不决定 Team milestone 是否外发；那由 `group.team.public_updates` / `team_scope.team.public_updates` 控制
 
 例如：
 

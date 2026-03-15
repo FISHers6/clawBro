@@ -16,6 +16,10 @@ pub struct StoredMessage {
     pub sender: Option<String>, // NEW: @claude / alice / cron etc.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCallRecord>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fragment_event_ids: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregation_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -210,6 +214,8 @@ mod tests {
             timestamp: Utc::now(),
             sender: None,
             tool_calls: None,
+            fragment_event_ids: None,
+            aggregation_mode: None,
         };
         storage.append_message(session_id, &msg).await.unwrap();
         let loaded = storage.load_messages(session_id).await.unwrap();
@@ -271,6 +277,8 @@ mod tests {
             timestamp: Utc::now(),
             sender: Some("@claude".to_string()),
             tool_calls: None,
+            fragment_event_ids: None,
+            aggregation_mode: None,
         };
         storage.append_message(session_id, &msg).await.unwrap();
         let loaded = storage.load_messages(session_id).await.unwrap();
@@ -292,6 +300,8 @@ mod tests {
                 timestamp: Utc::now(),
                 sender: None,
                 tool_calls: None,
+                fragment_event_ids: None,
+                aggregation_mode: None,
             };
             storage.append_message(session_id, &msg).await.unwrap();
         }
@@ -317,6 +327,8 @@ mod tests {
             timestamp: Utc::now(),
             sender: None,
             tool_calls: None,
+            fragment_event_ids: None,
+            aggregation_mode: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(
@@ -341,6 +353,33 @@ mod tests {
         assert_eq!(roundtrip.tool_call_id.as_deref(), Some("call-1"));
         assert_eq!(roundtrip.name, "read_file");
         assert_eq!(roundtrip.output.as_deref(), Some("ok"));
+    }
+
+    #[tokio::test]
+    async fn stored_message_fragment_refs_roundtrip() {
+        let dir = tempdir().unwrap();
+        let storage = SessionStorage::new(dir.path().to_path_buf());
+        let session_id = Uuid::new_v4();
+        let msg = StoredMessage {
+            id: Uuid::new_v4(),
+            role: "assistant".to_string(),
+            content: "internal turn".to_string(),
+            timestamp: Utc::now(),
+            sender: Some("@alpha".to_string()),
+            tool_calls: None,
+            fragment_event_ids: Some(vec!["frag-1".to_string(), "frag-2".to_string()]),
+            aggregation_mode: Some("turn_compacted".to_string()),
+        };
+        storage.append_message(session_id, &msg).await.unwrap();
+        let loaded = storage.load_messages(session_id).await.unwrap();
+        assert_eq!(
+            loaded[0].fragment_event_ids.as_ref().unwrap(),
+            &vec!["frag-1".to_string(), "frag-2".to_string()]
+        );
+        assert_eq!(
+            loaded[0].aggregation_mode.as_deref(),
+            Some("turn_compacted")
+        );
     }
 
     #[test]

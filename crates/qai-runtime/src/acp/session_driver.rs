@@ -441,10 +441,9 @@ pub async fn run_command_turn(
 
     authenticate_if_configured(&conn, acp_backend, acp_auth_method, &init_resp).await?;
 
-    let session_root = session
-        .workspace_dir
-        .clone()
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/")));
+    let session_root = session.workspace_dir.clone().unwrap_or_else(|| {
+        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"))
+    });
     let mcp_servers = build_mcp_servers(
         init_resp.agent_capabilities.mcp_capabilities.sse,
         init_resp.agent_capabilities.mcp_capabilities.http,
@@ -710,11 +709,17 @@ pub fn build_mcp_servers(
             if supports_http {
                 // Streamable HTTP MCP (MCP 2025-03-26 spec) — preferred when available
                 let url = format!("{base}/mcp");
-                servers.push(acp::McpServer::Http(acp::McpServerHttp::new("team-tools", &url)));
+                servers.push(acp::McpServer::Http(acp::McpServerHttp::new(
+                    "team-tools",
+                    &url,
+                )));
             } else {
                 // Legacy SSE MCP
                 let url = format!("{base}/sse");
-                servers.push(acp::McpServer::Sse(acp::McpServerSse::new("team-tools", &url)));
+                servers.push(acp::McpServer::Sse(acp::McpServerSse::new(
+                    "team-tools",
+                    &url,
+                )));
             }
         }
     }

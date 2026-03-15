@@ -447,6 +447,13 @@ impl SessionRegistry {
         route_orchestrator_for_session(&self.team_orchestrators, session_key)
     }
 
+    pub fn team_orchestrator_for_session(
+        &self,
+        session_key: &SessionKey,
+    ) -> Option<Arc<TeamOrchestrator>> {
+        self.get_orchestrator_for_session(session_key)
+    }
+
     /// Returns true when the Lead's direct text reply should be suppressed by `spawn_im_turn`.
     ///
     /// Suppression rule:
@@ -862,6 +869,8 @@ impl SessionRegistry {
             timestamp: inbound.timestamp,
             sender: Some(inbound.sender.clone()),
             tool_calls: None,
+            fragment_event_ids: None,
+            aggregation_mode: None,
         };
         storage.append_message(session_id, &user_msg).await?;
 
@@ -1028,6 +1037,7 @@ impl SessionRegistry {
                 user_text_for_log: &user_text_for_log,
                 full_text: turn.full_text,
                 is_lead,
+                team_orchestrator: session_team_orch,
             },
         )
         .await?;
@@ -2274,7 +2284,8 @@ mod tests {
             "Planning state must not suppress normal lead replies"
         );
 
-        *orch.team_state_inner.lock().unwrap() = crate::team::orchestrator::TeamState::AwaitingConfirm;
+        *orch.team_state_inner.lock().unwrap() =
+            crate::team::orchestrator::TeamState::AwaitingConfirm;
         assert!(
             !registry.should_suppress_lead_final_reply(&lead_key),
             "AwaitingConfirm state must not suppress confirmation replies"

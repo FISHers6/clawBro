@@ -113,3 +113,32 @@ Team mode keeps its own role logic:
 - Internal Specialist heartbeat turns may resolve through `team` bindings before the generated `target_agent` hint, so a whole team can be rebound to a different specialist backend family without changing orchestrator dispatch format.
 
 Canonical Team semantics still live in `/runtime/team-tools`. Routing only decides which backend receives the turn.
+
+## Team Output Semantics
+
+Routing and outward presentation are separate concerns.
+
+Team mode currently has three output planes:
+
+- lead text
+  - explicit `post_update` / `post_message`
+  - final lead reply when the turn does not transition into active Team execution
+- team milestones
+  - typed lifecycle events such as `TaskBlocked`, `TaskFailed`, `AllTasksDone`
+- tool/progress placeholders
+  - compact labels such as `⏳ 正在搜索代码`
+
+Their controls are intentionally independent:
+
+- `group.team.public_updates` / `team_scope.team.public_updates`
+  - controls whether Team milestones are externally visible
+  - supported values: `minimal`, `normal`, `verbose`
+- `[channels.lark].presentation` / `[channels.dingtalk].presentation`
+  - controls whether tool/progress placeholders are sent
+  - supported values: `final_only`, `progress_compact`
+
+This separation is important:
+
+- Team completion-routing and lead coordination remain internal by default.
+- External channels should only see milestones when the Team visibility mode allows them.
+- Tool/progress presentation must not accidentally change Team lifecycle visibility.

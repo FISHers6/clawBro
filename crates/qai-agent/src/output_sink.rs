@@ -472,7 +472,9 @@ mod tests {
         let recorded = calls.lock().unwrap().clone();
         // Pre-tool text flushed as segment
         assert!(
-            recorded.iter().any(|s| s == "segment:I'll look at the file..."),
+            recorded
+                .iter()
+                .any(|s| s == "segment:I'll look at the file..."),
             "pre-tool text must be sent as a segment before tool call; got: {recorded:?}"
         );
         // Post-tool answer sent as final (accumulated since last flush, not full_text)
@@ -482,7 +484,9 @@ mod tests {
         );
         // full_text must NOT be re-sent (would duplicate pre-tool narration)
         assert!(
-            !recorded.iter().any(|s| s.contains("I'll look at the file...Here's")),
+            !recorded
+                .iter()
+                .any(|s| s.contains("I'll look at the file...Here's")),
             "full_text must not be re-sent when segments already flushed; got: {recorded:?}"
         );
         // Segment must appear before the final

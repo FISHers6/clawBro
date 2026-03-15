@@ -24,4 +24,5 @@ fn codex_local_config_projection_writes_openai_compatible_projection() {
     assert!(config.contains("model_provider = \"openrouter_openai\""));
     assert!(config.contains("preferred_auth_method = \"apikey\""));
     assert!(config.contains("enableRouteSelection = true"));
+    assert!(config.contains("requires_openai_auth = false"));
 }

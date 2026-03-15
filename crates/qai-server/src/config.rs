@@ -1,6 +1,7 @@
 use anyhow::Result;
 use qai_agent::bindings::{BindingPeerKind, BindingRule};
 use qai_agent::roster::AgentEntry;
+use qai_agent::team::milestone_delivery::TeamPublicUpdatesMode;
 use qai_runtime::{AcpBackend, ApprovalMode, BackendFamily, BackendSpec, LaunchSpec};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -873,7 +874,7 @@ pub struct GroupTeamConfig {
     pub roster: Vec<String>,
     /// 里程碑广播详细程度（minimal / normal / verbose）
     #[serde(default = "default_public_updates")]
-    pub public_updates: String,
+    pub public_updates: TeamPublicUpdatesMode,
     /// 最大并行任务数
     #[serde(default = "default_max_parallel")]
     pub max_parallel: usize,
@@ -889,8 +890,8 @@ impl Default for GroupTeamConfig {
     }
 }
 
-fn default_public_updates() -> String {
-    "minimal".to_string()
+fn default_public_updates() -> TeamPublicUpdatesMode {
+    TeamPublicUpdatesMode::Minimal
 }
 fn default_max_parallel() -> usize {
     3
@@ -1682,7 +1683,7 @@ max_parallel = 5
         assert!(g.mode.auto_promote);
         assert_eq!(g.mode.front_bot.as_deref(), Some("claude"));
         assert_eq!(g.team.roster, vec!["codex", "researcher"]);
-        assert_eq!(g.team.public_updates, "verbose");
+        assert_eq!(g.team.public_updates, TeamPublicUpdatesMode::Verbose);
         assert_eq!(g.team.max_parallel, 5);
     }
 
@@ -1698,7 +1699,7 @@ scope = "group:lark:xyz"
         assert!(!g.mode.auto_promote);
         assert!(g.mode.front_bot.is_none());
         assert!(g.team.roster.is_empty());
-        assert_eq!(g.team.public_updates, "minimal");
+        assert_eq!(g.team.public_updates, TeamPublicUpdatesMode::Minimal);
         assert_eq!(g.team.max_parallel, 3);
     }
 
@@ -1763,6 +1764,10 @@ max_parallel = 2
         assert_eq!(team_scope.mode.front_bot.as_deref(), Some("claude"));
         assert_eq!(team_scope.mode.channel.as_deref(), Some("lark"));
         assert_eq!(team_scope.team.roster, vec!["codex", "researcher"]);
+        assert_eq!(
+            team_scope.team.public_updates,
+            TeamPublicUpdatesMode::Minimal
+        );
         assert_eq!(team_scope.team.max_parallel, 2);
     }
 

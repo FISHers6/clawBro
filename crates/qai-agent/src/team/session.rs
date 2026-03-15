@@ -10,7 +10,7 @@
 
 use anyhow::{Context, Result};
 use qai_protocol::SessionKey;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -69,6 +69,82 @@ impl TaskArtifactMeta {
             accepted_by,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LeaderUpdateKind {
+    PostUpdate,
+    FinalAnswerFragment,
+    SystemForward,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaderUpdateRecord {
+    pub event_id: String,
+    pub ts: String,
+    pub team_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lead_session_channel: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lead_session_scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lead_turn_id: Option<String>,
+    pub source_agent: String,
+    pub kind: LeaderUpdateKind,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_send_event_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_message_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelSendSourceKind {
+    LeadText,
+    Milestone,
+    Progress,
+    ToolPlaceholder,
+    GatewayError,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelSendStatus {
+    Sent,
+    SendFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelSendRecord {
+    pub event_id: String,
+    pub ts: String,
+    pub channel: String,
+    pub target_scope: String,
+    pub team_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lead_session_channel: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lead_session_scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_ts: Option<String>,
+    pub source_kind: ChannelSendSourceKind,
+    pub source_agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dedupe_key: Option<String>,
+    pub text: String,
+    pub status: ChannelSendStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 pub struct TeamSession {
@@ -284,14 +360,7 @@ impl TeamSession {
     }
 
     pub fn append_routing_outcome(&self, envelope: &TeamRoutingEnvelope) -> Result<()> {
-        use std::io::Write;
-        let path = self.dir.join("routing-events.jsonl");
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
-        writeln!(file, "{}", serde_json::to_string(envelope)?)?;
-        Ok(())
+        self.append_jsonl("routing-events.jsonl", envelope)
     }
 
     pub fn load_routing_outcomes(&self) -> Result<Vec<TeamRoutingEnvelope>> {
@@ -352,6 +421,73 @@ impl TeamSession {
             .lines()
             .filter(|line| !line.trim().is_empty())
             .count())
+    }
+
+    pub fn record_leader_update(
+        &self,
+        lead_session_key: Option<&SessionKey>,
+        source_agent: &str,
+        kind: LeaderUpdateKind,
+        text: &str,
+        task_id: Option<&str>,
+    ) -> Result<String> {
+        let event_id = uuid::Uuid::new_v4().to_string();
+        let record = LeaderUpdateRecord {
+            event_id: event_id.clone(),
+            ts: chrono::Utc::now().to_rfc3339(),
+            team_id: self.team_id.clone(),
+            lead_session_channel: lead_session_key.map(|key| key.channel.clone()),
+            lead_session_scope: lead_session_key.map(|key| key.scope.clone()),
+            lead_turn_id: None,
+            source_agent: source_agent.to_string(),
+            kind,
+            text: text.to_string(),
+            task_id: task_id.map(ToOwned::to_owned),
+            channel_send_event_id: None,
+            session_message_id: None,
+        };
+        self.append_jsonl("leader-updates.jsonl", &record)?;
+        Ok(event_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_channel_send(
+        &self,
+        channel: &str,
+        target_scope: &str,
+        lead_session_key: Option<&SessionKey>,
+        reply_to: Option<&str>,
+        thread_ts: Option<&str>,
+        source_kind: ChannelSendSourceKind,
+        source_agent: &str,
+        task_id: Option<&str>,
+        dedupe_key: Option<&str>,
+        text: &str,
+        status: ChannelSendStatus,
+        error: Option<&str>,
+    ) -> Result<String> {
+        let event_id = uuid::Uuid::new_v4().to_string();
+        let record = ChannelSendRecord {
+            event_id: event_id.clone(),
+            ts: chrono::Utc::now().to_rfc3339(),
+            channel: channel.to_string(),
+            target_scope: target_scope.to_string(),
+            team_id: self.team_id.clone(),
+            lead_session_channel: lead_session_key.map(|key| key.channel.clone()),
+            lead_session_scope: lead_session_key.map(|key| key.scope.clone()),
+            reply_to: reply_to.map(ToOwned::to_owned),
+            thread_ts: thread_ts.map(ToOwned::to_owned),
+            source_kind,
+            source_agent: source_agent.to_string(),
+            task_id: task_id.map(ToOwned::to_owned),
+            dedupe_key: dedupe_key.map(ToOwned::to_owned),
+            text: text.to_string(),
+            status,
+            provider_message_id: None,
+            error: error.map(ToOwned::to_owned),
+        };
+        self.append_jsonl("channel-sends.jsonl", &record)?;
+        Ok(event_id)
     }
 
     // ── task_reminder 构建 ───────────────────────────────────────────────────
@@ -502,6 +638,18 @@ impl TeamSession {
     fn read_file(&self, name: &str) -> String {
         std::fs::read_to_string(self.dir.join(name)).unwrap_or_default()
     }
+
+    fn append_jsonl<T: Serialize>(&self, name: &str, value: &T) -> Result<()> {
+        use std::io::Write;
+        let path = self.dir.join(name);
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("Failed to open {}", path.display()))?;
+        writeln!(file, "{}", serde_json::to_string(value)?)?;
+        Ok(())
+    }
 }
 
 fn append_bounded_line(path: &std::path::Path, line: &str, max_lines: usize) -> Result<()> {
@@ -606,6 +754,64 @@ mod tests {
         let md = session.read_tasks_md();
         assert!(md.contains("T001"));
         assert!(md.contains("Setup project"));
+    }
+
+    #[test]
+    fn test_record_leader_update_writes_jsonl() {
+        let (session, _tmp) = make_session();
+        let lead_key = SessionKey::new("lark", "user:test");
+        let event_id = session
+            .record_leader_update(
+                Some(&lead_key),
+                "codex-alpha",
+                LeaderUpdateKind::PostUpdate,
+                "正在处理",
+                Some("T001"),
+            )
+            .unwrap();
+
+        let content = std::fs::read_to_string(session.dir.join("leader-updates.jsonl")).unwrap();
+        let row: LeaderUpdateRecord = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(row.event_id, event_id);
+        assert_eq!(row.team_id, "team-001");
+        assert_eq!(row.lead_session_channel.as_deref(), Some("lark"));
+        assert_eq!(row.lead_session_scope.as_deref(), Some("user:test"));
+        assert_eq!(row.source_agent, "codex-alpha");
+        assert_eq!(row.text, "正在处理");
+        assert_eq!(row.task_id.as_deref(), Some("T001"));
+    }
+
+    #[test]
+    fn test_record_channel_send_writes_jsonl() {
+        let (session, _tmp) = make_session();
+        let lead_key = SessionKey::new("lark", "user:test");
+        let event_id = session
+            .record_channel_send(
+                "lark",
+                "user:test",
+                Some(&lead_key),
+                Some("msg-1"),
+                None,
+                ChannelSendSourceKind::LeadText,
+                "codex-alpha",
+                Some("T001"),
+                Some("dedupe-1"),
+                "任务已认领",
+                ChannelSendStatus::Sent,
+                None,
+            )
+            .unwrap();
+
+        let content = std::fs::read_to_string(session.dir.join("channel-sends.jsonl")).unwrap();
+        let row: ChannelSendRecord = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(row.event_id, event_id);
+        assert_eq!(row.channel, "lark");
+        assert_eq!(row.target_scope, "user:test");
+        assert_eq!(row.source_agent, "codex-alpha");
+        assert_eq!(row.task_id.as_deref(), Some("T001"));
+        assert_eq!(row.dedupe_key.as_deref(), Some("dedupe-1"));
+        assert_eq!(row.text, "任务已认领");
+        assert_eq!(row.status, ChannelSendStatus::Sent);
     }
 
     #[test]

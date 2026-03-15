@@ -302,6 +302,8 @@ mod tests {
             timestamp: chrono::Utc::now(),
             sender: Some("@codex".to_string()),
             tool_calls: None,
+            fragment_event_ids: None,
+            aggregation_mode: None,
         }]);
 
         assert_eq!(history.len(), 1);

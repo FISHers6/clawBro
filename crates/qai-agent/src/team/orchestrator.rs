@@ -28,7 +28,7 @@ use super::completion_routing::{
 use super::heartbeat::DispatchFn;
 use super::milestone::TeamMilestoneEvent;
 use super::registry::{Task, TaskRegistry};
-use super::session::{TaskArtifactMeta, TeamSession};
+use super::session::{LeaderUpdateKind, TaskArtifactMeta, TeamSession};
 use super::specialist_turn::{
     classify_specialist_turn, SpecialistActionKind, SpecialistActionRecord, SpecialistTurnOutcome,
 };
@@ -156,6 +156,7 @@ pub struct TeamOrchestrator {
     /// Recent canonical specialist actions for dispatch-window outcome classification.
     recent_specialist_actions: std::sync::Mutex<VecDeque<SpecialistActionRecord>>,
     dispatch_contexts: std::sync::Mutex<HashMap<(String, String), DispatchContextRecord>>,
+    pending_lead_fragments: std::sync::Mutex<Vec<PendingLeadFragment>>,
     #[cfg(test)]
     test_mcp_start_result: std::sync::Mutex<Option<std::result::Result<u16, String>>>,
 }
@@ -165,6 +166,12 @@ struct DispatchContextRecord {
     run_id: String,
     requester_session_key: SessionKey,
     parent_run_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingLeadFragment {
+    pub event_id: String,
+    pub text: String,
 }
 
 impl TeamOrchestrator {
@@ -193,6 +200,7 @@ impl TeamOrchestrator {
             pending_store_lock: std::sync::Mutex::new(()),
             recent_specialist_actions: std::sync::Mutex::new(VecDeque::new()),
             dispatch_contexts: std::sync::Mutex::new(HashMap::new()),
+            pending_lead_fragments: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             test_mcp_start_result: std::sync::Mutex::new(None),
         })
@@ -257,10 +265,47 @@ impl TeamOrchestrator {
 
     /// 向 IM 频道发布 Lead 的任意文字更新（post_update 工具调用时使用）
     pub fn post_message(&self, message: &str) {
+        self.record_leader_fragment(LeaderUpdateKind::PostUpdate, message);
         let event = TeamMilestoneEvent::LeadMessage {
             text: message.to_string(),
         };
         let _ = self.emit_milestone(event);
+    }
+
+    pub fn record_leader_fragment(&self, kind: LeaderUpdateKind, text: &str) {
+        let source_agent = self
+            .lead_agent_name
+            .get()
+            .cloned()
+            .unwrap_or_else(|| "leader".to_string());
+        match self.session.record_leader_update(
+            self.lead_session_key.get(),
+            &source_agent,
+            kind,
+            text,
+            None,
+        ) {
+            Ok(event_id) => self
+                .pending_lead_fragments
+                .lock()
+                .unwrap()
+                .push(PendingLeadFragment {
+                    event_id,
+                    text: text.to_string(),
+                }),
+            Err(err) => {
+                tracing::warn!(
+                    team_id = %self.session.team_id,
+                    error = %err,
+                    "Failed to record leader update ledger entry"
+                );
+            }
+        }
+    }
+
+    pub fn take_pending_lead_fragments(&self) -> Vec<PendingLeadFragment> {
+        let mut refs = self.pending_lead_fragments.lock().unwrap();
+        std::mem::take(&mut *refs)
     }
 
     pub fn notify_task_dispatched(&self, task_id: &str, task_title: &str, agent: &str) {
@@ -510,8 +555,8 @@ impl TeamOrchestrator {
         // Start Heartbeat (wire failure callback so permanent failures notify Lead)
         let self_for_failure = std::sync::Arc::clone(self);
         let failure_notify: super::heartbeat::FailureNotifyFn =
-            std::sync::Arc::new(move |task_id: String, reason: String| {
-                self_for_failure.dispatch_team_notify_failed(&task_id, &reason);
+            std::sync::Arc::new(move |task_id: String, agent: String, reason: String| {
+                self_for_failure.dispatch_team_notify_failed(&task_id, &agent, &reason);
             });
         let heartbeat = std::sync::Arc::new(
             super::heartbeat::OrchestratorHeartbeat::new(
@@ -778,6 +823,20 @@ impl TeamOrchestrator {
 
     /// Lead 验收已提交任务（submitted -> accepted），并复用里程碑检查逻辑。
     pub fn accept_submitted_task(&self, task_id: &str, by: &str) -> Result<()> {
+        let submitted_task = self.registry.get_task(task_id)?;
+        let (completed_agent, task_title) = submitted_task
+            .as_ref()
+            .map(|task| {
+                let completed_agent = match task.status_parsed() {
+                    super::registry::TaskStatus::Submitted { ref agent, .. } => agent.clone(),
+                    _ => task
+                        .assignee_hint
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string()),
+                };
+                (completed_agent, task.title.clone())
+            })
+            .unwrap_or_else(|| ("unknown".to_string(), task_id.to_string()));
         self.registry.accept_task(task_id, by)?;
         self.sync_task_artifacts(task_id)?;
         let _ = self.session.append_task_progress(
@@ -807,6 +866,20 @@ impl TeamOrchestrator {
         .to_string();
         let _ = self.session.append_event(&event);
         let _ = self.session.sync_tasks_md(&self.registry);
+
+        let tasks = self.registry.all_tasks().unwrap_or_default();
+        let done_count = tasks
+            .iter()
+            .filter(|t| t.status_raw == "done" || t.status_raw.starts_with("accepted:"))
+            .count();
+        let total = tasks.len();
+        self.emit_milestone(TeamMilestoneEvent::TaskDone {
+            task_id: task_id.to_string(),
+            task_title,
+            agent: completed_agent.clone(),
+            done_count,
+            total,
+        })?;
 
         let all_done = self.registry.all_done()?;
         if all_done {
@@ -960,10 +1033,15 @@ impl TeamOrchestrator {
     }
 
     /// 构建并发送 TeamNotify InboundMsg 给 Lead（task 永久失败）
-    pub fn dispatch_team_notify_failed(&self, task_id: &str, reason: &str) {
+    pub fn dispatch_team_notify_failed(&self, task_id: &str, agent: &str, reason: &str) {
+        let _ = self.emit_milestone(TeamMilestoneEvent::TaskFailed {
+            task_id: task_id.to_string(),
+            agent: agent.to_string(),
+            reason: reason.to_string(),
+        });
         self.dispatch_team_routing_event(self.build_routing_envelope(
             task_id,
-            "leader",
+            agent,
             TeamRoutingEvent::failed(task_id, reason),
         ));
     }
@@ -1193,6 +1271,8 @@ impl TeamOrchestrator {
             "pending-completions.jsonl",
             "delivered-milestones.jsonl",
             "delivery-dedupe-hits.jsonl",
+            "leader-updates.jsonl",
+            "channel-sends.jsonl",
         ] {
             let path = dir.join(filename);
             if path.exists() {
@@ -1207,6 +1287,7 @@ impl TeamOrchestrator {
         }
         // Reset in-memory state to Planning
         *self.team_state_inner.lock().unwrap() = TeamState::Planning;
+        self.pending_lead_fragments.lock().unwrap().clear();
         tracing::info!(team_id = %self.session.team_id, "Team workspace cleared");
         Ok(())
     }
@@ -1492,7 +1573,9 @@ mod tests {
             "unexpected initialize status: {response}"
         );
         assert!(
-            response.to_ascii_lowercase().contains("content-type: text/event-stream"),
+            response
+                .to_ascii_lowercase()
+                .contains("content-type: text/event-stream"),
             "missing SSE content type after /clear: {response}"
         );
         assert!(matches!(orch.team_state(), TeamState::Planning));
@@ -1749,7 +1832,7 @@ mod tests {
     async fn pending_routing_event_replays_once_notify_path_is_available() {
         let (orch, _tmp) = make_orchestrator();
         orch.set_scope(SessionKey::new("ws", "group:test-team"));
-        orch.dispatch_team_notify_failed("T404", "no lead yet");
+        orch.dispatch_team_notify_failed("T404", "codex", "no lead yet");
 
         let pending = orch.session.load_pending_completions().unwrap();
         assert_eq!(pending.len(), 1);
@@ -1788,7 +1871,7 @@ mod tests {
         orch.set_lead_session_key(SessionKey::new("ws", "group:lead"));
         orch.set_scope(SessionKey::new("ws", "group:scope"));
 
-        orch.dispatch_team_notify_failed("T777", "boom");
+        orch.dispatch_team_notify_failed("T777", "codex", "boom");
 
         let pending = orch.session.load_pending_completions().unwrap();
         assert_eq!(pending.len(), 1);
@@ -1804,7 +1887,7 @@ mod tests {
     fn routing_envelope_without_live_target_stays_pending_and_reports_missing_target() {
         let (orch, _tmp) = make_orchestrator();
 
-        orch.dispatch_team_notify_failed("T999", "no routing target");
+        orch.dispatch_team_notify_failed("T999", "codex", "no routing target");
 
         let pending = orch.session.load_pending_completions().unwrap();
         assert_eq!(pending.len(), 1);
@@ -1820,8 +1903,8 @@ mod tests {
     fn flush_pending_routing_events_preserves_unsent_records_when_channel_is_full() {
         let (orch, _tmp) = make_orchestrator();
         orch.set_scope(SessionKey::new("ws", "group:test-team"));
-        orch.dispatch_team_notify_failed("T001", "one");
-        orch.dispatch_team_notify_failed("T002", "two");
+        orch.dispatch_team_notify_failed("T001", "codex", "one");
+        orch.dispatch_team_notify_failed("T002", "codex", "two");
 
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         orch.set_lead_session_key(SessionKey::new("ws", "group:test-team"));
@@ -1864,6 +1947,16 @@ mod tests {
         ));
 
         let evs = events.lock().unwrap();
+        assert!(
+            evs.iter()
+                .any(|e| matches!(
+                    e,
+                    TeamMilestoneEvent::TaskDone { task_id, agent, done_count, total, .. }
+                    if task_id == "T005" && agent == "codex" && *done_count == 1 && *total == 1
+                )),
+            "TaskDone event must fire after accept; got: {:?}",
+            evs
+        );
         assert!(
             evs.iter()
                 .any(|e| matches!(e, TeamMilestoneEvent::AllTasksDone)),
@@ -2096,6 +2189,25 @@ mod tests {
                 if task_id == "T121" && task_title == "Implement JWT" && agent == "codex"
             )),
             "submit must emit TaskSubmitted {{ task_id, task_title, agent }}; got: {:?}",
+            evs
+        );
+    }
+
+    #[test]
+    fn test_failed_emits_typed_milestone_event() {
+        let (orch, _tmp) = make_orchestrator();
+        let events = collect_events(&orch);
+
+        orch.dispatch_team_notify_failed("T404", "codex", "max retries exceeded");
+
+        let evs = events.lock().unwrap();
+        assert!(
+            evs.iter().any(|e| matches!(
+                e,
+                TeamMilestoneEvent::TaskFailed { task_id, agent, reason }
+                if task_id == "T404" && agent == "codex" && reason == "max retries exceeded"
+            )),
+            "failed must emit TaskFailed {{ task_id, agent, reason }}; got: {:?}",
             evs
         );
     }

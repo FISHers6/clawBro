@@ -1,8 +1,6 @@
 use qai_protocol::SessionKey;
 use serde::{Deserialize, Serialize};
 
-use super::milestone::TeamMilestoneEvent;
-
 const RESULT_PAYLOAD_PREVIEW_LIMIT: usize = 1500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -296,84 +294,9 @@ pub struct TeamNotifyRequest {
     pub envelope: TeamRoutingEnvelope,
 }
 
-pub fn milestone_reply_policy(event: &TeamMilestoneEvent) -> CompletionReplyPolicy {
-    match event {
-        TeamMilestoneEvent::LeadMessage { text } => {
-            CompletionReplyPolicy::user_visible(Some(format!("lead_message:{text}")))
-        }
-        TeamMilestoneEvent::TaskDispatched { task_id, .. } => CompletionReplyPolicy {
-            dedupe_key: Some(format!("task_dispatched:{task_id}")),
-            ..CompletionReplyPolicy::internal_only()
-        },
-        TeamMilestoneEvent::TaskCheckpoint {
-            task_id,
-            agent,
-            note,
-        } => CompletionReplyPolicy {
-            dedupe_key: Some(format!("task_checkpoint:{task_id}:{agent}:{note}")),
-            ..CompletionReplyPolicy::internal_only()
-        },
-        TeamMilestoneEvent::TaskSubmitted { task_id, agent, .. } => CompletionReplyPolicy {
-            dedupe_key: Some(format!("task_submitted:{task_id}:{agent}")),
-            ..CompletionReplyPolicy::internal_only()
-        },
-        TeamMilestoneEvent::TaskBlocked {
-            task_id,
-            agent,
-            reason,
-            ..
-        } => CompletionReplyPolicy {
-            dedupe_key: Some(format!("task_blocked:{task_id}:{agent}:{reason}")),
-            ..CompletionReplyPolicy::internal_only()
-        },
-        TeamMilestoneEvent::TaskDone {
-            task_id,
-            agent,
-            done_count,
-            total,
-            ..
-        } => CompletionReplyPolicy {
-            audience: CompletionAudience::ParentThenUser,
-            dedupe_key: Some(format!("task_done:{task_id}:{agent}:{done_count}:{total}")),
-            ..CompletionReplyPolicy::internal_only()
-        },
-        TeamMilestoneEvent::TasksUnlocked { task_ids } => CompletionReplyPolicy {
-            dedupe_key: Some(format!("tasks_unlocked:{}", task_ids.join(","))),
-            ..CompletionReplyPolicy::internal_only()
-        },
-        TeamMilestoneEvent::AllTasksDone => CompletionReplyPolicy {
-            audience: CompletionAudience::ParentThenUser,
-            dedupe_key: Some("all_tasks_done".to_string()),
-            ..CompletionReplyPolicy::internal_only()
-        },
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn lead_message_is_user_visible() {
-        let policy = milestone_reply_policy(&TeamMilestoneEvent::LeadMessage {
-            text: "hello".to_string(),
-        });
-        assert_eq!(policy.audience, CompletionAudience::UserVisible);
-        assert_eq!(policy.mode, CompletionReplyMode::ExternalIfPossible);
-    }
-
-    #[test]
-    fn task_done_is_not_directly_user_visible() {
-        let policy = milestone_reply_policy(&TeamMilestoneEvent::TaskDone {
-            task_id: "T1".to_string(),
-            task_title: "task".to_string(),
-            agent: "worker".to_string(),
-            done_count: 1,
-            total: 1,
-        });
-        assert_eq!(policy.audience, CompletionAudience::ParentThenUser);
-        assert_eq!(policy.mode, CompletionReplyMode::InternalOnly);
-    }
 
     #[test]
     fn routing_envelope_tracks_requester_and_delivery_status() {

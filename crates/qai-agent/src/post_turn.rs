@@ -29,6 +29,7 @@ pub(crate) struct PostTurnInput<'a> {
     pub user_text_for_log: &'a str,
     pub full_text: String,
     pub is_lead: bool,
+    pub team_orchestrator: Option<std::sync::Arc<crate::team::orchestrator::TeamOrchestrator>>,
 }
 
 pub(crate) async fn process_post_turn(
@@ -56,18 +57,74 @@ pub(crate) async fn process_post_turn(
         }
     }
 
+    let pending_fragments = if input.is_lead {
+        input
+            .team_orchestrator
+            .as_ref()
+            .map(|orch| orch.take_pending_lead_fragments())
+            .filter(|fragments| !fragments.is_empty())
+    } else {
+        None
+    };
+
+    let pending_fragments =
+        if input.is_lead && !full_text.trim().is_empty() && pending_fragments.is_none() {
+            input.team_orchestrator.as_ref().map(|orch| {
+                orch.record_leader_fragment(
+                    crate::team::session::LeaderUpdateKind::FinalAnswerFragment,
+                    &full_text,
+                );
+                orch.take_pending_lead_fragments()
+            })
+        } else {
+            pending_fragments
+        };
+
+    let fragment_event_ids = pending_fragments
+        .as_ref()
+        .map(|fragments| {
+            fragments
+                .iter()
+                .map(|fragment| fragment.event_id.clone())
+                .collect::<Vec<_>>()
+        })
+        .filter(|ids| !ids.is_empty());
+
+    let stored_content = if full_text.trim().is_empty() {
+        pending_fragments
+            .as_ref()
+            .map(|fragments| {
+                fragments
+                    .iter()
+                    .map(|fragment| fragment.text.as_str())
+                    .filter(|text| !text.trim().is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+            })
+            .filter(|text| !text.trim().is_empty())
+            .unwrap_or_else(|| full_text.clone())
+    } else {
+        full_text.clone()
+    };
+
     let assistant_msg = StoredMessage {
         id: Uuid::new_v4(),
         role: "assistant".to_string(),
-        content: full_text.clone(),
+        content: stored_content.clone(),
         timestamp: chrono::Utc::now(),
         sender: input.sender_name,
         tool_calls: None,
+        aggregation_mode: fragment_event_ids
+            .as_ref()
+            .map(|_| "turn_compacted".to_string()),
+        fragment_event_ids,
     };
-    input
-        .storage
-        .append_message(input.session_id, &assistant_msg)
-        .await?;
+    if !assistant_msg.content.trim().is_empty() || assistant_msg.fragment_event_ids.is_some() {
+        input
+            .storage
+            .append_message(input.session_id, &assistant_msg)
+            .await?;
+    }
 
     processor
         .last_activity
@@ -80,7 +137,7 @@ pub(crate) async fn process_post_turn(
             .unwrap_or_else(|| "default".to_string());
         let log_entry = format!(
             "**[{}]**: {}\n\n**[@{}]**: {}",
-            input.inbound.sender, input.user_text_for_log, agent_name, full_text
+            input.inbound.sender, input.user_text_for_log, agent_name, stored_content
         );
         let store = ms.store();
         let sk = input.session_key.clone();
@@ -178,8 +235,8 @@ mod tests {
         // is_lead=true must block MentionTrigger even when source=Human,
         // preventing double-dispatch (MentionTrigger + Heartbeat both run beta).
         assert!(should_scan_mentions(&MsgSource::Human)); // Human would normally trigger
-        // The !is_lead guard in process_post_turn blocks the scan before we reach scan_and_dispatch.
-        // This test documents the invariant: Lead uses MCP tools, not @mentions.
+                                                          // The !is_lead guard in process_post_turn blocks the scan before we reach scan_and_dispatch.
+                                                          // This test documents the invariant: Lead uses MCP tools, not @mentions.
     }
 
     #[test]

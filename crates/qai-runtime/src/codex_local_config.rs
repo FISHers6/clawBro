@@ -78,7 +78,7 @@ enableRouteSelection = true
 name = "{provider_name}"
 base_url = "{base_url}"
 wire_api = "responses"
-requires_openai_auth = true
+requires_openai_auth = false
 {trust_section}"#
     )
 }
@@ -137,6 +137,7 @@ mod tests {
         assert!(config.contains("model = \"deepseek-chat\""));
         assert!(config.contains("preferred_auth_method = \"apikey\""));
         assert!(config.contains("enableRouteSelection = true"));
+        assert!(config.contains("requires_openai_auth = false"));
     }
 
     #[test]
@@ -160,6 +161,7 @@ mod tests {
             "trust section missing: {config}"
         );
         assert!(config.contains("trust_level = \"trusted\""));
+        assert!(config.contains("requires_openai_auth = false"));
     }
 
     #[test]
@@ -180,6 +182,7 @@ mod tests {
             !config.contains("[projects."),
             "unexpected trust section: {config}"
         );
+        assert!(config.contains("requires_openai_auth = false"));
     }
 
     #[test]

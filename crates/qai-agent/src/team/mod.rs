@@ -1,6 +1,7 @@
 pub mod completion_routing;
 pub mod heartbeat;
 pub mod milestone;
+pub mod milestone_delivery;
 pub mod orchestrator;
 pub mod registry;
 pub mod session;

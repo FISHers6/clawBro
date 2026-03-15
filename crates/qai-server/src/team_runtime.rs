@@ -1,6 +1,9 @@
 use crate::config::{GatewayConfig, InteractionMode};
 use anyhow::Result;
 use qai_agent::team::completion_routing::{RoutingDeliveryStatus, TeamRoutingEnvelope};
+use qai_agent::team::milestone::TeamMilestoneEvent;
+use qai_agent::team::milestone_delivery::{milestone_dedupe_key, milestone_is_public};
+use qai_agent::team::session::{ChannelSendSourceKind, ChannelSendStatus};
 use qai_agent::SessionRegistry;
 use qai_protocol::{InboundMsg, MsgContent, MsgSource, SessionKey};
 use std::collections::HashMap;
@@ -15,7 +18,7 @@ pub async fn wire_team_runtime(
     heartbeat_interval: Duration,
 ) -> Result<()> {
     use qai_agent::team::{
-        completion_routing::{milestone_reply_policy, RoutingDeliveryStatus, TeamNotifyRequest},
+        completion_routing::{RoutingDeliveryStatus, TeamNotifyRequest},
         heartbeat::DispatchFn,
         orchestrator::TeamOrchestrator,
         registry::TaskRegistry,
@@ -25,7 +28,10 @@ pub async fn wire_team_runtime(
     let (team_notify_tx, mut team_notify_rx) = mpsc::channel::<TeamNotifyRequest>(256);
     let team_notify_tx_for_orch = team_notify_tx.clone();
     let team_scopes = cfg.normalized_team_scopes();
-    tracing::info!(count = team_scopes.len(), "wire_team_runtime: team scopes found");
+    tracing::info!(
+        count = team_scopes.len(),
+        "wire_team_runtime: team scopes found"
+    );
 
     for team_scope in &team_scopes {
         tracing::info!(scope = %team_scope.scope, name = ?team_scope.name, "wire_team_runtime: wiring team scope");
@@ -155,10 +161,11 @@ pub async fn wire_team_runtime(
 
         let channels_for_notify = Arc::clone(&channel_map);
         let session_for_notify = Arc::clone(&session);
+        let public_updates_mode = team_scope.team.public_updates;
+        let lead_agent_name_for_notify = team_scope.mode.front_bot.clone();
         team_orch.set_milestone_fn(Arc::new(move |scope: qai_protocol::SessionKey, event| {
             use qai_agent::team::milestone::render_for_im;
-            let policy = milestone_reply_policy(&event);
-            if !milestone_is_user_deliverable(&policy) {
+            if !milestone_is_public(&event, public_updates_mode) {
                 tracing::debug!(
                     scope = %scope.scope,
                     kind = %event.kind_str(),
@@ -166,12 +173,12 @@ pub async fn wire_team_runtime(
                 );
                 return;
             }
-            if let Some(dedupe_key) = policy.dedupe_key.as_ref() {
-                match session_for_notify.mark_delivery_dedupe(&scope.scope, dedupe_key) {
+            if let Some(dedupe_key) = milestone_dedupe_key(&event) {
+                match session_for_notify.mark_delivery_dedupe(&scope.scope, &dedupe_key) {
                     Ok(true) => {}
                     Ok(false) => {
-                        let _ =
-                            session_for_notify.record_delivery_dedupe_hit(&scope.scope, dedupe_key);
+                        let _ = session_for_notify
+                            .record_delivery_dedupe_hit(&scope.scope, &dedupe_key);
                         tracing::debug!(
                             scope = %scope.scope,
                             kind = %event.kind_str(),
@@ -191,16 +198,46 @@ pub async fn wire_team_runtime(
             }
             let msg = render_for_im(&event);
             let channels = Arc::clone(&channels_for_notify);
+            let session_for_record = Arc::clone(&session_for_notify);
+            let lead_agent_name = lead_agent_name_for_notify.clone();
+            let dedupe_key_for_record = milestone_dedupe_key(&event);
             tokio::spawn(async move {
                 if let Some(ch) = channels.get(&scope.channel) {
                     let outbound = qai_protocol::OutboundMsg {
-                        session_key: scope,
+                        session_key: scope.clone(),
                         content: qai_protocol::MsgContent::text(msg),
                         reply_to: None,
                         thread_ts: None,
                     };
-                    if let Err(e) = ch.send(&outbound).await {
+                    let send_result = ch.send(&outbound).await;
+                    if let Err(e) = &send_result {
                         tracing::error!("Milestone notify send error: {e}");
+                    }
+                    let (source_kind, source_agent) =
+                        milestone_channel_origin(&event, lead_agent_name.as_deref());
+                    let (status, error) = match send_result {
+                        Ok(()) => (ChannelSendStatus::Sent, None),
+                        Err(err) => (ChannelSendStatus::SendFailed, Some(err.to_string())),
+                    };
+                    if let Err(err) = session_for_record.record_channel_send(
+                        &scope.channel,
+                        &scope.scope,
+                        None,
+                        None,
+                        None,
+                        source_kind,
+                        &source_agent,
+                        milestone_task_id(&event),
+                        dedupe_key_for_record.as_deref(),
+                        outbound.content.as_text().unwrap_or_default(),
+                        status,
+                        error.as_deref(),
+                    ) {
+                        tracing::warn!(
+                            team_id = %session_for_record.team_id,
+                            error = %err,
+                            "Failed to append milestone channel send ledger entry"
+                        );
                     }
                 }
             });
@@ -333,6 +370,47 @@ pub async fn wire_team_runtime(
     Ok(())
 }
 
+fn milestone_channel_origin(
+    event: &TeamMilestoneEvent,
+    lead_agent_name: Option<&str>,
+) -> (ChannelSendSourceKind, String) {
+    match event {
+        TeamMilestoneEvent::LeadMessage { .. } => (
+            ChannelSendSourceKind::LeadText,
+            lead_agent_name.unwrap_or("leader").to_string(),
+        ),
+        TeamMilestoneEvent::TaskDispatched { agent, .. }
+        | TeamMilestoneEvent::TaskCheckpoint { agent, .. }
+        | TeamMilestoneEvent::TaskSubmitted { agent, .. }
+        | TeamMilestoneEvent::TaskBlocked { agent, .. }
+        | TeamMilestoneEvent::TaskDone { agent, .. } => {
+            (ChannelSendSourceKind::Milestone, agent.clone())
+        }
+        TeamMilestoneEvent::TaskFailed { agent, .. }
+        => {
+            (ChannelSendSourceKind::Milestone, agent.clone())
+        }
+        TeamMilestoneEvent::TasksUnlocked { .. }
+        | TeamMilestoneEvent::AllTasksDone => {
+            (ChannelSendSourceKind::Milestone, "team-runtime".to_string())
+        }
+    }
+}
+
+fn milestone_task_id(event: &TeamMilestoneEvent) -> Option<&str> {
+    match event {
+        TeamMilestoneEvent::TaskDispatched { task_id, .. }
+        | TeamMilestoneEvent::TaskCheckpoint { task_id, .. }
+        | TeamMilestoneEvent::TaskSubmitted { task_id, .. }
+        | TeamMilestoneEvent::TaskBlocked { task_id, .. }
+        | TeamMilestoneEvent::TaskFailed { task_id, .. }
+        | TeamMilestoneEvent::TaskDone { task_id, .. } => Some(task_id.as_str()),
+        TeamMilestoneEvent::TasksUnlocked { .. }
+        | TeamMilestoneEvent::AllTasksDone
+        | TeamMilestoneEvent::LeadMessage { .. } => None,
+    }
+}
+
 fn truncate_for_missing_completion(text: &str, max_chars: usize) -> String {
     let mut truncated = text.chars().take(max_chars).collect::<String>();
     if text.chars().count() > max_chars {
@@ -378,21 +456,12 @@ fn team_notify_inbound(target: &SessionKey, text: &str) -> InboundMsg {
     }
 }
 
-fn milestone_is_user_deliverable(
-    policy: &qai_agent::team::completion_routing::CompletionReplyPolicy,
-) -> bool {
-    !matches!(
-        policy.audience,
-        qai_agent::team::completion_routing::CompletionAudience::ParentOnly
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qai_agent::team::completion_routing::{
-        CompletionReplyPolicy, RoutingDeliveryStatus, TeamRoutingEvent,
-    };
+    use qai_agent::team::completion_routing::{RoutingDeliveryStatus, TeamRoutingEvent};
+    use qai_agent::team::milestone::TeamMilestoneEvent;
+    use qai_agent::team::milestone_delivery::{milestone_is_public, TeamPublicUpdatesMode};
 
     #[test]
     fn routing_attempt_targets_dedupes_requester_and_fallbacks() {
@@ -446,17 +515,38 @@ mod tests {
     }
 
     #[test]
-    fn parent_then_user_milestones_are_user_deliverable() {
-        assert!(!milestone_is_user_deliverable(
-            &CompletionReplyPolicy::internal_only()
+    fn public_milestone_visibility_respects_mode() {
+        assert!(milestone_is_public(
+            &TeamMilestoneEvent::LeadMessage {
+                text: "hello".into()
+            },
+            TeamPublicUpdatesMode::Minimal
         ));
-        assert!(milestone_is_user_deliverable(
-            &CompletionReplyPolicy::user_visible(None)
+        assert!(!milestone_is_public(
+            &TeamMilestoneEvent::AllTasksDone,
+            TeamPublicUpdatesMode::Minimal
         ));
-        assert!(milestone_is_user_deliverable(
-            &qai_agent::team::completion_routing::milestone_reply_policy(
-                &qai_agent::team::milestone::TeamMilestoneEvent::AllTasksDone
-            )
+        assert!(milestone_is_public(
+            &TeamMilestoneEvent::AllTasksDone,
+            TeamPublicUpdatesMode::Normal
+        ));
+        assert!(!milestone_is_public(
+            &TeamMilestoneEvent::TaskDone {
+                task_id: "T1".into(),
+                task_title: "task".into(),
+                agent: "worker".into(),
+                done_count: 1,
+                total: 1,
+            },
+            TeamPublicUpdatesMode::Normal
+        ));
+        assert!(milestone_is_public(
+            &TeamMilestoneEvent::TaskFailed {
+                task_id: "T1".into(),
+                agent: "worker".into(),
+                reason: "boom".into(),
+            },
+            TeamPublicUpdatesMode::Normal
         ));
     }
 }

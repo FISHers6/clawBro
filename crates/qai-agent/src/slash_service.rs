@@ -95,7 +95,9 @@ pub(crate) async fn execute_slash_request(req: SlashRequest<'_>) -> Result<Contr
             req.control.clear_session_history(req.session_key).await;
             // Clear team workspace (tasks, events, jsonl files, reset state to Planning)
             req.control.clear_team_workspace(req.session_key).await;
-            Ok(ControlReply::Final("✅ 对话历史与团队工作区已全部清除".to_string()))
+            Ok(ControlReply::Final(
+                "✅ 对话历史与团队工作区已全部清除".to_string(),
+            ))
         }
     }
 }

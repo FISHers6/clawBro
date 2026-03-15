@@ -1,10 +1,14 @@
 use crate::config::ProgressPresentationMode;
 use crate::progress_presentation;
 use async_trait::async_trait;
+use qai_agent::team::orchestrator::TeamOrchestrator;
+use qai_agent::team::session::{ChannelSendSourceKind, ChannelSendStatus};
 use qai_agent::{throttled_stream, OutputSink, SessionRegistry, StreamControl};
 use qai_channels::Channel;
 use qai_protocol::{InboundMsg, OutboundMsg, SessionKey};
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, Mutex};
 
 /// No-op sink used for Team Lead turns — all user-visible output goes through
@@ -26,16 +30,20 @@ pub struct ImProgressSink {
     thread_ts: Option<String>,
     session_key: SessionKey,
     presentation: ProgressPresentationMode,
-    last_progress: Mutex<Option<String>>,
+    recent_progress: Mutex<HashMap<String, Instant>>,
+    team_orchestrator: Option<Arc<TeamOrchestrator>>,
 }
 
 impl ImProgressSink {
+    const PROGRESS_DEDUPE_WINDOW: Duration = Duration::from_secs(2);
+
     pub fn new(
         channel: Arc<dyn Channel>,
         session_key: SessionKey,
         reply_to: Option<String>,
         thread_ts: Option<String>,
         presentation: ProgressPresentationMode,
+        team_orchestrator: Option<Arc<TeamOrchestrator>>,
     ) -> Self {
         Self {
             channel,
@@ -43,7 +51,8 @@ impl ImProgressSink {
             thread_ts,
             session_key,
             presentation,
-            last_progress: Mutex::new(None),
+            recent_progress: Mutex::new(HashMap::new()),
+            team_orchestrator,
         }
     }
 }
@@ -60,20 +69,36 @@ impl OutputSink for ImProgressSink {
         if self.presentation != ProgressPresentationMode::ProgressCompact {
             return;
         }
-        let mut last = self.last_progress.lock().await;
-        if last.as_deref() == Some(progress) {
+        let now = Instant::now();
+        let mut recent = self.recent_progress.lock().await;
+        recent.retain(|_, seen_at| now.duration_since(*seen_at) <= Self::PROGRESS_DEDUPE_WINDOW);
+        if recent
+            .get(progress)
+            .is_some_and(|seen_at| now.duration_since(*seen_at) <= Self::PROGRESS_DEDUPE_WINDOW)
+        {
             return;
         }
-        *last = Some(progress.to_string());
+        recent.insert(progress.to_string(), now);
         let msg = OutboundMsg {
             session_key: self.session_key.clone(),
             content: qai_protocol::MsgContent::text(progress),
             reply_to: self.reply_to.clone(),
             thread_ts: self.thread_ts.clone(),
         };
-        if let Err(e) = self.channel.send(&msg).await {
+        let send_result = self.channel.send(&msg).await;
+        if let Err(e) = &send_result {
             tracing::warn!(channel = %self.channel.name(), "IM send_progress failed: {e}");
         }
+        record_team_channel_send(
+            self.team_orchestrator.as_ref(),
+            &self.session_key,
+            self.reply_to.as_deref(),
+            self.thread_ts.as_deref(),
+            ChannelSendSourceKind::ToolPlaceholder,
+            progress,
+            false,
+            send_result.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+        );
     }
 
     async fn send_final(&self, text: &str, _placeholder_id: Option<&str>) {
@@ -83,7 +108,8 @@ impl OutputSink for ImProgressSink {
             reply_to: self.reply_to.clone(),
             thread_ts: self.thread_ts.clone(),
         };
-        if let Err(e) = self.channel.send(&msg).await {
+        let send_result = self.channel.send(&msg).await;
+        if let Err(e) = &send_result {
             tracing::error!(channel = %self.channel.name(), "IM send_final failed: {e}");
         } else {
             tracing::debug!(
@@ -92,6 +118,16 @@ impl OutputSink for ImProgressSink {
                 "IM send_final succeeded"
             );
         }
+        record_team_channel_send(
+            self.team_orchestrator.as_ref(),
+            &self.session_key,
+            self.reply_to.as_deref(),
+            self.thread_ts.as_deref(),
+            ChannelSendSourceKind::LeadText,
+            text,
+            true,
+            send_result.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+        );
     }
 
     fn progress_for_tool_start(&self, tool_name: &str) -> Option<String> {
@@ -104,6 +140,74 @@ impl OutputSink for ImProgressSink {
 
     fn progress_for_tool_failure(&self, tool_name: &str) -> Option<String> {
         progress_presentation::format_tool_failure(self.presentation, tool_name)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinalDeliveryDecision {
+    Suppress,
+    StreamFinal,
+    DirectSend,
+}
+
+fn decide_final_delivery(
+    snapshot_suppressed: bool,
+    team_running_after_handle: bool,
+) -> FinalDeliveryDecision {
+    match (snapshot_suppressed, team_running_after_handle) {
+        (_, true) => FinalDeliveryDecision::Suppress,
+        (true, false) => FinalDeliveryDecision::DirectSend,
+        (false, false) => FinalDeliveryDecision::StreamFinal,
+    }
+}
+
+fn record_team_channel_send(
+    team_orchestrator: Option<&Arc<TeamOrchestrator>>,
+    session_key: &SessionKey,
+    reply_to: Option<&str>,
+    thread_ts: Option<&str>,
+    source_kind: ChannelSendSourceKind,
+    text: &str,
+    record_leader_fragment: bool,
+    send_result: std::result::Result<(), String>,
+) {
+    let Some(team_orchestrator) = team_orchestrator else {
+        return;
+    };
+    if record_leader_fragment && source_kind == ChannelSendSourceKind::LeadText {
+        team_orchestrator.record_leader_fragment(
+            qai_agent::team::session::LeaderUpdateKind::FinalAnswerFragment,
+            text,
+        );
+    }
+    let source_agent = team_orchestrator
+        .lead_agent_name
+        .get()
+        .cloned()
+        .unwrap_or_else(|| "leader".to_string());
+    let (status, error) = match send_result {
+        Ok(()) => (ChannelSendStatus::Sent, None),
+        Err(error) => (ChannelSendStatus::SendFailed, Some(error)),
+    };
+    if let Err(err) = team_orchestrator.session.record_channel_send(
+        &session_key.channel,
+        &session_key.scope,
+        team_orchestrator.lead_session_key.get(),
+        reply_to,
+        thread_ts,
+        source_kind,
+        &source_agent,
+        None,
+        None,
+        text,
+        status,
+        error.as_deref(),
+    ) {
+        tracing::warn!(
+            team_id = %team_orchestrator.session.team_id,
+            error = %err,
+            "Failed to append channel send ledger entry"
+        );
     }
 }
 
@@ -123,11 +227,13 @@ pub fn spawn_im_turn(
     // Capture before spawning tasks to snapshot state consistently (fixes TOCTOU).
     // When true: Lead communicates only via post_update — stream path must be silent.
     let suppress_lead_final = registry.should_suppress_lead_final_reply(&session_key);
+    let team_orchestrator_for_session = registry.team_orchestrator_for_session(&session_key);
 
     let registry_for_stream = registry.clone();
     let channel_for_stream = channel.clone();
     let session_key_for_stream = session_key.clone();
     let channel_name_for_stream = channel_name.clone();
+    let team_orchestrator_for_stream = team_orchestrator_for_session.clone();
     tokio::spawn(async move {
         let session_id = match registry_for_stream
             .session_manager_ref()
@@ -151,6 +257,7 @@ pub fn spawn_im_turn(
                 reply_to,
                 thread_ts,
                 presentation,
+                team_orchestrator_for_stream,
             );
             throttled_stream(event_rx, session_id, &sink, None, control_rx).await;
         }
@@ -161,17 +268,20 @@ pub fn spawn_im_turn(
     let session_key_for_handle = session_key.clone();
     let reply_to_for_handle = Some(inbound.id.clone());
     let thread_ts_for_handle = inbound.thread_ts.clone();
+    let team_orchestrator_for_handle = team_orchestrator_for_session;
     tokio::spawn(async move {
         match registry.handle(inbound).await {
             Ok(Some(reply)) => {
-                if suppress_lead_final {
-                    // Post-handle check: only suppress if team was actually started.
-                    // If Lead just chatted without delegating (state stays Planning),
-                    // the stream uses NullSink so StreamControl::Final would be a no-op —
-                    // send directly to channel instead.
-                    if registry.is_team_running_or_done(&session_key_for_handle) {
+                match decide_final_delivery(
+                    suppress_lead_final,
+                    registry.is_team_running_or_done(&session_key_for_handle),
+                ) {
+                    FinalDeliveryDecision::Suppress => {
                         let _ = control_tx.send(StreamControl::Stop);
-                    } else {
+                    }
+                    FinalDeliveryDecision::DirectSend => {
+                        // The stream used NullSink because the turn started in Running.
+                        // If Team is no longer running post-handle, send directly.
                         let _ = control_tx.send(StreamControl::Stop);
                         let msg = OutboundMsg {
                             session_key: session_key_for_handle.clone(),
@@ -179,12 +289,24 @@ pub fn spawn_im_turn(
                             reply_to: reply_to_for_handle,
                             thread_ts: thread_ts_for_handle,
                         };
-                        if let Err(e) = channel_for_handle.send(&msg).await {
+                        let send_result = channel_for_handle.send(&msg).await;
+                        if let Err(e) = &send_result {
                             tracing::error!(channel = %channel_name_for_handle, "lead direct send failed: {e}");
                         }
+                        record_team_channel_send(
+                            team_orchestrator_for_handle.as_ref(),
+                            &session_key_for_handle,
+                            msg.reply_to.as_deref(),
+                            msg.thread_ts.as_deref(),
+                            ChannelSendSourceKind::LeadText,
+                            &reply,
+                            false,
+                            send_result.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+                        );
                     }
-                } else {
-                    let _ = control_tx.send(StreamControl::Final(reply));
+                    FinalDeliveryDecision::StreamFinal => {
+                        let _ = control_tx.send(StreamControl::Final(reply));
+                    }
                 }
             }
             Ok(None) => {
@@ -242,6 +364,7 @@ mod tests {
             Some("reply-id".to_string()),
             None,
             presentation,
+            None,
         );
         (sink, channel)
     }
@@ -263,6 +386,49 @@ mod tests {
         assert_eq!(
             sent,
             vec!["⏳ 正在搜索代码".to_string(), "⏳ 正在整理结果".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_progress_dedupes_repeated_labels_within_window() {
+        let (sink, channel) = sink(ProgressPresentationMode::ProgressCompact);
+        sink.send_progress("⏳ 正在搜索代码", None).await;
+        sink.send_progress("⏳ 正在整理结果", None).await;
+        sink.send_progress("⏳ 正在搜索代码", None).await;
+        let sent = channel.sent.lock().unwrap().clone();
+        assert_eq!(
+            sent,
+            vec!["⏳ 正在搜索代码".to_string(), "⏳ 正在整理结果".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_progress_allows_same_label_after_window() {
+        let (sink, channel) = sink(ProgressPresentationMode::ProgressCompact);
+        sink.send_progress("⏳ 正在搜索代码", None).await;
+        tokio::time::sleep(ImProgressSink::PROGRESS_DEDUPE_WINDOW + Duration::from_millis(20))
+            .await;
+        sink.send_progress("⏳ 正在搜索代码", None).await;
+        let sent = channel.sent.lock().unwrap().clone();
+        assert_eq!(
+            sent,
+            vec!["⏳ 正在搜索代码".to_string(), "⏳ 正在搜索代码".to_string()]
+        );
+    }
+
+    #[test]
+    fn final_delivery_rechecks_team_state_after_handle() {
+        assert_eq!(
+            decide_final_delivery(false, true),
+            FinalDeliveryDecision::Suppress
+        );
+        assert_eq!(
+            decide_final_delivery(false, false),
+            FinalDeliveryDecision::StreamFinal
+        );
+        assert_eq!(
+            decide_final_delivery(true, false),
+            FinalDeliveryDecision::DirectSend
         );
     }
 }

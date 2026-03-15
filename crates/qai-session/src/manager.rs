@@ -336,6 +336,8 @@ mod tests {
                 timestamp: Utc::now(),
                 sender: None,
                 tool_calls: None,
+                fragment_event_ids: None,
+                aggregation_mode: None,
             },
         )
         .await
