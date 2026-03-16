@@ -83,7 +83,7 @@ pub(crate) async fn assemble_context(request: ContextAssemblyRequest<'_>) -> Con
         };
 
     let mut canonical_agent_memory = None;
-    let system_injection = if resolved_persona_dir.is_some() {
+    let mut system_injection = if resolved_persona_dir.is_some() {
         let (soul_md, identity_raw, agent_memory) =
             load_persona_layers(resolved_persona_dir.as_ref(), request.session_key);
         canonical_agent_memory = (!agent_memory.trim().is_empty()).then_some(agent_memory);
@@ -112,6 +112,13 @@ pub(crate) async fn assemble_context(request: ContextAssemblyRequest<'_>) -> Con
         }
         combine_gateway_and_workspace_injection(request.system_injection, &skill_injection)
     };
+    if let Some(roster_match) = request.roster_match {
+        append_active_agent_identity_injection(
+            &mut system_injection,
+            &roster_match.agent_name,
+            &roster_match.backend_id,
+        );
+    }
 
     let team_dir = if matches!(request.agent_role, AgentRole::Lead | AgentRole::Specialist) {
         request.session_team_orch.map(|o| o.session.dir.clone())
@@ -164,6 +171,7 @@ pub(crate) async fn assemble_context(request: ContextAssemblyRequest<'_>) -> Con
 pub(crate) fn build_history(recent_messages: &[StoredMessage]) -> Vec<HistoryMsg> {
     recent_messages
         .iter()
+        .filter(|message| !is_internal_gateway_team_notify(message))
         .map(|message| HistoryMsg {
             role: message.role.clone(),
             content: message.content.clone(),
@@ -171,6 +179,30 @@ pub(crate) fn build_history(recent_messages: &[StoredMessage]) -> Vec<HistoryMsg
             tool_calls: message.tool_calls.clone(),
         })
         .collect()
+}
+
+fn is_internal_gateway_team_notify(message: &StoredMessage) -> bool {
+    message.sender.as_deref() == Some("gateway")
+        && message.role == "user"
+        && message.content.starts_with("[团队通知]")
+}
+
+fn append_active_agent_identity_injection(
+    system_injection: &mut String,
+    agent_name: &str,
+    backend_id: &str,
+) {
+    let identity_block = format!(
+        "## 当前执行身份\n\n你当前执行的 agent 是 `{agent_name}`，当前 runtime backend 是 `{backend_id}`。\n\
+你必须以这个当前身份回答用户问题，不要把历史对话中其他 assistant 的自我介绍、旧 front-stage agent 名称或旧 backend 身份当成你当前的身份。\n\
+历史 assistant 消息只用于保留会话语义，不用于覆盖你当前的执行身份。"
+    );
+    if system_injection.trim().is_empty() {
+        *system_injection = identity_block;
+    } else {
+        system_injection.push_str("\n\n");
+        system_injection.push_str(&identity_block);
+    }
 }
 
 pub(crate) fn resolve_effective_workspace(
@@ -309,6 +341,35 @@ mod tests {
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].content, "done");
         assert_eq!(history[0].sender.as_deref(), Some("@codex"));
+    }
+
+    #[test]
+    fn build_history_excludes_internal_gateway_team_notify_messages() {
+        let visible = StoredMessage {
+            id: Uuid::new_v4(),
+            role: "user".to_string(),
+            content: "你好".to_string(),
+            timestamp: chrono::Utc::now(),
+            sender: Some("ou_1".to_string()),
+            tool_calls: None,
+            fragment_event_ids: None,
+            aggregation_mode: None,
+        };
+        let internal = StoredMessage {
+            id: Uuid::new_v4(),
+            role: "user".to_string(),
+            content: "[团队通知] 任务 T001 已验收".to_string(),
+            timestamp: chrono::Utc::now(),
+            sender: Some("gateway".to_string()),
+            tool_calls: None,
+            fragment_event_ids: None,
+            aggregation_mode: None,
+        };
+
+        let history = build_history(&[visible.clone(), internal]);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].content, visible.content);
+        assert_eq!(history[0].sender, visible.sender);
     }
 
     #[test]
@@ -486,8 +547,16 @@ mod tests {
         ))
         .await;
 
-        assert_eq!(single.ctx.system_injection, roster.ctx.system_injection);
         assert_eq!(single.ctx.agent_memory, roster.ctx.agent_memory);
         assert_eq!(single.resolved_persona_dir, roster.resolved_persona_dir);
+        assert!(roster
+            .ctx
+            .system_injection
+            .contains("你当前执行的 agent 是 `claude`"));
+        assert!(roster
+            .ctx
+            .system_injection
+            .contains("当前 runtime backend 是 `claude-main`"));
+        assert!(!single.ctx.system_injection.contains("当前执行身份"));
     }
 }

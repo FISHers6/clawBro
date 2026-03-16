@@ -279,6 +279,11 @@ pub struct TurnResult {
     /// load_session() 路径（resume）：None，prior_id 不变，无需写入。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub emitted_backend_session_id: Option<String>,
+    /// Deterministic fingerprint of the backend spec that produced/validated the
+    /// current backend session handle. Used to decide whether a stored resume
+    /// handle is still safe to reuse on a future turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_resume_fingerprint: Option<String>,
     /// 本次 turn 实际使用的 backend_id（由 run_dispatch_job 注入）。
     /// registry 层用此 key 调用 complete_turn()。
     #[serde(default, skip_serializing_if = "Option::is_none")]

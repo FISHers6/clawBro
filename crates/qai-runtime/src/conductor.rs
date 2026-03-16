@@ -211,6 +211,7 @@ mod tests {
                 full_text: "hello world".into(),
                 events: Vec::new(),
                 emitted_backend_session_id: None,
+                backend_resume_fingerprint: None,
                 used_backend_id: None,
             })
         }

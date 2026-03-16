@@ -4,9 +4,9 @@ use async_trait::async_trait;
 use qai_protocol::{render_scope_storage_key, AgentEvent};
 use qai_runtime::contract::RuntimeToolCall;
 use qai_runtime::{
-    acp::AcpBackendAdapter, ApprovalBroker, BackendRegistry, OpenClawBackendAdapter,
-    QuickAiNativeBackendAdapter, RuntimeConductor, RuntimeContext, RuntimeEvent,
-    RuntimeHistoryMessage, RuntimePruningPolicy, RuntimeRole, RuntimeSessionSpec,
+    acp::AcpBackendAdapter, fingerprint_backend_spec, ApprovalBroker, BackendRegistry,
+    OpenClawBackendAdapter, QuickAiNativeBackendAdapter, RuntimeConductor, RuntimeContext,
+    RuntimeEvent, RuntimeHistoryMessage, RuntimePruningPolicy, RuntimeRole, RuntimeSessionSpec,
     RuntimeTranscriptSemantics, ToolSurfaceSpec, TranscriptCompactionMode, TranscriptPruningMode,
     TurnIntent, TurnResult,
 };
@@ -29,6 +29,7 @@ pub struct RuntimeDispatchRequest {
 #[async_trait]
 pub trait RuntimeDispatch: Send + Sync {
     async fn dispatch(&self, request: RuntimeDispatchRequest) -> Result<TurnResult>;
+    async fn backend_resume_fingerprint(&self, backend_id: &str) -> Result<Option<String>>;
 }
 
 /// Convenience constructor that pre-registers all three adapters and returns a dispatch handle.
@@ -62,13 +63,15 @@ pub fn default_runtime_dispatch() -> Arc<dyn RuntimeDispatch> {
 }
 
 pub struct ConductorRuntimeDispatch {
+    registry: Arc<BackendRegistry>,
     worker_pool: RuntimeWorkerPool,
 }
 
 impl ConductorRuntimeDispatch {
     pub fn new(registry: Arc<BackendRegistry>) -> Self {
         Self {
-            worker_pool: RuntimeWorkerPool::new(registry, default_worker_count()),
+            worker_pool: RuntimeWorkerPool::new(Arc::clone(&registry), default_worker_count()),
+            registry,
         }
     }
 }
@@ -101,6 +104,13 @@ impl RuntimeDispatch for ConductorRuntimeDispatch {
                 Err(err)
             }
         }
+    }
+
+    async fn backend_resume_fingerprint(&self, backend_id: &str) -> Result<Option<String>> {
+        let Some(spec) = self.registry.backend_spec(backend_id).await else {
+            return Ok(None);
+        };
+        Ok(Some(fingerprint_backend_spec(&spec)?))
     }
 }
 
@@ -312,6 +322,7 @@ async fn run_dispatch_job(
     }
     // Stamp the resolved backend_id so registry can call complete_turn() with the correct key.
     Ok(TurnResult {
+        backend_resume_fingerprint: Some(fingerprint_backend_spec(&spec)?),
         used_backend_id: Some(backend_id),
         ..turn
     })
@@ -616,6 +627,7 @@ mod tests {
                 full_text: "hello world".into(),
                 events: vec![],
                 emitted_backend_session_id: None,
+                backend_resume_fingerprint: None,
                 used_backend_id: None,
             })
         }
@@ -659,6 +671,7 @@ mod tests {
                 full_text: "hello world".into(),
                 events: vec![],
                 emitted_backend_session_id: None,
+                backend_resume_fingerprint: None,
                 used_backend_id: None,
             })
         }

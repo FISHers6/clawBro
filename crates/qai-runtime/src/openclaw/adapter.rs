@@ -194,6 +194,7 @@ impl BackendAdapter for OpenClawBackendAdapter {
                         full_text: text,
                         events: Vec::new(),
                         emitted_backend_session_id: None,
+                        backend_resume_fingerprint: None,
                         used_backend_id: None,
                     });
                 }

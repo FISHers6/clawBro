@@ -78,6 +78,7 @@ pub async fn run_command_turn(
                 full_text,
                 events,
                 emitted_backend_session_id: None,
+                backend_resume_fingerprint: None,
                 used_backend_id: None,
             });
         }
@@ -97,6 +98,7 @@ pub async fn run_command_turn(
         full_text,
         events,
         emitted_backend_session_id: None,
+        backend_resume_fingerprint: None,
         used_backend_id: None,
     })
 }

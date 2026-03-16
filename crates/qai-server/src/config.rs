@@ -321,9 +321,10 @@ impl GatewayConfig {
                     if !matches!(
                         profile.protocol,
                         ProviderProfileProtocolConfig::OpenaiCompatible { .. }
+                            | ProviderProfileProtocolConfig::OfficialSession
                     ) {
                         anyhow::bail!(
-                            "backend `{}` sets codex projection = \"local_config\" but provider_profile `{}` is not openai_compatible",
+                            "backend `{}` sets codex projection = \"local_config\" but provider_profile `{}` is neither openai_compatible nor official_session",
                             backend.id,
                             profile_id
                         );

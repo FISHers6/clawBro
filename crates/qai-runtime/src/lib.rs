@@ -2,6 +2,7 @@ pub mod acp;
 pub mod adapter;
 pub mod approval;
 pub mod backend;
+pub mod backend_resume;
 pub mod codex_local_config;
 pub mod conductor;
 pub mod contract;
@@ -22,6 +23,7 @@ pub use backend::{
     ApprovalMode, BackendFamily, CapabilityProfile, NativeTeamCapability, RoleEligibility,
     ToolBridgeKind,
 };
+pub use backend_resume::fingerprint_backend_spec;
 pub use conductor::RuntimeConductor;
 pub use contract::{
     render_history_lines, render_runtime_prompt, ExternalMcpServerSpec, ExternalMcpTransport,

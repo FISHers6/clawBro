@@ -30,7 +30,7 @@ use qai_protocol::{
 };
 use qai_runtime::contract::{TeamCallback, TurnResult};
 use qai_runtime::{RuntimeEvent, TeamToolCall, TeamToolResponse};
-use qai_session::{SessionManager, SessionMeta, StoredMessage};
+use qai_session::{ResumableBackendSession, ResumeDropReason, SessionManager, StoredMessage};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -963,13 +963,65 @@ impl SessionRegistry {
             .or_else(|| fallback_backend_id.clone());
         // Load stored ACP session ID for this backend (if any) and stamp into ctx.
         if let Some(ref bid) = expected_backend_id {
-            let meta: Option<SessionMeta> = self
-                .session_manager
-                .load_meta(session_id)
-                .await
-                .ok()
-                .flatten();
-            ctx.backend_session_id = meta.and_then(|m| m.backend_session_ids.get(bid).cloned());
+            match self.runtime_dispatch.backend_resume_fingerprint(bid).await {
+                Ok(Some(fingerprint)) => match self
+                    .session_manager
+                    .load_resumable_backend_session_id(session_id, bid, &fingerprint)
+                    .await
+                {
+                    Ok(resume_state) => match resume_state {
+                        ResumableBackendSession::Reuse(backend_session_id) => {
+                            tracing::debug!(
+                                session_id = %session_id,
+                                backend_id = %bid,
+                                backend_session_id = %backend_session_id,
+                                "reusing stored backend session id"
+                            );
+                            ctx.backend_session_id = Some(backend_session_id);
+                        }
+                        ResumableBackendSession::NotAvailable => {
+                            tracing::debug!(
+                                session_id = %session_id,
+                                backend_id = %bid,
+                                "no resumable backend session id available; starting fresh backend session"
+                            );
+                        }
+                        ResumableBackendSession::DroppedStale {
+                            stale_session_id,
+                            reason,
+                        } => {
+                            let reason = match reason {
+                                ResumeDropReason::MissingFingerprint => "missing_fingerprint",
+                                ResumeDropReason::FingerprintMismatch => "fingerprint_mismatch",
+                            };
+                            tracing::debug!(
+                                session_id = %session_id,
+                                backend_id = %bid,
+                                stale_backend_session_id = %stale_session_id,
+                                drop_reason = reason,
+                                "dropping stale backend session id before runtime dispatch"
+                            );
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            backend_id = %bid,
+                            "failed to load resumable backend session id"
+                        );
+                    }
+                },
+                Ok(None) => {
+                    tracing::warn!(backend_id = %bid, "no backend fingerprint available for resume gating");
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        backend_id = %bid,
+                        "backend fingerprint lookup failed; forcing fresh backend session"
+                    );
+                }
+            }
             if let Err(e) = self.session_manager.begin_turn(session_id, bid).await {
                 tracing::warn!(error = %e, backend_id = %bid, "begin_turn failed");
             }
@@ -1035,6 +1087,10 @@ impl SessionRegistry {
             .as_ref()
             .ok()
             .and_then(|r| r.emitted_backend_session_id.clone());
+        let backend_resume_fingerprint = turn_result
+            .as_ref()
+            .ok()
+            .and_then(|r| r.backend_resume_fingerprint.clone());
         let complete_backend_id = turn_result
             .as_ref()
             .ok()
@@ -1043,7 +1099,12 @@ impl SessionRegistry {
         if let Some(ref bid) = complete_backend_id {
             if let Err(e) = self
                 .session_manager
-                .complete_turn(session_id, bid, emitted_session_id)
+                .complete_turn(
+                    session_id,
+                    bid,
+                    emitted_session_id,
+                    backend_resume_fingerprint,
+                )
                 .await
             {
                 tracing::warn!(error = %e, backend_id = %bid, "complete_turn failed");
@@ -1190,6 +1251,7 @@ mod tests {
         calls: Arc<AtomicUsize>,
         last_backend: Arc<std::sync::Mutex<Option<String>>>,
         history_snapshots: Arc<std::sync::Mutex<Vec<Vec<(String, String)>>>>,
+        backend_resume_fingerprint: Option<String>,
     }
 
     #[async_trait::async_trait]
@@ -1209,8 +1271,13 @@ mod tests {
                 full_text: format!("fake-dispatch: {}", request.intent.user_text),
                 events: vec![],
                 emitted_backend_session_id: None,
+                backend_resume_fingerprint: self.backend_resume_fingerprint.clone(),
                 used_backend_id: None,
             })
+        }
+
+        async fn backend_resume_fingerprint(&self, _backend_id: &str) -> Result<Option<String>> {
+            Ok(self.backend_resume_fingerprint.clone())
         }
     }
 
@@ -1443,6 +1510,7 @@ mod tests {
                 calls: Arc::clone(&calls),
                 last_backend: Arc::clone(&last_backend),
                 history_snapshots,
+                backend_resume_fingerprint: None,
             }),
         );
 
@@ -1486,6 +1554,7 @@ mod tests {
                 calls,
                 last_backend,
                 history_snapshots: Arc::clone(&history_snapshots),
+                backend_resume_fingerprint: None,
             }),
         );
 
@@ -1535,6 +1604,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_registry_drops_stale_backend_resume_id_when_fingerprint_changes() {
+        let dir =
+            std::env::temp_dir().join(format!("test-registry-resume-fp-{}", uuid::Uuid::new_v4()));
+        let storage = SessionStorage::new(dir);
+        let session_manager = Arc::new(SessionManager::new(storage));
+        let session_key = SessionKey::new("ws", "resume-fingerprint-user");
+        let session_id = session_manager.get_or_create(&session_key).await.unwrap();
+        session_manager
+            .complete_turn(
+                session_id,
+                "native-main",
+                Some("stale-backend-session".into()),
+                Some("fp-old".into()),
+            )
+            .await
+            .unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let last_backend = Arc::new(std::sync::Mutex::new(None));
+        let history_snapshots = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (registry, _rx) = SessionRegistry::with_runtime_dispatch(
+            Some("native-main".to_string()),
+            Arc::clone(&session_manager),
+            String::new(),
+            None,
+            None,
+            None,
+            None,
+            vec![],
+            Arc::new(FakeRuntimeDispatch {
+                calls,
+                last_backend,
+                history_snapshots,
+                backend_resume_fingerprint: Some("fp-new".into()),
+            }),
+        );
+
+        registry
+            .handle(InboundMsg {
+                id: "resume-fingerprint-1".to_string(),
+                session_key: session_key.clone(),
+                content: MsgContent::text("hello"),
+                sender: "user".to_string(),
+                channel: "ws".to_string(),
+                timestamp: chrono::Utc::now(),
+                thread_ts: None,
+                target_agent: None,
+                source: qai_protocol::MsgSource::Human,
+            })
+            .await
+            .unwrap();
+
+        let meta = session_manager
+            .load_meta(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !meta.backend_session_ids.contains_key("native-main"),
+            "stale backend resume id should be dropped instead of reused"
+        );
+        assert_eq!(
+            meta.backend_resume_fingerprints
+                .get("native-main")
+                .map(String::as_str),
+            Some("fp-new"),
+            "current turn should persist the new backend fingerprint"
+        );
+    }
+
+    #[tokio::test]
     async fn test_scope_binding_routes_no_mention_to_bound_agent() {
         let calls = Arc::new(AtomicUsize::new(0));
         let last_backend = Arc::new(std::sync::Mutex::new(None));
@@ -1562,6 +1702,7 @@ mod tests {
                 calls: Arc::clone(&calls),
                 last_backend: Arc::clone(&last_backend),
                 history_snapshots: Arc::new(std::sync::Mutex::new(Vec::new())),
+                backend_resume_fingerprint: None,
             }),
         );
         registry.register_scope_binding("group:lark:bound".to_string(), "claude".to_string());
@@ -1613,6 +1754,7 @@ mod tests {
                 calls: Arc::new(AtomicUsize::new(0)),
                 last_backend: Arc::clone(&last_backend),
                 history_snapshots: Arc::new(std::sync::Mutex::new(Vec::new())),
+                backend_resume_fingerprint: None,
             }),
         );
         registry.register_scope_binding("group:lark:bound".to_string(), "claude".to_string());
@@ -1652,6 +1794,7 @@ mod tests {
                 calls: Arc::new(AtomicUsize::new(0)),
                 last_backend: Arc::clone(&last_backend),
                 history_snapshots: Arc::new(std::sync::Mutex::new(Vec::new())),
+                backend_resume_fingerprint: None,
             }),
         );
         let key = SessionKey::new("lark", "group:lark:bound");
@@ -1706,6 +1849,7 @@ mod tests {
                 calls: Arc::new(AtomicUsize::new(0)),
                 last_backend: Arc::clone(&last_backend),
                 history_snapshots: Arc::new(std::sync::Mutex::new(Vec::new())),
+                backend_resume_fingerprint: None,
             }),
         );
         registry.register_binding(crate::bindings::BindingRule::scope(
@@ -1764,6 +1908,7 @@ mod tests {
                 calls: Arc::new(AtomicUsize::new(0)),
                 last_backend: Arc::clone(&last_backend),
                 history_snapshots: Arc::new(std::sync::Mutex::new(Vec::new())),
+                backend_resume_fingerprint: None,
             }),
         );
         registry.register_scope_binding("group:lark:bound".to_string(), "claude".to_string());
@@ -1818,6 +1963,7 @@ mod tests {
                 calls: Arc::new(AtomicUsize::new(0)),
                 last_backend: Arc::clone(&last_backend),
                 history_snapshots: Arc::new(std::sync::Mutex::new(Vec::new())),
+                backend_resume_fingerprint: None,
             }),
         );
         registry.register_binding(crate::bindings::BindingRule::Default {
@@ -1869,6 +2015,7 @@ mod tests {
                 calls: Arc::new(AtomicUsize::new(0)),
                 last_backend: Arc::clone(&last_backend),
                 history_snapshots: Arc::new(std::sync::Mutex::new(Vec::new())),
+                backend_resume_fingerprint: None,
             }),
         );
 
@@ -2375,6 +2522,7 @@ mod tests {
                 calls: Arc::clone(&calls),
                 last_backend,
                 history_snapshots,
+                backend_resume_fingerprint: None,
             }),
         );
 
@@ -2666,6 +2814,7 @@ mod tests {
                         agent: "openclaw-main".into(),
                     })],
                     emitted_backend_session_id: None,
+                    backend_resume_fingerprint: None,
                     used_backend_id: None,
                 },
             )

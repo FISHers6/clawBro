@@ -15,8 +15,157 @@ use crate::{
 use agent_client_protocol as acp;
 use std::cell::Cell;
 use std::collections::HashMap;
-use tokio::process::Command;
+use tokio::{
+    process::Command,
+    time::{Duration, Instant},
+};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+
+const ACP_PROMPT_FIRST_VISIBLE_TIMEOUT: Duration = Duration::from_secs(60);
+const ACP_PROMPT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+struct ChildKillGuard(tokio::process::Child);
+
+impl Drop for ChildKillGuard {
+    fn drop(&mut self) {
+        let _ = self.0.start_kill();
+    }
+}
+
+async fn terminate_and_reap_child(child: &mut tokio::process::Child, context: &str) {
+    match child.try_wait() {
+        Ok(Some(status)) => {
+            tracing::debug!(%context, ?status, "ACP child already exited before reap");
+            return;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(%context, %error, "Failed to inspect ACP child status before reap");
+        }
+    }
+
+    if let Err(error) = child.start_kill() {
+        tracing::warn!(%context, %error, "Failed to signal ACP child for shutdown");
+    }
+
+    match child.wait().await {
+        Ok(status) => tracing::debug!(%context, ?status, "ACP child terminated and reaped"),
+        Err(error) => tracing::warn!(%context, %error, "Failed to reap ACP child"),
+    }
+}
+
+fn maybe_note_first_live_update(
+    session_id: &acp::SessionId,
+    prompt_started_at: Instant,
+    first_live_update_at: &Cell<Option<Instant>>,
+    first_live_update_kind: &std::cell::RefCell<Option<&'static str>>,
+    update_kind: &'static str,
+) {
+    if first_live_update_at.get().is_some() {
+        return;
+    }
+    let now = Instant::now();
+    first_live_update_at.set(Some(now));
+    *first_live_update_kind.borrow_mut() = Some(update_kind);
+    tracing::debug!(
+        session_id = %session_id,
+        first_live_update_kind = update_kind,
+        first_live_update_latency_ms = now.duration_since(prompt_started_at).as_millis() as u64,
+        "ACP prompt produced first visible update"
+    );
+}
+
+fn format_acp_prompt_timeout_error(
+    session_id: &acp::SessionId,
+    total_elapsed: Duration,
+    idle_elapsed: Duration,
+    first_live_update_kind: Option<&'static str>,
+    reason: &'static str,
+) -> String {
+    format!(
+        "ACP prompt timed out ({reason}; session_id={session_id}; total_elapsed_ms={}; idle_elapsed_ms={}; first_live_update_kind={})",
+        total_elapsed.as_millis(),
+        idle_elapsed.as_millis(),
+        first_live_update_kind.unwrap_or("none"),
+    )
+}
+
+async fn wait_for_prompt_completion<F, T, E>(
+    prompt_future: F,
+    active_session_id: &acp::SessionId,
+    prompt_started_at: Instant,
+    last_activity_at: &Cell<Instant>,
+    first_live_update_at: &Cell<Option<Instant>>,
+    first_live_update_kind: &std::cell::RefCell<Option<&'static str>>,
+) -> anyhow::Result<()>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+    E: std::fmt::Debug,
+{
+    tokio::pin!(prompt_future);
+
+    loop {
+        let idle_deadline = last_activity_at.get() + ACP_PROMPT_IDLE_TIMEOUT;
+        let next_deadline = if first_live_update_at.get().is_none() {
+            std::cmp::min(
+                idle_deadline,
+                prompt_started_at + ACP_PROMPT_FIRST_VISIBLE_TIMEOUT,
+            )
+        } else {
+            idle_deadline
+        };
+
+        tokio::select! {
+            result = &mut prompt_future => {
+                let total_elapsed = prompt_started_at.elapsed();
+                let first_visible_latency_ms = first_live_update_at
+                    .get()
+                    .map(|instant| instant.duration_since(prompt_started_at).as_millis() as u64);
+                tracing::debug!(
+                    session_id = %active_session_id,
+                    prompt_total_latency_ms = total_elapsed.as_millis() as u64,
+                    first_live_update_latency_ms = first_visible_latency_ms,
+                    first_live_update_kind = first_live_update_kind.borrow().unwrap_or("none"),
+                    "ACP prompt request completed"
+                );
+                result.map_err(|error| anyhow::anyhow!("ACP prompt failed: {error:?}"))?;
+                return Ok(());
+            }
+            _ = tokio::time::sleep_until(next_deadline) => {
+                let now = Instant::now();
+                let idle_elapsed = now.duration_since(last_activity_at.get());
+                let total_elapsed = now.duration_since(prompt_started_at);
+                let first_kind = *first_live_update_kind.borrow();
+
+                if first_live_update_at.get().is_none()
+                    && total_elapsed >= ACP_PROMPT_FIRST_VISIBLE_TIMEOUT
+                {
+                    let message = format_acp_prompt_timeout_error(
+                        active_session_id,
+                        total_elapsed,
+                        idle_elapsed,
+                        first_kind,
+                        "no visible output before deadline",
+                    );
+                    tracing::warn!(session_id = %active_session_id, %message, "ACP prompt stalled before first visible update");
+                    return Err(anyhow::anyhow!(message));
+                }
+
+                if idle_elapsed >= ACP_PROMPT_IDLE_TIMEOUT {
+                    let message = format_acp_prompt_timeout_error(
+                        active_session_id,
+                        total_elapsed,
+                        idle_elapsed,
+                        first_kind,
+                        "no ACP session activity before deadline",
+                    );
+                    tracing::warn!(session_id = %active_session_id, %message, "ACP prompt stalled after session became idle");
+                    return Err(anyhow::anyhow!(message));
+                }
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcpCommandConfig {
@@ -35,13 +184,6 @@ pub async fn probe_command_backend(
     config: &AcpCommandConfig,
 ) -> anyhow::Result<acp::InitializeResponse> {
     use acp::Agent as _;
-
-    struct ChildKillGuard(tokio::process::Child);
-    impl Drop for ChildKillGuard {
-        fn drop(&mut self) {
-            let _ = self.0.start_kill();
-        }
-    }
 
     let mut child = ChildKillGuard(spawn_command(config, None)?);
     let stdin = child
@@ -105,10 +247,9 @@ pub async fn probe_command_backend(
             ),
         )
         .await
-        .map_err(|e| anyhow::anyhow!("ACP initialize failed: {e:?}"))?;
-
-    // child guard drops here
-    Ok(init)
+        .map_err(|e| anyhow::anyhow!("ACP initialize failed: {e:?}"));
+    terminate_and_reap_child(&mut child.0, "acp_probe").await;
+    init
 }
 
 pub async fn run_command_turn(
@@ -145,16 +286,6 @@ pub async fn run_command_turn(
             "ACP backend is bridge-backed; command is an adapter package, not a raw CLI"
         );
     }
-    // RAII guard: ensures the child process is killed on every exit path (early error returns,
-    // happy path, and future panics). Without this, any `?` before the final `child.kill()` call
-    // would leave a zombie process on the OS.
-    struct ChildKillGuard(tokio::process::Child);
-    impl Drop for ChildKillGuard {
-        fn drop(&mut self) {
-            let _ = self.0.start_kill();
-        }
-    }
-
     let projected_config = apply_provider_profile_for_acp_backend(config, acp_backend, &session)?;
     let projected_config = apply_codex_projection_for_acp_backend(
         &projected_config,
@@ -186,6 +317,8 @@ pub async fn run_command_turn(
     let outgoing = stdin.compat_write();
     let incoming = stdout.compat();
 
+    let turn_result = async {
+
     #[derive(Clone)]
     struct EventClient {
         sink: RuntimeEventSink,
@@ -198,6 +331,10 @@ pub async fn run_command_turn(
         /// to sink or accumulated, preventing replayed history from appearing as
         /// current-turn live output.
         suppress_replay: Rc<Cell<bool>>,
+        last_activity_at: Rc<Cell<Instant>>,
+        prompt_started_at: Rc<Cell<Instant>>,
+        first_live_update_at: Rc<Cell<Option<Instant>>>,
+        first_live_update_kind: Rc<RefCell<Option<&'static str>>>,
     }
 
     #[async_trait::async_trait(?Send)]
@@ -239,6 +376,7 @@ pub async fn run_command_turn(
             &self,
             notification: acp::SessionNotification,
         ) -> acp::Result<()> {
+            self.last_activity_at.set(Instant::now());
             let session_id = notification.session_id.clone();
             let update_kind = acp_session_update_kind(&notification.update);
             tracing::debug!(
@@ -256,6 +394,15 @@ pub async fn run_command_turn(
                         return Ok(());
                     }
                     if let acp::ContentBlock::Text(t) = chunk.content {
+                        if !t.text.is_empty() {
+                            maybe_note_first_live_update(
+                                &session_id,
+                                self.prompt_started_at.get(),
+                                &self.first_live_update_at,
+                                &self.first_live_update_kind,
+                                "agent_message_chunk",
+                            );
+                        }
                         tracing::debug!(
                             session_id = %session_id,
                             text_len = t.text.len(),
@@ -274,6 +421,13 @@ pub async fn run_command_turn(
                         );
                         return Ok(());
                     }
+                    maybe_note_first_live_update(
+                        &session_id,
+                        self.prompt_started_at.get(),
+                        &self.first_live_update_at,
+                        &self.first_live_update_kind,
+                        "tool_call",
+                    );
                     let call_id = tool_call.tool_call_id.to_string();
                     self.tool_titles
                         .borrow_mut()
@@ -299,6 +453,13 @@ pub async fn run_command_turn(
                         );
                         return Ok(());
                     }
+                    maybe_note_first_live_update(
+                        &session_id,
+                        self.prompt_started_at.get(),
+                        &self.first_live_update_at,
+                        &self.first_live_update_kind,
+                        "tool_call_update",
+                    );
                     let call_id = update.tool_call_id.to_string();
                     let seen_before = self.tool_titles.borrow().contains_key(&call_id);
                     if let Some(title) = update.fields.title.clone() {
@@ -406,6 +567,10 @@ pub async fn run_command_turn(
 
     let accumulated = Rc::new(RefCell::new(String::new()));
     let suppress_replay = Rc::new(Cell::new(false));
+    let last_activity_at = Rc::new(Cell::new(Instant::now()));
+    let prompt_started_at = Rc::new(Cell::new(Instant::now()));
+    let first_live_update_at = Rc::new(Cell::new(None));
+    let first_live_update_kind = Rc::new(RefCell::new(None));
     let client = EventClient {
         sink: sink.clone(),
         accumulated: accumulated.clone(),
@@ -413,6 +578,10 @@ pub async fn run_command_turn(
         approval_mode: session.approval_mode,
         tool_titles: Rc::new(RefCell::new(HashMap::new())),
         suppress_replay: suppress_replay.clone(),
+        last_activity_at: last_activity_at.clone(),
+        prompt_started_at: prompt_started_at.clone(),
+        first_live_update_at: first_live_update_at.clone(),
+        first_live_update_kind: first_live_update_kind.clone(),
     };
     let (conn, handle_io) = acp::ClientSideConnection::new(client, outgoing, incoming, |fut| {
         tokio::task::spawn_local(fut);
@@ -522,6 +691,11 @@ pub async fn run_command_turn(
 
     let prompt_session = session_for_acp_prompt(&session, acp_backend, transcript_ownership);
     let prompt_blocks = prompt_blocks_from_session(&prompt_session);
+    let prompt_start = Instant::now();
+    prompt_started_at.set(prompt_start);
+    last_activity_at.set(prompt_start);
+    first_live_update_at.set(None);
+    *first_live_update_kind.borrow_mut() = None;
     tracing::debug!(
         session_id = %active_session_id,
         transcript_ownership = ?transcript_ownership,
@@ -533,12 +707,19 @@ pub async fn run_command_turn(
                 _ => 0,
             })
             .sum::<usize>(),
+        first_visible_timeout_ms = ACP_PROMPT_FIRST_VISIBLE_TIMEOUT.as_millis() as u64,
+        idle_timeout_ms = ACP_PROMPT_IDLE_TIMEOUT.as_millis() as u64,
         "Sending ACP prompt request"
     );
-    conn.prompt(acp::PromptRequest::new(active_session_id, prompt_blocks))
-        .await
-        .map_err(|e| anyhow::anyhow!("ACP prompt failed: {e:?}"))?;
-    tracing::debug!("ACP prompt request completed");
+    wait_for_prompt_completion(
+        conn.prompt(acp::PromptRequest::new(active_session_id.clone(), prompt_blocks)),
+        &active_session_id,
+        prompt_start,
+        &last_activity_at,
+        &first_live_update_at,
+        &first_live_update_kind,
+    )
+    .await?;
 
     let full_text = accumulated.borrow().clone();
     tracing::debug!(
@@ -549,14 +730,18 @@ pub async fn run_command_turn(
         full_text: full_text.clone(),
     };
     let _ = sink.emit(complete.clone());
-    // child guard drops here and kills the process via start_kill()
-
     Ok(TurnResult {
         full_text,
         events: vec![complete],
         emitted_backend_session_id,
+        backend_resume_fingerprint: None,
         used_backend_id: None, // stamped by run_dispatch_job one level up
     })
+    }
+    .await;
+
+    terminate_and_reap_child(&mut child.0, "acp_command_turn").await;
+    turn_result
 }
 
 async fn authenticate_if_configured(
@@ -831,6 +1016,7 @@ fn spawn_command(
     let mut cmd = Command::new(&config.command);
     cmd.args(&config.args)
         .envs(config.env.iter().cloned())
+        .kill_on_drop(true)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit());
@@ -1424,6 +1610,7 @@ mod tests {
             full_text: "ok".into(),
             events: vec![],
             emitted_backend_session_id: Some(new_id.clone()), // ← new path emits Some
+            backend_resume_fingerprint: None,
             used_backend_id: None,
         };
         assert_eq!(
@@ -1437,6 +1624,7 @@ mod tests {
             full_text: "ok".into(),
             events: vec![],
             emitted_backend_session_id: None, // ← load path emits None (reuses prior_id)
+            backend_resume_fingerprint: None,
             used_backend_id: None,
         };
         assert!(
@@ -1471,5 +1659,42 @@ mod tests {
         let no_prior_id =
             ResumeStrategy::AcpLoadSession == ResumeStrategy::AcpLoadSession && true && false; // backend_session_id.is_none()
         assert!(!no_prior_id);
+    }
+
+    #[test]
+    fn prompt_timeout_message_mentions_reason_and_timings() {
+        let message = format_acp_prompt_timeout_error(
+            &acp::SessionId::new("test-session"),
+            Duration::from_secs(61),
+            Duration::from_secs(59),
+            Some("tool_call"),
+            "no visible output before deadline",
+        );
+        assert!(message.contains("test-session"));
+        assert!(message.contains("no visible output before deadline"));
+        assert!(message.contains("total_elapsed_ms=61000"));
+        assert!(message.contains("idle_elapsed_ms=59000"));
+        assert!(message.contains("first_live_update_kind=tool_call"));
+    }
+
+    #[tokio::test]
+    async fn terminate_and_reap_child_stops_process() {
+        let mut child = spawn_command(
+            &AcpCommandConfig {
+                command: "sleep".into(),
+                args: vec!["30".into()],
+                env: vec![],
+            },
+            None,
+        )
+        .unwrap();
+
+        terminate_and_reap_child(&mut child, "test_reap").await;
+
+        let status = child.try_wait().unwrap();
+        assert!(
+            status.is_some(),
+            "child should be reaped after explicit cleanup"
+        );
     }
 }

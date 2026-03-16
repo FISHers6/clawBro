@@ -6,6 +6,31 @@ use dashmap::DashMap;
 use qai_protocol::{normalize_conversation_identity, SessionKey};
 use std::sync::Arc;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeDropReason {
+    MissingFingerprint,
+    FingerprintMismatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumableBackendSession {
+    Reuse(String),
+    NotAvailable,
+    DroppedStale {
+        stale_session_id: String,
+        reason: ResumeDropReason,
+    },
+}
+
+impl ResumableBackendSession {
+    pub fn reusable_session_id(&self) -> Option<&str> {
+        match self {
+            Self::Reuse(session_id) => Some(session_id.as_str()),
+            _ => None,
+        }
+    }
+}
+
 pub struct SessionManager {
     storage: Arc<SessionStorage>,
     /// 内存缓存: normalized SessionKey → SessionId
@@ -37,6 +62,7 @@ impl SessionManager {
                 channel_instance: key.channel_instance.clone(),
                 message_count: 0,
                 backend_session_ids: Default::default(),
+                backend_resume_fingerprints: Default::default(),
                 session_status: SessionStatus::Idle,
             };
             self.storage.save_meta(&meta).await?;
@@ -56,6 +82,53 @@ impl SessionManager {
     /// 读取指定 session 的 meta（用于获取 backend_session_ids）
     pub async fn load_meta(&self, session_id: SessionId) -> Result<Option<SessionMeta>> {
         self.storage.load_meta(session_id).await
+    }
+
+    /// Load the stored backend-side resume handle only when it still matches the
+    /// currently configured backend fingerprint. A mismatch drops just this
+    /// backend's resume state and forces the next turn onto a fresh backend
+    /// session while preserving host conversation history.
+    pub async fn load_resumable_backend_session_id(
+        &self,
+        session_id: SessionId,
+        backend_id: &str,
+        expected_fingerprint: &str,
+    ) -> Result<ResumableBackendSession> {
+        let Some(mut meta) = self.storage.load_meta(session_id).await? else {
+            return Ok(ResumableBackendSession::NotAvailable);
+        };
+        let stored_id = meta.backend_session_ids.get(backend_id).cloned();
+        let stored_fingerprint = meta.backend_resume_fingerprints.get(backend_id).cloned();
+        if stored_id.is_none() {
+            return Ok(ResumableBackendSession::NotAvailable);
+        }
+        match stored_fingerprint.as_deref() {
+            Some(current) if current == expected_fingerprint => Ok(ResumableBackendSession::Reuse(
+                stored_id.expect("checked is_some above"),
+            )),
+            _ => {
+                let stale_session_id = stored_id.expect("checked is_some above");
+                let reason = if stored_fingerprint.is_some() {
+                    ResumeDropReason::FingerprintMismatch
+                } else {
+                    ResumeDropReason::MissingFingerprint
+                };
+                tracing::info!(
+                    session_id = %session_id,
+                    backend_id = %backend_id,
+                    had_stored_fingerprint = stored_fingerprint.is_some(),
+                    "dropping stale backend resume state due to fingerprint mismatch"
+                );
+                meta.backend_session_ids.remove(backend_id);
+                meta.backend_resume_fingerprints.remove(backend_id);
+                meta.updated_at = Utc::now();
+                self.storage.save_meta(&meta).await?;
+                Ok(ResumableBackendSession::DroppedStale {
+                    stale_session_id,
+                    reason,
+                })
+            }
+        }
     }
 
     /// 覆盖写 meta（原子 tmp→rename）
@@ -79,6 +152,7 @@ impl SessionManager {
                 channel_instance: None,
                 message_count: 0,
                 backend_session_ids: Default::default(),
+                backend_resume_fingerprints: Default::default(),
                 session_status: SessionStatus::Idle,
             });
         meta.session_status = SessionStatus::Running {
@@ -97,6 +171,7 @@ impl SessionManager {
         session_id: SessionId,
         backend_id: &str,
         emitted_session_id: Option<String>,
+        backend_resume_fingerprint: Option<String>,
     ) -> Result<()> {
         let mut meta = self
             .storage
@@ -111,10 +186,15 @@ impl SessionManager {
                 channel_instance: None,
                 message_count: 0,
                 backend_session_ids: Default::default(),
+                backend_resume_fingerprints: Default::default(),
                 session_status: SessionStatus::Idle,
             });
         if let Some(sid) = emitted_session_id {
             meta.backend_session_ids.insert(backend_id.to_string(), sid);
+        }
+        if let Some(fingerprint) = backend_resume_fingerprint {
+            meta.backend_resume_fingerprints
+                .insert(backend_id.to_string(), fingerprint);
         }
         meta.session_status = SessionStatus::Idle;
         meta.updated_at = Utc::now();
@@ -143,9 +223,11 @@ impl SessionManager {
                 channel_instance: None,
                 message_count: 0,
                 backend_session_ids: Default::default(),
+                backend_resume_fingerprints: Default::default(),
                 session_status: SessionStatus::Idle,
             });
         meta.backend_session_ids.clear();
+        meta.backend_resume_fingerprints.clear();
         meta.message_count = 0;
         meta.session_status = SessionStatus::Idle;
         meta.updated_at = Utc::now();
@@ -238,9 +320,14 @@ mod tests {
         let session_id = mgr.get_or_create(&key).await.unwrap();
 
         mgr.begin_turn(session_id, "claude-main").await.unwrap();
-        mgr.complete_turn(session_id, "claude-main", Some("acp-sess-abc123".into()))
-            .await
-            .unwrap();
+        mgr.complete_turn(
+            session_id,
+            "claude-main",
+            Some("acp-sess-abc123".into()),
+            Some("fp-1".into()),
+        )
+        .await
+        .unwrap();
 
         let meta = mgr.load_meta(session_id).await.unwrap().unwrap();
         assert_eq!(
@@ -255,6 +342,13 @@ mod tests {
             Some("acp-sess-abc123"),
             "expected ACP session ID stored"
         );
+        assert_eq!(
+            meta.backend_resume_fingerprints
+                .get("claude-main")
+                .map(String::as_str),
+            Some("fp-1"),
+            "expected backend resume fingerprint stored"
+        );
     }
 
     #[tokio::test]
@@ -265,13 +359,18 @@ mod tests {
 
         // First turn: store a session ID
         mgr.begin_turn(session_id, "claude-main").await.unwrap();
-        mgr.complete_turn(session_id, "claude-main", Some("existing-id".into()))
-            .await
-            .unwrap();
+        mgr.complete_turn(
+            session_id,
+            "claude-main",
+            Some("existing-id".into()),
+            Some("fp-existing".into()),
+        )
+        .await
+        .unwrap();
 
         // Second turn: complete with None (e.g. load_session path or error path)
         mgr.begin_turn(session_id, "claude-main").await.unwrap();
-        mgr.complete_turn(session_id, "claude-main", None)
+        mgr.complete_turn(session_id, "claude-main", None, Some("fp-existing".into()))
             .await
             .unwrap();
 
@@ -284,6 +383,12 @@ mod tests {
                 .map(String::as_str),
             Some("existing-id"),
             "None emitted_session_id must not clobber existing stored ID"
+        );
+        assert_eq!(
+            meta.backend_resume_fingerprints
+                .get("claude-main")
+                .map(String::as_str),
+            Some("fp-existing")
         );
     }
 
@@ -323,13 +428,23 @@ mod tests {
 
         // Simulate a completed turn that stored a backend session ID
         mgr.begin_turn(session_id, "claude-main").await.unwrap();
-        mgr.complete_turn(session_id, "claude-main", Some("old-acp-id".into()))
-            .await
-            .unwrap();
+        mgr.complete_turn(
+            session_id,
+            "claude-main",
+            Some("old-acp-id".into()),
+            Some("fp-claude".into()),
+        )
+        .await
+        .unwrap();
         // Also store a second backend to confirm all are cleared
-        mgr.complete_turn(session_id, "codex", Some("old-codex-id".into()))
-            .await
-            .unwrap();
+        mgr.complete_turn(
+            session_id,
+            "codex",
+            Some("old-codex-id".into()),
+            Some("fp-codex".into()),
+        )
+        .await
+        .unwrap();
 
         // Append a message so we can verify clear_messages works
         mgr.append_message(
@@ -355,6 +470,10 @@ mod tests {
             meta.backend_session_ids.is_empty(),
             "reset_conversation must clear all backend_session_ids"
         );
+        assert!(
+            meta.backend_resume_fingerprints.is_empty(),
+            "reset_conversation must clear all backend_resume_fingerprints"
+        );
         assert_eq!(
             meta.message_count, 0,
             "reset_conversation must reset message_count to 0"
@@ -377,12 +496,22 @@ mod tests {
         let id_a = mgr.get_or_create(&key_a).await.unwrap();
         let id_b = mgr.get_or_create(&key_b).await.unwrap();
 
-        mgr.complete_turn(id_a, "claude-main", Some("id-a".into()))
-            .await
-            .unwrap();
-        mgr.complete_turn(id_b, "claude-main", Some("id-b".into()))
-            .await
-            .unwrap();
+        mgr.complete_turn(
+            id_a,
+            "claude-main",
+            Some("id-a".into()),
+            Some("fp-a".into()),
+        )
+        .await
+        .unwrap();
+        mgr.complete_turn(
+            id_b,
+            "claude-main",
+            Some("id-b".into()),
+            Some("fp-b".into()),
+        )
+        .await
+        .unwrap();
 
         mgr.reset_conversation(id_a).await.unwrap();
 
@@ -406,9 +535,14 @@ mod tests {
 
         mgr.begin_turn(session_id, "claude-main").await.unwrap();
         // Simulate crash: store backend_session_id then leave Running
-        mgr.complete_turn(session_id, "claude-main", Some("prior-acp-id".into()))
-            .await
-            .unwrap();
+        mgr.complete_turn(
+            session_id,
+            "claude-main",
+            Some("prior-acp-id".into()),
+            Some("fp-prior".into()),
+        )
+        .await
+        .unwrap();
         mgr.begin_turn(session_id, "claude-main").await.unwrap();
         // Now it's stuck Running with a prior ACP session ID stored
 
@@ -423,6 +557,12 @@ mod tests {
                 .map(String::as_str),
             Some("prior-acp-id"),
             "backend_session_ids must not be cleared by recover_stuck_sessions"
+        );
+        assert_eq!(
+            meta.backend_resume_fingerprints
+                .get("claude-main")
+                .map(String::as_str),
+            Some("fp-prior")
         );
     }
 
@@ -448,5 +588,86 @@ mod tests {
         let id_b = mgr.get_or_create(&key_b).await.unwrap();
 
         assert_ne!(id_a, id_b);
+    }
+
+    #[tokio::test]
+    async fn load_resumable_backend_session_id_returns_match() {
+        let (mgr, _dir) = make_manager();
+        let key = SessionKey::new("lark", "user:resume-match");
+        let session_id = mgr.get_or_create(&key).await.unwrap();
+
+        mgr.complete_turn(
+            session_id,
+            "codex-main",
+            Some("backend-123".into()),
+            Some("fp-match".into()),
+        )
+        .await
+        .unwrap();
+
+        let loaded = mgr
+            .load_resumable_backend_session_id(session_id, "codex-main", "fp-match")
+            .await
+            .unwrap();
+
+        assert_eq!(loaded, ResumableBackendSession::Reuse("backend-123".into()));
+    }
+
+    #[tokio::test]
+    async fn load_resumable_backend_session_id_clears_mismatch() {
+        let (mgr, _dir) = make_manager();
+        let key = SessionKey::new("lark", "user:resume-mismatch");
+        let session_id = mgr.get_or_create(&key).await.unwrap();
+
+        mgr.complete_turn(
+            session_id,
+            "codex-main",
+            Some("stale-backend".into()),
+            Some("fp-old".into()),
+        )
+        .await
+        .unwrap();
+
+        let loaded = mgr
+            .load_resumable_backend_session_id(session_id, "codex-main", "fp-new")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            loaded,
+            ResumableBackendSession::DroppedStale {
+                stale_session_id: "stale-backend".into(),
+                reason: ResumeDropReason::FingerprintMismatch,
+            },
+            "mismatch must force a fresh backend session"
+        );
+        let meta = mgr.load_meta(session_id).await.unwrap().unwrap();
+        assert!(!meta.backend_session_ids.contains_key("codex-main"));
+        assert!(!meta.backend_resume_fingerprints.contains_key("codex-main"));
+    }
+
+    #[tokio::test]
+    async fn load_resumable_backend_session_id_drops_when_fingerprint_missing() {
+        let (mgr, _dir) = make_manager();
+        let key = SessionKey::new("lark", "user:resume-missing-fingerprint");
+        let session_id = mgr.get_or_create(&key).await.unwrap();
+
+        let mut meta = mgr.load_meta(session_id).await.unwrap().unwrap();
+        meta.backend_session_ids
+            .insert("codex-main".into(), "legacy-backend".into());
+        mgr.save_meta(&meta).await.unwrap();
+
+        let loaded = mgr
+            .load_resumable_backend_session_id(session_id, "codex-main", "fp-new")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            loaded,
+            ResumableBackendSession::DroppedStale {
+                stale_session_id: "legacy-backend".into(),
+                reason: ResumeDropReason::MissingFingerprint,
+            }
+        );
     }
 }

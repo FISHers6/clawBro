@@ -70,6 +70,10 @@ pub struct SessionMeta {
     /// 用于下次 turn 时通过 ACP session/load 恢复后端 session 状态。
     #[serde(default)]
     pub backend_session_ids: std::collections::HashMap<String, String>,
+    /// Per-backend deterministic fingerprint for validating whether a stored
+    /// backend_session_id still belongs to the currently configured backend spec.
+    #[serde(default)]
+    pub backend_resume_fingerprints: std::collections::HashMap<String, String>,
     /// 当前运行状态，用于检测 Gateway 崩溃后卡死的 session。
     #[serde(default = "SessionStatus::default_idle")]
     pub session_status: SessionStatus,
@@ -239,6 +243,7 @@ mod tests {
             channel_instance: Some("default".to_string()),
             message_count: 0,
             backend_session_ids: Default::default(),
+            backend_resume_fingerprints: Default::default(),
             session_status: SessionStatus::Idle,
         };
         storage.save_meta(&meta).await.unwrap();
@@ -246,6 +251,7 @@ mod tests {
         assert_eq!(loaded.channel, "dingtalk");
         assert_eq!(loaded.scope, "user_123");
         assert_eq!(loaded.channel_instance.as_deref(), Some("default"));
+        assert!(loaded.backend_resume_fingerprints.is_empty());
     }
 
     #[tokio::test]
@@ -399,6 +405,7 @@ mod tests {
         }"#;
         let meta: SessionMeta = serde_json::from_str(old_json).unwrap();
         assert!(meta.backend_session_ids.is_empty());
+        assert!(meta.backend_resume_fingerprints.is_empty());
         assert_eq!(meta.session_status, SessionStatus::Idle);
     }
 

@@ -76,6 +76,7 @@ impl BackendAdapter for ScriptedAdapter {
             full_text: scripted.full_text,
             events: scripted.events,
             emitted_backend_session_id: None,
+            backend_resume_fingerprint: None,
             used_backend_id: None,
         })
     }
