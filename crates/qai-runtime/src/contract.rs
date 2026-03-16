@@ -288,6 +288,14 @@ pub struct TurnResult {
     /// registry 层用此 key 调用 complete_turn()。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub used_backend_id: Option<String>,
+    /// Runtime-discovered resume recovery that the host must persist after the turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_recovery: Option<ResumeRecoveryAction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResumeRecoveryAction {
+    DropFailedLoadSessionHandle { stale_session_id: String },
 }
 
 pub fn render_history_lines(

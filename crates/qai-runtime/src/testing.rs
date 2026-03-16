@@ -78,6 +78,7 @@ impl BackendAdapter for ScriptedAdapter {
             emitted_backend_session_id: None,
             backend_resume_fingerprint: None,
             used_backend_id: None,
+            resume_recovery: None,
         })
     }
 }

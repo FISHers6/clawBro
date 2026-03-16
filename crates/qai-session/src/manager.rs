@@ -136,6 +136,23 @@ impl SessionManager {
         self.storage.save_meta(meta).await
     }
 
+    /// Explicitly drop one backend's stored resume state after runtime confirms
+    /// the handle is no longer resumable even though the fingerprint still matched.
+    pub async fn drop_backend_resume_state(
+        &self,
+        session_id: SessionId,
+        backend_id: &str,
+    ) -> Result<Option<String>> {
+        let Some(mut meta) = self.storage.load_meta(session_id).await? else {
+            return Ok(None);
+        };
+        let removed_id = meta.backend_session_ids.remove(backend_id);
+        meta.backend_resume_fingerprints.remove(backend_id);
+        meta.updated_at = Utc::now();
+        self.storage.save_meta(&meta).await?;
+        Ok(removed_id)
+    }
+
     /// turn 开始时调用：将 session_status 设为 Running。
     /// 写入失败只记录警告，不影响 turn 执行。
     pub async fn begin_turn(&self, session_id: SessionId, backend_id: &str) -> Result<()> {
@@ -668,6 +685,52 @@ mod tests {
                 stale_session_id: "legacy-backend".into(),
                 reason: ResumeDropReason::MissingFingerprint,
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_backend_resume_state_only_affects_target_backend() {
+        let (mgr, _dir) = make_manager();
+        let key = SessionKey::new("lark", "user:drop-one-backend");
+        let session_id = mgr.get_or_create(&key).await.unwrap();
+
+        mgr.complete_turn(
+            session_id,
+            "claude-main",
+            Some("claude-stale".into()),
+            Some("fp-claude".into()),
+        )
+        .await
+        .unwrap();
+        mgr.complete_turn(
+            session_id,
+            "codex-main",
+            Some("codex-live".into()),
+            Some("fp-codex".into()),
+        )
+        .await
+        .unwrap();
+
+        let removed = mgr
+            .drop_backend_resume_state(session_id, "claude-main")
+            .await
+            .unwrap();
+
+        assert_eq!(removed.as_deref(), Some("claude-stale"));
+        let meta = mgr.load_meta(session_id).await.unwrap().unwrap();
+        assert!(!meta.backend_session_ids.contains_key("claude-main"));
+        assert!(!meta.backend_resume_fingerprints.contains_key("claude-main"));
+        assert_eq!(
+            meta.backend_session_ids
+                .get("codex-main")
+                .map(String::as_str),
+            Some("codex-live")
+        );
+        assert_eq!(
+            meta.backend_resume_fingerprints
+                .get("codex-main")
+                .map(String::as_str),
+            Some("fp-codex")
         );
     }
 }

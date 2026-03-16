@@ -7,8 +7,8 @@ use crate::{
     backend::ApprovalMode,
     codex_local_config::prepare_isolated_codex_home,
     contract::{
-        render_runtime_prompt, ExternalMcpServerSpec, ExternalMcpTransport, RuntimeEvent,
-        RuntimeSessionSpec, TurnResult,
+        render_runtime_prompt, ExternalMcpServerSpec, ExternalMcpTransport, ResumeRecoveryAction,
+        RuntimeEvent, RuntimeSessionSpec, TurnResult,
     },
     event_sink::RuntimeEventSink,
 };
@@ -627,6 +627,7 @@ pub async fn run_command_turn(
 
     // Decide: resume via session/load or start a new session.
     let can_load = init_resp.agent_capabilities.load_session;
+    let mut resume_recovery = None;
     let (active_session_id, emitted_backend_session_id, transcript_ownership) =
         if policy.resume_strategy == ResumeStrategy::AcpLoadSession
             && can_load
@@ -649,23 +650,61 @@ pub async fn run_command_turn(
                         acp::SessionId::new(prior_id.clone()),
                         session_root.clone(),
                     )
-                    .mcp_servers(mcp_servers),
+                    .mcp_servers(mcp_servers.clone()),
                 )
                 .await;
             // Clear suppression before error propagation so the flag is never left set.
             suppress_replay.set(false);
-            load_result.map_err(|e| anyhow::anyhow!("ACP load_session failed: {e:?}"))?;
-            // LoadSessionResponse has no session_id field; reuse the passed-in prior_id.
-            tracing::debug!(session_id = %prior_id, "ACP session resumed via session/load");
-            (
-                acp::SessionId::new(prior_id.clone()),
-                None,
-                ClaudeTranscriptOwnership::BackendResume,
-            )
+            match load_result {
+                Ok(_) => {
+                    // LoadSessionResponse has no session_id field; reuse the passed-in prior_id.
+                    tracing::debug!(session_id = %prior_id, "ACP session resumed via session/load");
+                    (
+                        acp::SessionId::new(prior_id.clone()),
+                        None,
+                        ClaudeTranscriptOwnership::BackendResume,
+                    )
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        stale_backend_session_id = %prior_id,
+                        error = ?e,
+                        "ACP load_session failed; falling back to fresh new_session"
+                    );
+                    resume_recovery = Some(ResumeRecoveryAction::DropFailedLoadSessionHandle {
+                        stale_session_id: prior_id.clone(),
+                    });
+                    tracing::debug!("Sending ACP new_session request after load_session failure");
+                    let sess = conn
+                        .new_session(
+                            acp::NewSessionRequest::new(session_root.clone())
+                                .mcp_servers(mcp_servers.clone()),
+                        )
+                        .await
+                        .map_err(|new_err| {
+                            anyhow::anyhow!(
+                                "ACP load_session failed: {e:?}; fallback new_session failed: {new_err:?}"
+                            )
+                        })?;
+                    let new_id = sess.session_id.to_string();
+                    tracing::info!(
+                        stale_backend_session_id = %prior_id,
+                        new_backend_session_id = %new_id,
+                        "ACP load_session self-healed via fresh new_session"
+                    );
+                    (
+                        sess.session_id,
+                        Some(new_id),
+                        ClaudeTranscriptOwnership::HostReplay,
+                    )
+                }
+            }
         } else {
             tracing::debug!("Sending ACP new_session request");
             let sess = conn
-                .new_session(acp::NewSessionRequest::new(session_root).mcp_servers(mcp_servers))
+                .new_session(
+                    acp::NewSessionRequest::new(session_root).mcp_servers(mcp_servers.clone()),
+                )
                 .await
                 .map_err(|e| anyhow::anyhow!("ACP new_session failed: {e:?}"))?;
             let new_id = sess.session_id.to_string();
@@ -736,6 +775,7 @@ pub async fn run_command_turn(
         emitted_backend_session_id,
         backend_resume_fingerprint: None,
         used_backend_id: None, // stamped by run_dispatch_job one level up
+        resume_recovery,
     })
     }
     .await;
@@ -1612,6 +1652,7 @@ mod tests {
             emitted_backend_session_id: Some(new_id.clone()), // ← new path emits Some
             backend_resume_fingerprint: None,
             used_backend_id: None,
+            resume_recovery: None,
         };
         assert_eq!(
             new_turn.emitted_backend_session_id.as_deref(),
@@ -1626,6 +1667,7 @@ mod tests {
             emitted_backend_session_id: None, // ← load path emits None (reuses prior_id)
             backend_resume_fingerprint: None,
             used_backend_id: None,
+            resume_recovery: None,
         };
         assert!(
             load_turn.emitted_backend_session_id.is_none(),

@@ -80,6 +80,7 @@ pub async fn run_command_turn(
                 emitted_backend_session_id: None,
                 backend_resume_fingerprint: None,
                 used_backend_id: None,
+                resume_recovery: None,
             });
         }
         anyhow::bail!("native backend process exited with status {status}");
@@ -100,6 +101,7 @@ pub async fn run_command_turn(
         emitted_backend_session_id: None,
         backend_resume_fingerprint: None,
         used_backend_id: None,
+        resume_recovery: None,
     })
 }
 

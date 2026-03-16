@@ -575,50 +575,34 @@ impl TeamOrchestrator {
         // Write TEAM.md if not yet written
         let manifest = self.session.read_team_md();
         if manifest.is_empty() {
-            let _ = self.session.write_team_md("Team execution started.");
+            let lead_name = self
+                .lead_agent_name
+                .get()
+                .map(|s| s.as_str())
+                .unwrap_or("Lead");
+            let specialists = self
+                .available_specialists
+                .get()
+                .cloned()
+                .unwrap_or_default();
+            let _ = self.session.write_team_md(&render_team_manifest_document(
+                lead_name,
+                &specialists,
+                None,
+            ));
         }
 
-        // Write AGENTS.md — claude-code reads this automatically from workspace_dir,
-        // providing true system-level context for both Lead and Specialists.
-        let specialists_list = self
-            .available_specialists
-            .get()
-            .map(|v| {
-                v.iter()
-                    .map(|s| format!("- **{}**", s))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_else(|| "（未配置）".to_string());
         let lead_name = self
             .lead_agent_name
             .get()
             .map(|s| s.as_str())
             .unwrap_or("Lead");
-        let agents_md = format!(
-            "# Team Mode — Agent Roster\n\n\
-             ## Lead Agent: {lead_name}\n\
-             负责任务规划和协调。可用工具：\n\
-             - `create_task(id, title, spec, deps, assignee, success_criteria)` — 注册子任务\n\
-             - `start_execution()` — 启动所有 Ready 任务的并行执行\n\
-             - `request_confirmation(plan_summary)` — 复杂任务执行前请求用户确认\n\
-             - `post_update(message)` — 向用户播报进度\n\
-             - `get_task_status()` — 查看全部任务状态\n\
-             - `assign_task(task_id, agent)` — 重新分配任务给指定 Specialist\n\n\
-             ## Specialist Agents\n\
-             {specialists_list}\n\n\
-             各 Specialist 独立执行分配的任务，完成后调用：\n\
-             - `complete_task(task_id, note)` — 标记任务完成，note 为关键产出摘要\n\
-             - `block_task(task_id, reason)` — 任务无法完成时上报阻塞原因\n\n\
-             ## 工作流\n\
-             1. Lead 调用 `create_task()` 定义任务图（含依赖关系）\n\
-             2. Lead 调用 `start_execution()` 触发调度\n\
-             3. Heartbeat 自动将 Ready 任务派发给对应 Specialist\n\
-             4. Specialist 完成后调用 `complete_task()`，Lead 收到 `[团队通知]`\n\
-             5. 所有任务完成后 Lead 合成最终结果并 `post_update()` 给用户\n",
-            lead_name = lead_name,
-            specialists_list = specialists_list,
-        );
+        let specialists = self
+            .available_specialists
+            .get()
+            .cloned()
+            .unwrap_or_default();
+        let agents_md = render_team_agents_guide(lead_name, &specialists);
         let _ = self.session.write_agents_md(&agents_md);
 
         // Sync TASKS.md snapshot
@@ -673,7 +657,21 @@ impl TeamOrchestrator {
         }
 
         // 1. Write TEAM.md
-        self.session.write_team_md(&plan.team_manifest)?;
+        let lead_name = self
+            .lead_agent_name
+            .get()
+            .map(|s| s.as_str())
+            .unwrap_or("Lead");
+        let specialists = self
+            .available_specialists
+            .get()
+            .cloned()
+            .unwrap_or_default();
+        self.session.write_team_md(&render_team_manifest_document(
+            lead_name,
+            &specialists,
+            Some(plan.team_manifest.as_str()),
+        ))?;
 
         // 2. Register all tasks (sets state check, but start() bypasses it by writing directly to registry)
         for task in &plan.tasks {
@@ -1414,6 +1412,8 @@ impl TeamOrchestrator {
             .write_task_meta(&task.id, &TaskArtifactMeta::from_task(task))?;
         self.session
             .write_task_spec(&task.id, &render_task_spec(task))?;
+        self.session
+            .ensure_task_plan(&task.id, &render_task_plan(task))?;
         Ok(())
     }
 
@@ -1537,6 +1537,135 @@ fn render_task_spec(task: &Task) -> String {
             .as_deref()
             .unwrap_or("Complete the requested work."),
         deps = deps_section,
+    )
+}
+
+fn render_task_plan(task: &Task) -> String {
+    let deps = task.deps();
+    let deps_section = if deps.is_empty() {
+        "None".to_string()
+    } else {
+        deps.join(", ")
+    };
+    format!(
+        "# Task Plan: {title}\n\n**Task ID**: {id}\n**Assignee Hint**: {assignee}\n**Status**: {status}\n**Dependencies**: {deps}\n\n## Steps\n\n- [ ] Read `spec.md`, `TASKS.md`, and relevant team context\n- [ ] Break the work into concrete execution steps\n- [ ] Execute the task and capture meaningful checkpoints in `progress.md`\n- [ ] Write final deliverables to `result.md`\n\n## Notes\n\n- Success criteria: {criteria}\n- Update this file instead of keeping a private scratch plan.\n",
+        title = task.title,
+        id = task.id,
+        assignee = task.assignee_hint.as_deref().unwrap_or("unassigned"),
+        status = task.status_raw,
+        deps = deps_section,
+        criteria = task
+            .success_criteria
+            .as_deref()
+            .unwrap_or("Complete the requested work."),
+    )
+}
+
+fn render_team_manifest_document(
+    lead_name: &str,
+    specialists: &[String],
+    extra_manifest: Option<&str>,
+) -> String {
+    let specialists_list = if specialists.is_empty() {
+        "- none configured".to_string()
+    } else {
+        specialists
+            .iter()
+            .map(|name| format!("- `{name}`: specialist execution lane"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let extra_section = extra_manifest
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(|text| format!("\n## Team-Specific Notes\n\n{text}\n"))
+        .unwrap_or_default();
+    format!(
+        "# Team Constitution\n\n\
+## Mission\n\n\
+This team exists to coordinate user-visible work through one lead and zero or more specialists.\
+\nThe lead owns delegation, acceptance, and final user-facing synthesis. Specialists own execution inside their assigned tasks.\n\n\
+## Roles\n\n\
+- Lead: `{lead_name}`\n\
+- Specialists:\n{specialists_list}\n\n\
+## Shared Sources Of Truth\n\n\
+- `TEAM.md`: team contract and collaboration rules\n\
+- `AGENTS.md`: runtime operating guide for this team workspace\n\
+- `CONTEXT.md`: shared task background curated by the lead\n\
+- `TASKS.md`: current task snapshot\n\
+- `tasks/<task-id>/meta.json`: machine-readable task state\n\
+- `tasks/<task-id>/spec.md`: lead-authored task definition\n\
+- `tasks/<task-id>/plan.md`: specialist execution plan\n\
+- `tasks/<task-id>/progress.md`: append-only progress and escalation trail\n\
+- `tasks/<task-id>/result.md`: final specialist result plus lead acceptance notes\n\n\
+## Coordination Precedence\n\n\
+If the user is asking to delegate, split work, assign another bot, coordinate specialists, or manage team execution, the lead must enter team coordination first.\
+\nGeneric repo workflow skills are for performing work inside a task, not for replacing task creation or assignment.\n\n\
+## Speaking Rules\n\n\
+- Only the lead speaks to the user-facing channel.\n\
+- Specialists report upward through canonical team coordination actions.\n\
+- Internal coordination messages are not user-visible until the lead summarizes them.\n\n\
+## Task Lifecycle\n\n\
+1. Lead creates tasks with explicit specs and success criteria.\n\
+2. Team execution assigns ready tasks to specialists.\n\
+3. Specialists keep `plan.md`, `progress.md`, and `result.md` current.\n\
+4. Lead reviews submitted work, accepts or reopens it, then synthesizes a user-visible update.\n\n\
+## Transport Note\n\n\
+This team currently exposes coordination through the runtime team tool surface.\
+\nThat transport may change later, but this collaboration contract stays the same.\n\
+{extra_section}",
+        lead_name = lead_name,
+        specialists_list = specialists_list,
+        extra_section = extra_section,
+    )
+}
+
+fn render_team_agents_guide(lead_name: &str, specialists: &[String]) -> String {
+    let specialists_list = if specialists.is_empty() {
+        "- none configured".to_string()
+    } else {
+        specialists
+            .iter()
+            .map(|name| format!("- `{name}`"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        "# Team Workspace Operating Guide\n\n\
+This workspace is for coordinated team execution.\n\
+Read `TEAM.md`, `TASKS.md`, and task-local artifacts before acting.\n\n\
+## Current Lead\n\n\
+- `{lead_name}` is the front-stage lead for this team cycle.\n\
+- Available specialists:\n{specialists_list}\n\n\
+## Lead Turn Rules\n\n\
+Use team coordination first when the user intent is any of:\n\
+- delegate work to another bot or specialist\n\
+- split a request into sub-tasks\n\
+- track specialist progress or review specialist results\n\
+- ask for team execution, handoff, assignment, or re-assignment\n\n\
+For those requests, do not begin with generic repo workflow chatter like \"check skills\", \"brainstorm first\", or \"write a plan first\".\
+\nFirst decide the task graph and use the team coordination surface:\n\
+- `create_task(...)`\n\
+- `assign_task(...)`\n\
+- `start_execution()`\n\
+- `get_task_status()`\n\
+- `post_update(...)`\n\n\
+Generic repo workflow skills remain available, but they are for doing work inside a task or for explicit design/implementation requests from the user.\n\n\
+## Specialist Turn Rules\n\n\
+- Treat the assigned task and `tasks/<task-id>/...` artifacts as the working surface.\n\
+- Update `plan.md` before substantive execution if it still contains only the default scaffold.\n\
+- Use canonical team coordination actions for checkpoints, help requests, submission, completion, blocking, and reopen handling.\n\
+- Do not rely on plain natural-language replies as the only record of progress.\n\n\
+## Artifact Discipline\n\n\
+Each task directory should remain readable without replaying the whole transcript:\n\
+- `spec.md` explains the assignment\n\
+- `plan.md` explains the execution approach\n\
+- `progress.md` explains what happened during execution\n\
+- `result.md` contains the deliverable and review outcome\n\n\
+## User-Facing Rule\n\n\
+Only the lead owns direct user-facing synthesis. Specialists report through the team contract, even if the underlying transport changes in the future.\n",
+        lead_name = lead_name,
+        specialists_list = specialists_list,
     )
 }
 
@@ -2186,12 +2315,21 @@ mod tests {
 
         let team_md = orch.session.read_team_md();
         assert!(team_md.contains("Claude: Lead"));
+        assert!(team_md.contains("Team Constitution"));
+        assert!(team_md.contains("Coordination Precedence"));
+        assert!(team_md.contains("tasks/<task-id>/plan.md"));
+
+        let agents_md = orch.session.read_agents_md();
+        assert!(agents_md.contains("Lead Turn Rules"));
+        assert!(agents_md.contains("delegate work to another bot"));
+        assert!(agents_md.contains("Generic repo workflow skills remain available"));
 
         let task = orch.registry.get_task("T001").unwrap().unwrap();
         assert_eq!(task.title, "Setup");
         let task_dir = tmp.path().join("tasks").join("T001");
         assert!(task_dir.join("meta.json").is_file());
         assert!(task_dir.join("spec.md").is_file());
+        assert!(task_dir.join("plan.md").is_file());
     }
 
     #[test]

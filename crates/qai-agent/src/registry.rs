@@ -28,7 +28,7 @@ use qai_channels::mention_trigger::MentionTrigger;
 use qai_protocol::{
     normalize_conversation_identity, parse_session_key_text, AgentEvent, InboundMsg, SessionKey,
 };
-use qai_runtime::contract::{TeamCallback, TurnResult};
+use qai_runtime::contract::{ResumeRecoveryAction, TeamCallback, TurnResult};
 use qai_runtime::{RuntimeEvent, TeamToolCall, TeamToolResponse};
 use qai_session::{ResumableBackendSession, ResumeDropReason, SessionManager, StoredMessage};
 use std::sync::{Arc, OnceLock};
@@ -1091,12 +1091,43 @@ impl SessionRegistry {
             .as_ref()
             .ok()
             .and_then(|r| r.backend_resume_fingerprint.clone());
+        let resume_recovery = turn_result
+            .as_ref()
+            .ok()
+            .and_then(|r| r.resume_recovery.clone());
         let complete_backend_id = turn_result
             .as_ref()
             .ok()
             .and_then(|r| r.used_backend_id.clone())
             .or(expected_backend_id);
         if let Some(ref bid) = complete_backend_id {
+            if let Some(ResumeRecoveryAction::DropFailedLoadSessionHandle { stale_session_id }) =
+                resume_recovery
+            {
+                match self
+                    .session_manager
+                    .drop_backend_resume_state(session_id, bid)
+                    .await
+                {
+                    Ok(_) => {
+                        tracing::info!(
+                            session_id = %session_id,
+                            backend_id = %bid,
+                            stale_backend_session_id = %stale_session_id,
+                            "dropped stale backend resume state after runtime load_session failure"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            session_id = %session_id,
+                            backend_id = %bid,
+                            stale_backend_session_id = %stale_session_id,
+                            "failed to drop stale backend resume state after runtime recovery"
+                        );
+                    }
+                }
+            }
             if let Err(e) = self
                 .session_manager
                 .complete_turn(
@@ -1252,6 +1283,9 @@ mod tests {
         last_backend: Arc<std::sync::Mutex<Option<String>>>,
         history_snapshots: Arc<std::sync::Mutex<Vec<Vec<(String, String)>>>>,
         backend_resume_fingerprint: Option<String>,
+        emitted_backend_session_id: Option<String>,
+        used_backend_id: Option<String>,
+        resume_recovery: Option<ResumeRecoveryAction>,
     }
 
     #[async_trait::async_trait]
@@ -1270,9 +1304,13 @@ mod tests {
             Ok(TurnResult {
                 full_text: format!("fake-dispatch: {}", request.intent.user_text),
                 events: vec![],
-                emitted_backend_session_id: None,
+                emitted_backend_session_id: self.emitted_backend_session_id.clone(),
                 backend_resume_fingerprint: self.backend_resume_fingerprint.clone(),
-                used_backend_id: None,
+                used_backend_id: self
+                    .used_backend_id
+                    .clone()
+                    .or_else(|| request.intent.target_backend.clone()),
+                resume_recovery: self.resume_recovery.clone(),
             })
         }
 
@@ -1511,6 +1549,9 @@ mod tests {
                 last_backend: Arc::clone(&last_backend),
                 history_snapshots,
                 backend_resume_fingerprint: None,
+                emitted_backend_session_id: None,
+                used_backend_id: None,
+                resume_recovery: None,
             }),
         );
 
@@ -1555,6 +1596,9 @@ mod tests {
                 last_backend,
                 history_snapshots: Arc::clone(&history_snapshots),
                 backend_resume_fingerprint: None,
+                emitted_backend_session_id: None,
+                used_backend_id: None,
+                resume_recovery: None,
             }),
         );
 
@@ -1638,6 +1682,9 @@ mod tests {
                 last_backend,
                 history_snapshots,
                 backend_resume_fingerprint: Some("fp-new".into()),
+                emitted_backend_session_id: None,
+                used_backend_id: None,
+                resume_recovery: None,
             }),
         );
 
@@ -1675,6 +1722,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_registry_replaces_failed_load_session_handle_with_fresh_backend_session() {
+        let dir = std::env::temp_dir().join(format!(
+            "test-registry-resume-recovery-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let storage = SessionStorage::new(dir);
+        let session_manager = Arc::new(SessionManager::new(storage));
+        let session_key = SessionKey::new("ws", "resume-recovery-user");
+        let session_id = session_manager.get_or_create(&session_key).await.unwrap();
+        session_manager
+            .complete_turn(
+                session_id,
+                "native-main",
+                Some("stale-load-id".into()),
+                Some("fp-same".into()),
+            )
+            .await
+            .unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let last_backend = Arc::new(std::sync::Mutex::new(None));
+        let history_snapshots = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (registry, _rx) = SessionRegistry::with_runtime_dispatch(
+            Some("native-main".to_string()),
+            Arc::clone(&session_manager),
+            String::new(),
+            None,
+            None,
+            None,
+            None,
+            vec![],
+            Arc::new(FakeRuntimeDispatch {
+                calls,
+                last_backend,
+                history_snapshots,
+                backend_resume_fingerprint: Some("fp-same".into()),
+                emitted_backend_session_id: Some("fresh-new-id".into()),
+                used_backend_id: Some("native-main".into()),
+                resume_recovery: Some(ResumeRecoveryAction::DropFailedLoadSessionHandle {
+                    stale_session_id: "stale-load-id".into(),
+                }),
+            }),
+        );
+
+        registry
+            .handle(InboundMsg {
+                id: "resume-recovery-1".to_string(),
+                session_key: session_key.clone(),
+                content: MsgContent::text("hello after stale load"),
+                sender: "user".to_string(),
+                channel: "ws".to_string(),
+                timestamp: chrono::Utc::now(),
+                thread_ts: None,
+                target_agent: None,
+                source: qai_protocol::MsgSource::Human,
+            })
+            .await
+            .unwrap();
+
+        let meta = session_manager
+            .load_meta(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            meta.backend_session_ids
+                .get("native-main")
+                .map(String::as_str),
+            Some("fresh-new-id"),
+            "registry should replace the stale handle with the fresh backend session id"
+        );
+        assert_eq!(
+            meta.backend_resume_fingerprints
+                .get("native-main")
+                .map(String::as_str),
+            Some("fp-same"),
+            "registry should preserve the current fingerprint after recovery"
+        );
+    }
+
+    #[tokio::test]
     async fn test_scope_binding_routes_no_mention_to_bound_agent() {
         let calls = Arc::new(AtomicUsize::new(0));
         let last_backend = Arc::new(std::sync::Mutex::new(None));
@@ -1703,6 +1831,9 @@ mod tests {
                 last_backend: Arc::clone(&last_backend),
                 history_snapshots: Arc::new(std::sync::Mutex::new(Vec::new())),
                 backend_resume_fingerprint: None,
+                emitted_backend_session_id: None,
+                used_backend_id: None,
+                resume_recovery: None,
             }),
         );
         registry.register_scope_binding("group:lark:bound".to_string(), "claude".to_string());
@@ -1755,6 +1886,9 @@ mod tests {
                 last_backend: Arc::clone(&last_backend),
                 history_snapshots: Arc::new(std::sync::Mutex::new(Vec::new())),
                 backend_resume_fingerprint: None,
+                emitted_backend_session_id: None,
+                used_backend_id: None,
+                resume_recovery: None,
             }),
         );
         registry.register_scope_binding("group:lark:bound".to_string(), "claude".to_string());
@@ -1795,6 +1929,9 @@ mod tests {
                 last_backend: Arc::clone(&last_backend),
                 history_snapshots: Arc::new(std::sync::Mutex::new(Vec::new())),
                 backend_resume_fingerprint: None,
+                emitted_backend_session_id: None,
+                used_backend_id: None,
+                resume_recovery: None,
             }),
         );
         let key = SessionKey::new("lark", "group:lark:bound");
@@ -1850,6 +1987,9 @@ mod tests {
                 last_backend: Arc::clone(&last_backend),
                 history_snapshots: Arc::new(std::sync::Mutex::new(Vec::new())),
                 backend_resume_fingerprint: None,
+                emitted_backend_session_id: None,
+                used_backend_id: None,
+                resume_recovery: None,
             }),
         );
         registry.register_binding(crate::bindings::BindingRule::scope(
@@ -1909,6 +2049,9 @@ mod tests {
                 last_backend: Arc::clone(&last_backend),
                 history_snapshots: Arc::new(std::sync::Mutex::new(Vec::new())),
                 backend_resume_fingerprint: None,
+                emitted_backend_session_id: None,
+                used_backend_id: None,
+                resume_recovery: None,
             }),
         );
         registry.register_scope_binding("group:lark:bound".to_string(), "claude".to_string());
@@ -1964,6 +2107,9 @@ mod tests {
                 last_backend: Arc::clone(&last_backend),
                 history_snapshots: Arc::new(std::sync::Mutex::new(Vec::new())),
                 backend_resume_fingerprint: None,
+                emitted_backend_session_id: None,
+                used_backend_id: None,
+                resume_recovery: None,
             }),
         );
         registry.register_binding(crate::bindings::BindingRule::Default {
@@ -2016,6 +2162,9 @@ mod tests {
                 last_backend: Arc::clone(&last_backend),
                 history_snapshots: Arc::new(std::sync::Mutex::new(Vec::new())),
                 backend_resume_fingerprint: None,
+                emitted_backend_session_id: None,
+                used_backend_id: None,
+                resume_recovery: None,
             }),
         );
 
@@ -2523,6 +2672,9 @@ mod tests {
                 last_backend,
                 history_snapshots,
                 backend_resume_fingerprint: None,
+                emitted_backend_session_id: None,
+                used_backend_id: None,
+                resume_recovery: None,
             }),
         );
 
@@ -2816,6 +2968,7 @@ mod tests {
                     emitted_backend_session_id: None,
                     backend_resume_fingerprint: None,
                     used_backend_id: None,
+                    resume_recovery: None,
                 },
             )
             .await

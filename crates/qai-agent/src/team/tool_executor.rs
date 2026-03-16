@@ -89,19 +89,28 @@ pub async fn execute_team_tool_call(
             spec,
             deps,
             success_criteria,
-        } => TeamToolResponse {
-            ok: true,
-            message: team_orch.register_task(CreateTask {
-                id,
-                title,
-                assignee_hint: assignee,
-                deps,
-                timeout_secs: 1800,
-                spec,
-                success_criteria,
-            })?,
-            payload: None,
-        },
+        } => {
+            let task_id = id.clone();
+            TeamToolResponse {
+                ok: true,
+                message: team_orch.register_task(CreateTask {
+                    id,
+                    title,
+                    assignee_hint: assignee,
+                    deps,
+                    timeout_secs: 1800,
+                    spec,
+                    success_criteria,
+                })?,
+                payload: Some(serde_json::json!({
+                    "artifacts": [
+                        format!("tasks/{task_id}/meta.json"),
+                        format!("tasks/{task_id}/spec.md"),
+                        format!("tasks/{task_id}/plan.md")
+                    ]
+                })),
+            }
+        }
         TeamToolCall::StartExecution => TeamToolResponse {
             ok: true,
             message: team_orch.activate().await?,

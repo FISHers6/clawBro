@@ -34,6 +34,10 @@ pub struct TaskArtifactMeta {
     pub claimed_by: Option<String>,
     pub submitted_by: Option<String>,
     pub accepted_by: Option<String>,
+    pub spec_path: String,
+    pub plan_path: String,
+    pub progress_path: String,
+    pub result_path: String,
 }
 
 impl TaskArtifactMeta {
@@ -68,6 +72,10 @@ impl TaskArtifactMeta {
             claimed_by,
             submitted_by,
             accepted_by,
+            spec_path: format!("tasks/{}/spec.md", task.id),
+            plan_path: format!("tasks/{}/plan.md", task.id),
+            progress_path: format!("tasks/{}/progress.md", task.id),
+            result_path: format!("tasks/{}/result.md", task.id),
         }
     }
 }
@@ -241,6 +249,10 @@ impl TeamSession {
         self.write_file("AGENTS.md", content)
     }
 
+    pub fn read_agents_md(&self) -> String {
+        self.read_file("AGENTS.md")
+    }
+
     pub fn write_heartbeat_md(&self, content: &str) -> Result<()> {
         self.write_file("HEARTBEAT.md", content)
     }
@@ -262,6 +274,23 @@ impl TeamSession {
     pub fn write_task_spec(&self, task_id: &str, content: &str) -> Result<()> {
         self.ensure_task_dir(task_id)?;
         self.write_task_file(task_id, "spec.md", content)
+    }
+
+    pub fn write_task_plan(&self, task_id: &str, content: &str) -> Result<()> {
+        self.ensure_task_dir(task_id)?;
+        self.write_task_file(task_id, "plan.md", content)
+    }
+
+    pub fn ensure_task_plan(&self, task_id: &str, content: &str) -> Result<()> {
+        self.ensure_task_dir(task_id)?;
+        let path = self.task_dir(task_id).join("plan.md");
+        if path.is_file() {
+            let existing = std::fs::read_to_string(&path).unwrap_or_default();
+            if !existing.trim().is_empty() {
+                return Ok(());
+            }
+        }
+        self.write_task_file(task_id, "plan.md", content)
     }
 
     pub fn append_task_progress(&self, task_id: &str, content: &str) -> Result<()> {
@@ -1242,11 +1271,18 @@ mod tests {
             claimed_by: None,
             submitted_by: None,
             accepted_by: None,
+            spec_path: "tasks/T010/spec.md".into(),
+            plan_path: "tasks/T010/plan.md".into(),
+            progress_path: "tasks/T010/progress.md".into(),
+            result_path: "tasks/T010/result.md".into(),
         };
 
         session.write_task_meta("T010", &meta).unwrap();
         session
             .write_task_spec("T010", "# Spec\nImplement auth")
+            .unwrap();
+        session
+            .write_task_plan("T010", "# Task Plan\n- [ ] Draft auth flow")
             .unwrap();
         session
             .append_task_progress("T010", "[checkpoint] schema drafted")
@@ -1259,6 +1295,7 @@ mod tests {
         assert!(task_dir.is_dir());
         assert!(task_dir.join("meta.json").is_file());
         assert!(task_dir.join("spec.md").is_file());
+        assert!(task_dir.join("plan.md").is_file());
         assert!(task_dir.join("progress.md").is_file());
         assert!(task_dir.join("result.md").is_file());
 
@@ -1267,10 +1304,28 @@ mod tests {
         assert!(meta_text.contains("\"status\": \"pending\""));
         let spec_text = std::fs::read_to_string(task_dir.join("spec.md")).unwrap();
         assert!(spec_text.contains("Implement auth"));
+        let plan_text = std::fs::read_to_string(task_dir.join("plan.md")).unwrap();
+        assert!(plan_text.contains("Draft auth flow"));
         let progress_text = std::fs::read_to_string(task_dir.join("progress.md")).unwrap();
         assert!(progress_text.contains("schema drafted"));
         let result_text = std::fs::read_to_string(task_dir.join("result.md")).unwrap();
         assert!(result_text.contains("Ready for review"));
+    }
+
+    #[test]
+    fn test_ensure_task_plan_preserves_existing_edits() {
+        let (session, tmp) = make_session();
+        session
+            .write_task_plan("T012", "# Task Plan\n- [x] Existing step")
+            .unwrap();
+        session
+            .ensure_task_plan("T012", "# Task Plan\n- [ ] Replacement step")
+            .unwrap();
+
+        let plan =
+            std::fs::read_to_string(tmp.path().join("tasks").join("T012").join("plan.md")).unwrap();
+        assert!(plan.contains("Existing step"));
+        assert!(!plan.contains("Replacement step"));
     }
 
     #[test]

@@ -40,6 +40,16 @@ const TEAM_NOTIFY_PROTOCOL: &str = "\
 
 **不要**将 `[团队通知]` 内容直接转发给用户——总结后再通过 `post_update` 发送。";
 
+const TEAM_COORDINATION_PROTOCOL: &str = "\
+## Team Coordination Protocol
+
+If the user's visible request is asking you to delegate, assign another bot, split work across specialists, review specialist output, or otherwise coordinate a team, treat that as a team-orchestration request first.
+
+- Prefer the team coordination surface before generic repo workflow skills.
+- Do not begin those turns with generic repo workflow chatter such as checking general skills, brainstorming by default, or writing a generic repo plan before deciding whether to delegate.
+- Use generic repo workflow skills only when the user is asking you to design, implement, or analyze the work directly, or after a task already exists and the work is happening inside that task.
+- Today this coordination surface is exposed through runtime team tools. The behavior contract stays the same even if the transport changes later.";
+
 /// Conversation continuity contract injected for all runtime-backed turns.
 /// Makes session continuity an explicit system invariant instead of relying on
 /// model defaults.
@@ -181,6 +191,7 @@ impl<'a> SystemPromptBuilder<'a> {
 
         // ── Layer 7: TeamNotify protocol（仅 Lead 模式注入）──
         if matches!(self.agent_role, AgentRole::Lead) {
+            parts.push(TEAM_COORDINATION_PROTOCOL.to_string());
             parts.push(TEAM_NOTIFY_PROTOCOL.to_string());
         }
 
@@ -615,6 +626,14 @@ mod tests {
         assert!(
             prompt.contains("这一轮不要直接调用 `post_update`"),
             "Lead prompt must forbid final post_update during submitted review"
+        );
+        assert!(
+            prompt.contains("team-orchestration request first"),
+            "Lead prompt must include team coordination precedence"
+        );
+        assert!(
+            prompt.contains("generic repo workflow chatter"),
+            "Lead prompt must explicitly suppress generic workflow chatter for delegation turns"
         );
     }
 

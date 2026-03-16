@@ -119,6 +119,15 @@ pub(crate) async fn assemble_context(request: ContextAssemblyRequest<'_>) -> Con
             &roster_match.backend_id,
         );
     }
+    if matches!(request.agent_role, AgentRole::Lead | AgentRole::Specialist) {
+        if let Some(team_workspace_guide) = request
+            .session_team_orch
+            .map(|o| o.session.read_agents_md())
+            .filter(|content| !content.trim().is_empty())
+        {
+            append_team_workspace_guide_injection(&mut system_injection, &team_workspace_guide);
+        }
+    }
 
     let team_dir = if matches!(request.agent_role, AgentRole::Lead | AgentRole::Specialist) {
         request.session_team_orch.map(|o| o.session.dir.clone())
@@ -202,6 +211,16 @@ fn append_active_agent_identity_injection(
     } else {
         system_injection.push_str("\n\n");
         system_injection.push_str(&identity_block);
+    }
+}
+
+fn append_team_workspace_guide_injection(system_injection: &mut String, guide: &str) {
+    let guide_block = format!("## Team Workspace Guide\n\n{guide}");
+    if system_injection.trim().is_empty() {
+        *system_injection = guide_block;
+    } else {
+        system_injection.push_str("\n\n");
+        system_injection.push_str(&guide_block);
     }
 }
 
@@ -558,5 +577,57 @@ mod tests {
             .system_injection
             .contains("当前 runtime backend 是 `claude-main`"));
         assert!(!single.ctx.system_injection.contains("当前执行身份"));
+    }
+
+    #[tokio::test]
+    async fn lead_context_includes_team_workspace_guide_from_team_session_agents_md() {
+        use crate::team::{
+            heartbeat::DispatchFn, orchestrator::TeamOrchestrator, registry::TaskRegistry,
+            session::TeamSession,
+        };
+        use std::sync::Arc;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session = Arc::new(TeamSession::from_dir("team-ctx", tmp.path().to_path_buf()));
+        session
+            .write_agents_md("# Team Workspace Operating Guide\n\nUse create_task first.")
+            .unwrap();
+        let registry = Arc::new(TaskRegistry::new_in_memory().unwrap());
+        let dispatch_fn: DispatchFn = Arc::new(|_, _| Box::pin(async { Ok(()) }));
+        let orch = TeamOrchestrator::new(
+            registry,
+            session,
+            dispatch_fn,
+            std::time::Duration::from_secs(30),
+        );
+
+        let session_key = SessionKey::new("lark", "group:test");
+        let inbound = inbound(session_key.clone());
+        let initialized = DashSet::new();
+        let result = assemble_context(ContextAssemblyRequest {
+            session_id: Uuid::new_v4(),
+            session_key: &session_key,
+            inbound: &inbound,
+            recent_messages: &[],
+            roster_match: None,
+            agent_role: AgentRole::Lead,
+            task_reminder: None,
+            session_team_orch: Some(&orch),
+            system_injection: "",
+            memory_system: None,
+            default_persona_dir: None,
+            default_workspace: None,
+            session_workspace: None,
+            skill_loader_dirs: &[],
+            initialized_persona_dirs: &initialized,
+            team_tool_url: None,
+        })
+        .await;
+
+        assert!(result.ctx.system_injection.contains("Team Workspace Guide"));
+        assert!(result
+            .ctx
+            .system_injection
+            .contains("Use create_task first."));
     }
 }
