@@ -7,8 +7,8 @@ use crate::{
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaunchSpec {
-    Embedded,
-    Command {
+    BundledCommand,
+    ExternalCommand {
         command: String,
         args: Vec<String>,
         env: Vec<(String, String)>,

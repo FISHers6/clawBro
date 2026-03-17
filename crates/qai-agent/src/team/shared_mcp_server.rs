@@ -55,8 +55,8 @@ use qai_runtime::{RuntimeRole, TeamToolCall};
 /// Parameters for `create_task`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CreateTaskParams {
-    /// Unique task ID (e.g. "T001").
-    pub id: String,
+    /// Optional task ID. If omitted, the system allocates the next Txxx identifier.
+    pub id: Option<String>,
     /// Short human-readable title.
     pub title: String,
     /// Agent to assign the task to (e.g. "codex", "claude").
@@ -185,7 +185,7 @@ impl SharedTeamToolServer {
 
     /// Register a new task in the team's task graph during the Planning phase.
     #[tool(
-        description = "Lead only. Register a new task. Provide id, title, and optionally assignee, spec, deps (comma-separated IDs), success_criteria."
+        description = "Lead only. Register a new task. Provide title, and optionally id, assignee, spec, deps (comma-separated IDs), success_criteria."
     )]
     async fn create_task(&self, Parameters(p): Parameters<CreateTaskParams>) -> String {
         let deps: Vec<String> = p
@@ -199,7 +199,7 @@ impl SharedTeamToolServer {
             .collect();
 
         let task = CreateTask {
-            id: p.id.clone(),
+            id: p.id.clone().unwrap_or_default(),
             title: p.title,
             assignee_hint: p.assignee,
             deps,
@@ -212,7 +212,11 @@ impl SharedTeamToolServer {
             .invoke_canonical(
                 RuntimeRole::Leader,
                 TeamToolCall::CreateTask {
-                    id: task.id,
+                    id: if task.id.trim().is_empty() {
+                        None
+                    } else {
+                        Some(task.id)
+                    },
                     title: task.title,
                     assignee: task.assignee_hint,
                     spec: task.spec,
@@ -223,7 +227,10 @@ impl SharedTeamToolServer {
             .await
         {
             Ok(msg) => msg,
-            Err(e) => format!("Error registering task {}: {e}", p.id),
+            Err(e) => format!(
+                "Error registering task {}: {e}",
+                p.id.as_deref().unwrap_or("<auto>")
+            ),
         }
     }
 
@@ -600,7 +607,24 @@ mod tests {
         let (srv, _tmp) = make_server();
         let result = srv
             .create_task(Parameters(CreateTaskParams {
-                id: "T001".into(),
+                id: Some("T001".into()),
+                title: "Setup DB".into(),
+                assignee: None,
+                spec: None,
+                deps: None,
+                success_criteria: None,
+            }))
+            .await;
+        assert!(result.contains("T001"), "result: {result}");
+        assert!(result.contains("registered"), "result: {result}");
+    }
+
+    #[tokio::test]
+    async fn test_create_task_allocates_id_when_missing() {
+        let (srv, _tmp) = make_server();
+        let result = srv
+            .create_task(Parameters(CreateTaskParams {
+                id: None,
                 title: "Setup DB".into(),
                 assignee: None,
                 spec: None,

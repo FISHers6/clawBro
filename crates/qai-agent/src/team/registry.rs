@@ -229,6 +229,23 @@ impl TaskRegistry {
         Ok(input.id)
     }
 
+    pub fn next_task_id(&self) -> Result<String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id FROM tasks")?;
+        let mut rows = stmt.query([])?;
+        let mut max_num = 0u32;
+        while let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            if let Some(num) = id
+                .strip_prefix('T')
+                .and_then(|s| s.parse::<u32>().ok())
+            {
+                max_num = max_num.max(num);
+            }
+        }
+        Ok(format!("T{:03}", max_num + 1))
+    }
+
     /// 原子认领任务（乐观锁：只有 status='pending' 时才能认领）
     /// 返回 true 表示认领成功，false 表示已被他人认领
     pub fn try_claim(&self, task_id: &str, agent: &str) -> Result<bool> {

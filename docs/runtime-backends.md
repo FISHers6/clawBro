@@ -98,7 +98,7 @@ Implementation:
 
 - adapter: [`qai-runtime/src/native/adapter.rs`](/Users/fishers/Desktop/repo/quickai-openclaw/quickai-gateway/crates/qai-runtime/src/native/adapter.rs)
 - probe: [`qai-runtime/src/native/probe.rs`](/Users/fishers/Desktop/repo/quickai-openclaw/quickai-gateway/crates/qai-runtime/src/native/probe.rs)
-- rust agent bridge: [`quickai-rust-agent/src/runtime_bridge.rs`](/Users/fishers/Desktop/repo/quickai-openclaw/quickai-rust-agent/src/runtime_bridge.rs)
+- rust agent bridge: [`runtime_bridge.rs`](/Users/fishers/Desktop/repo/quickai-openclaw/quickai-gateway/crates/quickai-agent-sdk/src/runtime_bridge.rs)
 
 Important:
 
@@ -126,6 +126,10 @@ The `acp` family supports an optional `acp_backend` field that identifies the sp
 
 ### Claude via claude-agent-acp (bridge-backed)
 
+This is the active Claude product path.
+
+`quickai-claude-agent` is retained only as a deprecated legacy artifact and is not part of the standard runtime matrix.
+
 ```toml
 [[backend]]
 id = "claude-main"
@@ -133,7 +137,7 @@ family = "acp"
 acp_backend = "claude"
 
 [backend.launch]
-type = "command"
+type = "external_command"
 command = "npx"
 args = ["--yes", "--prefer-offline", "@zed-industries/claude-agent-acp@0.18.0"]
 
@@ -151,7 +155,7 @@ family = "acp"
 acp_backend = "codex"
 
 [backend.launch]
-type = "command"
+type = "external_command"
 command = "npx"
 args = ["--yes", "--prefer-offline", "@zed-industries/codex-acp@latest"]
 ```
@@ -165,7 +169,7 @@ family = "acp"
 acp_backend = "codebuddy"
 
 [backend.launch]
-type = "command"
+type = "external_command"
 command = "npx"
 args = ["@tencent-ai/codebuddy-code", "--acp"]
 ```
@@ -179,7 +183,7 @@ family = "acp"
 acp_backend = "qwen"
 
 [backend.launch]
-type = "command"
+type = "external_command"
 command = "npx"
 args = ["@qwen-code/qwen-code", "--acp"]
 ```
@@ -193,7 +197,7 @@ family = "acp"
 acp_backend = "iflow"
 
 [backend.launch]
-type = "command"
+type = "external_command"
 command = "iflow"
 args = ["--acp"]
 ```
@@ -207,7 +211,7 @@ family = "acp"
 acp_backend = "goose"
 
 [backend.launch]
-type = "command"
+type = "external_command"
 command = "goose"
 args = ["acp"]
 ```
@@ -222,7 +226,7 @@ id = "my-acp-tool"
 family = "acp"
 
 [backend.launch]
-type = "command"
+type = "external_command"
 command = "my-acp-tool"
 args = ["--acp"]
 ```
@@ -235,7 +239,7 @@ id = "codex-main"
 family = "acp"
 
 [backend.launch]
-type = "command"
+type = "external_command"
 command = "codex-acp"
 args = ["--stdio"]
 ```
@@ -277,8 +281,13 @@ id = "native-main"
 family = "quick_ai_native"
 
 [backend.launch]
-type = "embedded"
+type = "bundled_command"
 ```
+
+Launch config note:
+
+- Canonical launch types are `bundled_command` and `external_command`
+- Legacy `embedded` and `command` are still accepted as serde aliases for backward-compatible config loading
 
 Rosters can target a catalog backend directly:
 
@@ -317,7 +326,7 @@ id = "claude-main"
 family = "acp"
 
 [backend.launch]
-type = "command"
+type = "external_command"
 command = "claude-code"
 args = ["--dangerously-skip-permissions"]
 

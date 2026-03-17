@@ -21,8 +21,8 @@ struct BackendResumeFingerprint<'a> {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum LaunchFingerprint<'a> {
-    Embedded,
-    Command {
+    BundledCommand,
+    ExternalCommand {
         command: &'a str,
         args: &'a [String],
         env_keys: Vec<&'a str>,
@@ -84,11 +84,11 @@ fn backend_family_name(family: crate::backend::BackendFamily) -> &'static str {
 
 fn launch_fingerprint(launch: &LaunchSpec) -> LaunchFingerprint<'_> {
     match launch {
-        LaunchSpec::Embedded => LaunchFingerprint::Embedded,
-        LaunchSpec::Command { command, args, env } => {
+        LaunchSpec::BundledCommand => LaunchFingerprint::BundledCommand,
+        LaunchSpec::ExternalCommand { command, args, env } => {
             let mut env_keys: Vec<&str> = env.iter().map(|(key, _)| key.as_str()).collect();
             env_keys.sort_unstable();
-            LaunchFingerprint::Command {
+            LaunchFingerprint::ExternalCommand {
                 command,
                 args,
                 env_keys,
@@ -186,7 +186,7 @@ mod tests {
             backend_id: "codex-main".into(),
             family: BackendFamily::Acp,
             adapter_key: "acp".into(),
-            launch: LaunchSpec::Command {
+            launch: LaunchSpec::ExternalCommand {
                 command: "npx".into(),
                 args: vec!["@zed-industries/codex-acp".into()],
                 env: vec![
@@ -210,7 +210,7 @@ mod tests {
     fn fingerprint_ignores_secret_env_values_but_changes_on_provider_identity() {
         let mut first = base_codex_spec();
         let mut second = base_codex_spec();
-        if let LaunchSpec::Command { env, .. } = &mut second.launch {
+        if let LaunchSpec::ExternalCommand { env, .. } = &mut second.launch {
             env[1].1 = "different-secret".into();
         }
         assert_eq!(

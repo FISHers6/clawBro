@@ -2,6 +2,7 @@ use crate::{
     contract::{RuntimeEvent, RuntimeSessionSpec, TurnResult},
     event_sink::RuntimeEventSink,
 };
+use quickai_agent_sdk::bridge::AgentEvent;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::Command,
@@ -27,10 +28,14 @@ pub async fn run_command_turn(
         user_input = session.context.user_input.as_deref().unwrap_or_default(),
         "spawning native runtime turn"
     );
-    let mut child = spawn_command(config, session.workspace_dir.as_deref())?;
+    let mut child = spawn_command(
+        config,
+        session.workspace_dir.as_deref(),
+        session.team_tool_url.as_deref(),
+    )?;
     let mut stdin = child.stdin.take().expect("stdin available");
     let stdout = child.stdout.take().expect("stdout available");
-    let payload = serde_json::to_vec(&session)?;
+    let payload = serde_json::to_vec(&session.to_agent_turn_request())?;
     stdin.write_all(&payload).await?;
     stdin.shutdown().await?;
     // Native runtime-bridge processes read the full JSON payload from stdin until EOF.
@@ -47,7 +52,8 @@ pub async fn run_command_turn(
         if line.trim().is_empty() {
             continue;
         }
-        let event: RuntimeEvent = serde_json::from_str(&line)?;
+        let agent_event: AgentEvent = serde_json::from_str(&line)?;
+        let event = runtime_event_from_agent_event(agent_event);
         match &event {
             RuntimeEvent::TextDelta { .. }
             | RuntimeEvent::ToolCallStarted { .. }
@@ -105,9 +111,45 @@ pub async fn run_command_turn(
     })
 }
 
+fn runtime_event_from_agent_event(event: AgentEvent) -> RuntimeEvent {
+    match event {
+        AgentEvent::TextDelta { text } => RuntimeEvent::TextDelta { text },
+        AgentEvent::ToolCallStarted {
+            tool_name,
+            call_id,
+            input_summary,
+        } => RuntimeEvent::ToolCallStarted {
+            tool_name,
+            call_id,
+            input_summary,
+        },
+        AgentEvent::ToolCallCompleted {
+            tool_name,
+            call_id,
+            result,
+        } => RuntimeEvent::ToolCallCompleted {
+            tool_name,
+            call_id,
+            result,
+        },
+        AgentEvent::ToolCallFailed {
+            tool_name,
+            call_id,
+            error,
+        } => RuntimeEvent::ToolCallFailed {
+            tool_name,
+            call_id,
+            error,
+        },
+        AgentEvent::TurnComplete { full_text } => RuntimeEvent::TurnComplete { full_text },
+        AgentEvent::TurnFailed { error } => RuntimeEvent::TurnFailed { error },
+    }
+}
+
 fn spawn_command(
     config: &NativeCommandConfig,
     workspace_dir: Option<&std::path::Path>,
+    team_tool_url: Option<&str>,
 ) -> anyhow::Result<tokio::process::Child> {
     let mut cmd = Command::new(&config.command);
     cmd.args(&config.args)
@@ -115,6 +157,10 @@ fn spawn_command(
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit());
+
+    if let Some(url) = team_tool_url {
+        cmd.env("QUICKAI_TEAM_TOOL_URL", url);
+    }
 
     if let Some(ws) = workspace_dir {
         if ws.exists() {
@@ -146,7 +192,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_session_spec_serializes_for_native_bridge() {
+    fn turn_request_serializes_for_native_bridge() {
         let session = RuntimeSessionSpec {
             backend_id: "native".into(),
             participant_name: None,
@@ -163,9 +209,9 @@ mod tests {
             backend_session_id: None,
             context: RuntimeContext::default(),
         };
-        let json = serde_json::to_string(&session).unwrap();
-        assert!(json.contains("\"backend_id\":\"native\""));
+        let json = serde_json::to_string(&session.to_turn_request()).unwrap();
         assert!(json.contains("\"prompt_text\":\"hello\""));
+        assert!(!json.contains("team_tool_url"));
     }
 
     fn sample_runtime_session() -> RuntimeSessionSpec {

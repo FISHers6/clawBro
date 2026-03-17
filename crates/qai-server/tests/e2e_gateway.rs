@@ -10,12 +10,14 @@
 //!   QUICKAI_RUST_AGENT_BIN=/path/to/quickai-rust-agent \
 //!   cargo test -p qai-server --test e2e_gateway -- --nocapture
 //!
-//! ## test_gateway_e2e_claude_agent
+//! ## legacy test_gateway_e2e_quickai_claude_agent
+//! Legacy coverage only. The active Claude product path uses `claude-agent-acp`.
 //! Requires `claude` CLI installed and authenticated.
 //!
 //! To run:
+//!   LEGACY_QUICKAI_CLAUDE_AGENT=1 \
 //!   QUICKAI_CLAUDE_AGENT_BIN=/path/to/quickai-claude-agent \
-//!   cargo test -p qai-server --test e2e_gateway -- test_gateway_e2e_claude_agent --ignored --nocapture
+//!   cargo test -p qai-server --test e2e_gateway -- test_gateway_e2e_legacy_quickai_claude_agent --ignored --nocapture
 
 use futures_util::{SinkExt, StreamExt};
 use qai_agent::roster::AgentEntry;
@@ -171,17 +173,25 @@ async fn test_gateway_e2e_deepseek() {
     }
 }
 
-/// E2E test: Gateway WS → quickai-claude-agent (ACP) → claude CLI → reply
+/// Legacy E2E test: Gateway WS → quickai-claude-agent (ACP) → claude CLI → reply
 ///
-/// Requires the `claude` CLI installed and authenticated with an Anthropic account.
-/// The `quickai-claude-agent` binary must also be available.
+/// This path is no longer part of the active QuickAI product runtime matrix.
+/// It remains only as a legacy compatibility check when explicitly enabled.
 ///
 /// To run:
+///   LEGACY_QUICKAI_CLAUDE_AGENT=1 \
 ///   QUICKAI_CLAUDE_AGENT_BIN=/path/to/quickai-claude-agent \
-///   cargo test -p qai-server --test e2e_gateway -- test_gateway_e2e_claude_agent --ignored --nocapture
+///   cargo test -p qai-server --test e2e_gateway -- test_gateway_e2e_legacy_quickai_claude_agent --ignored --nocapture
 #[tokio::test]
 #[ignore = "requires claude CLI authenticated with Anthropic account"]
-async fn test_gateway_e2e_claude_agent() {
+async fn test_gateway_e2e_legacy_quickai_claude_agent() {
+    if std::env::var("LEGACY_QUICKAI_CLAUDE_AGENT").ok().as_deref() != Some("1") {
+        eprintln!(
+            "SKIP test_gateway_e2e_legacy_quickai_claude_agent: set LEGACY_QUICKAI_CLAUDE_AGENT=1 to run the deprecated quickai-claude-agent path"
+        );
+        return;
+    }
+
     // Install a default rustls CryptoProvider (required by tokio-tungstenite 0.26 / rustls 0.23).
     let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -208,13 +218,13 @@ async fn test_gateway_e2e_claude_agent() {
         }
     });
 
-    eprintln!("test_gateway_e2e_claude_agent: using binary = {agent_bin}");
+    eprintln!("test_gateway_e2e_legacy_quickai_claude_agent: using binary = {agent_bin}");
 
     let addr = start_test_gateway_with_backend(BackendSpec {
         backend_id: "claude-main".to_string(),
         family: BackendFamily::Acp,
         adapter_key: "acp".into(),
-        launch: LaunchSpec::Command {
+        launch: LaunchSpec::ExternalCommand {
             command: agent_bin,
             args: vec![],
             env: vec![],
@@ -343,7 +353,7 @@ async fn test_gateway_e2e_codex_bridge() {
         provider_profile: None,
         approval: Default::default(),
         external_mcp_servers: vec![],
-        launch: BackendLaunchConfig::Command {
+        launch: BackendLaunchConfig::ExternalCommand {
             command: "npx".into(),
             args: vec!["--yes".into(), "@zed-industries/codex-acp@0.9.5".into()],
             env: launch_env,
@@ -523,7 +533,7 @@ async fn test_gateway_e2e_codex_local_config_deepseek() {
         provider_profile: Some("deepseek-openai".into()),
         approval: Default::default(),
         external_mcp_servers: vec![],
-        launch: BackendLaunchConfig::Command {
+        launch: BackendLaunchConfig::ExternalCommand {
             command: "npx".into(),
             args: vec!["--yes".into(), "@zed-industries/codex-acp@0.9.5".into()],
             env: std::collections::BTreeMap::new(),
@@ -700,7 +710,7 @@ async fn test_gateway_e2e_codex_local_config_aicodewith() {
         provider_profile: Some("aicodewith-openai".into()),
         approval: Default::default(),
         external_mcp_servers: vec![],
-        launch: BackendLaunchConfig::Command {
+        launch: BackendLaunchConfig::ExternalCommand {
             command: "npx".into(),
             args: vec!["--yes".into(), "@zed-industries/codex-acp".into()],
             env: std::collections::BTreeMap::new(),
@@ -864,7 +874,7 @@ async fn test_gateway_ws_inbound_auto_subscribes_socket_to_session() {
         backend_id: "native-echo".to_string(),
         family: BackendFamily::QuickAiNative,
         adapter_key: "native".into(),
-        launch: LaunchSpec::Command {
+        launch: LaunchSpec::ExternalCommand {
             command: fixture,
             args: vec![],
             env: vec![],
@@ -1150,7 +1160,7 @@ async fn test_gateway_e2e_custom_acp_approval_via_ws_resolution() {
         backend_id: "approval-fixture".to_string(),
         family: BackendFamily::Acp,
         adapter_key: "acp".into(),
-        launch: LaunchSpec::Command {
+        launch: LaunchSpec::ExternalCommand {
             command: fixture,
             args: vec![],
             env: vec![],
@@ -1234,7 +1244,7 @@ async fn test_gateway_e2e_custom_acp_approval_via_slash_command() {
         backend_id: "approval-fixture".to_string(),
         family: BackendFamily::Acp,
         adapter_key: "acp".into(),
-        launch: LaunchSpec::Command {
+        launch: LaunchSpec::ExternalCommand {
             command: fixture,
             args: vec![],
             env: vec![],
@@ -1322,7 +1332,7 @@ async fn test_gateway_e2e_codex_auto_allow_projects_mode_on_new_and_load_session
         backend_id: "codex-fixture".to_string(),
         family: BackendFamily::Acp,
         adapter_key: "acp".into(),
-        launch: LaunchSpec::Command {
+        launch: LaunchSpec::ExternalCommand {
             command: fixture,
             args: vec![],
             env: vec![],
@@ -1393,7 +1403,7 @@ async fn test_gateway_e2e_mixed_backends_route_by_target_agent() {
             family: BackendFamilyConfig::QuickAiNative,
             adapter_key: None,
             external_mcp_servers: vec![],
-            launch: BackendLaunchConfig::Command {
+            launch: BackendLaunchConfig::ExternalCommand {
                 command: native_bin,
                 args: vec![],
                 env: Default::default(),
@@ -1409,7 +1419,7 @@ async fn test_gateway_e2e_mixed_backends_route_by_target_agent() {
             family: BackendFamilyConfig::Acp,
             adapter_key: None,
             external_mcp_servers: vec![],
-            launch: BackendLaunchConfig::Command {
+            launch: BackendLaunchConfig::ExternalCommand {
                 command: acp_bin,
                 args: vec![],
                 env: Default::default(),
@@ -1510,7 +1520,7 @@ async fn test_gateway_e2e_native_team_pipeline() {
             family: BackendFamilyConfig::QuickAiNative,
             adapter_key: None,
             external_mcp_servers: vec![],
-            launch: BackendLaunchConfig::Command {
+            launch: BackendLaunchConfig::ExternalCommand {
                 command: fixture.clone(),
                 args: vec![],
                 env: Default::default(),
@@ -1526,7 +1536,7 @@ async fn test_gateway_e2e_native_team_pipeline() {
             family: BackendFamilyConfig::QuickAiNative,
             adapter_key: None,
             external_mcp_servers: vec![],
-            launch: BackendLaunchConfig::Command {
+            launch: BackendLaunchConfig::ExternalCommand {
                 command: fixture,
                 args: vec![],
                 env: Default::default(),
@@ -1629,7 +1639,7 @@ async fn test_gateway_e2e_native_dm_team_pipeline() {
             family: BackendFamilyConfig::QuickAiNative,
             adapter_key: None,
             external_mcp_servers: vec![],
-            launch: BackendLaunchConfig::Command {
+            launch: BackendLaunchConfig::ExternalCommand {
                 command: fixture.clone(),
                 args: vec![],
                 env: Default::default(),
@@ -1645,7 +1655,7 @@ async fn test_gateway_e2e_native_dm_team_pipeline() {
             family: BackendFamilyConfig::QuickAiNative,
             adapter_key: None,
             external_mcp_servers: vec![],
-            launch: BackendLaunchConfig::Command {
+            launch: BackendLaunchConfig::ExternalCommand {
                 command: fixture,
                 args: vec![],
                 env: Default::default(),
@@ -1757,7 +1767,7 @@ async fn test_gateway_e2e_mixed_team_native_leader_acp_specialist() {
             family: BackendFamilyConfig::QuickAiNative,
             adapter_key: None,
             external_mcp_servers: vec![],
-            launch: BackendLaunchConfig::Command {
+            launch: BackendLaunchConfig::ExternalCommand {
                 command: leader_fixture,
                 args: vec![],
                 env: Default::default(),
@@ -1773,7 +1783,7 @@ async fn test_gateway_e2e_mixed_team_native_leader_acp_specialist() {
             family: BackendFamilyConfig::Acp,
             adapter_key: None,
             external_mcp_servers: vec![],
-            launch: BackendLaunchConfig::Command {
+            launch: BackendLaunchConfig::ExternalCommand {
                 command: worker_fixture,
                 args: vec![],
                 env: Default::default(),
@@ -1878,7 +1888,7 @@ async fn test_gateway_e2e_mixed_team_native_leader_openclaw_specialist() {
             family: BackendFamilyConfig::QuickAiNative,
             adapter_key: None,
             external_mcp_servers: vec![],
-            launch: BackendLaunchConfig::Command {
+            launch: BackendLaunchConfig::ExternalCommand {
                 command: leader_fixture,
                 args: vec![],
                 env: Default::default(),
@@ -2038,7 +2048,7 @@ async fn test_gateway_e2e_mixed_team_openclaw_leader_native_specialist() {
             family: BackendFamilyConfig::QuickAiNative,
             adapter_key: None,
             external_mcp_servers: vec![],
-            launch: BackendLaunchConfig::Command {
+            launch: BackendLaunchConfig::ExternalCommand {
                 command: specialist_fixture,
                 args: vec![],
                 env: Default::default(),
@@ -2171,7 +2181,7 @@ async fn test_gateway_e2e_mixed_team_openclaw_leader_acp_specialist() {
             family: BackendFamilyConfig::Acp,
             adapter_key: None,
             external_mcp_servers: vec![],
-            launch: BackendLaunchConfig::Command {
+            launch: BackendLaunchConfig::ExternalCommand {
                 command: specialist_fixture,
                 args: vec![],
                 env: Default::default(),
@@ -2281,7 +2291,7 @@ async fn test_registry_mixed_team_native_leader_acp_specialist_pipeline() {
             family: BackendFamilyConfig::QuickAiNative,
             adapter_key: None,
             external_mcp_servers: vec![],
-            launch: BackendLaunchConfig::Command {
+            launch: BackendLaunchConfig::ExternalCommand {
                 command: leader_fixture,
                 args: vec![],
                 env: Default::default(),
@@ -2297,7 +2307,7 @@ async fn test_registry_mixed_team_native_leader_acp_specialist_pipeline() {
             family: BackendFamilyConfig::Acp,
             adapter_key: None,
             external_mcp_servers: vec![],
-            launch: BackendLaunchConfig::Command {
+            launch: BackendLaunchConfig::ExternalCommand {
                 command: worker_fixture,
                 args: vec![],
                 env: Default::default(),
@@ -2414,7 +2424,7 @@ async fn test_registry_team_missing_completion_resets_claim_and_specialist_sessi
             family: BackendFamilyConfig::QuickAiNative,
             adapter_key: None,
             external_mcp_servers: vec![],
-            launch: BackendLaunchConfig::Command {
+            launch: BackendLaunchConfig::ExternalCommand {
                 command: leader_fixture,
                 args: vec![],
                 env: Default::default(),
@@ -2430,7 +2440,7 @@ async fn test_registry_team_missing_completion_resets_claim_and_specialist_sessi
             family: BackendFamilyConfig::QuickAiNative,
             adapter_key: None,
             external_mcp_servers: vec![],
-            launch: BackendLaunchConfig::Command {
+            launch: BackendLaunchConfig::ExternalCommand {
                 command: worker_fixture,
                 args: vec![],
                 env: Default::default(),
@@ -2597,7 +2607,7 @@ async fn test_registry_mixed_team_native_leader_openclaw_specialist_pipeline() {
             family: BackendFamilyConfig::QuickAiNative,
             adapter_key: None,
             external_mcp_servers: vec![],
-            launch: BackendLaunchConfig::Command {
+            launch: BackendLaunchConfig::ExternalCommand {
                 command: leader_fixture,
                 args: vec![],
                 env: Default::default(),

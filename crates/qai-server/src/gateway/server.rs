@@ -118,7 +118,7 @@ mod tests {
                 provider_profile: None,
                 approval: Default::default(),
                 external_mcp_servers: vec![],
-                launch: config::BackendLaunchConfig::Embedded,
+                launch: config::BackendLaunchConfig::BundledCommand,
             }],
             channels: config::ChannelsSection {
                 lark: Some(config::LarkSection {
@@ -180,7 +180,7 @@ mod tests {
                 backend_id: "native-main".into(),
                 family: BackendFamily::QuickAiNative,
                 adapter_key: "native".into(),
-                launch: LaunchSpec::Embedded,
+                launch: LaunchSpec::BundledCommand,
                 approval_mode: Default::default(),
                 external_mcp_servers: vec![],
                 provider_profile: None,

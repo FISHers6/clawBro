@@ -27,6 +27,8 @@
   - `/doctor`
   - `/diagnostics/*`
 
+当前 Claude 路径使用 `npx @zed-industries/claude-agent-acp`。`quickai-claude-agent` 仅保留为仓库内遗留实验产物，不属于标准产品接入路径。
+
 建议的上手顺序不是直接接 IM，而是：
 
 1. 先跑 `WS + quick_ai_native`
@@ -78,20 +80,24 @@ mkdir -p ~/.quickai/personas
 推荐先编译：
 
 ```bash
-cd /Users/fishers/Desktop/repo/quickai-openclaw/quickai-rust-agent
-cargo build
-
 cd /Users/fishers/Desktop/repo/quickai-openclaw/quickai-gateway
+cargo build -p quickai-rust-agent
 cargo build -p qai-server --bin quickai-gateway
 ```
 
-如果你使用 `quick_ai_native` family 的 `embedded` 启动方式，gateway 会默认尝试执行：
+如果你使用 `quick_ai_native` family 的 `bundled_command` 启动方式，gateway 会默认尝试执行 QuickAI 管理的捆绑 shell：
 
 ```bash
 quickai-rust-agent --runtime-bridge
 ```
 
-所以 `quickai-rust-agent` 需要在 `PATH` 里，或者你改成显式 `command` 启动。
+默认情况下不再依赖 `PATH`。如果你需要覆盖捆绑路径，再改成显式 `external_command` 启动。
+
+兼容性说明：
+
+- `embedded` 仍会被解析为 `bundled_command`
+- `command` 仍会被解析为 `external_command`
+- 文档和新配置示例统一使用新的 canonical 名称
 
 ## 4. 环境变量
 
@@ -199,7 +205,7 @@ id = "native-main"
 family = "quick_ai_native"
 
 [backend.launch]
-type = "embedded"
+type = "bundled_command"
 
 [skills]
 dir = "/Users/yourname/.quickai/skills"
@@ -290,9 +296,9 @@ curl http://127.0.0.1:8080/doctor
 - `TurnComplete`
 - 如有审批则可能看到 `ApprovalRequest`
 
-## 8. 单 Agent 但不用 embedded
+## 8. 单 Agent 但不用 bundled_command
 
-如果你不想依赖 `PATH` 中的 `quickai-rust-agent`，可以显式写成 `command`：
+如果你不想使用 QuickAI 管理的捆绑路径，可以显式写成 `external_command`：
 
 ```toml
 [agent]
@@ -303,8 +309,8 @@ id = "native-main"
 family = "quick_ai_native"
 
 [backend.launch]
-type = "command"
-command = "/Users/fishers/Desktop/repo/quickai-openclaw/quickai-rust-agent/target/debug/quickai-rust-agent"
+type = "external_command"
+command = "/Users/fishers/Desktop/repo/quickai-openclaw/quickai-gateway/target/debug/quickai-rust-agent"
 args = []
 ```
 
@@ -324,7 +330,7 @@ id = "native-main"
 family = "quick_ai_native"
 
 [backend.launch]
-type = "embedded"
+type = "bundled_command"
 ```
 
 如果你要给 `quick_ai_native` 挂外部 MCP SSE server，可以直接配在 backend 下：
@@ -369,7 +375,7 @@ family = "acp"
 acp_backend = "claude"
 
 [backend.launch]
-type = "command"
+type = "external_command"
 command = "npx"
 args = ["--yes", "--prefer-offline", "@zed-industries/claude-agent-acp@0.18.0"]
 
@@ -385,7 +391,7 @@ family = "acp"
 acp_backend = "codex"
 
 [backend.launch]
-type = "command"
+type = "external_command"
 command = "npx"
 args = ["--yes", "--prefer-offline", "@zed-industries/codex-acp@latest"]
 ```
@@ -400,7 +406,7 @@ family = "acp"
 acp_backend = "qwen"
 
 [backend.launch]
-type = "command"
+type = "external_command"
 command = "npx"
 args = ["@qwen-code/qwen-code", "--acp"]
 ```
@@ -413,7 +419,7 @@ family = "acp"
 acp_backend = "goose"
 
 [backend.launch]
-type = "command"
+type = "external_command"
 command = "goose"
 args = ["acp"]
 ```
@@ -426,7 +432,7 @@ id = "codex-main"
 family = "acp"
 
 [backend.launch]
-type = "command"
+type = "external_command"
 command = "codex-acp"
 args = ["--stdio"]
 ```
@@ -987,14 +993,14 @@ id = "native-main"
 family = "quick_ai_native"
 
 [backend.launch]
-type = "embedded"
+type = "bundled_command"
 
 [[backend]]
 id = "codex-main"
 family = "acp"
 
 [backend.launch]
-type = "command"
+type = "external_command"
 command = "codex-acp"
 args = ["--stdio"]
 
@@ -1165,14 +1171,14 @@ agent = "claude"
 
 常见原因：
 
-- `quickai-rust-agent` 不在 `PATH`
+- 捆绑路径下没有可执行的 `quickai-rust-agent`
 - 模型 API Key 没配
 - `QUICKAI_MODEL` 不可用
 
 处理：
 
 - 先单独运行 `quickai-rust-agent --runtime-bridge` 验证
-- 或改成显式 `command` 启动
+- 或改成显式 `external_command` 启动
 
 ### 22.5 Lark / DingTalk 配了但没收到消息
 

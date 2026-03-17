@@ -1,184 +1,17 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use crate::backend::ApprovalMode;
-use crate::provider_profiles::RuntimeProviderProfile;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TurnMode {
-    Solo,
-    Relay,
-    Team,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum RuntimeRole {
-    Solo,
-    Leader,
-    Specialist,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct RuntimeContext {
-    /// Derived system guidance for runtimes that need structured prompt text.
-    /// This is a projection layer, not the durable source of persona identity.
-    pub system_prompt: Option<String>,
-    /// Canonical visible file contract for this turn.
-    /// Entries are deterministic and role-aware projections of persona/workspace/team files.
-    pub workspace_native_files: Vec<String>,
-    /// Shared contextual memory projection for this turn.
-    pub memory_summary: Option<String>,
-    /// Private role-allowed memory projection for this turn.
-    pub agent_memory: Option<String>,
-    /// Projection of TEAM.md when team context is active.
-    pub team_manifest: Option<String>,
-    /// Derived task-local execution helper, not a durable context source.
-    pub task_reminder: Option<String>,
-    /// Canonical structured rolling history for this turn.
-    #[serde(default)]
-    pub history_messages: Vec<RuntimeHistoryMessage>,
-    /// Compatibility projection of rolling history for prompt-based backends.
-    #[serde(default)]
-    pub history_lines: Vec<String>,
-    /// Declares how runtimes should interpret raw transcript truth vs working-set transforms.
-    #[serde(default)]
-    pub transcript_semantics: RuntimeTranscriptSemantics,
-    pub user_input: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct RuntimeHistoryMessage {
-    pub role: String,
-    pub content: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sender: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tool_calls: Vec<RuntimeToolCall>,
-}
+pub use quickai_agent_sdk::bridge::{
+    AgentEvent as TurnRequestEvent, AgentResult as ProtocolTurnResult, AgentTurnRequest as TurnRequest,
+    ApprovalMode, ExecutionRole as RuntimeRole, ExternalMcpServerSpec, ExternalMcpTransport,
+    RuntimeContext, RuntimeHistoryMessage, RuntimeProviderProfile, RuntimeProviderProtocol,
+    RuntimePruningPolicy, RuntimeToolCall, RuntimeTranscriptSemantics, ToolSurfaceSpec,
+    TranscriptCompactionMode, TranscriptPruningMode,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RuntimeToolCall {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_call_id: Option<String>,
-    pub name: String,
-    pub input_json: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RuntimeTranscriptSemantics {
-    /// Request-local context reduction only. Must not rewrite persisted transcript truth.
-    pub pruning: TranscriptPruningMode,
-    /// Policy parameters for request-local pruning when enabled.
-    #[serde(default)]
-    pub pruning_policy: RuntimePruningPolicy,
-    /// Persisted/runtime-working-set relationship for this turn.
-    pub compaction: TranscriptCompactionMode,
-}
-
-impl Default for RuntimeTranscriptSemantics {
-    fn default() -> Self {
-        Self {
-            pruning: TranscriptPruningMode::Off,
-            pruning_policy: RuntimePruningPolicy::default(),
-            compaction: TranscriptCompactionMode::RawTranscriptOnly,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RuntimePruningPolicy {
-    pub keep_last_assistants: usize,
-    pub min_prunable_tool_chars: usize,
-    pub soft_trim_head_chars: usize,
-    pub soft_trim_tail_chars: usize,
-}
-
-impl Default for RuntimePruningPolicy {
-    fn default() -> Self {
-        Self {
-            keep_last_assistants: 3,
-            min_prunable_tool_chars: 4_000,
-            soft_trim_head_chars: 800,
-            soft_trim_tail_chars: 800,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum TranscriptPruningMode {
-    /// No request-local transcript reduction is applied.
-    #[default]
-    Off,
-    /// Reduce prompt bloat for one execution only; persisted transcript stays untouched.
-    RequestLocal,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum TranscriptCompactionMode {
-    /// Raw append-only transcript is both durable truth and runtime working set.
-    #[default]
-    RawTranscriptOnly,
-    /// Raw transcript remains durable truth; runtime consumes a persisted compacted working set.
-    WorkingSetProjection,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct ToolSurfaceSpec {
-    pub team_tools: bool,
-    pub local_skills: bool,
-    pub external_mcp: bool,
-    pub backend_native_tools: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TurnIntent {
-    pub session_key: qai_protocol::SessionKey,
-    pub mode: TurnMode,
-    pub leader_candidate: Option<String>,
-    pub target_backend: Option<String>,
-    pub user_text: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RuntimeSessionSpec {
-    pub backend_id: String,
-    pub participant_name: Option<String>,
-    pub session_key: qai_protocol::SessionKey,
-    pub role: RuntimeRole,
-    pub workspace_dir: Option<PathBuf>,
-    pub prompt_text: String,
-    pub tool_surface: ToolSurfaceSpec,
-    #[serde(default)]
-    pub approval_mode: ApprovalMode,
-    /// ACP-family MCP bridge endpoint (typically SSE).
-    pub tool_bridge_url: Option<String>,
-    /// User-configured external MCP servers for backend families that support them.
-    #[serde(default)]
-    pub external_mcp_servers: Vec<ExternalMcpServerSpec>,
-    /// Resolved host-owned provider profile for this turn, if any.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider_profile: Option<RuntimeProviderProfile>,
-    /// Family-agnostic synchronous Team Tool RPC endpoint.
-    pub team_tool_url: Option<String>,
-    pub context: RuntimeContext,
-    /// 上次该 session 在此 backend 使用的 ACP session ID（来自 SessionMeta）。
-    /// ACP bridge-backed backend 用于 session/load resume；其他 backend 忽略。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub backend_session_id: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExternalMcpServerSpec {
-    pub name: String,
-    pub transport: ExternalMcpTransport,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ExternalMcpTransport {
-    Sse { url: String },
+pub enum ResumeRecoveryAction {
+    DropStaleResumedSessionHandle { stale_session_id: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -274,28 +107,80 @@ pub enum RuntimeEvent {
 pub struct TurnResult {
     pub full_text: String,
     pub events: Vec<RuntimeEvent>,
-    /// 本次 turn 由 ACP backend 发出的新 session ID。
-    /// new_session() 路径：Some(id)，需要持久化到 SessionMeta。
-    /// load_session() 路径（resume）：None，prior_id 不变，无需写入。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub emitted_backend_session_id: Option<String>,
-    /// Deterministic fingerprint of the backend spec that produced/validated the
-    /// current backend session handle. Used to decide whether a stored resume
-    /// handle is still safe to reuse on a future turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_resume_fingerprint: Option<String>,
-    /// 本次 turn 实际使用的 backend_id（由 run_dispatch_job 注入）。
-    /// registry 层用此 key 调用 complete_turn()。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub used_backend_id: Option<String>,
-    /// Runtime-discovered resume recovery that the host must persist after the turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_recovery: Option<ResumeRecoveryAction>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TurnMode {
+    Solo,
+    Relay,
+    Team,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ResumeRecoveryAction {
-    DropStaleResumedSessionHandle { stale_session_id: String },
+pub struct TurnIntent {
+    pub session_key: qai_protocol::SessionKey,
+    pub mode: TurnMode,
+    pub leader_candidate: Option<String>,
+    pub target_backend: Option<String>,
+    pub user_text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeSessionSpec {
+    pub backend_id: String,
+    pub participant_name: Option<String>,
+    pub session_key: qai_protocol::SessionKey,
+    pub role: RuntimeRole,
+    pub workspace_dir: Option<PathBuf>,
+    pub prompt_text: String,
+    pub tool_surface: ToolSurfaceSpec,
+    #[serde(default)]
+    pub approval_mode: ApprovalMode,
+    /// ACP-family MCP bridge endpoint (typically SSE).
+    pub tool_bridge_url: Option<String>,
+    /// User-configured external MCP servers for backend families that support them.
+    #[serde(default)]
+    pub external_mcp_servers: Vec<ExternalMcpServerSpec>,
+    /// Resolved host-owned provider profile for this turn, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_profile: Option<RuntimeProviderProfile>,
+    /// Family-agnostic synchronous Team Tool RPC endpoint.
+    pub team_tool_url: Option<String>,
+    pub context: RuntimeContext,
+    /// 上次该 session 在此 backend 使用的 ACP session ID（来自 SessionMeta）。
+    /// ACP bridge-backed backend 用于 session/load resume；其他 backend 忽略。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_session_id: Option<String>,
+}
+
+impl RuntimeSessionSpec {
+    pub fn to_turn_request(&self) -> TurnRequest {
+        self.to_agent_turn_request()
+    }
+
+    pub fn to_agent_turn_request(&self) -> TurnRequest {
+        TurnRequest {
+            participant_name: self.participant_name.clone(),
+            session_ref: qai_protocol::render_session_key_text(&self.session_key),
+            role: self.role,
+            workspace_dir: self.workspace_dir.clone(),
+            prompt_text: self.prompt_text.clone(),
+            tool_surface: self.tool_surface.clone(),
+            approval_mode: self.approval_mode,
+            tool_bridge_url: self.tool_bridge_url.clone(),
+            external_mcp_servers: self.external_mcp_servers.clone(),
+            provider_profile: self.provider_profile.clone(),
+            context: self.context.clone(),
+        }
+    }
 }
 
 pub fn render_history_lines(

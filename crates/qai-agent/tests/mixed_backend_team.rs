@@ -288,7 +288,7 @@ fn backend_spec(backend_id: &str, family: BackendFamily, adapter_key: &str) -> B
         backend_id: backend_id.to_string(),
         family,
         adapter_key: adapter_key.to_string(),
-        launch: LaunchSpec::Embedded,
+        launch: LaunchSpec::BundledCommand,
         external_mcp_servers: vec![],
         provider_profile: None,
         acp_backend: None,
@@ -481,7 +481,7 @@ async fn mixed_backend_smoke_acp_lead_native_specialist_submit_and_accept() {
         .invoke_team_tool(
             &harness.specialist_key,
             TeamToolCall::CreateTask {
-                id: "BAD".into(),
+                id: Some("BAD".into()),
                 title: "should fail".into(),
                 assignee: Some("worker".into()),
                 spec: None,

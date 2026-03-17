@@ -1,6 +1,8 @@
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 
+pub use crate::contract::{RuntimeProviderProfile, RuntimeProviderProtocol};
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfiguredProviderProfile {
     pub id: String,
@@ -62,34 +64,4 @@ pub enum ConfiguredProviderProtocol {
         auth_token_env: String,
         default_model: String,
     },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RuntimeProviderProfile {
-    pub id: String,
-    pub protocol: RuntimeProviderProtocol,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "protocol", rename_all = "snake_case")]
-pub enum RuntimeProviderProtocol {
-    OfficialSession,
-    AnthropicCompatible {
-        base_url: String,
-        auth_token: String,
-        default_model: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        small_fast_model: Option<String>,
-    },
-    OpenaiCompatible {
-        base_url: String,
-        api_key: String,
-        default_model: String,
-    },
-}
-
-impl RuntimeProviderProfile {
-    pub fn is_official_session(&self) -> bool {
-        matches!(self.protocol, RuntimeProviderProtocol::OfficialSession)
-    }
 }

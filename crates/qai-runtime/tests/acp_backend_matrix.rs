@@ -12,7 +12,7 @@ fn make_acp_spec(acp_backend: Option<AcpBackend>, command: &str, args: &[&str]) 
         backend_id: format!("{command}-test"),
         family: BackendFamily::Acp,
         adapter_key: "acp".into(),
-        launch: LaunchSpec::Command {
+        launch: LaunchSpec::ExternalCommand {
             command: command.to_string(),
             args: args.iter().map(|s| s.to_string()).collect(),
             env: vec![],
@@ -36,7 +36,7 @@ fn claude_bridge_backed_backend_identity_preserved() {
     assert_eq!(spec.acp_backend, Some(AcpBackend::Claude));
     assert_eq!(spec.family, BackendFamily::Acp);
     match &spec.launch {
-        LaunchSpec::Command { command, args, .. } => {
+        LaunchSpec::ExternalCommand { command, args, .. } => {
             assert_eq!(command, "npx");
             assert_eq!(args, &["@zed-industries/claude-agent-acp"]);
         }
@@ -53,7 +53,7 @@ fn codex_bridge_backed_backend_identity_preserved() {
     );
     assert_eq!(spec.acp_backend, Some(AcpBackend::Codex));
     match &spec.launch {
-        LaunchSpec::Command { command, args, .. } => {
+        LaunchSpec::ExternalCommand { command, args, .. } => {
             assert_eq!(command, "npx");
             assert_eq!(args, &["@zed-industries/codex-acp"]);
         }
@@ -70,7 +70,7 @@ fn codebuddy_bridge_backed_backend_identity_preserved() {
     );
     assert_eq!(spec.acp_backend, Some(AcpBackend::Codebuddy));
     match &spec.launch {
-        LaunchSpec::Command { command, args, .. } => {
+        LaunchSpec::ExternalCommand { command, args, .. } => {
             assert_eq!(command, "npx");
             assert_eq!(args, &["@tencent-ai/codebuddy-code", "--acp"]);
         }
@@ -87,7 +87,7 @@ fn qwen_generic_acp_backend_identity_preserved() {
     );
     assert_eq!(spec.acp_backend, Some(AcpBackend::Qwen));
     match &spec.launch {
-        LaunchSpec::Command { command, args, .. } => {
+        LaunchSpec::ExternalCommand { command, args, .. } => {
             assert_eq!(command, "npx");
             assert_eq!(args, &["@qwen-code/qwen-code", "--acp"]);
         }
@@ -100,7 +100,7 @@ fn goose_generic_acp_subcommand_backend_identity_preserved() {
     let spec = make_acp_spec(Some(AcpBackend::Goose), "goose", &["acp"]);
     assert_eq!(spec.acp_backend, Some(AcpBackend::Goose));
     match &spec.launch {
-        LaunchSpec::Command { command, args, .. } => {
+        LaunchSpec::ExternalCommand { command, args, .. } => {
             assert_eq!(command, "goose");
             assert_eq!(args, &["acp"]);
         }
@@ -115,7 +115,7 @@ fn omitted_acp_backend_falls_back_to_generic_semantics() {
     assert_eq!(spec.family, BackendFamily::Acp);
     // Generic path — launch shape is preserved without any rewriting
     match &spec.launch {
-        LaunchSpec::Command { command, args, .. } => {
+        LaunchSpec::ExternalCommand { command, args, .. } => {
             assert_eq!(command, "some-acp-tool");
             assert_eq!(args, &["--acp"]);
         }
@@ -136,7 +136,7 @@ fn launch_shape_is_not_rewritten_for_any_backend() {
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_ref()).collect();
         let spec = make_acp_spec(backend, cmd, &arg_refs);
         match &spec.launch {
-            LaunchSpec::Command {
+            LaunchSpec::ExternalCommand {
                 command,
                 args: spec_args,
                 ..

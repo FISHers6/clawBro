@@ -682,7 +682,7 @@ impl SessionRegistry {
                 title,
                 assignee,
             } => TeamToolCall::CreateTask {
-                id: task_id,
+                id: Some(task_id),
                 title,
                 assignee: Some(assignee),
                 spec: None,
@@ -2067,7 +2067,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_session_backend_override_beats_scope_binding() {
+    async fn test_scope_binding_overrides_cached_session_backend() {
         let last_backend = Arc::new(std::sync::Mutex::new(None));
         let (registry, _rx) = make_registry_with_runtime_dispatch_and_roster(
             None,
@@ -2108,10 +2108,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            last_backend.lock().unwrap().as_deref(),
-            Some("manual-backend")
-        );
+        assert_eq!(last_backend.lock().unwrap().as_deref(), Some("claude-main"));
     }
 
     #[tokio::test]
@@ -3052,7 +3049,7 @@ mod tests {
             .invoke_team_tool(
                 &specialist_key,
                 TeamToolCall::CreateTask {
-                    id: "T401".into(),
+                    id: Some("T401".into()),
                     title: "illegal".into(),
                     assignee: Some("codex".into()),
                     spec: None,

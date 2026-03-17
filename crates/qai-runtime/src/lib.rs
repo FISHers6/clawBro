@@ -29,7 +29,7 @@ pub use contract::{
     render_history_lines, render_runtime_prompt, ExternalMcpServerSpec, ExternalMcpTransport,
     PermissionRequest, RuntimeContext, RuntimeEvent, RuntimeHistoryMessage, RuntimePruningPolicy,
     RuntimeRole, RuntimeSessionSpec, RuntimeTranscriptSemantics, TeamCallback, ToolSurfaceSpec,
-    TranscriptCompactionMode, TranscriptPruningMode, TurnIntent, TurnMode, TurnResult,
+    TranscriptCompactionMode, TranscriptPruningMode, TurnIntent, TurnMode, TurnRequest, TurnResult,
 };
 pub use event_sink::RuntimeEventSink;
 pub use helper_contract::{

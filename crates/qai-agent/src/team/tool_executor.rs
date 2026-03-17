@@ -90,11 +90,14 @@ pub async fn execute_team_tool_call(
             deps,
             success_criteria,
         } => {
-            let task_id = id.clone();
+            let task_id = match id {
+                Some(id) if !id.trim().is_empty() => id,
+                _ => team_orch.allocate_task_id()?,
+            };
             TeamToolResponse {
                 ok: true,
                 message: team_orch.register_task(CreateTask {
-                    id,
+                    id: task_id.clone(),
                     title,
                     assignee_hint: assignee,
                     deps,
@@ -333,7 +336,7 @@ mod tests {
             Arc::clone(&orch),
             RuntimeRole::Leader,
             TeamToolCall::CreateTask {
-                id: "T500".into(),
+                id: Some("T500".into()),
                 title: "wire adapter".into(),
                 assignee: Some("codex".into()),
                 spec: None,
@@ -355,7 +358,7 @@ mod tests {
         let err = ensure_team_tool_allowed(
             RuntimeRole::Specialist,
             &TeamToolCall::CreateTask {
-                id: "T501".into(),
+                id: Some("T501".into()),
                 title: "illegal".into(),
                 assignee: None,
                 spec: None,
@@ -368,5 +371,30 @@ mod tests {
 
         assert!(err.contains("CreateTask"));
         assert!(err.contains("Specialist"));
+    }
+
+    #[tokio::test]
+    async fn executor_allocates_task_id_when_create_task_id_missing() {
+        let orch = make_orchestrator();
+
+        let response = execute_team_tool_call(
+            Arc::clone(&orch),
+            RuntimeRole::Leader,
+            TeamToolCall::CreateTask {
+                id: None,
+                title: "auto id task".into(),
+                assignee: None,
+                spec: None,
+                deps: vec![],
+                success_criteria: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(response.ok);
+        assert!(response.message.contains("T001"));
+        let task = orch.registry.get_task("T001").unwrap().unwrap();
+        assert_eq!(task.title, "auto id task");
     }
 }

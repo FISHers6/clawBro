@@ -7,19 +7,56 @@ use crate::{
     native::session_driver::{run_command_turn, NativeCommandConfig},
     registry::BackendSpec,
 };
+use std::path::PathBuf;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct QuickAiNativeBackendAdapter;
 
 impl QuickAiNativeBackendAdapter {
+    fn resolve_bundled_shell_path() -> PathBuf {
+        if let Ok(current_exe) = std::env::current_exe() {
+            if let Some(dir) = current_exe.parent() {
+                let sibling = dir.join("quickai-rust-agent");
+                if sibling.exists() {
+                    return sibling;
+                }
+            }
+        }
+
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../..")
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.."));
+        let dev_debug = repo_root.join("quickai-gateway/target/debug/quickai-rust-agent");
+        if dev_debug.exists() {
+            return dev_debug;
+        }
+        let dev_release = repo_root.join("quickai-gateway/target/release/quickai-rust-agent");
+        if dev_release.exists() {
+            return dev_release;
+        }
+
+        repo_root.join("quickai-gateway/target/debug/quickai-rust-agent")
+    }
+
     fn command_config(spec: &BackendSpec) -> anyhow::Result<NativeCommandConfig> {
         match &spec.launch {
-            LaunchSpec::Embedded => Ok(NativeCommandConfig {
-                command: "quickai-rust-agent".into(),
-                args: vec!["--runtime-bridge".into()],
-                env: vec![],
-            }),
-            LaunchSpec::Command { command, args, env } => {
+            LaunchSpec::BundledCommand => {
+                let command = Self::resolve_bundled_shell_path()
+                    .to_string_lossy()
+                    .into_owned();
+                tracing::debug!(
+                    backend_id = %spec.backend_id,
+                    command = %command,
+                    "resolved bundled native shell path"
+                );
+                Ok(NativeCommandConfig {
+                    command,
+                    args: vec!["--runtime-bridge".into()],
+                    env: vec![],
+                })
+            }
+            LaunchSpec::ExternalCommand { command, args, env } => {
                 let mut args = args.clone();
                 if !args.iter().any(|arg| arg == "--runtime-bridge") {
                     args.insert(0, "--runtime-bridge".into());
@@ -31,7 +68,7 @@ impl QuickAiNativeBackendAdapter {
                 })
             }
             other => anyhow::bail!(
-                "native backend '{}' requires LaunchSpec::Embedded or LaunchSpec::Command, got {other:?}",
+                "native backend '{}' requires LaunchSpec::BundledCommand or LaunchSpec::ExternalCommand, got {other:?}",
                 spec.backend_id
             ),
         }
@@ -80,7 +117,7 @@ mod tests {
             backend_id: "quickai-native".into(),
             family: BackendFamily::QuickAiNative,
             adapter_key: "native".into(),
-            launch: LaunchSpec::Embedded,
+            launch: LaunchSpec::BundledCommand,
             approval_mode: Default::default(),
             external_mcp_servers: vec![],
             provider_profile: None,
@@ -152,13 +189,13 @@ mod tests {
 
         assert!(err
             .to_string()
-            .contains("LaunchSpec::Embedded or LaunchSpec::Command"));
+            .contains("LaunchSpec::BundledCommand or LaunchSpec::ExternalCommand"));
     }
 
     #[test]
-    fn native_adapter_embedded_launch_maps_to_default_runtime_bridge() {
+    fn native_adapter_bundled_launch_maps_to_default_runtime_bridge() {
         let cfg = QuickAiNativeBackendAdapter::command_config(&native_spec()).unwrap();
-        assert_eq!(cfg.command, "quickai-rust-agent");
+        assert!(cfg.command.ends_with("quickai-rust-agent"));
         assert!(cfg.args.iter().any(|a| a == "--runtime-bridge"));
     }
 }

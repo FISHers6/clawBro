@@ -699,7 +699,7 @@ mod tests {
                 backend_id: "codex".into(),
                 family: BackendFamily::Acp,
                 adapter_key: "acp".into(),
-                launch: LaunchSpec::Command {
+                launch: LaunchSpec::ExternalCommand {
                     command: "codex-acp".into(),
                     args: vec![],
                     env: vec![],
@@ -770,7 +770,7 @@ mod tests {
         let spec = runtime_registry.backend_spec("codex").await.unwrap();
         assert_eq!(spec.family, BackendFamily::Acp);
         assert_eq!(spec.adapter_key, "acp");
-        assert!(matches!(spec.launch, LaunchSpec::Command { .. }));
+        assert!(matches!(spec.launch, LaunchSpec::ExternalCommand { .. }));
     }
 
     #[tokio::test]
@@ -784,7 +784,7 @@ mod tests {
                 backend_id: "claude".into(),
                 family: BackendFamily::Acp,
                 adapter_key: "acp".into(),
-                launch: LaunchSpec::Embedded,
+                launch: LaunchSpec::BundledCommand,
                 external_mcp_servers: vec![],
                 provider_profile: None,
                 acp_backend: None,
@@ -847,7 +847,7 @@ mod tests {
                 backend_id: "codex".into(),
                 family: BackendFamily::Acp,
                 adapter_key: "acp".into(),
-                launch: LaunchSpec::Embedded,
+                launch: LaunchSpec::BundledCommand,
                 external_mcp_servers: vec![qai_runtime::ExternalMcpServerSpec {
                     name: "filesystem".into(),
                     transport: qai_runtime::ExternalMcpTransport::Sse {

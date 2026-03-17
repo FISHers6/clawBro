@@ -950,8 +950,7 @@ mod tests {
     fn missing_completion_excerpt_nonempty_result_without_captured_returns_none() {
         // If capture_specialist_reply_text errored and captured_reply_text is None,
         // but result has actual text, we should NOT emit a misleading zero-output diagnostic.
-        let excerpt =
-            missing_completion_excerpt(&Ok(Some("actual output".to_string())), None);
+        let excerpt = missing_completion_excerpt(&Ok(Some("actual output".to_string())), None);
         assert!(
             excerpt.is_none(),
             "Non-empty Ok(Some) without captured text should yield None, got: {excerpt:?}"

@@ -1,0 +1,34 @@
+[package]
+name = "quickai-agent-sdk"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.90"
+description = "Reusable QuickAI agent execution core for library and shell runtimes"
+license = "MIT"
+repository = "https://github.com/fishers/quickai-openclaw"
+readme = "README.md"
+keywords = ["ai", "agent", "sdk", "llm"]
+categories = ["api-bindings", "development-tools"]
+
+[dependencies]
+rig-core = { version = "0.20", path = "../../../vendor/rig-core-0.20.0", features = ["rmcp"] }
+rmcp = { version = "0.6.4", features = ["client", "transport-sse-client-reqwest"] }
+reqwest = { version = "0.12", features = ["rustls-tls", "json"], default-features = false }
+tokio = { version = "1", features = ["rt", "macros", "io-std", "process", "sync", "time", "fs"] }
+futures = "0.3"
+anyhow = "1"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+glob = "0.3"
+walkdir = "2.5"
+regex = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["full"] }
+tempfile = "3"
+rmcp = { version = "0.6.4", features = ["client", "server", "macros", "transport-sse-client-reqwest", "transport-sse-server"] }
+axum = "0.8"
+schemars = "1"

@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 qai-protocol = { path = "../qai-protocol" }
+quickai-agent-sdk = { path = "../quickai-agent-sdk" }
 serde.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true

@@ -497,7 +497,8 @@ pub type ApprovalModeConfig = ApprovalMode;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BackendLaunchConfig {
-    Command {
+    #[serde(alias = "command")]
+    ExternalCommand {
         command: String,
         #[serde(default)]
         args: Vec<String>,
@@ -523,13 +524,14 @@ pub enum BackendLaunchConfig {
         #[serde(default)]
         lead_helper_mode: bool,
     },
-    Embedded,
+    #[serde(alias = "embedded")]
+    BundledCommand,
 }
 
 impl BackendLaunchConfig {
     pub fn into_launch_spec(self) -> LaunchSpec {
         match self {
-            Self::Command { command, args, env } => LaunchSpec::Command {
+            Self::ExternalCommand { command, args, env } => LaunchSpec::ExternalCommand {
                 command,
                 args,
                 env: env.into_iter().collect(),
@@ -555,7 +557,7 @@ impl BackendLaunchConfig {
                 team_helper_args,
                 lead_helper_mode,
             },
-            Self::Embedded => LaunchSpec::Embedded,
+            Self::BundledCommand => LaunchSpec::BundledCommand,
         }
     }
 }
@@ -1210,7 +1212,7 @@ family = "acp"
 adapter_key = "acp"
 
 [backend.launch]
-type = "command"
+type = "external_command"
 command = "codex-acp"
 args = ["--stdio"]
         "#;
@@ -1220,7 +1222,7 @@ args = ["--stdio"]
         assert_eq!(spec.backend_id, "codex-main");
         assert_eq!(spec.family, BackendFamily::Acp);
         assert_eq!(spec.adapter_key, "acp");
-        assert!(matches!(spec.launch, LaunchSpec::Command { .. }));
+        assert!(matches!(spec.launch, LaunchSpec::ExternalCommand { .. }));
     }
 
     #[test]
@@ -1302,13 +1304,13 @@ id = "native-main"
 family = "quick_ai_native"
 
 [backend.launch]
-type = "embedded"
+type = "bundled_command"
         "#;
         let cfg: GatewayConfig = toml::from_str(toml).unwrap();
         let spec = cfg.backends[0].to_backend_spec(None);
         assert_eq!(spec.family, BackendFamily::QuickAiNative);
         assert_eq!(spec.adapter_key, "native");
-        assert!(matches!(spec.launch, LaunchSpec::Embedded));
+        assert!(matches!(spec.launch, LaunchSpec::BundledCommand));
     }
 
     #[test]
@@ -1319,7 +1321,7 @@ id = "native-main"
 family = "quick_ai_native"
 
 [backend.launch]
-type = "embedded"
+type = "bundled_command"
 
 [[backend.external_mcp_servers]]
 name = "filesystem"
@@ -1373,7 +1375,7 @@ id = "native-main"
 family = "quick_ai_native"
 
 [backend.launch]
-type = "embedded"
+type = "bundled_command"
 
 [[agent_roster]]
 name = "reviewer"
@@ -1395,7 +1397,7 @@ id = "native-main"
 family = "quick_ai_native"
 
 [backend.launch]
-type = "embedded"
+type = "bundled_command"
         "#;
         let cfg: GatewayConfig = toml::from_str(toml).unwrap();
         let err = cfg.validate_runtime_topology().unwrap_err();
@@ -1413,7 +1415,7 @@ id = "native-main"
 family = "quick_ai_native"
 
 [backend.launch]
-type = "embedded"
+type = "bundled_command"
 
 [agent]
 backend_id = "native-main"
@@ -1453,7 +1455,7 @@ id = "native-main"
 family = "quick_ai_native"
 
 [backend.launch]
-type = "embedded"
+type = "bundled_command"
 
 [agent]
 backend_id = "native-main"
@@ -1486,7 +1488,7 @@ id = "native-main"
 family = "quick_ai_native"
 
 [backend.launch]
-type = "embedded"
+type = "bundled_command"
 
 [agent]
 backend_id = "native-main"
@@ -1522,7 +1524,7 @@ id = "native-main"
 family = "quick_ai_native"
 
 [backend.launch]
-type = "embedded"
+type = "bundled_command"
 
 [agent]
 backend_id = "   "
@@ -1547,7 +1549,7 @@ id = "native-main"
 family = "quick_ai_native"
 
 [backend.launch]
-type = "embedded"
+type = "bundled_command"
 
 [agent]
 backend_id = " native-main "
@@ -1951,7 +1953,7 @@ id = "native-main"
 family = "quick_ai_native"
 
 [backend.launch]
-type = "embedded"
+type = "bundled_command"
 
 [agent]
 backend_id = "native-main"
@@ -1991,7 +1993,7 @@ id = "native-main"
 family = "quick_ai_native"
 
 [backend.launch]
-type = "embedded"
+type = "bundled_command"
 
 [agent]
 backend_id = "native-main"
@@ -2026,7 +2028,7 @@ id = "native-main"
 family = "quick_ai_native"
 
 [backend.launch]
-type = "embedded"
+type = "bundled_command"
 
 [agent]
 backend_id = "native-main"
@@ -2067,7 +2069,7 @@ id = "native-main"
 family = "quick_ai_native"
 
 [backend.launch]
-type = "embedded"
+type = "bundled_command"
 
 [agent]
 backend_id = "native-main"
@@ -2109,7 +2111,7 @@ id = "native-main"
 family = "quick_ai_native"
 
 [backend.launch]
-type = "embedded"
+type = "bundled_command"
 
 [agent]
 backend_id = "native-main"
@@ -2150,7 +2152,7 @@ id = "native-main"
 family = "quick_ai_native"
 
 [backend.launch]
-type = "embedded"
+type = "bundled_command"
 
 [agent]
 backend_id = "native-main"
@@ -2201,7 +2203,7 @@ id = "native-main"
 family = "quick_ai_native"
 
 [backend.launch]
-type = "embedded"
+type = "bundled_command"
 
 [agent]
 backend_id = "native-main"
@@ -2250,7 +2252,7 @@ id = "native-main"
 family = "quick_ai_native"
 
 [backend.launch]
-type = "embedded"
+type = "bundled_command"
 
 [[agent_roster]]
 name = "claude"
@@ -2308,7 +2310,7 @@ id = "native-main"
 family = "quick_ai_native"
 
 [backend.launch]
-type = "embedded"
+type = "bundled_command"
 
 [[agent_roster]]
 name = "claude"
@@ -2336,7 +2338,7 @@ id = "native-main"
 family = "quick_ai_native"
 
 [backend.launch]
-type = "embedded"
+type = "bundled_command"
 
 [agent]
 backend_id = "native-main"
@@ -2363,7 +2365,7 @@ id = "native-main"
 family = "quick_ai_native"
 
 [backend.launch]
-type = "embedded"
+type = "bundled_command"
 
 [[backend.external_mcp_servers]]
 name = "   "
@@ -2390,7 +2392,7 @@ id = "native-main"
 family = "quick_ai_native"
 
 [backend.launch]
-type = "embedded"
+type = "bundled_command"
 
 [[backend.external_mcp_servers]]
 name = "filesystem"
@@ -2421,7 +2423,7 @@ id = "native-main"
 family = "quick_ai_native"
 
 [backend.launch]
-type = "embedded"
+type = "bundled_command"
 
 [[backend.external_mcp_servers]]
 name = "team-tools"
@@ -2448,7 +2450,7 @@ family = "acp"
 acp_backend = "claude"
 
 [backend.launch]
-type = "command"
+type = "external_command"
 command = "npx"
 args = ["@zed-industries/claude-agent-acp"]
 
@@ -2469,7 +2471,7 @@ family = "acp"
 acp_backend = "qwen"
 
 [backend.launch]
-type = "command"
+type = "external_command"
 command = "npx"
 args = ["@qwen-code/qwen-code", "--acp"]
 
@@ -2489,7 +2491,7 @@ id = "generic-acp"
 family = "acp"
 
 [backend.launch]
-type = "command"
+type = "external_command"
 command = "some-acp-tool"
 args = ["--acp"]
 
@@ -2510,7 +2512,7 @@ family = "quick_ai_native"
 acp_backend = "claude"
 
 [backend.launch]
-type = "embedded"
+type = "bundled_command"
 
 [agent]
 backend_id = "native-main"
@@ -2530,7 +2532,7 @@ family = "acp"
 acp_backend = "gemini"
 
 [backend.launch]
-type = "command"
+type = "external_command"
 command = "gemini"
 args = ["--acp"]
         "#;

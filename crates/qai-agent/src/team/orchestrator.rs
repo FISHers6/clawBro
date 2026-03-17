@@ -549,6 +549,11 @@ impl TeamOrchestrator {
         Ok(format!("Task {} registered.", id))
     }
 
+    pub fn allocate_task_id(&self) -> Result<String> {
+        self.archive_completed_cycle_if_needed()?;
+        self.registry.next_task_id()
+    }
+
     // ── 激活执行（供 LeadMcpServer.start_execution 调用）──────────────────
 
     /// Eagerly start the unified SharedTeamMcpServer so both Lead and Specialist

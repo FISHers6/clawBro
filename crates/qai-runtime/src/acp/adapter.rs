@@ -23,13 +23,13 @@ impl AcpBackendAdapter {
 
     fn command_config(spec: &BackendSpec) -> anyhow::Result<AcpCommandConfig> {
         match &spec.launch {
-            LaunchSpec::Command { command, args, env } => Ok(AcpCommandConfig {
+            LaunchSpec::ExternalCommand { command, args, env } => Ok(AcpCommandConfig {
                 command: command.clone(),
                 args: args.clone(),
                 env: env.clone(),
             }),
             other => Err(anyhow::anyhow!(
-                "ACP backend '{}' requires LaunchSpec::Command, got {other:?}",
+                "ACP backend '{}' requires LaunchSpec::ExternalCommand, got {other:?}",
                 spec.backend_id
             )),
         }
@@ -96,6 +96,6 @@ mod tests {
         };
 
         let err = adapter.probe(&spec).await.unwrap_err();
-        assert!(err.to_string().contains("LaunchSpec::Command"));
+        assert!(err.to_string().contains("LaunchSpec::ExternalCommand"));
     }
 }

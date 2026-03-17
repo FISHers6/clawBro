@@ -247,7 +247,7 @@ mod tests {
                 backend_id: "codex".into(),
                 family: BackendFamily::Acp,
                 adapter_key: "fake".into(),
-                launch: LaunchSpec::Embedded,
+                launch: LaunchSpec::BundledCommand,
                 approval_mode: Default::default(),
                 external_mcp_servers: vec![],
                 provider_profile: None,

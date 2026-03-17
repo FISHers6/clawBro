@@ -142,6 +142,7 @@ pub(crate) async fn assemble_context(request: ContextAssemblyRequest<'_>) -> Con
     };
     let effective_workspace = resolve_effective_workspace(
         request.agent_role,
+        frontstage_human_turn,
         team_dir.clone(),
         workspace_dir_resolved.clone(),
     );
@@ -237,10 +238,17 @@ fn append_team_workspace_guide_injection(system_injection: &mut String, guide: &
 
 pub(crate) fn resolve_effective_workspace(
     agent_role: AgentRole,
+    frontstage_human_turn: bool,
     team_dir: Option<PathBuf>,
     workspace_dir_resolved: Option<PathBuf>,
 ) -> Option<PathBuf> {
-    if agent_role == AgentRole::Specialist {
+    // Specialist always works inside the team directory.
+    // Lead processing a backend team notification (not a live human message) also
+    // needs the team directory so that relative paths like `tasks/T006/result.md`
+    // resolve correctly against the team workspace root.
+    if agent_role == AgentRole::Specialist
+        || (agent_role == AgentRole::Lead && !frontstage_human_turn)
+    {
         team_dir.or(workspace_dir_resolved)
     } else {
         workspace_dir_resolved
@@ -409,10 +417,50 @@ mod tests {
     fn specialist_workspace_prefers_team_dir() {
         let resolved = resolve_effective_workspace(
             AgentRole::Specialist,
+            false,
             Some(PathBuf::from("/tmp/team")),
             Some(PathBuf::from("/tmp/workspace")),
         );
         assert_eq!(resolved, Some(PathBuf::from("/tmp/team")));
+    }
+
+    // Regression: Lead processing a backend team-notify turn (e.g. acceptance
+    // check after specialist submission) must also resolve to the team directory
+    // so that relative paths like `tasks/T006/result.md` resolve correctly.
+    #[test]
+    fn lead_backend_team_notify_turn_uses_team_dir() {
+        let resolved = resolve_effective_workspace(
+            AgentRole::Lead,
+            false, // backend turn — NOT a frontstage human message
+            Some(PathBuf::from("/tmp/team")),
+            Some(PathBuf::from("/tmp/workspace")),
+        );
+        assert_eq!(resolved, Some(PathBuf::from("/tmp/team")));
+    }
+
+    // Lead processing a live frontstage human message keeps the ordinary workspace
+    // so the agent operates in the business workspace, not the team artefact dir.
+    #[test]
+    fn lead_frontstage_human_turn_keeps_workspace_root() {
+        let resolved = resolve_effective_workspace(
+            AgentRole::Lead,
+            true, // frontstage human turn
+            Some(PathBuf::from("/tmp/team")),
+            Some(PathBuf::from("/tmp/workspace")),
+        );
+        assert_eq!(resolved, Some(PathBuf::from("/tmp/workspace")));
+    }
+
+    // Solo agents are unaffected by team_dir regardless of turn type.
+    #[test]
+    fn solo_agent_always_uses_workspace_root() {
+        let resolved = resolve_effective_workspace(
+            AgentRole::Solo,
+            false,
+            Some(PathBuf::from("/tmp/team")),
+            Some(PathBuf::from("/tmp/workspace")),
+        );
+        assert_eq!(resolved, Some(PathBuf::from("/tmp/workspace")));
     }
 
     #[test]

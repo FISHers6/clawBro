@@ -37,7 +37,7 @@ pub async fn start_test_gateway(agent_binary: &str) -> Result<SocketAddr> {
         backend_id: "test-default".to_string(),
         family: BackendFamily::Acp,
         adapter_key: "acp".into(),
-        launch: LaunchSpec::Command {
+        launch: LaunchSpec::ExternalCommand {
             command: agent_binary.to_string(),
             args: vec![],
             env: vec![],
@@ -152,11 +152,13 @@ fn backend_catalog_entry(spec: BackendSpec) -> config::BackendCatalogEntry {
         BackendFamily::QuickAiNative => config::BackendFamilyConfig::QuickAiNative,
     };
     let launch = match spec.launch {
-        LaunchSpec::Command { command, args, env } => config::BackendLaunchConfig::Command {
-            command,
-            args,
-            env: env.into_iter().collect(),
-        },
+        LaunchSpec::ExternalCommand { command, args, env } => {
+            config::BackendLaunchConfig::ExternalCommand {
+                command,
+                args,
+                env: env.into_iter().collect(),
+            }
+        }
         LaunchSpec::GatewayWs {
             endpoint,
             token,
@@ -178,7 +180,7 @@ fn backend_catalog_entry(spec: BackendSpec) -> config::BackendCatalogEntry {
             team_helper_args,
             lead_helper_mode,
         },
-        LaunchSpec::Embedded => config::BackendLaunchConfig::Embedded,
+        LaunchSpec::BundledCommand => config::BackendLaunchConfig::BundledCommand,
     };
     config::BackendCatalogEntry {
         id: spec.backend_id,

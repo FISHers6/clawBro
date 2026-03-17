@@ -192,7 +192,7 @@ mod tests {
                 backend_id: "codex".into(),
                 family: BackendFamily::Acp,
                 adapter_key: "fake".into(),
-                launch: LaunchSpec::Embedded,
+                launch: LaunchSpec::BundledCommand,
                 approval_mode: Default::default(),
                 external_mcp_servers: vec![],
                 provider_profile: None,
@@ -224,7 +224,7 @@ mod tests {
                 backend_id: "openclaw-main".into(),
                 family: BackendFamily::OpenClawGateway,
                 adapter_key: "fake".into(),
-                launch: LaunchSpec::Embedded,
+                launch: LaunchSpec::BundledCommand,
                 approval_mode: Default::default(),
                 external_mcp_servers: vec![],
                 provider_profile: None,
@@ -255,7 +255,7 @@ mod tests {
                 backend_id: "native-main".into(),
                 family: BackendFamily::QuickAiNative,
                 adapter_key: "fake".into(),
-                launch: LaunchSpec::Embedded,
+                launch: LaunchSpec::BundledCommand,
                 approval_mode: Default::default(),
                 external_mcp_servers: vec![],
                 provider_profile: None,
@@ -279,7 +279,7 @@ mod tests {
                 backend_id: "native-main".into(),
                 family: BackendFamily::QuickAiNative,
                 adapter_key: "native".into(),
-                launch: LaunchSpec::Command {
+                launch: LaunchSpec::ExternalCommand {
                     command: "quickai-rust-agent".into(),
                     args: vec!["--stdio".into()],
                     env: vec![("RUST_LOG".into(), "debug".into())],
@@ -297,7 +297,7 @@ mod tests {
         assert_eq!(spec.backend_id, "native-main");
         assert_eq!(spec.adapter_key, "native");
         match spec.launch {
-            LaunchSpec::Command { command, args, env } => {
+            LaunchSpec::ExternalCommand { command, args, env } => {
                 assert_eq!(command, "quickai-rust-agent");
                 assert_eq!(args, vec!["--stdio"]);
                 assert_eq!(env, vec![("RUST_LOG".to_string(), "debug".to_string())]);
@@ -315,7 +315,7 @@ mod tests {
                 backend_id: "claude-main".into(),
                 family: BackendFamily::Acp,
                 adapter_key: "acp".into(),
-                launch: LaunchSpec::Command {
+                launch: LaunchSpec::ExternalCommand {
                     command: "npx".into(),
                     args: vec!["@zed-industries/claude-agent-acp".into()],
                     env: vec![],
@@ -341,7 +341,7 @@ mod tests {
                 backend_id: "generic-acp".into(),
                 family: BackendFamily::Acp,
                 adapter_key: "acp".into(),
-                launch: LaunchSpec::Command {
+                launch: LaunchSpec::ExternalCommand {
                     command: "some-acp-tool".into(),
                     args: vec!["--acp".into()],
                     env: vec![],
@@ -367,7 +367,7 @@ mod tests {
                 backend_id: "native-main".into(),
                 family: BackendFamily::QuickAiNative,
                 adapter_key: "native".into(),
-                launch: LaunchSpec::Embedded,
+                launch: LaunchSpec::BundledCommand,
                 approval_mode: Default::default(),
                 external_mcp_servers: vec![],
                 provider_profile: None,
