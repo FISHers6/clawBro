@@ -610,7 +610,7 @@ pub async fn run_command_turn(
         auth_methods = ?init_resp
             .auth_methods
             .iter()
-            .map(|method| method.id.to_string())
+            .map(|method| method.id().to_string())
             .collect::<Vec<_>>(),
         "ACP initialize completed"
     );
@@ -869,13 +869,13 @@ async fn authenticate_if_configured(
     let advertised = init_resp
         .auth_methods
         .iter()
-        .any(|candidate| candidate.id.to_string() == method.protocol_id());
+        .any(|candidate| candidate.id().to_string() == method.protocol_id());
 
     if !advertised {
         let available = init_resp
             .auth_methods
             .iter()
-            .map(|method| method.id.to_string())
+            .map(|method| method.id().to_string())
             .collect::<Vec<_>>()
             .join(", ");
         anyhow::bail!(

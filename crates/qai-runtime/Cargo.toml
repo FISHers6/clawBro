@@ -1,11 +1,12 @@
 [package]
 name = "qai-runtime"
 version = "0.1.0"
+publish = false
 edition = "2021"
 
 [dependencies]
-qai-protocol = { path = "../qai-protocol" }
-quickai-agent-sdk = { path = "../quickai-agent-sdk" }
+qai-protocol = { path = "../qai-protocol", version = "0.1.0" }
+quickai-agent-sdk = { path = "../quickai-agent-sdk", version = "0.1.0" }
 serde.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
@@ -15,7 +16,7 @@ futures.workspace = true
 tokio-util = { version = "0.7", features = ["compat"] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
 tracing.workspace = true
-agent-client-protocol = { path = "../../../acp/rust-sdk/src/agent-client-protocol", features = ["unstable_session_usage", "unstable_session_info_update"] }
+agent-client-protocol = { version = "0.10.2", features = ["unstable_session_usage"] }
 serde_json.workspace = true
 uuid.workspace = true
 

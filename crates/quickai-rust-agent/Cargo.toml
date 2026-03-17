@@ -1,6 +1,7 @@
 [package]
 name = "quickai-rust-agent"
 version = "0.1.0"
+publish = false
 edition = "2021"
 description = "QuickAI Rust Agent — ACP server binary powered by rig-core"
 license = "MIT"

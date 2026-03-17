@@ -110,7 +110,7 @@ fn parse_call(mut args: Vec<String>) -> Result<TeamToolCall> {
     let subcommand = args.remove(0);
     match subcommand.as_str() {
         "create-task" => Ok(TeamToolCall::CreateTask {
-            id: take_flag(&mut args, "--id")?,
+            id: Some(take_flag(&mut args, "--id")?),
             title: take_flag(&mut args, "--title")?,
             assignee: take_optional_flag(&mut args, "--assignee"),
             spec: take_optional_flag(&mut args, "--spec"),
@@ -213,7 +213,7 @@ fn render_helper_output(call: &TeamToolCall, response: TeamToolResponse) -> Valu
         } => render_team_helper_success(
             "create_task",
             Map::from_iter([
-                ("task_id".into(), Value::String(id.clone())),
+                ("task_id".into(), Value::String(id.clone().unwrap_or_default())),
                 ("title".into(), Value::String(title.clone())),
                 (
                     "assignee".into(),
@@ -510,7 +510,7 @@ mod tests {
     fn render_create_task_as_structured_json() {
         let rendered = render_helper_output(
             &TeamToolCall::CreateTask {
-                id: "T1".into(),
+                id: Some("T1".into()),
                 title: "Implement JWT".into(),
                 assignee: Some("worker".into()),
                 spec: None,

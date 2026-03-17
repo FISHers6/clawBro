@@ -10,6 +10,7 @@ pub mod im_sink;
 pub mod progress_presentation;
 pub mod state;
 pub mod team_runtime;
+pub mod cli;
 
 pub use config::GatewayConfig;
 pub use state::{AppState, BrokerApprovalResolver};

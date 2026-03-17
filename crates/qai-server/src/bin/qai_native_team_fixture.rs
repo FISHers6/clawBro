@@ -78,7 +78,7 @@ async fn run_leader(session: &RuntimeSessionSpec) -> Result<()> {
         team_url,
         &session.session_key,
         TeamToolCall::CreateTask {
-            id: "T001".to_string(),
+            id: Some("T001".to_string()),
             title: "fixture task".to_string(),
             assignee: Some("worker".to_string()),
             spec: Some("Implement the fixture task".to_string()),

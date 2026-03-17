@@ -121,7 +121,7 @@ mod tests {
             .json(&TeamToolRequest {
                 session_key: lead_key,
                 call: TeamToolCall::CreateTask {
-                    id: "T300".into(),
+                    id: Some("T300".into()),
                     title: "ship docs".into(),
                     assignee: Some("codex".into()),
                     spec: None,

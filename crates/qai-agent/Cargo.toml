@@ -1,14 +1,15 @@
 [package]
 name = "qai-agent"
 version = "0.1.0"
+publish = false
 edition = "2021"
 
 [dependencies]
-qai-protocol  = { path = "../qai-protocol" }
-qai-runtime   = { path = "../qai-runtime" }
-qai-session   = { path = "../qai-session" }
-qai-skills    = { path = "../qai-skills" }
-qai-channels  = { path = "../qai-channels" }
+qai-protocol  = { path = "../qai-protocol", version = "0.1.0" }
+qai-runtime   = { path = "../qai-runtime", version = "0.1.0" }
+qai-session   = { path = "../qai-session", version = "0.1.0" }
+qai-skills    = { path = "../qai-skills", version = "0.1.0" }
+qai-channels  = { path = "../qai-channels", version = "0.1.0" }
 axum.workspace       = true
 tokio.workspace      = true
 futures.workspace    = true
@@ -19,7 +20,7 @@ anyhow.workspace     = true
 tracing.workspace    = true
 uuid.workspace       = true
 dashmap.workspace    = true
-agent-client-protocol = { path = "../../../acp/rust-sdk/src/agent-client-protocol" }
+agent-client-protocol = { version = "0.10.2" }
 tokio-util = { version = "0.7", features = ["compat"] }
 rmcp = { version = "=0.8.5", features = ["server", "transport-sse-server", "transport-streamable-http-server"] }
 chrono.workspace     = true

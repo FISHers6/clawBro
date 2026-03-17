@@ -1,10 +1,11 @@
 [package]
 name = "qai-session"
 version = "0.1.0"
+publish = false
 edition = "2021"
 
 [dependencies]
-qai-protocol  = { path = "../qai-protocol" }
+qai-protocol  = { path = "../qai-protocol", version = "0.1.0" }
 tokio.workspace       = true
 serde.workspace       = true
 serde_json.workspace  = true
