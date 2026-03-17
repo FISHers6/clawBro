@@ -46,6 +46,9 @@ pub struct AgentCtx {
     pub agent_memory: Option<String>,
     /// Canonical team manifest for lead/specialist turns.
     pub team_manifest: Option<String>,
+    /// External human-facing turn that should not be driven by workspace-native
+    /// repo workflow skills or file projection.
+    pub frontstage_human_turn: bool,
     /// ACP backend session ID for resuming a previous session.
     pub backend_session_id: Option<String>,
 }
@@ -70,6 +73,7 @@ impl Default for AgentCtx {
             shared_memory: None,
             agent_memory: None,
             team_manifest: None,
+            frontstage_human_turn: false,
             backend_session_id: None,
         }
     }

@@ -2,6 +2,7 @@
 //! Implements Feishu long-connection WebSocket mode.
 //! Env: LARK_APP_ID, LARK_APP_SECRET
 
+use crate::mention_parsing::{derive_fanout_message_id, extract_agent_mentions};
 use crate::traits::Channel;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -10,23 +11,9 @@ use futures::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
 use qai_protocol::{InboundMsg, MsgContent, OutboundMsg, SessionKey};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMsg;
-
-/// Extract first @mention from message text (e.g. "@claude review" → Some("@claude"))
-/// This is Lark-specific text parsing - in future can be enhanced to parse Lark's
-/// rich @mention format (e.g. <at user_id="xxx">@name</at>)
-fn extract_first_mention(text: &str) -> Option<String> {
-    // Simple regex-free extraction: find first word starting with '@'
-    text.split_whitespace()
-        .find(|w| w.starts_with('@'))
-        .map(|w| {
-            // Strip trailing punctuation
-            w.trim_end_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
-                .to_string()
-        })
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LarkTriggerMode {
@@ -85,10 +72,6 @@ fn is_lark_placeholder_mention(token: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn extract_target_agent_mention(text: &str) -> Option<String> {
-    extract_first_mention(text).filter(|mention| !is_lark_placeholder_mention(mention))
-}
-
 fn has_lark_platform_trigger(text: &str) -> bool {
     text.split_whitespace().any(is_lark_placeholder_mention)
 }
@@ -118,9 +101,13 @@ const FEISHU_WS_ENDPOINT_URL: &str = "https://open.feishu.cn/callback/ws/endpoin
 pub struct LarkChannel {
     pub instance_id: String,
     pub app_id: String,
+    pub bot_name: Option<String>,
+    known_bot_name_to_instance: HashMap<String, String>,
+    group_ingress_owner: bool,
     pub app_secret: String,
     client: reqwest::Client,
     trigger_policy: LarkTriggerPolicy,
+    accept_unmentioned_group_messages: bool,
     /// Cached access token: (token_string, time_fetched).
     /// Feishu app_access_token is valid for 7200s; we treat it as valid for 7000s
     /// to provide a safety margin against clock skew and network latency.
@@ -130,21 +117,38 @@ pub struct LarkChannel {
 
 impl LarkChannel {
     pub fn new(app_id: String, app_secret: String, trigger_policy: LarkTriggerPolicy) -> Self {
-        Self::new_with_instance("default", app_id, app_secret, trigger_policy)
+        Self::new_with_instance(
+            "default",
+            None,
+            app_id,
+            app_secret,
+            trigger_policy,
+            true,
+            HashMap::new(),
+            true,
+        )
     }
 
     pub fn new_with_instance(
         instance_id: impl Into<String>,
+        bot_name: Option<String>,
         app_id: String,
         app_secret: String,
         trigger_policy: LarkTriggerPolicy,
+        accept_unmentioned_group_messages: bool,
+        known_bot_name_to_instance: HashMap<String, String>,
+        group_ingress_owner: bool,
     ) -> Self {
         Self {
             instance_id: instance_id.into(),
             app_id,
+            bot_name,
+            known_bot_name_to_instance,
+            group_ingress_owner,
             app_secret,
             client: reqwest::Client::new(),
             trigger_policy,
+            accept_unmentioned_group_messages,
             token_cache: tokio::sync::Mutex::new(None),
             seen_message_ids: tokio::sync::Mutex::new(HashMap::new()),
         }
@@ -173,9 +177,13 @@ impl LarkChannel {
             .map_err(|_| anyhow::anyhow!("LARK_APP_SECRET not set"))?;
         Ok(Self::new_with_instance(
             "default",
+            None,
             app_id,
             app_secret,
             LarkTriggerPolicy::all_messages(),
+            true,
+            HashMap::new(),
+            true,
         ))
     }
 
@@ -410,7 +418,15 @@ impl PbFrame {
 
 #[derive(Debug, Deserialize)]
 struct LarkMsgEvent {
+    #[serde(default)]
+    header: LarkEventHeader,
     event: LarkMsgEventBody,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct LarkEventHeader {
+    #[serde(default)]
+    app_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -438,11 +454,86 @@ struct LarkMessage {
     chat_type: String, // "group" or "p2p"
     #[serde(default)]
     chat_id: String, // group chat ID when chat_type == "group"
+    #[serde(default)]
+    mentions: Vec<LarkMention>,
 }
 
 #[derive(Deserialize)]
 struct LarkTextContent {
     text: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct LarkMention {
+    #[serde(default)]
+    name: String,
+}
+
+fn normalize_mention_name(value: &str) -> String {
+    value.trim().trim_start_matches('@').to_lowercase()
+}
+
+fn current_instance_is_platform_mentioned(message: &LarkMessage, bot_name: Option<&str>) -> bool {
+    let Some(bot_name) = bot_name else {
+        return false;
+    };
+    let expected = normalize_mention_name(bot_name);
+    !expected.is_empty()
+        && message
+            .mentions
+            .iter()
+            .map(|mention| normalize_mention_name(&mention.name))
+            .any(|name| name == expected)
+}
+
+fn map_text_mentions_to_targets(
+    text: &str,
+    known_bot_name_to_instance: &HashMap<String, String>,
+) -> Vec<String> {
+    extract_agent_mentions(text)
+        .into_iter()
+        .filter(|mention| !is_lark_placeholder_mention(mention))
+        .map(|mention| {
+            let normalized = normalize_mention_name(&mention);
+            known_bot_name_to_instance
+                .get(&normalized)
+                .map(|instance| format!("@{instance}"))
+                .unwrap_or(mention)
+        })
+        .collect()
+}
+
+fn map_platform_mentions_to_targets(
+    message: &LarkMessage,
+    known_bot_name_to_instance: &HashMap<String, String>,
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut targets = Vec::new();
+    for mention in &message.mentions {
+        let normalized = normalize_mention_name(&mention.name);
+        if let Some(instance_id) = known_bot_name_to_instance.get(&normalized) {
+            let target = format!("@{instance_id}");
+            if seen.insert(target.clone()) {
+                targets.push(target);
+            }
+        }
+    }
+    targets
+}
+
+fn target_channel_instance(
+    target_agent: &str,
+    known_bot_name_to_instance: &HashMap<String, String>,
+) -> Option<String> {
+    let candidate = target_agent.strip_prefix('@').map(str::trim)?;
+    if known_bot_name_to_instance
+        .values()
+        .any(|value| value == candidate)
+    {
+        Some(candidate.to_string())
+    } else {
+        None
+    }
 }
 
 fn decode_binary_frame(raw: &[u8]) -> Option<PbFrame> {
@@ -677,16 +768,46 @@ async fn handle_event(
         return;
     }
 
-    // Extract first @mention from text for agent routing (platform-specific extraction)
-    // Examples: "@claude review this" → Some("@claude")
-    let target_agent = extract_target_agent_mention(&text);
-
     // Derive scope: group uses chat_id, p2p uses open_id
     let scope = derive_scope(
         &event.event.message.chat_type,
         &event.event.message.chat_id,
         &open_id,
     );
+    let is_group_scope = scope.starts_with("group:");
+    let current_instance_mentioned =
+        current_instance_is_platform_mentioned(&event.event.message, channel.bot_name.as_deref());
+
+    if is_group_scope && !channel.group_ingress_owner {
+        tracing::debug!(
+            scope = %scope,
+            instance = %channel.instance_id,
+            "Lark group message skipped on non-owner instance"
+        );
+        return;
+    }
+
+    if is_group_scope {
+        if has_platform_trigger {
+            if !current_instance_mentioned && channel.known_bot_name_to_instance.is_empty() {
+                tracing::debug!(
+                    scope = %scope,
+                    instance = %channel.instance_id,
+                    app_id = %event.header.app_id,
+                    configured_bot_name = channel.bot_name.as_deref().unwrap_or(""),
+                    "Lark group message skipped because current instance was not mentioned"
+                );
+                return;
+            }
+        } else if !channel.accept_unmentioned_group_messages {
+            tracing::debug!(
+                scope = %scope,
+                instance = %channel.instance_id,
+                "Lark group message skipped on non-default instance without explicit mention"
+            );
+            return;
+        }
+    }
 
     if !should_accept_lark_scope(trigger_policy, &scope, has_platform_trigger) {
         tracing::debug!(
@@ -707,21 +828,55 @@ async fn handle_event(
         return;
     }
 
-    // Use Feishu message_id as InboundMsg.id so that
-    // OutboundMsg.reply_to = message_id → reply API URL
-    let inbound = InboundMsg {
-        id: event.event.message.message_id,
-        session_key: SessionKey::with_instance("lark", channel.instance_id.clone(), &scope),
-        content: MsgContent::text(&text),
-        sender: open_id,
-        channel: "lark".to_string(),
-        timestamp: Utc::now(),
-        thread_ts: None,
-        target_agent,
-        source: qai_protocol::MsgSource::Human,
-    };
+    let mut targets = Vec::new();
+    if is_group_scope {
+        targets.extend(map_platform_mentions_to_targets(
+            &event.event.message,
+            &channel.known_bot_name_to_instance,
+        ));
+    }
+    for target in map_text_mentions_to_targets(&text, &channel.known_bot_name_to_instance) {
+        if !targets.contains(&target) {
+            targets.push(target);
+        }
+    }
+    if targets.is_empty() && is_group_scope && current_instance_mentioned {
+        targets.push(format!("@{}", channel.instance_id));
+    }
 
-    let _ = tx.send(inbound).await;
+    if targets.is_empty() {
+        let inbound = InboundMsg {
+            id: event.event.message.message_id,
+            session_key: SessionKey::with_instance("lark", channel.instance_id.clone(), &scope),
+            content: MsgContent::text(&text),
+            sender: open_id,
+            channel: "lark".to_string(),
+            timestamp: Utc::now(),
+            thread_ts: None,
+            target_agent: None,
+            source: qai_protocol::MsgSource::Human,
+        };
+        let _ = tx.send(inbound).await;
+        return;
+    }
+
+    for target_agent in targets {
+        let channel_instance =
+            target_channel_instance(&target_agent, &channel.known_bot_name_to_instance)
+                .unwrap_or_else(|| channel.instance_id.clone());
+        let inbound = InboundMsg {
+            id: derive_fanout_message_id(&event.event.message.message_id, Some(&target_agent)),
+            session_key: SessionKey::with_instance("lark", channel_instance, &scope),
+            content: MsgContent::text(&text),
+            sender: open_id.clone(),
+            channel: "lark".to_string(),
+            timestamp: Utc::now(),
+            thread_ts: None,
+            target_agent: Some(target_agent),
+            source: qai_protocol::MsgSource::Human,
+        };
+        let _ = tx.send(inbound).await;
+    }
 }
 
 #[cfg(test)]
@@ -732,6 +887,13 @@ mod tests {
 
     // Serialize env-mutating tests to avoid races
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn instance_map() -> HashMap<String, String> {
+        HashMap::from([
+            ("claw".to_string(), "alpha".to_string()),
+            ("claude".to_string(), "beta".to_string()),
+        ])
+    }
 
     #[test]
     fn test_lark_channel_from_env_missing() {
@@ -788,21 +950,21 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_first_mention_basic() {
+    fn test_extract_agent_mentions_basic() {
         assert_eq!(
-            extract_first_mention("@claude review this"),
-            Some("@claude".to_string())
+            extract_agent_mentions("@claude review this"),
+            vec!["@claude".to_string()]
         );
-        assert_eq!(extract_first_mention("no mention here"), None);
+        assert!(extract_agent_mentions("no mention here").is_empty());
         assert_eq!(
-            extract_first_mention("@codex please help @claude"),
-            Some("@codex".to_string())
+            extract_agent_mentions("@codex please help @claude"),
+            vec!["@codex".to_string(), "@claude".to_string()]
         );
         assert_eq!(
-            extract_first_mention("hello @claude,"),
-            Some("@claude".to_string())
+            extract_agent_mentions("hello @claude,"),
+            vec!["@claude".to_string()]
         );
-        assert_eq!(extract_first_mention(""), None);
+        assert!(extract_agent_mentions("").is_empty());
     }
 
     #[test]
@@ -936,20 +1098,29 @@ mod tests {
     fn test_lark_channel_new_with_instance_stores_instance_id() {
         let ch = LarkChannel::new_with_instance(
             "beta",
+            Some("beta-bot".to_string()),
             "id".to_string(),
             "secret".to_string(),
             policy(LarkTriggerMode::AllMessages, LarkTriggerMode::AllMessages),
+            false,
+            HashMap::new(),
+            false,
         );
         assert_eq!(ch.instance_id, "beta");
+        assert_eq!(ch.bot_name.as_deref(), Some("beta-bot"));
     }
 
     #[tokio::test]
     async fn test_lark_inbound_session_key_carries_channel_instance() {
         let channel = LarkChannel::new_with_instance(
             "beta",
+            Some("beta-bot".to_string()),
             "id".to_string(),
             "secret".to_string(),
             policy(LarkTriggerMode::AllMessages, LarkTriggerMode::AllMessages),
+            false,
+            HashMap::new(),
+            false,
         );
         let checker = crate::allowlist::AllowlistChecker::load();
         let (tx, mut rx) = mpsc::channel(1);
@@ -980,6 +1151,192 @@ mod tests {
         assert_eq!(
             inbound.session_key.channel_instance.as_deref(),
             Some("beta")
+        );
+    }
+
+    #[tokio::test]
+    async fn lark_group_message_only_dispatches_to_mentioned_instance() {
+        let checker = crate::allowlist::AllowlistChecker::from_path(None::<std::path::PathBuf>);
+        let (alpha_tx, mut alpha_rx) = mpsc::channel(1);
+        let (beta_tx, mut beta_rx) = mpsc::channel(1);
+        let alpha = LarkChannel::new_with_instance(
+            "alpha",
+            Some("claw".to_string()),
+            "id-alpha".to_string(),
+            "secret".to_string(),
+            policy(LarkTriggerMode::MentionOnly, LarkTriggerMode::AllMessages),
+            true,
+            instance_map(),
+            true,
+        );
+        let beta = LarkChannel::new_with_instance(
+            "beta",
+            Some("Claude".to_string()),
+            "id-beta".to_string(),
+            "secret".to_string(),
+            policy(LarkTriggerMode::MentionOnly, LarkTriggerMode::AllMessages),
+            false,
+            instance_map(),
+            false,
+        );
+        let payload = serde_json::json!({
+            "header": { "event_type": "im.message.receive_v1", "app_id": "id-alpha" },
+            "event": {
+                "sender": { "sender_id": { "open_id": "ou_group_user" } },
+                "message": {
+                    "message_id": "om_group_alpha",
+                    "message_type": "text",
+                    "content": "{\"text\":\"@_user_1 你好\"}",
+                    "chat_type": "group",
+                    "chat_id": "oc_group_1",
+                    "mentions": [{"name":"claw"}]
+                }
+            }
+        });
+
+        handle_event(
+            &alpha,
+            payload.clone(),
+            &alpha_tx,
+            &checker,
+            alpha.trigger_policy,
+        )
+        .await;
+        handle_event(&beta, payload, &beta_tx, &checker, beta.trigger_policy).await;
+
+        let inbound = alpha_rx
+            .recv()
+            .await
+            .expect("alpha should receive the message");
+        assert_eq!(inbound.target_agent.as_deref(), Some("@alpha"));
+        assert!(
+            beta_rx.try_recv().is_err(),
+            "beta should skip alpha-only mention"
+        );
+    }
+
+    #[tokio::test]
+    async fn lark_unmentioned_group_message_only_default_instance_accepts() {
+        let checker = crate::allowlist::AllowlistChecker::from_path(None::<std::path::PathBuf>);
+        let (alpha_tx, mut alpha_rx) = mpsc::channel(1);
+        let (beta_tx, mut beta_rx) = mpsc::channel(1);
+        let alpha = LarkChannel::new_with_instance(
+            "alpha",
+            Some("claw".to_string()),
+            "id-alpha".to_string(),
+            "secret".to_string(),
+            policy(LarkTriggerMode::AllMessages, LarkTriggerMode::AllMessages),
+            true,
+            instance_map(),
+            true,
+        );
+        let beta = LarkChannel::new_with_instance(
+            "beta",
+            Some("Claude".to_string()),
+            "id-beta".to_string(),
+            "secret".to_string(),
+            policy(LarkTriggerMode::AllMessages, LarkTriggerMode::AllMessages),
+            false,
+            instance_map(),
+            false,
+        );
+        let payload = serde_json::json!({
+            "header": { "event_type": "im.message.receive_v1", "app_id": "id-alpha" },
+            "event": {
+                "sender": { "sender_id": { "open_id": "ou_group_user" } },
+                "message": {
+                    "message_id": "om_group_unmentioned",
+                    "message_type": "text",
+                    "content": "{\"text\":\"你好\"}",
+                    "chat_type": "group",
+                    "chat_id": "oc_group_1",
+                    "mentions": []
+                }
+            }
+        });
+
+        handle_event(
+            &alpha,
+            payload.clone(),
+            &alpha_tx,
+            &checker,
+            alpha.trigger_policy,
+        )
+        .await;
+        handle_event(&beta, payload, &beta_tx, &checker, beta.trigger_policy).await;
+
+        assert!(
+            alpha_rx.recv().await.is_some(),
+            "default instance should accept"
+        );
+        assert!(
+            beta_rx.try_recv().is_err(),
+            "non-default instance should skip"
+        );
+    }
+
+    #[tokio::test]
+    async fn lark_group_message_with_multiple_platform_mentions_fans_out() {
+        let checker = crate::allowlist::AllowlistChecker::from_path(None::<std::path::PathBuf>);
+        let (alpha_tx, mut alpha_rx) = mpsc::channel(4);
+        let (beta_tx, mut beta_rx) = mpsc::channel(1);
+        let alpha = LarkChannel::new_with_instance(
+            "alpha",
+            Some("claw".to_string()),
+            "id-alpha".to_string(),
+            "secret".to_string(),
+            policy(LarkTriggerMode::MentionOnly, LarkTriggerMode::AllMessages),
+            true,
+            instance_map(),
+            true,
+        );
+        let beta = LarkChannel::new_with_instance(
+            "beta",
+            Some("Claude".to_string()),
+            "id-beta".to_string(),
+            "secret".to_string(),
+            policy(LarkTriggerMode::MentionOnly, LarkTriggerMode::AllMessages),
+            false,
+            instance_map(),
+            false,
+        );
+        let payload = serde_json::json!({
+            "header": { "event_type": "im.message.receive_v1", "app_id": "id-alpha" },
+            "event": {
+                "sender": { "sender_id": { "open_id": "ou_group_user" } },
+                "message": {
+                    "message_id": "om_group_multi",
+                    "message_type": "text",
+                    "content": "{\"text\":\"@_user_1 @_user_2 你好\"}",
+                    "chat_type": "group",
+                    "chat_id": "oc_group_1",
+                    "mentions": [{"name":"claw"}, {"name":"Claude"}]
+                }
+            }
+        });
+
+        handle_event(
+            &alpha,
+            payload.clone(),
+            &alpha_tx,
+            &checker,
+            alpha.trigger_policy,
+        )
+        .await;
+        handle_event(&beta, payload, &beta_tx, &checker, beta.trigger_policy).await;
+
+        let first = alpha_rx.recv().await.expect("first fanout inbound");
+        let second = alpha_rx.recv().await.expect("second fanout inbound");
+        let mut targets = vec![
+            first.target_agent.unwrap_or_default(),
+            second.target_agent.unwrap_or_default(),
+        ];
+        targets.sort();
+        assert_eq!(targets, vec!["@alpha".to_string(), "@beta".to_string()]);
+        assert_ne!(first.id, second.id);
+        assert!(
+            beta_rx.try_recv().is_err(),
+            "non-owner instance must not duplicate fanout"
         );
     }
 

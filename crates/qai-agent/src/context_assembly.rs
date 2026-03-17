@@ -5,7 +5,7 @@ use crate::routing::RosterMatchData;
 use crate::team::orchestrator::TeamOrchestrator;
 use crate::traits::{AgentCtx, AgentRole, HistoryMsg};
 use dashmap::DashSet;
-use qai_protocol::{InboundMsg, SessionKey};
+use qai_protocol::{InboundMsg, MsgSource, SessionKey};
 use qai_session::StoredMessage;
 use qai_skills::{PersonaSkillData, SkillLoader};
 use std::path::PathBuf;
@@ -39,6 +39,11 @@ pub(crate) struct ContextAssemblyResult {
 
 pub(crate) async fn assemble_context(request: ContextAssemblyRequest<'_>) -> ContextAssemblyResult {
     let history = build_history(request.recent_messages);
+    let frontstage_human_turn = is_frontstage_human_turn(
+        request.inbound.source.clone(),
+        request.session_key.channel.as_str(),
+        request.agent_role,
+    );
     let workspace_dir_resolved = request
         .session_workspace
         .or_else(|| request.roster_match.and_then(|rm| rm.workspace_dir.clone()))
@@ -48,6 +53,7 @@ pub(crate) async fn assemble_context(request: ContextAssemblyRequest<'_>) -> Con
         workspace_dir_resolved.as_ref(),
         request.roster_match,
         request.skill_loader_dirs,
+        frontstage_human_turn,
     );
 
     let resolved_persona_dir = resolve_persona_dir(
@@ -172,9 +178,14 @@ pub(crate) async fn assemble_context(request: ContextAssemblyRequest<'_>) -> Con
             shared_memory: canonical_shared_memory,
             agent_memory: canonical_agent_memory,
             team_manifest: canonical_team_manifest,
+            frontstage_human_turn,
             backend_session_id: None, // populated by registry after context assembly
         },
     }
+}
+
+fn is_frontstage_human_turn(source: MsgSource, channel: &str, agent_role: AgentRole) -> bool {
+    source == MsgSource::Human && channel == "lark" && !matches!(agent_role, AgentRole::Specialist)
 }
 
 pub(crate) fn build_history(recent_messages: &[StoredMessage]) -> Vec<HistoryMsg> {
@@ -281,12 +292,15 @@ fn load_skill_injection(
     workspace_dir_resolved: Option<&PathBuf>,
     roster_match: Option<&RosterMatchData>,
     skill_loader_dirs: &[PathBuf],
+    frontstage_human_turn: bool,
 ) -> (String, Option<PersonaSkillData>) {
     let mut agent_skill_dirs = Vec::new();
-    if let Some(workspace) = workspace_dir_resolved {
-        let canonical = workspace.join(".agents").join("skills");
-        if canonical.exists() {
-            agent_skill_dirs.push(canonical);
+    if !frontstage_human_turn {
+        if let Some(workspace) = workspace_dir_resolved {
+            let canonical = workspace.join(".agents").join("skills");
+            if canonical.exists() {
+                agent_skill_dirs.push(canonical);
+            }
         }
     }
     if let Some(rm) = roster_match {
@@ -413,7 +427,7 @@ mod tests {
         .unwrap();
 
         let (skill_injection, first_persona) =
-            load_skill_injection(None, None, &[tmp.path().to_path_buf()]);
+            load_skill_injection(None, None, &[tmp.path().to_path_buf()], false);
         let combined = combine_gateway_and_workspace_injection("", &skill_injection);
         assert!(first_persona.is_some());
         assert!(combined.is_empty());
@@ -577,6 +591,55 @@ mod tests {
             .system_injection
             .contains("当前 runtime backend 是 `claude-main`"));
         assert!(!single.ctx.system_injection.contains("当前执行身份"));
+    }
+
+    #[test]
+    fn frontstage_human_turn_detected_for_human_lead_and_solo_only() {
+        assert!(is_frontstage_human_turn(
+            MsgSource::Human,
+            "lark",
+            AgentRole::Solo
+        ));
+        assert!(is_frontstage_human_turn(
+            MsgSource::Human,
+            "lark",
+            AgentRole::Lead
+        ));
+        assert!(!is_frontstage_human_turn(
+            MsgSource::Human,
+            "lark",
+            AgentRole::Specialist
+        ));
+        assert!(!is_frontstage_human_turn(
+            MsgSource::Heartbeat,
+            "lark",
+            AgentRole::Lead
+        ));
+        assert!(!is_frontstage_human_turn(
+            MsgSource::Human,
+            "ws",
+            AgentRole::Lead
+        ));
+    }
+
+    #[test]
+    fn frontstage_human_turn_skips_workspace_skill_injection() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let skill_dir = workspace.path().join(".agents").join("skills").join("demo");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: demo\ndescription: demo\n---\nUse demo skill.",
+        )
+        .unwrap();
+
+        let (skill_injection, _) =
+            load_skill_injection(Some(&workspace.path().to_path_buf()), None, &[], true);
+        assert!(skill_injection.trim().is_empty());
+
+        let (normal_injection, _) =
+            load_skill_injection(Some(&workspace.path().to_path_buf()), None, &[], false);
+        assert!(normal_injection.contains("demo"));
     }
 
     #[tokio::test]

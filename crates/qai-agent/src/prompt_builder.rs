@@ -58,6 +58,9 @@ const CONVERSATION_CONTINUITY_PROTOCOL: &str = "\
 
 你正在一个持久会话中工作。系统已经把最近的真实对话历史提供给你。
 
+- 当前轮里，最新的用户消息永远是你必须直接响应的对象；较早的消息只作为上下文参考。
+- 不要因为上一条消息刚讨论过某个问题，就在当前用户只发了新的短句、问候或不同问题时机械重复上一条回答。
+- 只有当最新用户消息明确要求延续、重试、补充、回顾或继续上一条主题时，才继续上一条未完成的话题。
 - 当用户询问“我刚才说了什么”“上一条消息是什么”“延续刚才的话题”时，必须只基于系统显式提供的用户可见聊天历史回答。
 - 只要上下文里存在先前消息，就不要声称“无法查看历史”“只能看到当前消息”。
 - 不要把 AGENTS.md、CLAUDE.md、skills、环境上下文、系统提示、开发者提示、工具结果、session bootstrap 内容当作“上一条用户消息”或“用户历史”。
@@ -248,6 +251,7 @@ mod tests {
         assert!(result.contains("IDENTITY content"));
         assert!(result.contains("SKILLS content"));
         assert!(result.contains("会话连续性协议"));
+        assert!(result.contains("最新的用户消息永远是你必须直接响应的对象"));
         // No persona blocks expected
         assert!(!result.contains("Cognitive Architecture"));
     }

@@ -10,11 +10,11 @@ use qai_agent::{
     TurnExecutionContext,
 };
 use qai_channels::Channel;
-use qai_protocol::{InboundMsg, OutboundMsg, SessionKey};
+use qai_protocol::{AgentEvent, InboundMsg, OutboundMsg, SessionKey};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{broadcast, oneshot, Mutex};
 
 /// No-op sink used for Team Lead turns — all user-visible output goes through
 /// `post_update` tool calls (via milestone_fn → ch.send()), not the stream path.
@@ -93,7 +93,7 @@ impl OutputSink for ImProgressSink {
             reply_to: self.reply_to.clone(),
             thread_ts: self.thread_ts.clone(),
         };
-        let send_result = self.channel.send(&msg).await;
+        let send_result = send_with_reply_fallback(self.channel.as_ref(), msg).await;
         if let Err(e) = &send_result {
             tracing::warn!(channel = %self.channel.name(), "IM send_progress failed: {e}");
         }
@@ -117,7 +117,7 @@ impl OutputSink for ImProgressSink {
             reply_to: self.reply_to.clone(),
             thread_ts: self.thread_ts.clone(),
         };
-        let send_result = self.channel.send(&msg).await;
+        let send_result = send_with_reply_fallback(self.channel.as_ref(), msg).await;
         if let Err(e) = &send_result {
             tracing::error!(channel = %self.channel.name(), "IM send_final failed: {e}");
         } else {
@@ -150,6 +150,24 @@ impl OutputSink for ImProgressSink {
 
     fn progress_for_tool_failure(&self, tool_name: &str) -> Option<String> {
         progress_presentation::format_tool_failure(self.presentation, tool_name)
+    }
+}
+
+async fn send_with_reply_fallback(channel: &dyn Channel, msg: OutboundMsg) -> anyhow::Result<()> {
+    match channel.send(&msg).await {
+        Ok(()) => Ok(()),
+        Err(error) if msg.reply_to.is_some() => {
+            tracing::warn!(
+                channel = %channel.name(),
+                reply_to = msg.reply_to.as_deref().unwrap_or(""),
+                error = %error,
+                "reply_to send failed; retrying as direct scope send"
+            );
+            let mut fallback = msg;
+            fallback.reply_to = None;
+            channel.send(&fallback).await
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -269,7 +287,7 @@ pub fn spawn_im_turn(
     let session_key = inbound.session_key.clone();
     let thread_ts = inbound.thread_ts.clone();
     let reply_to = Some(inbound.id.clone());
-    let event_rx = registry.global_sender().subscribe();
+    let (turn_event_tx, turn_event_rx) = broadcast::channel::<AgentEvent>(1024);
     let (control_tx, control_rx) = oneshot::channel::<StreamControl>();
 
     // Capture before spawning tasks to snapshot state consistently (fixes TOCTOU).
@@ -322,7 +340,7 @@ pub fn spawn_im_turn(
 
         if suppress_lead_final {
             // Lead in Team mode: all stream output suppressed; post_update is the only channel.
-            throttled_stream(event_rx, session_id, &NullSink, None, control_rx).await;
+            throttled_stream(turn_event_rx, session_id, &NullSink, None, control_rx).await;
         } else {
             let (
                 stream_channel,
@@ -346,7 +364,7 @@ pub fn spawn_im_turn(
                 presentation,
                 team_orchestrator_for_stream,
             );
-            throttled_stream(event_rx, session_id, &sink, None, control_rx).await;
+            throttled_stream(turn_event_rx, session_id, &sink, None, control_rx).await;
         }
     });
 
@@ -357,8 +375,12 @@ pub fn spawn_im_turn(
     let team_orchestrator_for_handle = team_orchestrator_for_session;
     let resolved_delivery_for_handle = resolved_delivery;
     let fallback_channel_for_handle = channel.clone();
+    let turn_event_tx_for_handle = turn_event_tx;
     tokio::spawn(async move {
-        match registry.handle_with_context(inbound, turn_ctx).await {
+        match registry
+            .handle_with_context_and_events(inbound, turn_ctx, turn_event_tx_for_handle)
+            .await
+        {
             Ok(Some(reply)) => {
                 match decide_final_delivery(
                     suppress_lead_final,
@@ -390,7 +412,8 @@ pub fn spawn_im_turn(
                             reply_to: send_reply_to,
                             thread_ts: send_thread_ts,
                         };
-                        let send_result = send_channel.send(&msg).await;
+                        let send_result =
+                            send_with_reply_fallback(send_channel.as_ref(), msg.clone()).await;
                         if let Err(e) = &send_result {
                             tracing::error!(channel = %channel_name_for_handle, "lead direct send failed: {e}");
                         }
@@ -437,6 +460,7 @@ mod tests {
 
     struct MockChannel {
         sent: StdMutex<Vec<String>>,
+        fail_when_reply_to: bool,
     }
 
     #[async_trait]
@@ -446,6 +470,9 @@ mod tests {
         }
 
         async fn send(&self, msg: &OutboundMsg) -> Result<()> {
+            if self.fail_when_reply_to && msg.reply_to.is_some() {
+                anyhow::bail!("reply target not found");
+            }
             let MsgContent::Text { text } = &msg.content else {
                 unreachable!()
             };
@@ -461,6 +488,7 @@ mod tests {
     fn sink(presentation: ProgressPresentationMode) -> (ImProgressSink, Arc<MockChannel>) {
         let channel = Arc::new(MockChannel {
             sent: StdMutex::new(Vec::new()),
+            fail_when_reply_to: false,
         });
         let sink = ImProgressSink::new(
             channel.clone(),
@@ -522,6 +550,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_with_reply_fallback_retries_without_reply_to() {
+        let channel = MockChannel {
+            sent: StdMutex::new(Vec::new()),
+            fail_when_reply_to: true,
+        };
+        let msg = OutboundMsg {
+            session_key: SessionKey::new("mock", "group:test"),
+            content: MsgContent::text("hello"),
+            reply_to: Some("reply-id".into()),
+            thread_ts: None,
+        };
+        send_with_reply_fallback(&channel, msg).await.unwrap();
+        assert_eq!(
+            channel.sent.lock().unwrap().clone(),
+            vec!["hello".to_string()]
+        );
+    }
+
+    #[tokio::test]
     async fn compact_progress_allows_same_label_after_window() {
         let (sink, channel) = sink(ProgressPresentationMode::ProgressCompact);
         sink.send_progress("⏳ 正在搜索代码", None).await;
@@ -540,6 +587,7 @@ mod tests {
         let (team_orchestrator, _tmp) = make_team_orchestrator();
         let channel = Arc::new(MockChannel {
             sent: StdMutex::new(Vec::new()),
+            fail_when_reply_to: false,
         });
         let sink = ImProgressSink::new(
             channel,

@@ -295,7 +295,7 @@ pub struct TurnResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResumeRecoveryAction {
-    DropFailedLoadSessionHandle { stale_session_id: String },
+    DropStaleResumedSessionHandle { stale_session_id: String },
 }
 
 pub fn render_history_lines(
@@ -465,7 +465,13 @@ pub fn render_runtime_prompt(session: &RuntimeSessionSpec) -> String {
     }
     if let Some(user_input) = session.context.user_input.as_deref() {
         if !user_input.trim().is_empty() {
-            parts.push(user_input.to_string());
+            parts.push(format!(
+                "## 当前轮用户消息（必须优先直接响应）\n\n\
+下面这条是当前轮最新的用户消息。必须先直接回答这条消息；较早的历史内容只作为上下文参考。\
+除非这条最新消息明确要求继续、补充或回顾上一话题，否则不要重复上一条回复。\n\n\
+<latest_user_message>\n{}\n</latest_user_message>",
+                user_input
+            ));
         }
     }
     if parts.is_empty() {
@@ -597,7 +603,8 @@ mod tests {
         let prompt = render_runtime_prompt(&spec);
         assert!(prompt.contains("<system_context>"));
         assert!(prompt.contains("[user]: hi"));
-        assert!(prompt.contains("ship it"));
+        assert!(prompt.contains("当前轮用户消息（必须优先直接响应）"));
+        assert!(prompt.contains("<latest_user_message>\nship it\n</latest_user_message>"));
         assert!(!prompt.contains("legacy raw prompt"));
     }
 
@@ -647,7 +654,7 @@ mod tests {
         assert!(prompt.contains("[assistant]: [@codex]: second"));
         assert!(prompt.contains("[tool_call:read#call-1]: {\"path\":\"README.md\"}"));
         assert!(prompt.contains("[tool_result:read#call-1]: ok"));
-        assert!(prompt.contains("third"));
+        assert!(prompt.contains("<latest_user_message>\nthird\n</latest_user_message>"));
         assert!(!prompt.contains("legacy raw prompt"));
     }
 

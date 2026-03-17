@@ -172,7 +172,7 @@ impl SessionStorage {
         let dir = self.session_dir(meta.session_id);
         tokio::fs::create_dir_all(&dir).await?;
         let path = dir.join("metadata.json");
-        let tmp = dir.join("metadata.json.tmp");
+        let tmp = dir.join(format!("metadata.json.{}.tmp", Uuid::new_v4()));
         let json = serde_json::to_string_pretty(meta)?;
         tokio::fs::write(&tmp, json).await?;
         tokio::fs::rename(&tmp, &path).await?;
@@ -252,6 +252,32 @@ mod tests {
         assert_eq!(loaded.scope, "user_123");
         assert_eq!(loaded.channel_instance.as_deref(), Some("default"));
         assert!(loaded.backend_resume_fingerprints.is_empty());
+    }
+
+    #[tokio::test]
+    async fn concurrent_save_meta_calls_do_not_collide_on_tmp_path() {
+        let dir = tempdir().unwrap();
+        let storage = SessionStorage::new(dir.path().to_path_buf());
+        let session_id = Uuid::new_v4();
+        let meta = SessionMeta {
+            session_id,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            channel: "lark".to_string(),
+            scope: "group:oc_race".to_string(),
+            channel_instance: Some("alpha".to_string()),
+            message_count: 0,
+            backend_session_ids: Default::default(),
+            backend_resume_fingerprints: Default::default(),
+            session_status: SessionStatus::Idle,
+        };
+
+        let (left, right) = tokio::join!(storage.save_meta(&meta), storage.save_meta(&meta));
+        left.unwrap();
+        right.unwrap();
+
+        let loaded = storage.load_meta(session_id).await.unwrap().unwrap();
+        assert_eq!(loaded.scope, "group:oc_race");
     }
 
     #[tokio::test]

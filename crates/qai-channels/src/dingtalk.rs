@@ -2,6 +2,7 @@
 //! 文档参考: https://open.dingtalk.com/document/orgapp/stream
 //! 认证: DINGTALK_APP_KEY + DINGTALK_APP_SECRET 环境变量
 
+use crate::mention_parsing::{derive_fanout_message_id, extract_agent_mentions};
 use crate::traits::Channel;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -285,20 +286,39 @@ impl Channel for DingTalkChannel {
                             let session_webhook =
                                 data["sessionWebhook"].as_str().map(str::to_string);
                             if !content_text.is_empty() {
-                                // Extract first @mention for agent routing
-                                let target_agent = extract_first_mention(&content_text);
-                                let inbound = InboundMsg {
-                                    id: event_id,
-                                    session_key: SessionKey::new("dingtalk", &scope),
-                                    content: MsgContent::text(&content_text),
-                                    sender: user_id,
-                                    channel: "dingtalk".to_string(),
-                                    timestamp: Utc::now(),
-                                    thread_ts: session_webhook,
-                                    target_agent,
-                                    source: qai_protocol::MsgSource::Human,
-                                };
-                                let _ = tx.send(inbound).await;
+                                let targets = extract_agent_mentions(&content_text);
+                                if targets.is_empty() {
+                                    let inbound = InboundMsg {
+                                        id: event_id,
+                                        session_key: SessionKey::new("dingtalk", &scope),
+                                        content: MsgContent::text(&content_text),
+                                        sender: user_id,
+                                        channel: "dingtalk".to_string(),
+                                        timestamp: Utc::now(),
+                                        thread_ts: session_webhook,
+                                        target_agent: None,
+                                        source: qai_protocol::MsgSource::Human,
+                                    };
+                                    let _ = tx.send(inbound).await;
+                                } else {
+                                    for target_agent in targets {
+                                        let inbound = InboundMsg {
+                                            id: derive_fanout_message_id(
+                                                &event_id,
+                                                Some(&target_agent),
+                                            ),
+                                            session_key: SessionKey::new("dingtalk", &scope),
+                                            content: MsgContent::text(&content_text),
+                                            sender: user_id.clone(),
+                                            channel: "dingtalk".to_string(),
+                                            timestamp: Utc::now(),
+                                            thread_ts: session_webhook.clone(),
+                                            target_agent: Some(target_agent),
+                                            source: qai_protocol::MsgSource::Human,
+                                        };
+                                        let _ = tx.send(inbound).await;
+                                    }
+                                }
                             }
                         }
                     }
@@ -553,5 +573,20 @@ mod tests {
             "@claude please check user@example.com",
             false
         ));
+    }
+
+    #[test]
+    fn multiple_mentions_expand_to_distinct_fanout_ids() {
+        let text = "@claude 你好 @codex 你也来";
+        let targets = crate::mention_parsing::extract_agent_mentions(text);
+        assert_eq!(targets, vec!["@claude".to_string(), "@codex".to_string()]);
+        assert_eq!(
+            crate::mention_parsing::derive_fanout_message_id("evt-1", Some("@claude")),
+            "evt-1#target=claude"
+        );
+        assert_eq!(
+            crate::mention_parsing::derive_fanout_message_id("evt-1", Some("@codex")),
+            "evt-1#target=codex"
+        );
     }
 }

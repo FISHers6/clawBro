@@ -776,6 +776,26 @@ impl SessionRegistry {
         inbound: InboundMsg,
         turn_ctx: TurnExecutionContext,
     ) -> Result<Option<String>> {
+        self.handle_with_context_internal(inbound, turn_ctx, None)
+            .await
+    }
+
+    pub async fn handle_with_context_and_events(
+        &self,
+        inbound: InboundMsg,
+        turn_ctx: TurnExecutionContext,
+        turn_event_tx: broadcast::Sender<AgentEvent>,
+    ) -> Result<Option<String>> {
+        self.handle_with_context_internal(inbound, turn_ctx, Some(turn_event_tx))
+            .await
+    }
+
+    async fn handle_with_context_internal(
+        &self,
+        inbound: InboundMsg,
+        turn_ctx: TurnExecutionContext,
+        turn_event_tx: Option<broadcast::Sender<AgentEvent>>,
+    ) -> Result<Option<String>> {
         // Idempotent dedup
         if !self.dedup.check_and_insert(&inbound.id) {
             tracing::debug!("Dedup: skipping duplicate msg {}", inbound.id);
@@ -1029,7 +1049,10 @@ impl SessionRegistry {
 
         // Per-call event channel: forward to global_tx + ws_subs
         // TurnComplete is enriched with sender_name here (engine itself doesn't know roster)
-        let (session_tx, _) = broadcast::channel::<AgentEvent>(1024);
+        let session_tx = turn_event_tx.unwrap_or_else(|| {
+            let (tx, _) = broadcast::channel::<AgentEvent>(1024);
+            tx
+        });
         let global_tx = self.global_tx.clone();
         let ws_subs_clone = Arc::clone(&self.ws_subs);
         let normalized_sk_for_fwd = normalized_session_key.clone();
@@ -1101,7 +1124,7 @@ impl SessionRegistry {
             .and_then(|r| r.used_backend_id.clone())
             .or(expected_backend_id);
         if let Some(ref bid) = complete_backend_id {
-            if let Some(ResumeRecoveryAction::DropFailedLoadSessionHandle { stale_session_id }) =
+            if let Some(ResumeRecoveryAction::DropStaleResumedSessionHandle { stale_session_id }) =
                 resume_recovery
             {
                 match self
@@ -1114,7 +1137,7 @@ impl SessionRegistry {
                             session_id = %session_id,
                             backend_id = %bid,
                             stale_backend_session_id = %stale_session_id,
-                            "dropped stale backend resume state after runtime load_session failure"
+                            "dropped stale backend resume state after runtime recovery"
                         );
                     }
                     Err(e) => {
@@ -1319,6 +1342,47 @@ mod tests {
         }
     }
 
+    struct SequencedStreamingRuntimeDispatch {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeDispatch for SequencedStreamingRuntimeDispatch {
+        async fn dispatch(&self, request: RuntimeDispatchRequest) -> Result<TurnResult> {
+            let idx = self.calls.fetch_add(1, Ordering::SeqCst);
+            let (text, delay_ms) = if idx == 0 {
+                ("first turn reply", 150_u64)
+            } else {
+                ("second turn reply", 0_u64)
+            };
+            if delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+            let session_id = request.ctx.session_id;
+            let _ = request.event_tx.send(AgentEvent::TextDelta {
+                session_id,
+                delta: text.to_string(),
+            });
+            let _ = request.event_tx.send(AgentEvent::TurnComplete {
+                session_id,
+                full_text: text.to_string(),
+                sender: None,
+            });
+            Ok(TurnResult {
+                full_text: text.to_string(),
+                events: vec![],
+                emitted_backend_session_id: None,
+                backend_resume_fingerprint: None,
+                used_backend_id: request.intent.target_backend.clone(),
+                resume_recovery: None,
+            })
+        }
+
+        async fn backend_resume_fingerprint(&self, _backend_id: &str) -> Result<Option<String>> {
+            Ok(None)
+        }
+    }
+
     struct FakeApprovalResolver {
         decisions: Arc<std::sync::Mutex<Vec<(String, ApprovalDecision)>>>,
         result: bool,
@@ -1401,6 +1465,97 @@ mod tests {
             vec![],
             runtime_dispatch,
         )
+    }
+
+    #[tokio::test]
+    async fn per_turn_event_channel_isolated_for_same_session() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (registry, _rx) = make_registry_with_runtime_dispatch_and_roster(
+            Some("codex-main"),
+            vec![],
+            Arc::new(SequencedStreamingRuntimeDispatch {
+                calls: Arc::clone(&calls),
+            }),
+        );
+        let session_key = SessionKey::with_instance("lark", "beta", "user:test");
+
+        let inbound1 = InboundMsg {
+            id: "msg-1".to_string(),
+            session_key: session_key.clone(),
+            content: MsgContent::text("first"),
+            sender: "user".to_string(),
+            channel: "lark".to_string(),
+            timestamp: chrono::Utc::now(),
+            thread_ts: None,
+            target_agent: None,
+            source: qai_protocol::MsgSource::Human,
+        };
+        let inbound2 = InboundMsg {
+            id: "msg-2".to_string(),
+            session_key,
+            content: MsgContent::text("second"),
+            sender: "user".to_string(),
+            channel: "lark".to_string(),
+            timestamp: chrono::Utc::now(),
+            thread_ts: None,
+            target_agent: None,
+            source: qai_protocol::MsgSource::Human,
+        };
+
+        let (tx1, mut rx1) = broadcast::channel::<AgentEvent>(32);
+        let (tx2, mut rx2) = broadcast::channel::<AgentEvent>(32);
+
+        let registry1 = Arc::clone(&registry);
+        let first = tokio::spawn(async move {
+            registry1
+                .handle_with_context_and_events(inbound1, TurnExecutionContext::default(), tx1)
+                .await
+                .expect("first turn succeeds")
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let registry2 = Arc::clone(&registry);
+        let second = tokio::spawn(async move {
+            registry2
+                .handle_with_context_and_events(inbound2, TurnExecutionContext::default(), tx2)
+                .await
+                .expect("second turn succeeds")
+        });
+
+        let first_event = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                match rx1.recv().await.expect("rx1 event") {
+                    AgentEvent::TurnComplete { full_text, .. } => break full_text,
+                    _ => continue,
+                }
+            }
+        })
+        .await
+        .expect("first channel should receive first turn complete");
+        assert_eq!(first_event, "first turn reply");
+
+        assert_eq!(
+            first.await.expect("first join"),
+            Some("first turn reply".to_string())
+        );
+
+        let second_event = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                match rx2.recv().await.expect("rx2 event") {
+                    AgentEvent::TurnComplete { full_text, .. } => break full_text,
+                    _ => continue,
+                }
+            }
+        })
+        .await
+        .expect("second channel should receive second turn complete");
+        assert_eq!(second_event, "second turn reply");
+
+        assert_eq!(
+            second.await.expect("second join"),
+            Some("second turn reply".to_string())
+        );
     }
 
     #[test]
@@ -1760,7 +1915,7 @@ mod tests {
                 backend_resume_fingerprint: Some("fp-same".into()),
                 emitted_backend_session_id: Some("fresh-new-id".into()),
                 used_backend_id: Some("native-main".into()),
-                resume_recovery: Some(ResumeRecoveryAction::DropFailedLoadSessionHandle {
+                resume_recovery: Some(ResumeRecoveryAction::DropStaleResumedSessionHandle {
                     stale_session_id: "stale-load-id".into(),
                 }),
             }),

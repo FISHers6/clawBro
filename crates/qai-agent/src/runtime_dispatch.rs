@@ -427,15 +427,17 @@ fn collect_workspace_native_files(ctx: &AgentCtx) -> Vec<String> {
         push_visible_relative_file(&mut files, &mut seen, persona_dir, &scoped_memory_name);
     }
 
-    if let Some(workspace_root) = ctx.workspace_root.as_ref() {
-        for name in ["AGENTS.md", "CLAUDE.md", "USER.md", "HEARTBEAT.md"] {
-            push_visible_file(&mut files, &mut seen, workspace_root, name);
+    if !ctx.frontstage_human_turn {
+        if let Some(workspace_root) = ctx.workspace_root.as_ref() {
+            for name in ["AGENTS.md", "CLAUDE.md", "USER.md", "HEARTBEAT.md"] {
+                push_visible_file(&mut files, &mut seen, workspace_root, name);
+            }
         }
-    }
 
-    if let Some(team_dir) = ctx.team_dir.as_ref() {
-        for name in ["TEAM.md", "CONTEXT.md", "TASKS.md", "HEARTBEAT.md"] {
-            push_visible_file(&mut files, &mut seen, team_dir, name);
+        if let Some(team_dir) = ctx.team_dir.as_ref() {
+            for name in ["TEAM.md", "CONTEXT.md", "TASKS.md", "HEARTBEAT.md"] {
+                push_visible_file(&mut files, &mut seen, team_dir, name);
+            }
         }
     }
 
@@ -984,6 +986,35 @@ mod tests {
         );
         assert!(files.contains(&"TEAM.md".to_string()));
         assert!(files.contains(&"CONTEXT.md".to_string()));
+    }
+
+    #[test]
+    fn collect_workspace_native_files_hides_workspace_and_team_files_for_frontstage_human_turns() {
+        let persona = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let team = tempdir().unwrap();
+        std::fs::write(persona.path().join("SOUL.md"), "soul").unwrap();
+        std::fs::write(persona.path().join("IDENTITY.md"), "identity").unwrap();
+        std::fs::write(workspace.path().join("AGENTS.md"), "agents").unwrap();
+        std::fs::write(workspace.path().join("CLAUDE.md"), "claude").unwrap();
+        std::fs::write(team.path().join("TEAM.md"), "team").unwrap();
+        std::fs::write(team.path().join("TASKS.md"), "tasks").unwrap();
+
+        let mut ctx = AgentCtx::default();
+        ctx.session_key = qai_protocol::SessionKey::new("lark", "group:test");
+        ctx.frontstage_human_turn = true;
+        ctx.persona_dir = Some(persona.path().to_path_buf());
+        ctx.workspace_root = Some(workspace.path().to_path_buf());
+        ctx.workspace_dir = Some(workspace.path().to_path_buf());
+        ctx.team_dir = Some(team.path().to_path_buf());
+
+        let files = collect_workspace_native_files(&ctx);
+        assert!(files.contains(&"SOUL.md".to_string()));
+        assert!(files.contains(&"IDENTITY.md".to_string()));
+        assert!(!files.contains(&"AGENTS.md".to_string()));
+        assert!(!files.contains(&"CLAUDE.md".to_string()));
+        assert!(!files.contains(&"TEAM.md".to_string()));
+        assert!(!files.contains(&"TASKS.md".to_string()));
     }
 
     #[test]

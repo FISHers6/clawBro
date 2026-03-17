@@ -1,6 +1,7 @@
 pub mod allowlist;
 pub mod dingtalk;
 pub mod lark;
+mod mention_parsing;
 pub mod mention_trigger;
 pub mod traits;
 

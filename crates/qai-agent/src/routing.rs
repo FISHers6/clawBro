@@ -64,6 +64,11 @@ pub(crate) fn resolve_turn_routing(
     let roster_match = if specialist_binding_match.is_some() {
         specialist_binding_match
     } else {
+        let deterministic_binding_match = if inbound.target_agent.is_none() {
+            resolve_binding_match(roster, inbound, session_key, bindings)
+        } else {
+            None
+        };
         inbound
             .target_agent
             .as_deref()
@@ -78,10 +83,10 @@ pub(crate) fn resolve_turn_routing(
                     None
                 }
             })
+            .or(deterministic_binding_match)
             .or_else(|| {
                 if inbound.target_agent.is_none() && session_backend_id.is_none() {
-                    resolve_binding_match(roster, inbound, session_key, bindings)
-                        .or_else(|| resolve_default_roster_match(roster))
+                    resolve_default_roster_match(roster)
                 } else {
                     None
                 }
@@ -320,7 +325,7 @@ mod tests {
     }
 
     #[test]
-    fn scope_binding_only_applies_when_session_backend_unset() {
+    fn scope_binding_overrides_cached_session_backend() {
         let bindings = vec![BindingRule::scope("group:route", "claude")];
         let roster = make_roster();
 
@@ -344,10 +349,53 @@ mod tests {
             Some("manual-backend".to_string()),
             None,
         );
-        assert_eq!(
-            manual.intent.target_backend.as_deref(),
-            Some("manual-backend")
+        assert_eq!(manual.intent.target_backend.as_deref(), Some("claude-main"));
+    }
+
+    #[test]
+    fn channel_instance_binding_overrides_cached_default_backend() {
+        let roster = AgentRoster::new(vec![
+            AgentEntry {
+                name: "claude-alpha".into(),
+                mentions: vec!["@alpha".into()],
+                backend_id: "claude-main".into(),
+                persona_dir: None,
+                workspace_dir: None,
+                extra_skills_dirs: vec![],
+            },
+            AgentEntry {
+                name: "codex-beta".into(),
+                mentions: vec!["@beta".into()],
+                backend_id: "codex-main".into(),
+                persona_dir: None,
+                workspace_dir: None,
+                extra_skills_dirs: vec![],
+            },
+        ]);
+        let mut inbound = inbound("user:ou_beta", None);
+        inbound.session_key.channel_instance = Some("beta".into());
+        let bindings = vec![BindingRule::ChannelInstance {
+            channel: "lark".into(),
+            channel_instance: "beta".into(),
+            agent_name: "codex-beta".into(),
+        }];
+
+        let decision = resolve_turn_routing(
+            &inbound,
+            Some(&roster),
+            &bindings,
+            &DashMap::new(),
+            &DashSet::new(),
+            Some("claude-main".to_string()),
+            None,
         );
+
+        assert_eq!(
+            decision.intent.target_backend.as_deref(),
+            Some("codex-main")
+        );
+        assert_eq!(decision.fallback_backend_id.as_deref(), Some("codex-main"));
+        assert_eq!(decision.sender_name.as_deref(), Some("@codex-beta"));
     }
 
     #[test]

@@ -226,6 +226,17 @@ async fn main() -> Result<()> {
                 };
             match lark_instances {
                 Ok(instances) => {
+                    let known_lark_bot_mentions = instances
+                        .iter()
+                        .filter_map(|instance| {
+                            instance.bot_name.as_ref().map(|bot_name| {
+                                (
+                                    bot_name.trim().trim_start_matches('@').to_lowercase(),
+                                    instance.id.clone(),
+                                )
+                            })
+                        })
+                        .collect::<std::collections::HashMap<_, _>>();
                     let requested_default = lark_cfg.default_instance_id().to_string();
                     let has_requested_default = instances
                         .iter()
@@ -244,9 +255,13 @@ async fn main() -> Result<()> {
                             || (!has_requested_default && index == 0);
                         let channel = Arc::new(qai_channels::LarkChannel::new_with_instance(
                             instance.id.clone(),
+                            instance.bot_name.clone(),
                             instance.app_id,
                             instance.app_secret,
                             lark_trigger_policy,
+                            is_default,
+                            known_lark_bot_mentions.clone(),
+                            is_default,
                         ));
                         cron_channel_map.register(
                             "lark",

@@ -65,7 +65,7 @@ pub async fn throttled_stream(
     target_session_id: uuid::Uuid,
     sink: &dyn OutputSink,
     placeholder_id: Option<String>,
-    mut control: tokio::sync::oneshot::Receiver<StreamControl>,
+    control: tokio::sync::oneshot::Receiver<StreamControl>,
 ) {
     let throttle = Duration::from_millis(500);
     let mut accumulated = String::new();
@@ -79,17 +79,18 @@ pub async fn throttled_stream(
     // turn's text and would re-send already-delivered segments). Instead it
     // sends only the remaining accumulated text since the last flush.
     let mut has_flushed_segment = false;
+    let mut pending_control_final: Option<String> = None;
+    let mut control = std::pin::pin!(control);
 
     loop {
         let placeholder = current_placeholder.as_deref();
         tokio::select! {
             biased; // check explicit control first to avoid stale placeholder updates
-            signal = &mut control => {
+            signal = &mut control, if pending_control_final.is_none() => {
                 match signal {
                     Ok(StreamControl::Stop) | Err(_) => break,
                     Ok(StreamControl::Final(text)) => {
-                        sink.send_final(&text, placeholder).await;
-                        break;
+                        pending_control_final = Some(text);
                     }
                 }
             },
@@ -185,7 +186,12 @@ pub async fn throttled_stream(
                         }
                         _ => {} // filter other sessions or irrelevant events
                     },
-                    Err(_) => break, // channel closed or lagged (broadcast overflow)
+                    Err(_) => {
+                        if let Some(text) = pending_control_final.take() {
+                            sink.send_final(&text, placeholder).await;
+                        }
+                        break;
+                    } // channel closed or lagged (broadcast overflow)
                 }
             }
             _ = tokio::time::sleep(throttle) => {
@@ -332,7 +338,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_throttled_stream_control_final_sends_sync_reply() {
-        let (_tx, rx) = broadcast::channel::<AgentEvent>(16);
+        let (tx, rx) = broadcast::channel::<AgentEvent>(16);
         let session_id = Uuid::new_v4();
         let calls = Arc::new(Mutex::new(vec![]));
         let sink = MockSink {
@@ -343,12 +349,59 @@ mod tests {
         control_tx
             .send(StreamControl::Final("sync control reply".to_string()))
             .unwrap();
+        drop(tx);
         throttled_stream(rx, session_id, &sink, None, control_rx).await;
 
         let recorded = calls.lock().unwrap().clone();
         assert!(
             recorded.iter().any(|s| s == "final:sync control reply"),
             "explicit final control signal must send final reply"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_throttled_stream_control_final_does_not_duplicate_flushed_segments() {
+        let (tx, rx) = broadcast::channel::<AgentEvent>(16);
+        let session_id = Uuid::new_v4();
+        let calls = Arc::new(Mutex::new(vec![]));
+        let sink = MockSink {
+            calls: calls.clone(),
+        };
+
+        let _ = tx.send(AgentEvent::TextDelta {
+            session_id,
+            delta: "前置说明".to_string(),
+        });
+        let _ = tx.send(AgentEvent::ToolCallStart {
+            session_id,
+            tool_name: "Skill".to_string(),
+            call_id: "call-1".to_string(),
+        });
+        let _ = tx.send(AgentEvent::TextDelta {
+            session_id,
+            delta: "最终答复".to_string(),
+        });
+        let _ = tx.send(AgentEvent::TurnComplete {
+            session_id,
+            full_text: "前置说明最终答复".to_string(),
+            sender: None,
+        });
+
+        let (control_tx, control_rx) = make_cancel();
+        control_tx
+            .send(StreamControl::Final("前置说明最终答复".to_string()))
+            .unwrap();
+        drop(tx);
+        throttled_stream(rx, session_id, &sink, None, control_rx).await;
+
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec![
+                "segment:前置说明".to_string(),
+                "progress:start:Skill".to_string(),
+                "final:最终答复".to_string()
+            ]
         );
     }
 

@@ -35,6 +35,8 @@ pub struct SessionManager {
     storage: Arc<SessionStorage>,
     /// 内存缓存: normalized SessionKey → SessionId
     active: DashMap<SessionKey, SessionId>,
+    /// Singleflight guard for first-time creation per normalized session key.
+    creation_locks: DashMap<SessionKey, Arc<tokio::sync::Mutex<()>>>,
 }
 
 impl SessionManager {
@@ -42,12 +44,22 @@ impl SessionManager {
         Self {
             storage: Arc::new(storage),
             active: DashMap::new(),
+            creation_locks: DashMap::new(),
         }
     }
 
     /// 获取或创建 Session（幂等，基于 UUID v5 确定性 ID）
     pub async fn get_or_create(&self, key: &SessionKey) -> Result<SessionId> {
         let normalized = normalize_conversation_identity(key);
+        if let Some(id) = self.active.get(&normalized) {
+            return Ok(*id);
+        }
+        let create_lock = self
+            .creation_locks
+            .entry(normalized.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _create_guard = create_lock.lock().await;
         if let Some(id) = self.active.get(&normalized) {
             return Ok(*id);
         }
@@ -732,5 +744,26 @@ mod tests {
                 .map(String::as_str),
             Some("fp-codex")
         );
+    }
+
+    #[tokio::test]
+    async fn get_or_create_singleflights_concurrent_first_session_creation() {
+        let (mgr, _dir) = make_manager();
+        let key = SessionKey::with_instance("lark", "alpha", "group:oc_race");
+
+        let (a, b, c) = tokio::join!(
+            mgr.get_or_create(&key),
+            mgr.get_or_create(&key),
+            mgr.get_or_create(&key)
+        );
+
+        let a = a.unwrap();
+        let b = b.unwrap();
+        let c = c.unwrap();
+        assert_eq!(a, b);
+        assert_eq!(b, c);
+
+        let meta = mgr.load_meta(a).await.unwrap().unwrap();
+        assert_eq!(meta.scope, "group:oc_race");
     }
 }

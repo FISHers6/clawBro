@@ -21,7 +21,8 @@ use tokio::{
 };
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-const ACP_PROMPT_FIRST_VISIBLE_TIMEOUT: Duration = Duration::from_secs(60);
+const ACP_PROMPT_FIRST_VISIBLE_TIMEOUT_DEFAULT: Duration = Duration::from_secs(60);
+const ACP_PROMPT_FIRST_VISIBLE_TIMEOUT_CLAUDE: Duration = Duration::from_secs(90);
 const ACP_PROMPT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 struct ChildKillGuard(tokio::process::Child);
@@ -90,6 +91,13 @@ fn format_acp_prompt_timeout_error(
     )
 }
 
+fn is_resumed_prompt_context_overflow(error: &anyhow::Error) -> bool {
+    let rendered = format!("{error:?}").to_ascii_lowercase();
+    rendered.contains("maximum context length")
+        || (rendered.contains("invalid_request_error")
+            && rendered.contains("reduce the length of the messages"))
+}
+
 async fn wait_for_prompt_completion<F, T, E>(
     prompt_future: F,
     active_session_id: &acp::SessionId,
@@ -97,6 +105,7 @@ async fn wait_for_prompt_completion<F, T, E>(
     last_activity_at: &Cell<Instant>,
     first_live_update_at: &Cell<Option<Instant>>,
     first_live_update_kind: &std::cell::RefCell<Option<&'static str>>,
+    first_visible_timeout: Duration,
 ) -> anyhow::Result<()>
 where
     F: std::future::Future<Output = Result<T, E>>,
@@ -107,10 +116,7 @@ where
     loop {
         let idle_deadline = last_activity_at.get() + ACP_PROMPT_IDLE_TIMEOUT;
         let next_deadline = if first_live_update_at.get().is_none() {
-            std::cmp::min(
-                idle_deadline,
-                prompt_started_at + ACP_PROMPT_FIRST_VISIBLE_TIMEOUT,
-            )
+            std::cmp::min(idle_deadline, prompt_started_at + first_visible_timeout)
         } else {
             idle_deadline
         };
@@ -138,7 +144,7 @@ where
                 let first_kind = *first_live_update_kind.borrow();
 
                 if first_live_update_at.get().is_none()
-                    && total_elapsed >= ACP_PROMPT_FIRST_VISIBLE_TIMEOUT
+                    && total_elapsed >= first_visible_timeout
                 {
                     let message = format_acp_prompt_timeout_error(
                         active_session_id,
@@ -265,6 +271,7 @@ pub async fn run_command_turn(
     use std::{cell::RefCell, rc::Rc};
 
     let policy = AcpBackendPolicy::for_backend(acp_backend);
+    let first_visible_timeout = first_visible_timeout_for_backend(acp_backend);
     tracing::debug!(
         acp_backend = ?acp_backend,
         approval_mode = ?session.approval_mode,
@@ -628,7 +635,7 @@ pub async fn run_command_turn(
     // Decide: resume via session/load or start a new session.
     let can_load = init_resp.agent_capabilities.load_session;
     let mut resume_recovery = None;
-    let (active_session_id, emitted_backend_session_id, transcript_ownership) =
+    let (mut active_session_id, mut emitted_backend_session_id, mut transcript_ownership) =
         if policy.resume_strategy == ResumeStrategy::AcpLoadSession
             && can_load
             && session.backend_session_id.is_some()
@@ -671,7 +678,7 @@ pub async fn run_command_turn(
                         error = ?e,
                         "ACP load_session failed; falling back to fresh new_session"
                     );
-                    resume_recovery = Some(ResumeRecoveryAction::DropFailedLoadSessionHandle {
+                    resume_recovery = Some(ResumeRecoveryAction::DropStaleResumedSessionHandle {
                         stale_session_id: prior_id.clone(),
                     });
                     tracing::debug!("Sending ACP new_session request after load_session failure");
@@ -703,7 +710,8 @@ pub async fn run_command_turn(
             tracing::debug!("Sending ACP new_session request");
             let sess = conn
                 .new_session(
-                    acp::NewSessionRequest::new(session_root).mcp_servers(mcp_servers.clone()),
+                    acp::NewSessionRequest::new(session_root.clone())
+                        .mcp_servers(mcp_servers.clone()),
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("ACP new_session failed: {e:?}"))?;
@@ -716,49 +724,96 @@ pub async fn run_command_turn(
             )
         };
 
-    tracing::debug!(
-        session_id = %active_session_id,
-        "Applying Codex session mode projection if required"
-    );
-    apply_codex_session_mode_projection(
-        &conn,
-        acp_backend,
-        &active_session_id,
-        session.approval_mode,
-    )
-    .await?;
+    loop {
+        tracing::debug!(
+            session_id = %active_session_id,
+            "Applying Codex session mode projection if required"
+        );
+        apply_codex_session_mode_projection(
+            &conn,
+            acp_backend,
+            &active_session_id,
+            session.approval_mode,
+        )
+        .await?;
 
-    let prompt_session = session_for_acp_prompt(&session, acp_backend, transcript_ownership);
-    let prompt_blocks = prompt_blocks_from_session(&prompt_session);
-    let prompt_start = Instant::now();
-    prompt_started_at.set(prompt_start);
-    last_activity_at.set(prompt_start);
-    first_live_update_at.set(None);
-    *first_live_update_kind.borrow_mut() = None;
-    tracing::debug!(
-        session_id = %active_session_id,
-        transcript_ownership = ?transcript_ownership,
-        prompt_blocks = prompt_blocks.len(),
-        prompt_text_len = prompt_blocks
-            .iter()
-            .map(|block| match block {
-                acp::ContentBlock::Text(text) => text.text.len(),
-                _ => 0,
-            })
-            .sum::<usize>(),
-        first_visible_timeout_ms = ACP_PROMPT_FIRST_VISIBLE_TIMEOUT.as_millis() as u64,
-        idle_timeout_ms = ACP_PROMPT_IDLE_TIMEOUT.as_millis() as u64,
-        "Sending ACP prompt request"
-    );
-    wait_for_prompt_completion(
-        conn.prompt(acp::PromptRequest::new(active_session_id.clone(), prompt_blocks)),
-        &active_session_id,
-        prompt_start,
-        &last_activity_at,
-        &first_live_update_at,
-        &first_live_update_kind,
-    )
-    .await?;
+        let prompt_session = session_for_acp_prompt(&session, acp_backend, transcript_ownership);
+        let prompt_blocks = prompt_blocks_from_session(&prompt_session);
+        let prompt_start = Instant::now();
+        prompt_started_at.set(prompt_start);
+        last_activity_at.set(prompt_start);
+        first_live_update_at.set(None);
+        *first_live_update_kind.borrow_mut() = None;
+        tracing::debug!(
+            session_id = %active_session_id,
+            transcript_ownership = ?transcript_ownership,
+            prompt_blocks = prompt_blocks.len(),
+            prompt_text_len = prompt_blocks
+                .iter()
+                .map(|block| match block {
+                    acp::ContentBlock::Text(text) => text.text.len(),
+                    _ => 0,
+                })
+                .sum::<usize>(),
+            first_visible_timeout_ms = first_visible_timeout.as_millis() as u64,
+            idle_timeout_ms = ACP_PROMPT_IDLE_TIMEOUT.as_millis() as u64,
+            "Sending ACP prompt request"
+        );
+        match wait_for_prompt_completion(
+            conn.prompt(acp::PromptRequest::new(
+                active_session_id.clone(),
+                prompt_blocks,
+            )),
+            &active_session_id,
+            prompt_start,
+            &last_activity_at,
+            &first_live_update_at,
+            &first_live_update_kind,
+            first_visible_timeout,
+        )
+        .await
+        {
+            Ok(()) => break,
+            Err(error)
+                if transcript_ownership == ClaudeTranscriptOwnership::BackendResume
+                    && first_live_update_at.get().is_none()
+                    && is_resumed_prompt_context_overflow(&error) =>
+            {
+                let stale_session_id = active_session_id.to_string();
+                tracing::warn!(
+                    stale_backend_session_id = %stale_session_id,
+                    error = %error,
+                    "ACP resumed prompt exceeded context budget; retrying via fresh new_session"
+                );
+                resume_recovery = Some(ResumeRecoveryAction::DropStaleResumedSessionHandle {
+                    stale_session_id: stale_session_id.clone(),
+                });
+                accumulated.borrow_mut().clear();
+                tracing::debug!("Sending ACP new_session request after resumed prompt overflow");
+                let sess = conn
+                    .new_session(
+                        acp::NewSessionRequest::new(session_root.clone())
+                            .mcp_servers(mcp_servers.clone()),
+                    )
+                    .await
+                    .map_err(|new_err| {
+                        anyhow::anyhow!(
+                            "ACP resumed prompt overflow: {error:?}; fallback new_session failed: {new_err:?}"
+                        )
+                    })?;
+                let new_id = sess.session_id.to_string();
+                tracing::info!(
+                    stale_backend_session_id = %stale_session_id,
+                    new_backend_session_id = %new_id,
+                    "ACP resumed prompt self-healed via fresh new_session"
+                );
+                active_session_id = sess.session_id;
+                emitted_backend_session_id = Some(new_id);
+                transcript_ownership = ClaudeTranscriptOwnership::HostReplay;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 
     let full_text = accumulated.borrow().clone();
     tracing::debug!(
@@ -782,6 +837,13 @@ pub async fn run_command_turn(
 
     terminate_and_reap_child(&mut child.0, "acp_command_turn").await;
     turn_result
+}
+
+fn first_visible_timeout_for_backend(acp_backend: Option<AcpBackend>) -> Duration {
+    match acp_backend {
+        Some(AcpBackend::Claude) => ACP_PROMPT_FIRST_VISIBLE_TIMEOUT_CLAUDE,
+        _ => ACP_PROMPT_FIRST_VISIBLE_TIMEOUT_DEFAULT,
+    }
 }
 
 async fn authenticate_if_configured(
@@ -1251,6 +1313,36 @@ mod tests {
         let servers = build_mcp_servers(true, true, Some("http://127.0.0.1:9999"), &[]);
         assert_eq!(servers.len(), 1);
         assert!(matches!(servers[0], acp::McpServer::Http(_)));
+    }
+
+    #[test]
+    fn first_visible_timeout_is_backend_aware() {
+        assert_eq!(
+            first_visible_timeout_for_backend(Some(AcpBackend::Claude)),
+            Duration::from_secs(90)
+        );
+        assert_eq!(
+            first_visible_timeout_for_backend(Some(AcpBackend::Codex)),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            first_visible_timeout_for_backend(None),
+            Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn detects_context_overflow_for_resumed_prompt_recovery() {
+        let err = anyhow::anyhow!(
+            "ACP prompt failed: Internal error: API Error: 400 {{\"error\":{{\"message\":\"This model's maximum context length is 131072 tokens. However, you requested 135248 tokens (127056 in the messages, 8192 in the completion). Please reduce the length of the messages or completion.\",\"type\":\"invalid_request_error\"}}}}"
+        );
+        assert!(is_resumed_prompt_context_overflow(&err));
+    }
+
+    #[test]
+    fn ignores_non_context_errors_for_resumed_prompt_recovery() {
+        let err = anyhow::anyhow!("ACP prompt failed: transport disconnected");
+        assert!(!is_resumed_prompt_context_overflow(&err));
     }
 
     #[test]
