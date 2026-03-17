@@ -1,0 +1,32 @@
+[package]
+name = "clawbro-agent"
+version = "0.1.0"
+publish = false
+edition = "2021"
+
+[dependencies]
+clawbro-protocol  = { path = "../clawbro-protocol", version = "0.1.0" }
+clawbro-runtime   = { path = "../clawbro-runtime", version = "0.1.0" }
+clawbro-session   = { path = "../clawbro-session", version = "0.1.0" }
+clawbro-skills    = { path = "../clawbro-skills", version = "0.1.0" }
+clawbro-channels  = { path = "../clawbro-channels", version = "0.1.0" }
+axum.workspace       = true
+tokio.workspace      = true
+futures.workspace    = true
+async-trait.workspace = true
+serde.workspace      = true
+serde_json.workspace = true
+anyhow.workspace     = true
+tracing.workspace    = true
+uuid.workspace       = true
+dashmap.workspace    = true
+agent-client-protocol = { version = "0.10.2" }
+tokio-util = { version = "0.7", features = ["compat"] }
+rmcp = { version = "=0.8.5", features = ["server", "transport-sse-server", "transport-streamable-http-server"] }
+chrono.workspace     = true
+dirs = "5"
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+[dev-dependencies]
+tempfile = "3"
+toml = "0.8"

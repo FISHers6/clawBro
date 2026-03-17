@@ -1,0 +1,17 @@
+[package]
+name = "clawbro-protocol"
+version = "0.1.0"
+publish = false
+edition = "2021"
+description = "Host-neutral runtime contract for ClawBro runtimes, shells, and gateways"
+license = "MIT"
+repository = "https://github.com/fishers/clawbro-openclaw"
+readme = "README.md"
+keywords = ["ai", "agent", "protocol", "runtime"]
+categories = ["api-bindings", "development-tools"]
+
+[dependencies]
+serde.workspace      = true
+serde_json.workspace = true
+uuid.workspace       = true
+chrono.workspace     = true

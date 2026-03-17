@@ -1,4 +1,4 @@
-# QuickAI CLI 设计方案
+# ClawBro CLI 设计方案
 
 > 日期：2026-03-18
 > 参考：zeroclaw CLI 架构研究（`docs/research/zeroclaw-cli-architecture-research.md`）、nanoclaw Skills 研究
@@ -7,13 +7,13 @@
 
 ## 背景与目标
 
-QuickAI Gateway 需要一个面向终端用户的 CLI，解决 onboarding 问题：
-- 用户不知道如何创建 `~/.quickai/config.toml`
+ClawBro Gateway 需要一个面向终端用户的 CLI，解决 onboarding 问题：
+- 用户不知道如何创建 `~/.clawbro/config.toml`
 - 手动编辑 TOML 容易出错且不友好
 - 添加新功能（Channel、Agent、Backend）需要了解配置结构
 
 **双轨并行**：
-1. **CLI 命令**（非交互式/脚本友好）：`quickai add channel lark`
+1. **CLI 命令**（非交互式/脚本友好）：`clawbro add channel lark`
 2. **Claude Code Skills**（AI 引导式）：`/add-lark`（调用本文定义的 Skill）
 
 两者生成**相同的配置结果**，用户可以选择喜欢的方式。
@@ -25,24 +25,24 @@ QuickAI Gateway 需要一个面向终端用户的 CLI，解决 onboarding 问题
 ### Binary 名称
 
 ```
-quickai          — 主 CLI（配置管理 + 状态查询）
-quickai-gateway  — 纯服务端（保持现有行为，只负责 serve）
+clawbro          — 主 CLI（配置管理 + 状态查询）
+clawbro-gateway  — 纯服务端（保持现有行为，只负责 serve）
 ```
 
 > 参考 zeroclaw：`zeroclaw` 一个 binary 搞定所有事（init/add/serve/status）。
-> quickai 也应该一个入口覆盖所有，`quickai serve` 等同于 `quickai-gateway`。
+> clawbro 也应该一个入口覆盖所有，`clawbro serve` 等同于 `clawbro-gateway`。
 
 ### 放哪里
 
-选项 A（推荐）：在 `qai-server` crate 增加一个新 `[[bin]]`：
+选项 A（推荐）：在 `clawbro-server` crate 增加一个新 `[[bin]]`：
 ```toml
 [[bin]]
-name = "quickai"
-path = "src/bin/quickai_cli.rs"
+name = "clawbro"
+path = "src/bin/clawbro_cli.rs"
 ```
 
-选项 B：新建 `crates/qai-cli` crate，专门承载 CLI 逻辑。
-- 好处：职责分离，`qai-server` 不膨胀
+选项 B：新建 `crates/clawbro-cli` crate，专门承载 CLI 逻辑。
+- 好处：职责分离，`clawbro-server` 不膨胀
 - 坏处：增加一个 crate
 
 **建议选 A（初期），代码量增大后再分离**。
@@ -52,9 +52,9 @@ path = "src/bin/quickai_cli.rs"
 ## 命令树（完整设计）
 
 ```
-quickai
+clawbro
 ├── serve [--config <path>] [--port <port>]
-│                     启动 Gateway 服务（等同于直接运行 quickai-gateway）
+│                     启动 Gateway 服务（等同于直接运行 clawbro-gateway）
 │
 ├── init              交互式初始化向导（等同于 /setup skill 的 CLI 版本）
 │   [--mode solo|multi|team]
@@ -105,7 +105,7 @@ quickai
 │   [--fix]           自动修复可以修复的问题
 │
 ├── key
-│   ├── set <provider> <key>   设置 API Key 到 ~/.quickai/.env
+│   ├── set <provider> <key>   设置 API Key 到 ~/.clawbro/.env
 │   └── check                 检查所有 API Key 是否有效
 │
 └── team              Team 模式运维命令（需要 Gateway 正在运行）
@@ -120,13 +120,13 @@ quickai
 
 | 操作 | CLI 命令 | Claude Code Skill | 结果 |
 |------|---------|-----------------|------|
-| 初始化 | `quickai init` | `/setup` | 生成 `~/.quickai/config.toml` |
-| 添加飞书 | `quickai add channel lark` | `/add-lark` | 追加 `[channels.lark]` |
-| 添加钉钉 | `quickai add channel dingtalk` | `/add-dingtalk` | 追加 `[channels.dingtalk]` |
-| 添加 Backend | `quickai add backend codex` | `/add-acp-backend` | 追加 `[[backend]]` |
-| 添加 Agent | `quickai add agent rex` | `/add-agent` | 追加 `[[agent_roster]]` |
-| 开启 Team | `quickai add team-mode` | `/add-team-mode` | 追加 `[[group]]` |
-| 诊断 | `quickai doctor` | `/doctor` | 检查报告 |
+| 初始化 | `clawbro init` | `/setup` | 生成 `~/.clawbro/config.toml` |
+| 添加飞书 | `clawbro add channel lark` | `/add-lark` | 追加 `[channels.lark]` |
+| 添加钉钉 | `clawbro add channel dingtalk` | `/add-dingtalk` | 追加 `[channels.dingtalk]` |
+| 添加 Backend | `clawbro add backend codex` | `/add-acp-backend` | 追加 `[[backend]]` |
+| 添加 Agent | `clawbro add agent rex` | `/add-agent` | 追加 `[[agent_roster]]` |
+| 开启 Team | `clawbro add team-mode` | `/add-team-mode` | 追加 `[[group]]` |
+| 诊断 | `clawbro doctor` | `/doctor` | 检查报告 |
 
 **Skills 是 AI 引导版 CLI**：
 - 有更多解释、提示、上下文帮助
@@ -144,26 +144,26 @@ quickai
 
 ### P0（MVP，onboarding 必需）
 
-1. `quickai init` — 最重要，解决"第一次怎么用"问题
-2. `quickai serve` — 等同于 quickai-gateway，统一入口
-3. `quickai doctor` — 诊断问题
-4. `quickai key set` — 设置 API Key
+1. `clawbro init` — 最重要，解决"第一次怎么用"问题
+2. `clawbro serve` — 等同于 clawbro-gateway，统一入口
+3. `clawbro doctor` — 诊断问题
+4. `clawbro key set` — 设置 API Key
 
 ### P1（常用功能）
 
-5. `quickai add channel lark`
-6. `quickai add channel dingtalk`
-7. `quickai config show / validate`
-8. `quickai status`
-9. `quickai list agents|backends`
+5. `clawbro add channel lark`
+6. `clawbro add channel dingtalk`
+7. `clawbro config show / validate`
+8. `clawbro status`
+9. `clawbro list agents|backends`
 
 ### P2（进阶功能）
 
-10. `quickai add backend <type>`
-11. `quickai add agent <name>`
-12. `quickai add team-mode`
-13. `quickai team status/tasks`
-14. `quickai remove *`
+10. `clawbro add backend <type>`
+11. `clawbro add agent <name>`
+12. `clawbro add team-mode`
+13. `clawbro team status/tasks`
+14. `clawbro remove *`
 
 ---
 
@@ -172,7 +172,7 @@ quickai
 ### 依赖
 
 ```toml
-# 在 qai-server/Cargo.toml 中追加
+# 在 clawbro-server/Cargo.toml 中追加
 clap = { version = "4", features = ["derive", "env", "color"] }
 dialoguer = "0.11"        # 交互式提示（select/input/confirm）
 indicatif = "0.17"        # 进度条
@@ -185,26 +185,26 @@ toml_edit = "0.22"        # 无损 TOML 编辑（保留注释和格式）
 ### 代码结构
 
 ```
-crates/qai-server/src/bin/quickai_cli.rs   — bin 入口
-crates/qai-server/src/cli/
+crates/clawbro-server/src/bin/clawbro_cli.rs   — bin 入口
+crates/clawbro-server/src/cli/
   mod.rs          — CLI 模块导出
   args.rs         — clap Args 结构（derive 宏定义所有命令）
-  init.rs         — quickai init 实现
+  init.rs         — clawbro init 实现
   add/
     channel_lark.rs
     channel_dingtalk.rs
     backend.rs
     agent.rs
     team_mode.rs
-  config.rs       — quickai config show/validate/set
-  doctor.rs       — quickai doctor
-  key.rs          — quickai key set/check
-  status.rs       — quickai status
-  team.rs         — quickai team status/tasks
-  serve.rs        — quickai serve（调用现有 main 逻辑）
+  config.rs       — clawbro config show/validate/set
+  doctor.rs       — clawbro doctor
+  key.rs          — clawbro key set/check
+  status.rs       — clawbro status
+  team.rs         — clawbro team status/tasks
+  serve.rs        — clawbro serve（调用现有 main 逻辑）
   utils/
     config_editor.rs  — toml_edit 包装，读写 config.toml
-    env_editor.rs     — 读写 ~/.quickai/.env
+    env_editor.rs     — 读写 ~/.clawbro/.env
     terminal.rs       — 颜色、表格、spinners
 ```
 
@@ -215,7 +215,7 @@ crates/qai-server/src/cli/
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "quickai", about = "QuickAI Gateway CLI", version)]
+#[command(name = "clawbro", about = "ClawBro Gateway CLI", version)]
 pub struct Cli {
     #[arg(short, long, global = true, help = "配置文件路径")]
     pub config: Option<PathBuf>,
@@ -298,10 +298,10 @@ impl ConfigEditor {
 
 ---
 
-## `quickai init` 交互流程（CLI 版）
+## `clawbro init` 交互流程（CLI 版）
 
 ```
-$ quickai init
+$ clawbro init
 
   ██████  ██    ██ ██  ██████ ██   ██  █████  ██
  ██    ██ ██    ██ ██ ██      ██  ██  ██   ██ ██
@@ -309,12 +309,12 @@ $ quickai init
  ██ ▄▄ ██ ██    ██ ██ ██      ██  ██  ██   ██ ██
   ██████   ██████  ██  ██████ ██   ██ ██   ██ ██
 
-  QuickAI Gateway — 初始化向导
+  ClawBro Gateway — 初始化向导
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-✓ 已找到 quickai-gateway
-✓ 已找到 quickai-rust-agent
+✓ 已找到 clawbro-gateway
+✓ 已找到 clawbro-rust-agent
 
 ? 选择 AI Provider: ›
   ❯ Anthropic（Claude）
@@ -324,7 +324,7 @@ $ quickai init
 
 ? 输入 ANTHROPIC_API_KEY: › sk-ant-***（输入时隐藏）
 
-✓ API Key 已写入 ~/.quickai/.env
+✓ API Key 已写入 ~/.clawbro/.env
 
 ? 选择运行模式: ›
   ❯ Solo（单 Agent，适合个人使用）
@@ -346,21 +346,21 @@ $ quickai init
   backend_id = "native-main"
   ...
 
-? 写入 ~/.quickai/config.toml？ › (Y/n)
+? 写入 ~/.clawbro/config.toml？ › (Y/n)
 
 ✓ 配置已写入！
 
 ? 接入 IM Channel？ ›
   ❯ 暂不接入，只用 WebSocket
-    飞书（运行 quickai add channel lark）
-    钉钉（运行 quickai add channel dingtalk）
+    飞书（运行 clawbro add channel lark）
+    钉钉（运行 clawbro add channel dingtalk）
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   🎉 初始化完成！
 
-  启动命令：source ~/.quickai/.env && quickai serve
-  添加飞书：quickai add channel lark
-  诊断问题：quickai doctor
+  启动命令：source ~/.clawbro/.env && clawbro serve
+  添加飞书：clawbro add channel lark
+  诊断问题：clawbro doctor
 ```
 
 ---
@@ -369,19 +369,19 @@ $ quickai init
 
 ```bash
 # 一行完成初始化（适合 Dockerfile）
-quickai init \
+clawbro init \
   --non-interactive \
   --mode solo \
   --provider anthropic
 
 # 添加飞书（非交互，所有参数通过 flag 提供）
-quickai add channel lark \
+clawbro add channel lark \
   --app-id cli_xxxx \
   --app-secret xxxx \
   --verification-token xxxx
 
 # 设置 API Key（非交互）
-quickai key set anthropic sk-ant-xxxx
+clawbro key set anthropic sk-ant-xxxx
 ```
 
 ---
@@ -392,20 +392,20 @@ quickai key set anthropic sk-ant-xxxx
 
 ```bash
 # macOS
-curl -L https://github.com/fishers/quickai-openclaw/releases/latest/download/quickai-darwin-aarch64.tar.gz | tar xz
-mv quickai ~/.local/bin/
-mv quickai-gateway ~/.local/bin/
-mv quickai-rust-agent ~/.local/bin/
+curl -L https://github.com/fishers/clawbro-openclaw/releases/latest/download/clawbro-darwin-aarch64.tar.gz | tar xz
+mv clawbro ~/.local/bin/
+mv clawbro-gateway ~/.local/bin/
+mv clawbro-rust-agent ~/.local/bin/
 ```
 
 ### 方式 2：从源码编译
 
 ```bash
-git clone https://github.com/fishers/quickai-openclaw
-cd quickai-openclaw/quickai-gateway
-cargo build -r -p qai-server --bin quickai
-cargo build -r -p qai-server --bin quickai-gateway
-cargo build -r -p quickai-rust-agent
+git clone https://github.com/fishers/clawbro-openclaw
+cd clawbro-openclaw/clawbro-gateway
+cargo build -r -p clawbro-server --bin clawbro
+cargo build -r -p clawbro-server --bin clawbro-gateway
+cargo build -r -p clawbro-rust-agent
 ```
 
 ### 方式 3：Claude Code Skills 用户
@@ -419,10 +419,10 @@ cargo build -r -p quickai-rust-agent
 一个 Release 包含三个 binary：
 
 ```
-quickai-gateway-v0.x.x-darwin-aarch64.tar.gz
-  ├── quickai           — 主 CLI（P0 实现后）
-  ├── quickai-gateway   — 服务端（现有）
-  └── quickai-rust-agent — 内置 ACP Agent（现有）
+clawbro-gateway-v0.x.x-darwin-aarch64.tar.gz
+  ├── clawbro           — 主 CLI（P0 实现后）
+  ├── clawbro-gateway   — 服务端（现有）
+  └── clawbro-rust-agent — 内置 ACP Agent（现有）
 ```
 
 GitHub Actions workflow 目标平台：
@@ -436,14 +436,14 @@ GitHub Actions workflow 目标平台：
 ## 实现计划
 
 ### Task 1：骨架 + serve 子命令（0.5 天）
-- `qai-server/src/bin/quickai_cli.rs`
+- `clawbro-server/src/bin/clawbro_cli.rs`
 - `clap` Args 定义（Commands 枚举）
 - `serve` 子命令复用 main 逻辑
 
 ### Task 2：config_editor + key 子命令（0.5 天）
 - `toml_edit` 包装
-- `quickai key set <provider> <key>`
-- `quickai config show / validate`
+- `clawbro key set <provider> <key>`
+- `clawbro config show / validate`
 
 ### Task 3：init 交互向导（1 天）
 - `dialoguer` 交互提示

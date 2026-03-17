@@ -2,18 +2,18 @@
 
 ## Purpose
 
-QuickAI uses two cooperating context channels:
+ClawBro uses two cooperating context channels:
 
 - runtime contract
 - filesystem-native contract
 
 The runtime contract carries structured fields such as `memory_summary`, `agent_memory`, `team_manifest`, and `task_reminder`.
 Those fields are projections of the filesystem-native contract.
-The filesystem contract exposes stable context files so different backend families and CLI agents can consume one shared context shape without QuickAI pretending every backend speaks the same transport.
+The filesystem contract exposes stable context files so different backend families and CLI agents can consume one shared context shape without ClawBro pretending every backend speaks the same transport.
 
 ## Current Contract
 
-When present in the resolved persona, workspace, or team roots, QuickAI projects these files into `RuntimeContext.workspace_native_files`:
+When present in the resolved persona, workspace, or team roots, ClawBro projects these files into `RuntimeContext.workspace_native_files`:
 
 - `SOUL.md`
 - `IDENTITY.md`
@@ -33,7 +33,7 @@ When present in the resolved persona, workspace, or team roots, QuickAI projects
 - `workspace_root` contributes workspace files such as `AGENTS.md`, `CLAUDE.md`, optional `USER.md`, and optional `HEARTBEAT.md`.
 - `team_root` contributes team-scoped files such as `TEAM.md`, `CONTEXT.md`, `TASKS.md`, and optional `HEARTBEAT.md`.
 - The projected contract is deterministic and ordered as: persona files, workspace files, team files.
-- If the same filename exists in multiple roots, QuickAI deduplicates by filename in the visible-file projection.
+- If the same filename exists in multiple roots, ClawBro deduplicates by filename in the visible-file projection.
 
 ## Role Notes
 
@@ -41,11 +41,11 @@ When present in the resolved persona, workspace, or team roots, QuickAI projects
 - `Lead`: receives persona and workspace-native files plus team-scoped files when team mode is active.
 - `Specialist`: receives role-allowed persona files plus team-scoped files. `MEMORY.md` is not automatically exposed to specialists.
 
-This is intentionally conservative: QuickAI standardizes file visibility first, and keeps prompt/runtime semantics separate from raw file projection.
+This is intentionally conservative: ClawBro standardizes file visibility first, and keeps prompt/runtime semantics separate from raw file projection.
 
 ## Projection Rule
 
-QuickAI treats files as the durable source of truth and `RuntimeContext` as the projection layer:
+ClawBro treats files as the durable source of truth and `RuntimeContext` as the projection layer:
 
 - `system_prompt` is derived support text for runtimes that need structured prompt assembly
 - `memory_summary` projects shared contextual memory
@@ -58,7 +58,7 @@ QuickAI treats files as the durable source of truth and `RuntimeContext` as the 
 `HEARTBEAT.md` is common in mature systems such as OpenClaw and hiClaw.
 It represents periodic operational intent in a durable, inspectable form rather than burying it inside prompt text or scheduler-specific code.
 
-Adding it to the contract now gives QuickAI:
+Adding it to the contract now gives ClawBro:
 
 - a stable cross-backend context shape
 - a place to evolve heartbeat-native behavior later

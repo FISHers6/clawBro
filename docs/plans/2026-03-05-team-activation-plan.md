@@ -16,24 +16,24 @@
 
 | File | Change |
 |------|--------|
-| `crates/qai-protocol/src/types.rs` | +`MsgSource::TeamNotify` variant |
-| `crates/qai-agent/src/team/orchestrator.rs` | +`TeamState`, +`lead_session_key`, +`lead_mcp_server_port`, +`register_task()`, +`activate()`, +`post_message()` |
-| `crates/qai-agent/src/team/session.rs` | Extend `build_task_reminder()`: inject upstream completion notes |
-| `crates/qai-agent/src/team/lead_mcp_server.rs` | **NEW**: 6 Lead tools |
-| `crates/qai-agent/src/team/mod.rs` | +`pub mod lead_mcp_server` |
-| `crates/qai-agent/src/registry.rs` | Lead detection + Layer 0 + TeamNotify dispatch + confirmation interceptor |
-| `crates/qai-server/src/main.rs` | Spawn LeadMcpServer, wire `lead_mcp_server_port` |
+| `crates/clawbro-protocol/src/types.rs` | +`MsgSource::TeamNotify` variant |
+| `crates/clawbro-agent/src/team/orchestrator.rs` | +`TeamState`, +`lead_session_key`, +`lead_mcp_server_port`, +`register_task()`, +`activate()`, +`post_message()` |
+| `crates/clawbro-agent/src/team/session.rs` | Extend `build_task_reminder()`: inject upstream completion notes |
+| `crates/clawbro-agent/src/team/lead_mcp_server.rs` | **NEW**: 6 Lead tools |
+| `crates/clawbro-agent/src/team/mod.rs` | +`pub mod lead_mcp_server` |
+| `crates/clawbro-agent/src/registry.rs` | Lead detection + Layer 0 + TeamNotify dispatch + confirmation interceptor |
+| `crates/clawbro-server/src/main.rs` | Spawn LeadMcpServer, wire `lead_mcp_server_port` |
 
 ---
 
-## Task 1: Add `MsgSource::TeamNotify` to qai-protocol
+## Task 1: Add `MsgSource::TeamNotify` to clawbro-protocol
 
 **Files:**
-- Modify: `crates/qai-protocol/src/types.rs`
+- Modify: `crates/clawbro-protocol/src/types.rs`
 
 **Step 1: Write the failing test**
 
-In `crates/qai-protocol/src/types.rs` tests block, add:
+In `crates/clawbro-protocol/src/types.rs` tests block, add:
 
 ```rust
 #[test]
@@ -51,14 +51,14 @@ fn test_team_notify_variant_exists() {
 **Step 2: Run test to verify it fails**
 
 ```bash
-cargo test -p qai-protocol test_team_notify_variant_exists 2>&1 | tail -5
+cargo test -p clawbro-protocol test_team_notify_variant_exists 2>&1 | tail -5
 ```
 
 Expected: `error[E0599]: no variant named \`TeamNotify\``
 
 **Step 3: Add the variant**
 
-In `crates/qai-protocol/src/types.rs`, add after `Heartbeat`:
+In `crates/clawbro-protocol/src/types.rs`, add after `Heartbeat`:
 
 ```rust
     /// Heartbeat,
@@ -71,7 +71,7 @@ The enum now has 6 variants. `#[serde(rename_all = "snake_case")]` produces `"te
 **Step 4: Run test to verify it passes**
 
 ```bash
-cargo test -p qai-protocol -- --nocapture 2>&1 | tail -5
+cargo test -p clawbro-protocol -- --nocapture 2>&1 | tail -5
 ```
 
 Expected: all tests pass.
@@ -79,7 +79,7 @@ Expected: all tests pass.
 **Step 5: Commit**
 
 ```bash
-git add crates/qai-protocol/src/types.rs
+git add crates/clawbro-protocol/src/types.rs
 git commit -m "feat(protocol): add MsgSource::TeamNotify for Lead feedback loop"
 ```
 
@@ -88,7 +88,7 @@ git commit -m "feat(protocol): add MsgSource::TeamNotify for Lead feedback loop"
 ## Task 2: TeamOrchestrator — TeamState + register_task() + activate()
 
 **Files:**
-- Modify: `crates/qai-agent/src/team/orchestrator.rs`
+- Modify: `crates/clawbro-agent/src/team/orchestrator.rs`
 
 ### Step 1: Write failing tests first
 
@@ -132,14 +132,14 @@ async fn test_activate_starts_heartbeat_and_mcp() {
 **Step 2: Run tests to verify they fail**
 
 ```bash
-cargo test -p qai-agent team_state 2>&1 | tail -10
+cargo test -p clawbro-agent team_state 2>&1 | tail -10
 ```
 
 Expected: compile error — `TeamState` not defined.
 
 **Step 3: Add TeamState + new fields**
 
-In `crates/qai-agent/src/team/orchestrator.rs`:
+In `crates/clawbro-agent/src/team/orchestrator.rs`:
 
 After the existing imports, add:
 
@@ -164,7 +164,7 @@ In `TeamOrchestrator` struct, add fields after `mcp_server_port`:
     /// 当前 Team 执行状态（Planning / AwaitingConfirm / Running / Done）
     pub team_state_inner: std::sync::Mutex<TeamState>,
     /// Lead Agent 的 IM session key（设置后用于 TeamNotify 路由）
-    pub lead_session_key: std::sync::OnceLock<qai_protocol::SessionKey>,
+    pub lead_session_key: std::sync::OnceLock<clawbro_protocol::SessionKey>,
     /// Bound port of the Lead MCP server (set after spawn in main.rs).
     pub lead_mcp_server_port: std::sync::OnceLock<u16>,
 ```
@@ -191,7 +191,7 @@ After `set_notify_fn()`:
     }
 
     /// 设置 Lead 的 IM session key（由 main.rs 在启动时或首次 Lead 消息时调用）
-    pub fn set_lead_session_key(&self, key: qai_protocol::SessionKey) {
+    pub fn set_lead_session_key(&self, key: clawbro_protocol::SessionKey) {
         let _ = self.lead_session_key.set(key);
     }
 
@@ -310,7 +310,7 @@ Correction to the activate() return:
 **Step 5: Run tests**
 
 ```bash
-cargo test -p qai-agent test_register_task test_team_state test_activate 2>&1 | tail -20
+cargo test -p clawbro-agent test_register_task test_team_state test_activate 2>&1 | tail -20
 ```
 
 Expected: all 3 new tests pass. Existing tests still pass.
@@ -318,7 +318,7 @@ Expected: all 3 new tests pass. Existing tests still pass.
 **Step 6: Commit**
 
 ```bash
-git add crates/qai-agent/src/team/orchestrator.rs
+git add crates/clawbro-agent/src/team/orchestrator.rs
 git commit -m "feat(team): add TeamState + register_task() + activate() to TeamOrchestrator"
 ```
 
@@ -327,7 +327,7 @@ git commit -m "feat(team): add TeamState + register_task() + activate() to TeamO
 ## Task 3: Upstream Result Injection in build_task_reminder()
 
 **Files:**
-- Modify: `crates/qai-agent/src/team/session.rs`
+- Modify: `crates/clawbro-agent/src/team/session.rs`
 
 ### Step 1: Write failing test
 
@@ -368,7 +368,7 @@ fn test_build_task_reminder_injects_upstream_notes() {
 **Step 2: Run to verify failure**
 
 ```bash
-cargo test -p qai-agent test_build_task_reminder_injects_upstream 2>&1 | tail -5
+cargo test -p clawbro-agent test_build_task_reminder_injects_upstream 2>&1 | tail -5
 ```
 
 Expected: test fails — upstream section not found.
@@ -444,7 +444,7 @@ The full updated format call (showing only the changed tail):
 **Step 4: Run tests**
 
 ```bash
-cargo test -p qai-agent session 2>&1 | tail -10
+cargo test -p clawbro-agent session 2>&1 | tail -10
 ```
 
 Expected: all session tests pass including the new one.
@@ -452,7 +452,7 @@ Expected: all session tests pass including the new one.
 **Step 5: Commit**
 
 ```bash
-git add crates/qai-agent/src/team/session.rs
+git add crates/clawbro-agent/src/team/session.rs
 git commit -m "feat(team): inject upstream completion notes into Specialist task_reminder"
 ```
 
@@ -461,12 +461,12 @@ git commit -m "feat(team): inject upstream completion notes into Specialist task
 ## Task 4: Implement LeadMcpServer
 
 **Files:**
-- Create: `crates/qai-agent/src/team/lead_mcp_server.rs`
-- Modify: `crates/qai-agent/src/team/mod.rs`
+- Create: `crates/clawbro-agent/src/team/lead_mcp_server.rs`
+- Modify: `crates/clawbro-agent/src/team/mod.rs`
 
 ### Step 1: Study the existing TeamToolServer pattern
 
-Read `crates/qai-agent/src/team/mcp_server.rs`. The `spawn()` method:
+Read `crates/clawbro-agent/src/team/mcp_server.rs`. The `spawn()` method:
 1. Creates `rmcp::ServiceExt` router with `Router::new()` and `.route(tool_handler)`
 2. Binds `TcpListener::bind("127.0.0.1:0")`
 3. Returns `TeamMcpServerHandle { port }`
@@ -475,17 +475,17 @@ The `LeadMcpServer` follows the same pattern exactly.
 
 ### Step 2: Write failing test (compilation-level)
 
-Add to `crates/qai-agent/src/team/mod.rs`:
+Add to `crates/clawbro-agent/src/team/mod.rs`:
 
 ```rust
 pub mod lead_mcp_server;
 ```
 
-Run `cargo check -p qai-agent` — fails because the file doesn't exist.
+Run `cargo check -p clawbro-agent` — fails because the file doesn't exist.
 
 ### Step 3: Create lead_mcp_server.rs with all 6 tools
 
-Create `crates/qai-agent/src/team/lead_mcp_server.rs`:
+Create `crates/clawbro-agent/src/team/lead_mcp_server.rs`:
 
 ```rust
 //! LeadMcpServer — per-group MCP server for the Lead Agent.
@@ -720,7 +720,7 @@ Note: `TaskRegistry::all_tasks()` and `TaskRegistry::reassign_task()` don't exis
 
 ### Step 3b: Add missing TaskRegistry methods
 
-In `crates/qai-agent/src/team/registry.rs`, add after `mark_done()`:
+In `crates/clawbro-agent/src/team/registry.rs`, add after `mark_done()`:
 
 ```rust
     /// Return all tasks (for get_task_status snapshot).
@@ -826,12 +826,12 @@ mod tests {
 }
 ```
 
-(Add `tokio-test = "0.4"` to `[dev-dependencies]` in `qai-agent/Cargo.toml` if not present.)
+(Add `tokio-test = "0.4"` to `[dev-dependencies]` in `clawbro-agent/Cargo.toml` if not present.)
 
 **Step 5: Run tests**
 
 ```bash
-cargo test -p qai-agent lead_mcp_server 2>&1 | tail -20
+cargo test -p clawbro-agent lead_mcp_server 2>&1 | tail -20
 ```
 
 Expected: all 4 new tests pass.
@@ -839,7 +839,7 @@ Expected: all 4 new tests pass.
 **Step 6: Commit**
 
 ```bash
-git add crates/qai-agent/src/team/lead_mcp_server.rs crates/qai-agent/src/team/mod.rs crates/qai-agent/src/team/orchestrator.rs crates/qai-agent/src/team/registry.rs
+git add crates/clawbro-agent/src/team/lead_mcp_server.rs crates/clawbro-agent/src/team/mod.rs crates/clawbro-agent/src/team/orchestrator.rs crates/clawbro-agent/src/team/registry.rs
 git commit -m "feat(team): add LeadMcpServer with 6 Lead tools (create_task, start_execution, request_confirmation, post_update, get_task_status, assign_task)"
 ```
 
@@ -848,7 +848,7 @@ git commit -m "feat(team): add LeadMcpServer with 6 Lead tools (create_task, sta
 ## Task 5: TeamNotify Routing + Confirmation Interceptor + Lead Layer 0 in registry.rs
 
 **Files:**
-- Modify: `crates/qai-agent/src/registry.rs`
+- Modify: `crates/clawbro-agent/src/registry.rs`
 
 This task has 3 sub-parts. All are in the same file.
 
@@ -889,10 +889,10 @@ if let Some(lead_key) = team_orch.lead_session_key.get().cloned() {
 
     let registry_clone = Arc::clone(/* need self ref */);
     let notify_id = uuid::Uuid::new_v4().to_string();
-    let lead_msg = qai_protocol::InboundMsg {
+    let lead_msg = clawbro_protocol::InboundMsg {
         id: notify_id,
         session_key: lead_key.clone(),
-        content: qai_protocol::MsgContent::text(notify_content),
+        content: clawbro_protocol::MsgContent::text(notify_content),
         sender: "gateway".to_string(),
         channel: lead_key.channel.clone(),
         timestamp: chrono::Utc::now(),
@@ -905,7 +905,7 @@ if let Some(lead_key) = team_orch.lead_session_key.get().cloned() {
                 None::<String>
             })
             .flatten(),
-        source: qai_protocol::MsgSource::TeamNotify,
+        source: clawbro_protocol::MsgSource::TeamNotify,
     };
     // Spawn async so we don't recurse (handle() is not re-entrant for same session)
     // Need self reference — use OnceLock trick or pass via closure
@@ -1128,7 +1128,7 @@ For now, a simpler compile-level test is sufficient. The scenario will be verifi
 **Step: Run cargo check**
 
 ```bash
-cargo check -p qai-agent 2>&1 | tail -30
+cargo check -p clawbro-agent 2>&1 | tail -30
 ```
 
 Fix any compile errors. Common issues:
@@ -1140,7 +1140,7 @@ Fix any compile errors. Common issues:
 **Step: Run full test suite**
 
 ```bash
-cargo test -p qai-agent 2>&1 | tail -20
+cargo test -p clawbro-agent 2>&1 | tail -20
 ```
 
 Expected: all existing tests plus new ones pass.
@@ -1148,7 +1148,7 @@ Expected: all existing tests plus new ones pass.
 **Step 6: Commit**
 
 ```bash
-git add crates/qai-agent/src/registry.rs
+git add crates/clawbro-agent/src/registry.rs
 git commit -m "feat(registry): TeamNotify routing, confirmation interceptor, Lead Layer 0 injection"
 ```
 
@@ -1157,14 +1157,14 @@ git commit -m "feat(registry): TeamNotify routing, confirmation interceptor, Lea
 ## Task 6: Wire LeadMcpServer in main.rs
 
 **Files:**
-- Modify: `crates/qai-server/src/main.rs`
+- Modify: `crates/clawbro-server/src/main.rs`
 
 ### Step 1: Add import
 
-In main.rs, in the `use qai_agent::team::{ ... }` block, add:
+In main.rs, in the `use clawbro_agent::team::{ ... }` block, add:
 
 ```rust
-use qai_agent::team::lead_mcp_server::LeadToolServer;
+use clawbro_agent::team::lead_mcp_server::LeadToolServer;
 ```
 
 ### Step 2: Spawn LeadMcpServer after TeamOrchestrator is created
@@ -1198,7 +1198,7 @@ For groups configured with `interaction = "team"`, set the lead session key at s
 ```rust
         // Wire lead_session_key from Team groups in config
         for group in &cfg.groups {
-            if matches!(group.mode.interaction, qai_server::config::InteractionMode::Team) {
+            if matches!(group.mode.interaction, clawbro_server::config::InteractionMode::Team) {
                 // Derive session key from group scope + first active channel
                 // Group scope is like "group:oc_xxx" — channel is determined at runtime
                 // We use a best-effort: check which channels are enabled
@@ -1209,7 +1209,7 @@ For groups configured with `interaction = "team"`, set the lead session key at s
                 } else {
                     "ws"
                 };
-                let lead_key = qai_protocol::SessionKey::new(channel_name, &group.scope);
+                let lead_key = clawbro_protocol::SessionKey::new(channel_name, &group.scope);
                 team_orch.set_lead_session_key(lead_key.clone());
                 team_orch.set_scope(lead_key);
                 tracing::info!(scope = %group.scope, "Team group lead_session_key wired");
@@ -1221,7 +1221,7 @@ For groups configured with `interaction = "team"`, set the lead session key at s
 ### Step 4: Compile check
 
 ```bash
-cargo check -p qai-server 2>&1 | tail -20
+cargo check -p clawbro-server 2>&1 | tail -20
 ```
 
 Fix any import or type errors.
@@ -1237,7 +1237,7 @@ Expected: ≥ 307 tests pass, 0 failures.
 **Step 6: Commit**
 
 ```bash
-git add crates/qai-server/src/main.rs
+git add crates/clawbro-server/src/main.rs
 git commit -m "feat(server): wire LeadMcpServer and lead_session_key in main.rs"
 ```
 

@@ -1,19 +1,19 @@
-# QuickAI CLI Implementation Plan
+# ClawBro CLI Implementation Plan
 
 > **For agentic workers:** REQUIRED: Use superpowers:subagent-driven-development or superpowers:executing-plans to implement this plan.
 
-**Goal:** Build a `quickai` CLI binary — interactive `setup` wizard + `auth`, `config`, `serve`, `doctor`, `status`, `completions` subcommands. Full custom provider/model/URL/auth support.
+**Goal:** Build a `clawbro` CLI binary — interactive `setup` wizard + `auth`, `config`, `serve`, `doctor`, `status`, `completions` subcommands. Full custom provider/model/URL/auth support.
 
-**Architecture:** New `[[bin]] quickai` in `qai-server`. `serve` exec-replaces into `quickai-gateway` binary (no code duplication). Config written via string building (not toml_edit — avoids extra dep). Provider credentials stored in `~/.quickai/.env`.
+**Architecture:** New `[[bin]] clawbro` in `clawbro-server`. `serve` exec-replaces into `clawbro-gateway` binary (no code duplication). Config written via string building (not toml_edit — avoids extra dep). Provider credentials stored in `~/.clawbro/.env`.
 
-**Tech Stack:** clap 4 (derive + env), dialoguer 0.11, console 0.15, which 6, existing qai-server config types (read-only for status/doctor)
+**Tech Stack:** clap 4 (derive + env), dialoguer 0.11, console 0.15, which 6, existing clawbro-server config types (read-only for status/doctor)
 
 ---
 
 ## Command Tree
 
 ```
-quickai
+clawbro
 ├── setup               交互式向导：语言→provider→apikey→模式→auth→channel→写配置
 │   --lang zh|en|ja|ko  跳过语言步骤
 │   --provider <name>   anthropic|openai|deepseek|azure|ollama|custom
@@ -25,7 +25,7 @@ quickai
 │   --non-interactive   全参数非交互模式（CI/脚本）
 │
 ├── auth
-│   ├── set <provider> <key>   写入 ~/.quickai/.env
+│   ├── set <provider> <key>   写入 ~/.clawbro/.env
 │   ├── list                   显示已配置的 provider（key 脱敏）
 │   └── check                  探活各 provider API Key
 │
@@ -34,7 +34,7 @@ quickai
 │   ├── validate        语法+拓扑校验（调用 GatewayConfig::validate_runtime_topology）
 │   └── edit            用 $EDITOR 打开 config.toml
 │
-├── serve               exec 替换为 quickai-gateway 进程
+├── serve               exec 替换为 clawbro-gateway 进程
 │   --config <path>     覆盖配置路径
 │   --port <port>       覆盖端口
 │
@@ -52,29 +52,29 @@ quickai
 | File | Action | Responsibility |
 |------|--------|----------------|
 | `Cargo.toml` (workspace) | Modify | 添加 clap/dialoguer/console/which |
-| `crates/qai-server/Cargo.toml` | Modify | 新增 `[[bin]] quickai`，引用新依赖 |
-| `crates/qai-server/src/bin/quickai_cli.rs` | Create | binary 入口，clap parse → dispatch |
-| `crates/qai-server/src/cli/mod.rs` | Create | pub mod 导出 |
-| `crates/qai-server/src/cli/args.rs` | Create | 全部 clap derive 结构 |
-| `crates/qai-server/src/cli/i18n.rs` | Create | Language enum + 4语言 Messages |
-| `crates/qai-server/src/cli/setup/mod.rs` | Create | setup 向导主流程 |
-| `crates/qai-server/src/cli/setup/provider.rs` | Create | provider 选择 + API key + base URL |
-| `crates/qai-server/src/cli/setup/mode.rs` | Create | solo/multi/team 模式 + port + workspace |
-| `crates/qai-server/src/cli/setup/auth_cfg.rs` | Create | ws_token 配置步骤 |
-| `crates/qai-server/src/cli/setup/channel.rs` | Create | lark/dingtalk 凭证收集 |
-| `crates/qai-server/src/cli/setup/writer.rs` | Create | ConfigInput → TOML 字符串 → 写磁盘 |
-| `crates/qai-server/src/cli/auth.rs` | Create | `quickai auth` 子命令实现 |
-| `crates/qai-server/src/cli/config_cmd.rs` | Create | `quickai config` 子命令实现 |
-| `crates/qai-server/src/cli/serve.rs` | Create | exec 替换为 quickai-gateway |
-| `crates/qai-server/src/cli/doctor.rs` | Create | 诊断检查列表 |
-| `crates/qai-server/src/cli/status.rs` | Create | 配置摘要展示 |
-| `crates/qai-server/src/lib.rs` | Modify | 追加 `pub mod cli` |
+| `crates/clawbro-server/Cargo.toml` | Modify | 新增 `[[bin]] clawbro`，引用新依赖 |
+| `crates/clawbro-server/src/bin/clawbro_cli.rs` | Create | binary 入口，clap parse → dispatch |
+| `crates/clawbro-server/src/cli/mod.rs` | Create | pub mod 导出 |
+| `crates/clawbro-server/src/cli/args.rs` | Create | 全部 clap derive 结构 |
+| `crates/clawbro-server/src/cli/i18n.rs` | Create | Language enum + 4语言 Messages |
+| `crates/clawbro-server/src/cli/setup/mod.rs` | Create | setup 向导主流程 |
+| `crates/clawbro-server/src/cli/setup/provider.rs` | Create | provider 选择 + API key + base URL |
+| `crates/clawbro-server/src/cli/setup/mode.rs` | Create | solo/multi/team 模式 + port + workspace |
+| `crates/clawbro-server/src/cli/setup/auth_cfg.rs` | Create | ws_token 配置步骤 |
+| `crates/clawbro-server/src/cli/setup/channel.rs` | Create | lark/dingtalk 凭证收集 |
+| `crates/clawbro-server/src/cli/setup/writer.rs` | Create | ConfigInput → TOML 字符串 → 写磁盘 |
+| `crates/clawbro-server/src/cli/auth.rs` | Create | `clawbro auth` 子命令实现 |
+| `crates/clawbro-server/src/cli/config_cmd.rs` | Create | `clawbro config` 子命令实现 |
+| `crates/clawbro-server/src/cli/serve.rs` | Create | exec 替换为 clawbro-gateway |
+| `crates/clawbro-server/src/cli/doctor.rs` | Create | 诊断检查列表 |
+| `crates/clawbro-server/src/cli/status.rs` | Create | 配置摘要展示 |
+| `crates/clawbro-server/src/lib.rs` | Modify | 追加 `pub mod cli` |
 
 ---
 
 ## Task 1 — 依赖 + binary 骨架 + clap Args + i18n
 
-**Files:** Cargo.toml (workspace), qai-server/Cargo.toml, quickai_cli.rs, cli/mod.rs, cli/args.rs, cli/i18n.rs, lib.rs
+**Files:** Cargo.toml (workspace), clawbro-server/Cargo.toml, clawbro_cli.rs, cli/mod.rs, cli/args.rs, cli/i18n.rs, lib.rs
 
 ### Steps
 
@@ -88,13 +88,13 @@ console   = "0.15"
 which     = "6"
 ```
 
-- [ ] **1.2 qai-server/Cargo.toml — 新 binary + 依赖引用**
+- [ ] **1.2 clawbro-server/Cargo.toml — 新 binary + 依赖引用**
 
 新增 `[[bin]]`（在现有 `[[bin]]` 后）：
 ```toml
 [[bin]]
-name = "quickai"
-path = "src/bin/quickai_cli.rs"
+name = "clawbro"
+path = "src/bin/clawbro_cli.rs"
 ```
 
 在 `[dependencies]` 末尾追加：
@@ -105,12 +105,12 @@ console.workspace   = true
 which.workspace     = true
 ```
 
-- [ ] **1.3 创建 `src/bin/quickai_cli.rs`**
+- [ ] **1.3 创建 `src/bin/clawbro_cli.rs`**
 
 ```rust
 use anyhow::Result;
 use clap::Parser;
-use qai_server::cli::args::{Cli, Commands};
+use clawbro_server::cli::args::{Cli, Commands};
 
 #[tokio::main]
 async fn main() {
@@ -123,13 +123,13 @@ async fn main() {
 async fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Setup(args)        => qai_server::cli::setup::run(args).await,
-        Commands::Auth(args)         => qai_server::cli::auth::run(args).await,
-        Commands::Config(args)       => qai_server::cli::config_cmd::run(args).await,
-        Commands::Serve(args)        => qai_server::cli::serve::run(args).await,
-        Commands::Doctor             => qai_server::cli::doctor::run().await,
-        Commands::Status             => qai_server::cli::status::run().await,
-        Commands::Completions(args)  => qai_server::cli::completions::run(args),
+        Commands::Setup(args)        => clawbro_server::cli::setup::run(args).await,
+        Commands::Auth(args)         => clawbro_server::cli::auth::run(args).await,
+        Commands::Config(args)       => clawbro_server::cli::config_cmd::run(args).await,
+        Commands::Serve(args)        => clawbro_server::cli::serve::run(args).await,
+        Commands::Doctor             => clawbro_server::cli::doctor::run().await,
+        Commands::Status             => clawbro_server::cli::status::run().await,
+        Commands::Completions(args)  => clawbro_server::cli::completions::run(args),
     }
 }
 ```
@@ -142,8 +142,8 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(
-    name = "quickai",
-    about = "QuickAI Gateway — AI Agent 配置与运行",
+    name = "clawbro",
+    about = "ClawBro Gateway — AI Agent 配置与运行",
     version,
     propagate_version = true
 )]
@@ -182,7 +182,7 @@ pub struct SetupArgs {
     pub provider: Option<ProviderArg>,
 
     /// API Key（跳过交互式输入）
-    #[arg(long, env = "QUICKAI_SETUP_API_KEY")]
+    #[arg(long, env = "CLAWBRO_SETUP_API_KEY")]
     pub api_key: Option<String>,
 
     /// 自定义 API Base URL（OpenAI/Anthropic 兼容端点，或 Ollama 地址）
@@ -219,7 +219,7 @@ pub struct AuthArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum AuthCommands {
-    /// 设置 API Key（写入 ~/.quickai/.env）
+    /// 设置 API Key（写入 ~/.clawbro/.env）
     Set {
         /// provider 名称: anthropic | openai | deepseek | azure | ollama | custom
         provider: String,
@@ -252,12 +252,12 @@ pub enum ConfigCommands {
 // ── serve ──────────────────────────────────────────────────────────────────
 #[derive(clap::Args, Debug, Default)]
 pub struct ServeArgs {
-    /// 配置文件路径（默认 ~/.quickai/config.toml）
+    /// 配置文件路径（默认 ~/.clawbro/config.toml）
     #[arg(long)]
     pub config: Option<PathBuf>,
 
     /// 覆盖监听端口
-    #[arg(long, env = "QUICKAI_PORT")]
+    #[arg(long, env = "CLAWBRO_PORT")]
     pub port: Option<u16>,
 }
 
@@ -327,9 +327,9 @@ pub mod cli;
 - [ ] **1.9 验证编译 + --help**
 
 ```bash
-cd /Users/fishers/Desktop/repo/quickai-openclaw/quickai-gateway
-cargo build -p qai-server --bin quickai 2>&1 | grep -E "^error" | head -20
-cargo run -p qai-server --bin quickai -- --help 2>&1
+cd /Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway
+cargo build -p clawbro-server --bin clawbro 2>&1 | grep -E "^error" | head -20
+cargo run -p clawbro-server --bin clawbro -- --help 2>&1
 ```
 
 预期：0 errors，help 显示 7 个子命令。
@@ -409,7 +409,7 @@ impl Messages {
 }
 
 static ZH: Messages = Messages {
-    welcome: "════════════════════════════════════\n  QuickAI Gateway 初始化向导\n════════════════════════════════════",
+    welcome: "════════════════════════════════════\n  ClawBro Gateway 初始化向导\n════════════════════════════════════",
     select_language: "请选择界面语言 / Select Language",
     select_provider: "选择 AI Provider",
     enter_api_key: "请输入 API Key",
@@ -437,15 +437,15 @@ static ZH: Messages = Messages {
     enter_dingtalk_agent_id: "AgentId（数字，在钉钉开放平台基础信息页，可留空）",
     enter_dingtalk_bot_name: "Bot 名称（可留空）",
     confirm_write: "确认写入配置文件？",
-    written_config: "✓ 配置已写入 ~/.quickai/config.toml",
-    written_env: "✓ API Key 已写入 ~/.quickai/.env",
+    written_config: "✓ 配置已写入 ~/.clawbro/config.toml",
+    written_env: "✓ API Key 已写入 ~/.clawbro/.env",
     backed_up: "✓ 旧配置已备份",
     done: "🎉 初始化完成！",
-    next_steps: "启动 Gateway：\n  source ~/.quickai/.env && quickai serve\n\n其他命令：\n  quickai doctor      — 诊断问题\n  quickai status      — 查看配置\n  quickai auth list   — 查看 API Key\n  quickai setup       — 重新配置",
+    next_steps: "启动 Gateway：\n  source ~/.clawbro/.env && clawbro serve\n\n其他命令：\n  clawbro doctor      — 诊断问题\n  clawbro status      — 查看配置\n  clawbro auth list   — 查看 API Key\n  clawbro setup       — 重新配置",
 };
 
 static EN: Messages = Messages {
-    welcome: "════════════════════════════════════\n  QuickAI Gateway Setup Wizard\n════════════════════════════════════",
+    welcome: "════════════════════════════════════\n  ClawBro Gateway Setup Wizard\n════════════════════════════════════",
     select_language: "Select Language / 选择语言",
     select_provider: "Select AI Provider",
     enter_api_key: "Enter API Key",
@@ -473,15 +473,15 @@ static EN: Messages = Messages {
     enter_dingtalk_agent_id: "AgentId (number, from DingTalk app basic info, optional)",
     enter_dingtalk_bot_name: "Bot name (optional)",
     confirm_write: "Write configuration files?",
-    written_config: "✓ Config written to ~/.quickai/config.toml",
-    written_env: "✓ API Key written to ~/.quickai/.env",
+    written_config: "✓ Config written to ~/.clawbro/config.toml",
+    written_env: "✓ API Key written to ~/.clawbro/.env",
     backed_up: "✓ Old config backed up",
     done: "Setup complete!",
-    next_steps: "Start Gateway:\n  source ~/.quickai/.env && quickai serve\n\nOther commands:\n  quickai doctor      — diagnose issues\n  quickai status      — show config\n  quickai auth list   — view API keys\n  quickai setup       — reconfigure",
+    next_steps: "Start Gateway:\n  source ~/.clawbro/.env && clawbro serve\n\nOther commands:\n  clawbro doctor      — diagnose issues\n  clawbro status      — show config\n  clawbro auth list   — view API keys\n  clawbro setup       — reconfigure",
 };
 
 static JA: Messages = Messages {
-    welcome: "════════════════════════════════════\n  QuickAI Gateway セットアップ\n════════════════════════════════════",
+    welcome: "════════════════════════════════════\n  ClawBro Gateway セットアップ\n════════════════════════════════════",
     select_language: "言語を選択 / Select Language",
     select_provider: "AIプロバイダーを選択",
     enter_api_key: "APIキーを入力",
@@ -509,15 +509,15 @@ static JA: Messages = Messages {
     enter_dingtalk_agent_id: "AgentId（数字、任意）",
     enter_dingtalk_bot_name: "Bot名（任意）",
     confirm_write: "設定ファイルを書き込みますか？",
-    written_config: "✓ ~/.quickai/config.toml に設定を書き込みました",
-    written_env: "✓ APIキーを ~/.quickai/.env に書き込みました",
+    written_config: "✓ ~/.clawbro/config.toml に設定を書き込みました",
+    written_env: "✓ APIキーを ~/.clawbro/.env に書き込みました",
     backed_up: "✓ 旧設定をバックアップしました",
     done: "セットアップ完了！",
-    next_steps: "起動：\n  source ~/.quickai/.env && quickai serve\n\nその他：\n  quickai doctor      — 問題診断\n  quickai status      — 設定確認",
+    next_steps: "起動：\n  source ~/.clawbro/.env && clawbro serve\n\nその他：\n  clawbro doctor      — 問題診断\n  clawbro status      — 設定確認",
 };
 
 static KO: Messages = Messages {
-    welcome: "════════════════════════════════════\n  QuickAI Gateway 설정 마법사\n════════════════════════════════════",
+    welcome: "════════════════════════════════════\n  ClawBro Gateway 설정 마법사\n════════════════════════════════════",
     select_language: "언어 선택 / Select Language",
     select_provider: "AI 공급자 선택",
     enter_api_key: "API 키 입력",
@@ -545,11 +545,11 @@ static KO: Messages = Messages {
     enter_dingtalk_agent_id: "AgentId（숫자, 선택사항）",
     enter_dingtalk_bot_name: "봇 이름（선택사항）",
     confirm_write: "설정 파일을 저장하시겠습니까?",
-    written_config: "✓ ~/.quickai/config.toml 저장 완료",
-    written_env: "✓ API 키가 ~/.quickai/.env에 저장되었습니다",
+    written_config: "✓ ~/.clawbro/config.toml 저장 완료",
+    written_env: "✓ API 키가 ~/.clawbro/.env에 저장되었습니다",
     backed_up: "✓ 이전 설정이 백업되었습니다",
     done: "설정 완료！",
-    next_steps: "시작：\n  source ~/.quickai/.env && quickai serve\n\n기타：\n  quickai doctor      — 문제 진단\n  quickai status      — 설정 확인",
+    next_steps: "시작：\n  source ~/.clawbro/.env && clawbro serve\n\n기타：\n  clawbro doctor      — 문제 진단\n  clawbro status      — 설정 확인",
 };
 
 #[cfg(test)]
@@ -816,7 +816,7 @@ mod tests {
 - [ ] **2.4 运行测试**
 
 ```bash
-cargo test -p qai-server cli 2>&1 | tail -20
+cargo test -p clawbro-server cli 2>&1 | tail -20
 ```
 
 预期：i18n + provider 测试全部 PASS。
@@ -975,7 +975,7 @@ pub struct WriteInputs<'a> {
 /// 生成完整 config.toml 内容字符串
 pub fn build_config_toml(input: &WriteInputs) -> String {
     let home = dirs::home_dir().unwrap_or_default();
-    let qdir = home.join(".quickai");
+    let qdir = home.join(".clawbro");
     let mut s = String::new();
 
     // [gateway]
@@ -1043,7 +1043,7 @@ pub fn build_config_toml(input: &WriteInputs) -> String {
     s.push_str("[memory]\n");
     s.push_str(&format!("shared_dir = {:?}\n", qdir.join("shared").to_string_lossy().as_ref()));
     s.push_str("distill_every_n = 20\n");
-    s.push_str("distiller_binary = \"quickai-rust-agent\"\n");
+    s.push_str("distiller_binary = \"clawbro-rust-agent\"\n");
     s.push('\n');
 
     // [skills]
@@ -1130,10 +1130,10 @@ pub fn write_env(provider: &ProviderConfig, channel: &ChannelConfig) -> Result<(
 }
 
 pub fn config_path() -> PathBuf {
-    dirs::home_dir().unwrap_or_default().join(".quickai").join("config.toml")
+    dirs::home_dir().unwrap_or_default().join(".clawbro").join("config.toml")
 }
 pub fn env_path() -> PathBuf {
-    dirs::home_dir().unwrap_or_default().join(".quickai").join(".env")
+    dirs::home_dir().unwrap_or_default().join(".clawbro").join(".env")
 }
 
 #[cfg(test)]
@@ -1257,7 +1257,7 @@ mod tests {
 - [ ] **3.5 运行 writer 测试**
 
 ```bash
-cargo test -p qai-server setup 2>&1 | tail -20
+cargo test -p clawbro-server setup 2>&1 | tail -20
 ```
 
 预期：10 个测试 PASS。
@@ -1307,7 +1307,7 @@ pub async fn run(args: SetupArgs) -> Result<()> {
             Confirm::with_theme(&theme).with_prompt(m.confirm_write).default(true).interact()?
         };
         if !overwrite {
-            println!("已取消。重新配置请运行：quickai setup --reinit");
+            println!("已取消。重新配置请运行：clawbro setup --reinit");
             return Ok(());
         }
     }
@@ -1329,7 +1329,7 @@ pub async fn run(args: SetupArgs) -> Result<()> {
     };
 
     // ── Step 7: 创建运行时目录 ────────────────────────────────
-    let qdir = dirs::home_dir().unwrap_or_default().join(".quickai");
+    let qdir = dirs::home_dir().unwrap_or_default().join(".clawbro");
     for sub in ["sessions", "shared", "skills", "personas"] {
         std::fs::create_dir_all(qdir.join(sub))?;
     }
@@ -1375,7 +1375,7 @@ pub async fn run(args: AuthArgs) -> Result<()> {
 }
 
 fn env_path() -> std::path::PathBuf {
-    dirs::home_dir().unwrap_or_default().join(".quickai").join(".env")
+    dirs::home_dir().unwrap_or_default().join(".clawbro").join(".env")
 }
 
 fn load_env_map() -> HashMap<String, String> {
@@ -1421,8 +1421,8 @@ fn cmd_set(provider: &str, key: &str) -> Result<()> {
     let mut map = load_env_map();
     map.insert(var.to_string(), key.to_string());
     save_env_map(&map)?;
-    println!("{} {} 已更新 (~/.quickai/.env)", style("✓").green(), var);
-    println!("  生效命令：source ~/.quickai/.env");
+    println!("{} {} 已更新 (~/.clawbro/.env)", style("✓").green(), var);
+    println!("  生效命令：source ~/.clawbro/.env");
     Ok(())
 }
 
@@ -1439,8 +1439,8 @@ fn cmd_list() -> Result<()> {
         }
     }
     if !any {
-        println!("  {} 未找到任何 API Key（~/.quickai/.env 不存在或为空）", style("–").yellow());
-        println!("  运行 quickai auth set anthropic <key> 设置");
+        println!("  {} 未找到任何 API Key（~/.clawbro/.env 不存在或为空）", style("–").yellow());
+        println!("  运行 clawbro auth set anthropic <key> 设置");
     }
     Ok(())
 }
@@ -1526,13 +1526,13 @@ pub async fn run(args: ConfigArgs) -> Result<()> {
 }
 
 fn config_path() -> std::path::PathBuf {
-    dirs::home_dir().unwrap_or_default().join(".quickai").join("config.toml")
+    dirs::home_dir().unwrap_or_default().join(".clawbro").join("config.toml")
 }
 
 fn cmd_show() -> Result<()> {
     let path = config_path();
     if !path.exists() {
-        println!("{} config.toml 不存在 — 请先运行 quickai setup", style("✗").red());
+        println!("{} config.toml 不存在 — 请先运行 clawbro setup", style("✗").red());
         return Ok(());
     }
     let content = std::fs::read_to_string(&path)?;
@@ -1566,7 +1566,7 @@ fn cmd_validate() -> Result<()> {
     let _: toml::Value = toml::from_str(&content)
         .context("TOML 语法错误")?;
     // 拓扑检查（加载并调用 validate_runtime_topology）
-    let cfg = qai_server::config::GatewayConfig::load()
+    let cfg = clawbro_server::config::GatewayConfig::load()
         .context("配置加载失败")?;
     cfg.validate_runtime_topology()
         .context("拓扑校验失败")?;
@@ -1577,7 +1577,7 @@ fn cmd_validate() -> Result<()> {
 fn cmd_edit() -> Result<()> {
     let path = config_path();
     if !path.exists() {
-        println!("{} config.toml 不存在，请先运行 quickai setup", style("✗").red());
+        println!("{} config.toml 不存在，请先运行 clawbro setup", style("✗").red());
         return Ok(());
     }
     let editor = std::env::var("EDITOR")
@@ -1622,11 +1622,11 @@ use anyhow::{Context, Result};
 pub async fn run(args: ServeArgs) -> Result<()> {
     // 确定配置路径
     let config_path = args.config.unwrap_or_else(|| {
-        dirs::home_dir().unwrap_or_default().join(".quickai").join("config.toml")
+        dirs::home_dir().unwrap_or_default().join(".clawbro").join("config.toml")
     });
     if !config_path.exists() {
         anyhow::bail!(
-            "配置文件不存在: {}\n请先运行: quickai setup",
+            "配置文件不存在: {}\n请先运行: clawbro setup",
             config_path.display()
         );
     }
@@ -1634,14 +1634,14 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     // 加载 .env（当前进程，然后 exec 子进程继承）
     load_dot_env();
 
-    // 找到 quickai-gateway binary
-    let gateway_bin = which::which("quickai-gateway")
-        .context("找不到 quickai-gateway，请确认已安装并在 PATH 中")?;
+    // 找到 clawbro-gateway binary
+    let gateway_bin = which::which("clawbro-gateway")
+        .context("找不到 clawbro-gateway，请确认已安装并在 PATH 中")?;
 
     // 设置环境变量传递给子进程
-    std::env::set_var("QUICKAI_CONFIG", config_path.to_string_lossy().as_ref());
+    std::env::set_var("CLAWBRO_CONFIG", config_path.to_string_lossy().as_ref());
     if let Some(port) = args.port {
-        std::env::set_var("QUICKAI_PORT", port.to_string());
+        std::env::set_var("CLAWBRO_PORT", port.to_string());
     }
 
     // exec 替换当前进程（Unix）
@@ -1657,13 +1657,13 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     {
         let status = std::process::Command::new(&gateway_bin)
             .status()
-            .context("quickai-gateway 启动失败")?;
+            .context("clawbro-gateway 启动失败")?;
         std::process::exit(status.code().unwrap_or(1));
     }
 }
 
 fn load_dot_env() {
-    let env_path = dirs::home_dir().unwrap_or_default().join(".quickai").join(".env");
+    let env_path = dirs::home_dir().unwrap_or_default().join(".clawbro").join(".env");
     let Ok(content) = std::fs::read_to_string(&env_path) else { return };
     for line in content.lines() {
         let line = line.trim();
@@ -1685,13 +1685,13 @@ use anyhow::Result;
 use console::style;
 
 pub async fn run() -> Result<()> {
-    println!("{}", style("QuickAI Doctor").bold().cyan());
+    println!("{}", style("ClawBro Doctor").bold().cyan());
     println!("{}", "─".repeat(40));
     let mut issues = 0usize;
 
     // 1. Binary
     println!("\n[1] Binary");
-    for bin in ["quickai-gateway", "quickai-rust-agent"] {
+    for bin in ["clawbro-gateway", "clawbro-rust-agent"] {
         match which::which(bin) {
             Ok(p) => println!("  {} {} ({})", style("✓").green(), bin, p.display()),
             Err(_) => { println!("  {} {} 未找到 — 请检查 PATH 或重新编译", style("✗").red(), bin); issues += 1; }
@@ -1700,48 +1700,48 @@ pub async fn run() -> Result<()> {
 
     // 2. Config
     println!("\n[2] 配置文件");
-    let cfg_path = dirs::home_dir().unwrap_or_default().join(".quickai").join("config.toml");
+    let cfg_path = dirs::home_dir().unwrap_or_default().join(".clawbro").join("config.toml");
     if cfg_path.exists() {
         let content = std::fs::read_to_string(&cfg_path).unwrap_or_default();
         match toml::from_str::<toml::Value>(&content) {
-            Ok(_) => println!("  {} ~/.quickai/config.toml (TOML 语法正常)", style("✓").green()),
+            Ok(_) => println!("  {} ~/.clawbro/config.toml (TOML 语法正常)", style("✓").green()),
             Err(e) => { println!("  {} config.toml 语法错误: {e}", style("✗").red()); issues += 1; }
         }
     } else {
-        println!("  {} config.toml 不存在 — 请运行: quickai setup", style("✗").red());
+        println!("  {} config.toml 不存在 — 请运行: clawbro setup", style("✗").red());
         issues += 1;
     }
 
     // 3. API Key
     println!("\n[3] API Key");
-    let env_path = dirs::home_dir().unwrap_or_default().join(".quickai").join(".env");
+    let env_path = dirs::home_dir().unwrap_or_default().join(".clawbro").join(".env");
     if env_path.exists() {
-        println!("  {} ~/.quickai/.env 存在", style("✓").green());
+        println!("  {} ~/.clawbro/.env 存在", style("✓").green());
     } else {
-        println!("  {} ~/.quickai/.env 不存在", style("–").yellow());
+        println!("  {} ~/.clawbro/.env 不存在", style("–").yellow());
     }
     for var in ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"] {
         match std::env::var(var) {
             Ok(v) if !v.is_empty() => println!("  {} {} 已设置（当前 shell）", style("✓").green(), var),
-            _ => println!("  {} {} 未设置（运行 source ~/.quickai/.env）", style("–").yellow(), var),
+            _ => println!("  {} {} 未设置（运行 source ~/.clawbro/.env）", style("–").yellow(), var),
         }
     }
 
     // 4. 运行时目录
     println!("\n[4] 运行时目录");
     for sub in ["sessions", "shared", "skills"] {
-        let p = dirs::home_dir().unwrap_or_default().join(".quickai").join(sub);
+        let p = dirs::home_dir().unwrap_or_default().join(".clawbro").join(sub);
         if p.exists() {
-            println!("  {} ~/.quickai/{}", style("✓").green(), sub);
+            println!("  {} ~/.clawbro/{}", style("✓").green(), sub);
         } else {
-            println!("  {} ~/.quickai/{} 不存在 (mkdir -p ~/.quickai/{})", style("✗").red(), sub, sub);
+            println!("  {} ~/.clawbro/{} 不存在 (mkdir -p ~/.clawbro/{})", style("✗").red(), sub, sub);
             issues += 1;
         }
     }
 
     // 5. Gateway 进程
     println!("\n[5] Gateway");
-    let port_file = dirs::home_dir().unwrap_or_default().join(".quickai").join("gateway.port");
+    let port_file = dirs::home_dir().unwrap_or_default().join(".clawbro").join("gateway.port");
     if port_file.exists() {
         let port = std::fs::read_to_string(&port_file).unwrap_or_default();
         println!("  {} 运行中 (port: {})", style("✓").green(), port.trim());
@@ -1767,11 +1767,11 @@ use anyhow::Result;
 use console::style;
 
 pub async fn run() -> Result<()> {
-    let cfg_path = dirs::home_dir().unwrap_or_default().join(".quickai").join("config.toml");
-    println!("{}", style("QuickAI Gateway — 配置摘要").bold().cyan());
+    let cfg_path = dirs::home_dir().unwrap_or_default().join(".clawbro").join("config.toml");
+    println!("{}", style("ClawBro Gateway — 配置摘要").bold().cyan());
     println!("{}", "─".repeat(40));
     if !cfg_path.exists() {
-        println!("{} config.toml 不存在 — 请先运行: quickai setup", style("⚠").yellow());
+        println!("{} config.toml 不存在 — 请先运行: clawbro setup", style("⚠").yellow());
         return Ok(());
     }
     let content = std::fs::read_to_string(&cfg_path)?;
@@ -1811,9 +1811,9 @@ pub async fn run() -> Result<()> {
     println!("  WS Auth     {}", if has_auth { style("已启用").green().to_string() } else { "开放模式（无 token）".into() });
 
     let has_key = std::env::var("ANTHROPIC_API_KEY").or_else(|_| std::env::var("OPENAI_API_KEY")).is_ok();
-    println!("  API Key     {}", if has_key { style("已设置").green().to_string() } else { style("未设置（source ~/.quickai/.env）").yellow().to_string() });
+    println!("  API Key     {}", if has_key { style("已设置").green().to_string() } else { style("未设置（source ~/.clawbro/.env）").yellow().to_string() });
 
-    let port_file = dirs::home_dir().unwrap_or_default().join(".quickai").join("gateway.port");
+    let port_file = dirs::home_dir().unwrap_or_default().join(".clawbro").join("gateway.port");
     println!("  Gateway     {}", if port_file.exists() { style("运行中").green().to_string() } else { style("未运行").dim().to_string() });
 
     println!("\n配置文件: {}", cfg_path.display());
@@ -1831,7 +1831,7 @@ use clap_complete::{generate, shells};
 
 pub fn run(args: CompletionsArgs) -> Result<()> {
     let mut cmd = Cli::command();
-    let bin_name = "quickai";
+    let bin_name = "clawbro";
     match args.shell {
         ShellArg::Bash       => generate(shells::Bash,       &mut cmd, bin_name, &mut std::io::stdout()),
         ShellArg::Zsh        => generate(shells::Zsh,        &mut cmd, bin_name, &mut std::io::stdout()),
@@ -1850,7 +1850,7 @@ pub fn run(args: CompletionsArgs) -> Result<()> {
 ```toml
 clap_complete = "4"
 ```
-在 `qai-server/Cargo.toml`：
+在 `clawbro-server/Cargo.toml`：
 ```toml
 clap_complete.workspace = true
 ```
@@ -1858,7 +1858,7 @@ clap_complete.workspace = true
 - [ ] **4.9 全量编译**
 
 ```bash
-cargo build -p qai-server --bin quickai 2>&1 | grep -E "^error" | head -30
+cargo build -p clawbro-server --bin clawbro 2>&1 | grep -E "^error" | head -30
 ```
 
 预期：0 errors。
@@ -1866,7 +1866,7 @@ cargo build -p qai-server --bin quickai 2>&1 | grep -E "^error" | head -30
 - [ ] **4.10 全量测试**
 
 ```bash
-cargo test -p qai-server -- cli 2>&1 | tail -30
+cargo test -p clawbro-server -- cli 2>&1 | tail -30
 ```
 
 预期：所有 cli 测试 PASS。
@@ -1875,37 +1875,37 @@ cargo test -p qai-server -- cli 2>&1 | tail -30
 
 ```bash
 # help
-./target/debug/quickai --help
-./target/debug/quickai setup --help
-./target/debug/quickai auth --help
-./target/debug/quickai config --help
+./target/debug/clawbro --help
+./target/debug/clawbro setup --help
+./target/debug/clawbro auth --help
+./target/debug/clawbro config --help
 
 # doctor（无需 TTY）
-./target/debug/quickai doctor
+./target/debug/clawbro doctor
 
 # status
-./target/debug/quickai status
+./target/debug/clawbro status
 
 # auth list
-./target/debug/quickai auth list
+./target/debug/clawbro auth list
 
 # 非交互 setup（端到端）
-./target/debug/quickai setup \
+./target/debug/clawbro setup \
   --lang zh --provider anthropic \
   --api-key "sk-ant-test" \
   --mode solo --non-interactive
 
-cat ~/.quickai/config.toml
-cat ~/.quickai/.env
+cat ~/.clawbro/config.toml
+cat ~/.clawbro/.env
 
 # completions
-./target/debug/quickai completions zsh | head -5
+./target/debug/clawbro completions zsh | head -5
 
 # config show（脱敏验证）
-./target/debug/quickai config show
+./target/debug/clawbro config show
 
 # config validate
-./target/debug/quickai config validate
+./target/debug/clawbro config validate
 ```
 
 预期：

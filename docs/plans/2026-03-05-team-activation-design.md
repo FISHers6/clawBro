@@ -363,15 +363,15 @@ If it does NOT match, the message is forwarded to Lead normally (Lead may adjust
 
 | File | Change |
 |------|--------|
-| `qai-protocol/src/types.rs` | Add `MsgSource::TeamNotify` |
-| `qai-agent/src/team/orchestrator.rs` | Add `TeamState`, `lead_session_key`, `activate()`, `register_task()` |
-| `qai-agent/src/team/lead_mcp_server.rs` | **New**: LeadMcpServer with 6 tools |
-| `qai-agent/src/team/mod.rs` | Add `pub mod lead_mcp_server` |
-| `qai-agent/src/registry.rs` | TeamNotify routing, confirmation interception, Lead MCP injection |
-| `qai-agent/src/prompt_builder.rs` | Add Lead Team mode Layer 0 (planning vs running state) |
-| `qai-agent/src/team/session.rs` | `build_task_reminder`: inject upstream completion notes |
-| `qai-server/src/main.rs` | Wire LeadMcpServer per group, wire TeamNotify dispatch |
-| `qai-protocol/src/config.rs` | Add `public_updates` field to `GroupConfig.team` |
+| `clawbro-protocol/src/types.rs` | Add `MsgSource::TeamNotify` |
+| `clawbro-agent/src/team/orchestrator.rs` | Add `TeamState`, `lead_session_key`, `activate()`, `register_task()` |
+| `clawbro-agent/src/team/lead_mcp_server.rs` | **New**: LeadMcpServer with 6 tools |
+| `clawbro-agent/src/team/mod.rs` | Add `pub mod lead_mcp_server` |
+| `clawbro-agent/src/registry.rs` | TeamNotify routing, confirmation interception, Lead MCP injection |
+| `clawbro-agent/src/prompt_builder.rs` | Add Lead Team mode Layer 0 (planning vs running state) |
+| `clawbro-agent/src/team/session.rs` | `build_task_reminder`: inject upstream completion notes |
+| `clawbro-server/src/main.rs` | Wire LeadMcpServer per group, wire TeamNotify dispatch |
+| `clawbro-protocol/src/config.rs` | Add `public_updates` field to `GroupConfig.team` |
 
 ---
 

@@ -10,7 +10,7 @@
 
 ### 1.1 原始问题
 
-早期 QuickAI team runtime 的完成通知有三个根本缺陷：
+早期 ClawBro team runtime 的完成通知有三个根本缺陷：
 
 1. `lead_session_key` 在启动时静态注入，所有 completion 都发往同一固定目标，无法追踪"是谁发起了这次 dispatch"
 2. 所有 milestone 事件通过 `render_for_im()` 直接发到 IM group，没有"内部通知父 session"和"外发给用户"的区分
@@ -150,7 +150,7 @@ dispatch_team_routing_event(envelope):
 
 对比 OpenClaw 的 steered/queued/direct/fallback：
 
-| OpenClaw 模式 | QuickAI 对应 | 说明 |
+| OpenClaw 模式 | ClawBro 对应 | 说明 |
 |--------------|-------------|------|
 | Steered（注入当前轮次）| 暂未实现 | 需要 embedded message queue |
 | Queued（当前轮结束后处理）| QueuedDelivered（隐式）| 靠 session semaphore 串行保证 |
@@ -230,7 +230,7 @@ runtime = "acp_codex"
 
 [[agent]]
 id = "native"
-runtime = "quickai_native"
+runtime = "clawbro_native"
 
 # channel 层：只描述收发入口
 [channels.lark.account.main]
@@ -286,7 +286,7 @@ roster = ["codex", "native"]  # specialist 不要求有单独 channel account
 
 ## 9. 与 OpenClaw 对比总结
 
-| 维度 | OpenClaw | QuickAI Gateway |
+| 维度 | OpenClaw | ClawBro Gateway |
 |------|---------|-----------------|
 | 完成通知载体 | 结构化 `task_completion` 内部事件 | 结构化 `TeamRoutingEnvelope` |
 | 状态机持久化 | JS 内存（进程级） | SQLite + 乐观锁（崩溃安全）|
@@ -298,5 +298,5 @@ roster = ["codex", "native"]  # specialist 不要求有单独 channel account
 | Steered 模式 | ✅ 实现 | ❌ 未实现 |
 | 父子链向上溯源 | 自动沿 requester chain | 手动配置 fallback_session_keys |
 
-**核心优势**：SQLite 状态机 + 持久化 pending completions 使 QuickAI 在崩溃恢复方面比 OpenClaw 更健壮。
+**核心优势**：SQLite 状态机 + 持久化 pending completions 使 ClawBro 在崩溃恢复方面比 OpenClaw 更健壮。
 **核心差距**：Steered 模式（mid-turn injection）尚未实现；自动 requester chain 溯源需要后续补充。

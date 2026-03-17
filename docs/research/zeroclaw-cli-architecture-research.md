@@ -1,9 +1,9 @@
 # ZeroClaw CLI 架构研究报告
 
-> 研究目的：学习 zeroclaw 的 CLI 设计、配置体系、Channel/Provider 支持，作为 quickai-gateway 二进制分发和用户体验设计的参考。
+> 研究目的：学习 zeroclaw 的 CLI 设计、配置体系、Channel/Provider 支持，作为 clawbro-gateway 二进制分发和用户体验设计的参考。
 >
 > 研究日期：2026-03-18
-> 研究源码：`/Users/fishers/Desktop/repo/quickai-openclaw/zeroclaw`
+> 研究源码：`/Users/fishers/Desktop/repo/clawbro-openclaw/zeroclaw`
 > ZeroClaw 版本：0.4.3
 
 ---
@@ -544,11 +544,11 @@ zeroclaw doctor
 
 ---
 
-## 九、对 quickai-gateway 的设计参考
+## 九、对 clawbro-gateway 的设计参考
 
 ### 9.1 可以直接借鉴的
 
-| zeroclaw 设计 | quickai-gateway 对应 |
+| zeroclaw 设计 | clawbro-gateway 对应 |
 |-------------|-------------------|
 | `onboard` 命令（交互+非交互） | 目前缺失，用户只能手写 config.toml |
 | `status` 命令（系统状态总览）| 有 `/status` HTTP 接口，但无 CLI |
@@ -558,7 +558,7 @@ zeroclaw doctor
 | `ZEROCLAW_API_KEY` 等环境变量覆盖 | 部分支持（backend env 字段） |
 | API Key / URL / Model 可在 CLI 中指定 | 目前只有 config.toml |
 
-### 9.2 quickai-gateway 特有优势（不需要照搬的）
+### 9.2 clawbro-gateway 特有优势（不需要照搬的）
 
 - **Team/Specialist 模式**：zeroclaw 没有 Lead/Specialist 多 Agent 编排
 - **Persona + Skills 系统**：结构比 zeroclaw 更深
@@ -568,7 +568,7 @@ zeroclaw doctor
 ### 9.3 最值得学习的差距
 
 1. **`onboard` 命令**：zeroclaw 有完整引导初始化，降低用户门槛极大
-2. **CLI 覆盖参数**：zeroclaw 的 `--api-key`、`--provider`、`--model` 可以在 CLI 上覆盖 config，quickai-gateway 全靠 config.toml，调试麻烦
+2. **CLI 覆盖参数**：zeroclaw 的 `--api-key`、`--provider`、`--model` 可以在 CLI 上覆盖 config，clawbro-gateway 全靠 config.toml，调试麻烦
 3. **Shell 补全**：clap 支持免费生成，一行代码的事
 4. **`config schema` 命令**：dump JSON Schema 帮助用户了解所有可配字段
 

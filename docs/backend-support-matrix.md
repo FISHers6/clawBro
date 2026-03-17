@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This document answers a narrower question than [`runtime-backends.md`](/Users/fishers/Desktop/repo/quickai-openclaw/quickai-gateway/docs/runtime-backends.md):
+This document answers a narrower question than [`runtime-backends.md`](/Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway/docs/runtime-backends.md):
 
 - Which backend families are supported today?
 - Which runtime capabilities are truly implemented vs only architecturally planned?
@@ -19,7 +19,7 @@ It is intentionally conservative. If a capability has not been validated in code
 
 ## Backend Families
 
-| Family | Current role in QuickAI | Session continuity | Tool lifecycle events | Team contract | Current level |
+| Family | Current role in ClawBro | Session continuity | Tool lifecycle events | Team contract | Current level |
 | --- | --- | --- | --- | --- | --- |
 | `quick_ai_native` | Canonical native consumer | Structured host transcript consumed directly by native bridge | Native tool wrapper emits canonical start/completed/failed events | Canonical Team Tool RPC | `Complete` |
 | `acp` | Compatibility family with real protocol events | Host-owned transcript projected into ACP session/prompt flow | ACP `ToolCall / ToolCallUpdate` normalized into canonical events | Canonical Team Tool / MCP bridge | `Structured` |
@@ -29,7 +29,7 @@ It is intentionally conservative. If a capability has not been validated in code
 
 ### What is host-owned
 
-QuickAI owns:
+ClawBro owns:
 
 - session transcript truth
 - recent structured history projection
@@ -47,11 +47,11 @@ Each backend family still owns its local execution details:
 - `acp`: ACP session/protocol mechanics
 - `open_claw_gateway`: OpenClaw run/session behavior behind gateway WS
 
-QuickAI does not try to erase these differences. It normalizes them through host-side contracts.
+ClawBro does not try to erase these differences. It normalizes them through host-side contracts.
 
 ## Runtime Progress Events
 
-QuickAI now has a host-level runtime progress contract:
+ClawBro now has a host-level runtime progress contract:
 
 - `ToolCallStarted`
 - `ToolCallCompleted`
@@ -71,7 +71,7 @@ Status: `Complete`
 
 Validated by:
 
-- `cargo test -p quickai-rust-agent`
+- `cargo test -p clawbro-rust-agent`
 - real Lark DM regression with compact progress and final reply
 
 #### `acp`
@@ -81,7 +81,7 @@ Status: `Structured`
 - Tool lifecycle comes from ACP protocol-native updates:
   - `SessionUpdate::ToolCall`
   - `SessionUpdate::ToolCallUpdate`
-- QuickAI normalizes these into canonical runtime events
+- ClawBro normalizes these into canonical runtime events
 - This is not text guessing and not fake progress
 
 ACP update compatibility:
@@ -92,8 +92,8 @@ ACP update compatibility:
 
 Validated by:
 
-- `cargo test -p qai-runtime`
-- `cargo test -p qai-server`
+- `cargo test -p clawbro-runtime`
+- `cargo test -p clawbro-server`
 - Echo fixture emits `UsageUpdate` + `SessionInfoUpdate` before text; all ACP E2E tests pass
 
 Current limitation:
@@ -102,7 +102,7 @@ Current limitation:
 
 ### ACP Backend Identity and Support Levels
 
-The `acp` family supports multiple CLI-backed agents. QuickAI models them in three categories:
+The `acp` family supports multiple CLI-backed agents. ClawBro models them in three categories:
 
 #### Category A: Bridge-Backed ACP Backends
 
@@ -138,7 +138,7 @@ Can be launched with a direct command + args. Expected to speak ACP over stdio.
 
 | Backend | Status | Notes |
 | --- | --- | --- |
-| Gemini CLI | `Declared` | No validated ACP path in QuickAI; not in the `acp_backend` enum |
+| Gemini CLI | `Declared` | No validated ACP path in ClawBro; not in the `acp_backend` enum |
 
 **Support level semantics:**
 
@@ -156,26 +156,26 @@ Status: `Structured`
   - `toolCallId`
   - `name`
   - `isError`
-- QuickAI preserves helper-result parsing for team helper JSON, then falls back to generic tool lifecycle parsing
+- ClawBro preserves helper-result parsing for team helper JSON, then falls back to generic tool lifecycle parsing
 
 Validated by:
 
-- `cargo test -p qai-runtime`
-- `cargo test -p qai-server`
+- `cargo test -p clawbro-runtime`
+- `cargo test -p clawbro-server`
 - OpenClaw source tests run locally after installing dependencies:
   - `src/gateway/server-chat.agent-events.test.ts`
   - `src/tui/tui-event-handlers.test.ts`
 
 Current limitation:
 
-- QuickAI does not yet normalize OpenClaw `phase: "update"` into a host event
+- ClawBro does not yet normalize OpenClaw `phase: "update"` into a host event
 - That is acceptable for `final_only` and `progress_compact`, but not enough for a future verbose/debug surface
 
 ## External MCP Support
 
 | Family | External MCP config ownership | Current support | Notes |
 | --- | --- | --- | --- |
-| `quick_ai_native` | `[[backend.external_mcp_servers]]` | `Complete` | native runtime now receives the list through `RuntimeSessionSpec`, connects from inside `quickai-rust-agent`, and is covered by real SSE MCP integration tests |
+| `quick_ai_native` | `[[backend.external_mcp_servers]]` | `Complete` | native runtime now receives the list through `RuntimeSessionSpec`, connects from inside `clawbro-rust-agent`, and is covered by real SSE MCP integration tests |
 | `acp` | `[[backend.external_mcp_servers]]` | `Structured` | ACP merges external SSE MCP servers with the existing `team-tools` bridge |
 | `open_claw_gateway` | n/a in this phase | `Not Yet` | OpenClaw still keeps team helper CLI bridge, but does not claim generic external MCP parity |
 
@@ -193,7 +193,7 @@ This is intentional. It keeps system ownership clear:
 
 ## Channel Presentation
 
-QuickAI intentionally separates:
+ClawBro intentionally separates:
 
 - transcript truth
 - runtime progress events
@@ -241,7 +241,7 @@ Reason:
 
 ### Codex Local-Config Projection Constraint
 
-`Codex` now supports two distinct projection paths in QuickAI:
+`Codex` now supports two distinct projection paths in ClawBro:
 
 - `acp_auth_projection`
   - for `chatgpt`, `openai_api_key`, and `codex_api_key`
@@ -254,7 +254,7 @@ supports the Codex `responses` API surface.
 
 A generic OpenAI-compatible `/v1` endpoint is not sufficient by itself.
 
-QuickAI has already validated one negative case:
+ClawBro has already validated one negative case:
 
 - `Codex + local_config_projection + DeepSeek /v1`
   - projection succeeded
@@ -317,7 +317,7 @@ These are not mainline correctness problems. They are parity and product-surface
 
 ## Recommended interpretation
 
-The honest status of QuickAI today is:
+The honest status of ClawBro today is:
 
 - one shared host contract now exists across `quick_ai_native`, `acp`, and `open_claw_gateway`
 - family parity is real enough to build on

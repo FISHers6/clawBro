@@ -2,7 +2,7 @@
 
 ## Purpose
 
-`quickai-gateway` now exposes a minimal operations surface for runtime and team visibility.
+`clawbro-gateway` now exposes a minimal operations surface for runtime and team visibility.
 
 This is not a full runbook yet. It is the first stable contract for day-2 inspection.
 

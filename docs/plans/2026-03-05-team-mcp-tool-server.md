@@ -26,24 +26,24 @@ With MCP tool calls, the LLM calls `complete_task({task_id: "T003", note: "..."}
 
 | File | Role |
 |------|------|
-| `crates/qai-agent/src/team/mcp_server.rs` | **New**: HTTP MCP server (ServerHandler) |
-| `crates/qai-agent/src/team/mod.rs` | Add `pub mod mcp_server` |
-| `crates/qai-agent/src/team/orchestrator.rs` | Add `mcp_server_handle` field; start/stop lifecycle |
-| `crates/qai-agent/src/traits.rs` | Add `mcp_server_url: Option<String>` to `AgentCtx` |
-| `crates/qai-agent/src/registry.rs` | Inject `mcp_server_url` into `AgentCtx` for Specialist turns |
-| `crates/qai-agent/src/acp_engine.rs` | Read `mcp_capabilities.http` from initialize response; populate `mcp_servers` |
-| `crates/qai-agent/Cargo.toml` | Add `rmcp = "0.8.3"` |
+| `crates/clawbro-agent/src/team/mcp_server.rs` | **New**: HTTP MCP server (ServerHandler) |
+| `crates/clawbro-agent/src/team/mod.rs` | Add `pub mod mcp_server` |
+| `crates/clawbro-agent/src/team/orchestrator.rs` | Add `mcp_server_handle` field; start/stop lifecycle |
+| `crates/clawbro-agent/src/traits.rs` | Add `mcp_server_url: Option<String>` to `AgentCtx` |
+| `crates/clawbro-agent/src/registry.rs` | Inject `mcp_server_url` into `AgentCtx` for Specialist turns |
+| `crates/clawbro-agent/src/acp_engine.rs` | Read `mcp_capabilities.http` from initialize response; populate `mcp_servers` |
+| `crates/clawbro-agent/Cargo.toml` | Add `rmcp = "0.8.3"` |
 
 ---
 
 ## Task 1: Add rmcp dependency and verify API surface
 
 **Files:**
-- Modify: `crates/qai-agent/Cargo.toml`
+- Modify: `crates/clawbro-agent/Cargo.toml`
 
 **Step 1: Add dependency**
 
-In `crates/qai-agent/Cargo.toml` under `[dependencies]`, add:
+In `crates/clawbro-agent/Cargo.toml` under `[dependencies]`, add:
 ```toml
 rmcp = { version = "0.8.3", features = ["server", "transport-sse-server"] }
 ```
@@ -52,13 +52,13 @@ rmcp = { version = "0.8.3", features = ["server", "transport-sse-server"] }
 
 Run:
 ```bash
-cd /path/to/quickai-gateway && cargo doc -p qai-agent --no-deps 2>&1 | tail -20
+cd /path/to/clawbro-gateway && cargo doc -p clawbro-agent --no-deps 2>&1 | tail -20
 ```
 
 Then check the rmcp types by running:
 ```bash
-cargo add rmcp@0.8.3 --features server,transport-sse-server -p qai-agent 2>&1
-cargo check -p qai-agent 2>&1 | head -30
+cargo add rmcp@0.8.3 --features server,transport-sse-server -p clawbro-agent 2>&1
+cargo check -p clawbro-agent 2>&1 | head -30
 ```
 
 Specifically verify these types exist (they may differ by version):
@@ -72,15 +72,15 @@ Specifically verify these types exist (they may differ by version):
 **Step 3: Verify compilation**
 
 ```bash
-cargo check -p qai-agent 2>&1 | grep -E "^error"
+cargo check -p clawbro-agent 2>&1 | grep -E "^error"
 ```
 Expected: 0 errors (rmcp added, no code using it yet).
 
 **Step 4: Commit**
 
 ```bash
-git add crates/qai-agent/Cargo.toml Cargo.lock
-git commit -m "chore(qai-agent): add rmcp dependency for team MCP server"
+git add crates/clawbro-agent/Cargo.toml Cargo.lock
+git commit -m "chore(clawbro-agent): add rmcp dependency for team MCP server"
 ```
 
 ---
@@ -88,8 +88,8 @@ git commit -m "chore(qai-agent): add rmcp dependency for team MCP server"
 ## Task 2: Implement TeamToolServer (mcp_server.rs)
 
 **Files:**
-- Create: `crates/qai-agent/src/team/mcp_server.rs`
-- Modify: `crates/qai-agent/src/team/mod.rs`
+- Create: `crates/clawbro-agent/src/team/mcp_server.rs`
+- Modify: `crates/clawbro-agent/src/team/mod.rs`
 
 **Step 1: Create `team/mcp_server.rs`**
 
@@ -232,7 +232,7 @@ impl TeamToolServer {
 impl rmcp::ServerHandler for TeamToolServer {}
 ```
 
-> **⚠️ rmcp API note:** The exact proc-macro path (`rmcp::tool` vs `#[tool]` with `use rmcp::tool`) and transport API (`SseServer::serve_with_shutdown` signature) depends on the installed version. Run `cargo doc -p qai-agent --open` after adding the dependency to verify. Adjust the proc-macro attribute paths and `SseServer` call accordingly.
+> **⚠️ rmcp API note:** The exact proc-macro path (`rmcp::tool` vs `#[tool]` with `use rmcp::tool`) and transport API (`SseServer::serve_with_shutdown` signature) depends on the installed version. Run `cargo doc -p clawbro-agent --open` after adding the dependency to verify. Adjust the proc-macro attribute paths and `SseServer` call accordingly.
 
 **Step 2: Add module to `team/mod.rs`**
 
@@ -248,7 +248,7 @@ pub mod session;
 **Step 3: Compile-check (no tests yet)**
 
 ```bash
-cargo check -p qai-agent 2>&1 | grep -E "^error"
+cargo check -p clawbro-agent 2>&1 | grep -E "^error"
 ```
 
 Fix any proc-macro path errors by consulting `cargo doc` output for rmcp.
@@ -325,14 +325,14 @@ mod tests {
 **Step 5: Run tests**
 
 ```bash
-cargo test -p qai-agent team::mcp_server 2>&1
+cargo test -p clawbro-agent team::mcp_server 2>&1
 ```
 Expected: 2 tests pass.
 
 **Step 6: Commit**
 
 ```bash
-git add crates/qai-agent/src/team/mcp_server.rs crates/qai-agent/src/team/mod.rs
+git add crates/clawbro-agent/src/team/mcp_server.rs crates/clawbro-agent/src/team/mod.rs
 git commit -m "feat(team): add TeamToolServer — MCP server for complete_task/block_task tool calls"
 ```
 
@@ -341,7 +341,7 @@ git commit -m "feat(team): add TeamToolServer — MCP server for complete_task/b
 ## Task 3: Wire TeamMcpServer lifecycle into TeamOrchestrator
 
 **Files:**
-- Modify: `crates/qai-agent/src/team/orchestrator.rs`
+- Modify: `crates/clawbro-agent/src/team/orchestrator.rs`
 
 **Step 1: Add `mcp_server_handle` field**
 
@@ -448,14 +448,14 @@ For tests inside `orchestrator.rs`, the existing sync tests that call `orch.star
 **Step 6: Run tests**
 
 ```bash
-cargo test -p qai-agent team::orchestrator 2>&1
+cargo test -p clawbro-agent team::orchestrator 2>&1
 ```
 Expected: all orchestrator tests pass.
 
 **Step 7: Commit**
 
 ```bash
-git add crates/qai-agent/src/team/orchestrator.rs
+git add crates/clawbro-agent/src/team/orchestrator.rs
 git commit -m "feat(orchestrator): spawn per-team HTTP MCP server on start(), stop on stop()"
 ```
 
@@ -464,8 +464,8 @@ git commit -m "feat(orchestrator): spawn per-team HTTP MCP server on start(), st
 ## Task 4: Add `mcp_server_url` to `AgentCtx` + inject in `registry.rs`
 
 **Files:**
-- Modify: `crates/qai-agent/src/traits.rs`
-- Modify: `crates/qai-agent/src/registry.rs`
+- Modify: `crates/clawbro-agent/src/traits.rs`
+- Modify: `crates/clawbro-agent/src/registry.rs`
 
 **Step 1: Add field to AgentCtx**
 
@@ -502,7 +502,7 @@ let ctx = AgentCtx {
 **Step 3: Compile-check**
 
 ```bash
-cargo check -p qai-agent 2>&1 | grep "^error"
+cargo check -p clawbro-agent 2>&1 | grep "^error"
 ```
 
 Any `AgentCtx` construction that doesn't include `mcp_server_url` will now fail to compile. Fix each by adding `mcp_server_url: None` where not applicable (non-Specialist paths and tests).
@@ -517,7 +517,7 @@ Expected: 0 failures.
 **Step 5: Commit**
 
 ```bash
-git add crates/qai-agent/src/traits.rs crates/qai-agent/src/registry.rs
+git add crates/clawbro-agent/src/traits.rs crates/clawbro-agent/src/registry.rs
 git commit -m "feat(ctx): add mcp_server_url to AgentCtx; inject for Specialist turns"
 ```
 
@@ -526,7 +526,7 @@ git commit -m "feat(ctx): add mcp_server_url to AgentCtx; inject for Specialist 
 ## Task 5: Extend AcpEngine to pass mcp_servers in NewSessionRequest
 
 **Files:**
-- Modify: `crates/qai-agent/src/acp_engine.rs`
+- Modify: `crates/clawbro-agent/src/acp_engine.rs`
 
 **Step 1: Capture `initialize()` response to read `mcp_capabilities`**
 
@@ -534,7 +534,7 @@ Change:
 ```rust
 conn.initialize(
     acp::InitializeRequest::new(acp::ProtocolVersion::V1).client_info(
-        acp::Implementation::new("quickai-gateway", env!("CARGO_PKG_VERSION")),
+        acp::Implementation::new("clawbro-gateway", env!("CARGO_PKG_VERSION")),
     ),
 )
 .await
@@ -545,7 +545,7 @@ To:
 ```rust
 let init_resp = conn.initialize(
     acp::InitializeRequest::new(acp::ProtocolVersion::V1).client_info(
-        acp::Implementation::new("quickai-gateway", env!("CARGO_PKG_VERSION")),
+        acp::Implementation::new("clawbro-gateway", env!("CARGO_PKG_VERSION")),
     ),
 )
 .await
@@ -606,7 +606,7 @@ let sess = conn
 **Step 3: Compile-check**
 
 ```bash
-cargo check -p qai-agent 2>&1 | grep "^error"
+cargo check -p clawbro-agent 2>&1 | grep "^error"
 ```
 
 Adjust `McpServer` variant syntax based on compiler error. The compiler will tell you the exact enum shape.
@@ -650,7 +650,7 @@ Extract the mcp_servers construction into a pure function `build_mcp_servers(sup
 **Step 5: Run tests**
 
 ```bash
-cargo test -p qai-agent acp_engine 2>&1
+cargo test -p clawbro-agent acp_engine 2>&1
 cargo test --workspace 2>&1 | grep -E "FAILED|^test result"
 ```
 Expected: new tests pass, no regressions.
@@ -658,7 +658,7 @@ Expected: new tests pass, no regressions.
 **Step 6: Commit**
 
 ```bash
-git add crates/qai-agent/src/acp_engine.rs
+git add crates/clawbro-agent/src/acp_engine.rs
 git commit -m "feat(acp_engine): inject team-tools MCP server into NewSessionRequest for Specialist turns"
 ```
 
@@ -678,12 +678,12 @@ Expected: 0 failures, count ≥ previous baseline.
 The prompt-marker fallback requires no code changes — `mark_done` with `LIKE 'claimed%'` guard already handles double-call. Verify by reading the relevant test:
 
 ```bash
-cargo test -p qai-agent test_create_and_claim_task 2>&1
+cargo test -p clawbro-agent test_create_and_claim_task 2>&1
 ```
 
 **Step 3: Document system prompt update**
 
-In the Specialist's `task_reminder` (built by `TeamSession::build_task_reminder()`), add a line explaining the available MCP tools. Edit `crates/qai-agent/src/team/session.rs` in `build_task_reminder()`:
+In the Specialist's `task_reminder` (built by `TeamSession::build_task_reminder()`), add a line explaining the available MCP tools. Edit `crates/clawbro-agent/src/team/session.rs` in `build_task_reminder()`:
 
 ```rust
 // After the existing format! string, append:
@@ -696,7 +696,7 @@ This tells the LLM about both paths.
 **Step 4: Final commit**
 
 ```bash
-git add crates/qai-agent/src/team/session.rs
+git add crates/clawbro-agent/src/team/session.rs
 git commit -m "docs(team): update task_reminder to mention MCP tools alongside marker fallback"
 ```
 

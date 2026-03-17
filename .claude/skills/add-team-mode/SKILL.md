@@ -7,7 +7,7 @@ description: 引导为群组或单聊启用 Team 模式（Lead + Specialists 协
 
 ## 关于本 Skill
 
-Team 模式让 QuickAI Gateway 支持多 Agent 协作：
+Team 模式让 ClawBro Gateway 支持多 Agent 协作：
 - **Lead Agent**：接收用户消息，拆解任务，分配给 Specialists，验收结果
 - **Specialist Agents**：并行执行子任务，汇报完成状态
 - 适合复杂工程任务（大型代码修改、多步骤研究、跨文件重构等）
@@ -20,7 +20,7 @@ Team 模式让 QuickAI Gateway 支持多 Agent 协作：
 
 ```bash
 echo "--- 当前 agent_roster ---"
-grep -A 6 '\[\[agent_roster\]\]' ~/.quickai/config.toml 2>/dev/null || echo "⚠ 无 agent_roster"
+grep -A 6 '\[\[agent_roster\]\]' ~/.clawbro/config.toml 2>/dev/null || echo "⚠ 无 agent_roster"
 ```
 
 **Team 模式要求**：
@@ -37,7 +37,7 @@ Team 模式最少需要 2 个 Agent（1 Lead + 1 Specialist）。
 ### 0.2 检查是否已有 Team 配置
 
 ```bash
-grep -q '\[\[group\]\]\|\[\[team_scope\]\]' ~/.quickai/config.toml 2>/dev/null && \
+grep -q '\[\[group\]\]\|\[\[team_scope\]\]' ~/.clawbro/config.toml 2>/dev/null && \
   echo "⚠ 已有 Team 配置，本次将追加新配置" || \
   echo "✓ 将新建 Team 配置"
 ```
@@ -202,10 +202,10 @@ max_parallel   = 2
 
 ```bash
 # 备份
-cp ~/.quickai/config.toml ~/.quickai/config.toml.bak.$(date +%Y%m%d%H%M%S)
+cp ~/.clawbro/config.toml ~/.clawbro/config.toml.bak.$(date +%Y%m%d%H%M%S)
 
 # 追加 Team 配置
-cat >> ~/.quickai/config.toml << 'TOMLEOF'
+cat >> ~/.clawbro/config.toml << 'TOMLEOF'
 
 <生成的 [[group]] 或 [[team_scope]] 段>
 TOMLEOF
@@ -221,16 +221,16 @@ echo "✓ Team 模式配置已写入"
 
 ```bash
 echo "--- 新增的 Team 配置 ---"
-grep -A 12 '\[\[group\]\]\|\[\[team_scope\]\]' ~/.quickai/config.toml | tail -20
+grep -A 12 '\[\[group\]\]\|\[\[team_scope\]\]' ~/.clawbro/config.toml | tail -20
 ```
 
 ### 3.2 重启 Gateway 验证
 
 ```bash
-source ~/.quickai/.env && quickai-gateway &
+source ~/.clawbro/.env && clawbro-gateway &
 GATEWAY_PID=$!
 sleep 2
-PORT=$(cat ~/.quickai/gateway.port 2>/dev/null || echo "8080")
+PORT=$(cat ~/.clawbro/gateway.port 2>/dev/null || echo "8080")
 
 # 健康检查
 curl -s http://127.0.0.1:$PORT/health | python3 -m json.tool 2>/dev/null

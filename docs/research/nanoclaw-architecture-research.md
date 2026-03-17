@@ -1,9 +1,9 @@
 # NanoClaw 架构研究报告
 
-> 研究目的：深度分析 nanoclaw 的设计哲学、Skills 配置体系、Channel 架构，作为 quickai-gateway 设计参考。
+> 研究目的：深度分析 nanoclaw 的设计哲学、Skills 配置体系、Channel 架构，作为 clawbro-gateway 设计参考。
 >
 > 研究日期：2026-03-18
-> 研究源码：`/Users/fishers/Desktop/repo/quickai-openclaw/nanoclaw`
+> 研究源码：`/Users/fishers/Desktop/repo/clawbro-openclaw/nanoclaw`
 > NanoClaw 版本：1.2.12
 
 ---
@@ -493,7 +493,7 @@ npm run dev            # 开发模式（tsx，热重载）
 
 ---
 
-## 十三、对 quickai-gateway 的设计参考
+## 十三、对 clawbro-gateway 的设计参考
 
 ### 最值得学习的设计
 
@@ -502,13 +502,13 @@ npm run dev            # 开发模式（tsx，热重载）
 | Skills = 自注册 Channel（合并代码）| Channel 配置复杂度降低；按需安装减少维护负担 |
 | `update-nanoclaw` skill | 定制 fork + 上游同步，解决"个人定制 vs 社区更新"矛盾 |
 | Credential Proxy | 多 backend 凭据安全注入（gateway 已有类似思路，但可以更显式）|
-| 文件夹即上下文（`groups/{name}/CLAUDE.md`）| quickai-gateway 的 persona/workspace 契约已有，值得对齐 |
+| 文件夹即上下文（`groups/{name}/CLAUDE.md`）| clawbro-gateway 的 persona/workspace 契约已有，值得对齐 |
 | IPC via 文件系统 | 简单可靠，适合跨进程通信（当前 gateway 用 WebSocket，不同场景）|
-| main 组特权设计 | quickai-gateway 的 Solo/Lead 角色设计与此类似 |
+| main 组特权设计 | clawbro-gateway 的 Solo/Lead 角色设计与此类似 |
 
-### quickai-gateway 有而 NanoClaw 没有的
+### clawbro-gateway 有而 NanoClaw 没有的
 
-| quickai-gateway 特有 | 说明 |
+| clawbro-gateway 特有 | 说明 |
 |--------------------|------|
 | Team/Lead/Specialist 编排 | NanoClaw 只有 Swarm（实验性）|
 | ACP 协议（codex/claude-code CLI 接入）| NanoClaw 只接 Claude API |

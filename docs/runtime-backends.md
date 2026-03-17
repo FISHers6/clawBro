@@ -2,7 +2,7 @@
 
 ## Purpose
 
-`quickai-gateway` now separates:
+`clawbro-gateway` now separates:
 
 - `Business Control Plane`
 - `Agent Runtime / Conductor Plane`
@@ -12,7 +12,7 @@ This document describes the runtime side only: backend families, their adapters,
 Routing precedence is documented separately in [`routing-contract.md`](routing-contract.md).
 Validated backend capability levels and current product-facing boundaries are documented separately in [`backend-support-matrix.md`](backend-support-matrix.md).
 
-Current control-plane decomposition in `qai-agent`:
+Current control-plane decomposition in `clawbro-agent`:
 
 - `routing.rs` resolves turn destination and backend hints
 - `context_assembly.rs` builds workspace/persona/shared context
@@ -41,9 +41,9 @@ Status: active
 
 Implementation:
 
-- adapter: [`qai-runtime/src/acp/adapter.rs`](/Users/fishers/Desktop/repo/quickai-openclaw/quickai-gateway/crates/qai-runtime/src/acp/adapter.rs)
-- probe: [`qai-runtime/src/acp/probe.rs`](/Users/fishers/Desktop/repo/quickai-openclaw/quickai-gateway/crates/qai-runtime/src/acp/probe.rs)
-- session driver: [`qai-runtime/src/acp/session_driver.rs`](/Users/fishers/Desktop/repo/quickai-openclaw/quickai-gateway/crates/qai-runtime/src/acp/session_driver.rs)
+- adapter: [`clawbro-runtime/src/acp/adapter.rs`](/Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway/crates/clawbro-runtime/src/acp/adapter.rs)
+- probe: [`clawbro-runtime/src/acp/probe.rs`](/Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway/crates/clawbro-runtime/src/acp/probe.rs)
+- session driver: [`clawbro-runtime/src/acp/session_driver.rs`](/Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway/crates/clawbro-runtime/src/acp/session_driver.rs)
 
 Notes:
 
@@ -57,9 +57,9 @@ Status: active
 
 Implementation:
 
-- adapter: [`qai-runtime/src/openclaw/adapter.rs`](/Users/fishers/Desktop/repo/quickai-openclaw/quickai-gateway/crates/qai-runtime/src/openclaw/adapter.rs)
-- client: [`qai-runtime/src/openclaw/client.rs`](/Users/fishers/Desktop/repo/quickai-openclaw/quickai-gateway/crates/qai-runtime/src/openclaw/client.rs)
-- probe: [`qai-runtime/src/openclaw/probe.rs`](/Users/fishers/Desktop/repo/quickai-openclaw/quickai-gateway/crates/qai-runtime/src/openclaw/probe.rs)
+- adapter: [`clawbro-runtime/src/openclaw/adapter.rs`](/Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway/crates/clawbro-runtime/src/openclaw/adapter.rs)
+- client: [`clawbro-runtime/src/openclaw/client.rs`](/Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway/crates/clawbro-runtime/src/openclaw/client.rs)
+- probe: [`clawbro-runtime/src/openclaw/probe.rs`](/Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway/crates/clawbro-runtime/src/openclaw/probe.rs)
 
 Default eligibility:
 
@@ -67,11 +67,11 @@ Default eligibility:
 - `relay = true`
 - `specialist = false` unless an explicit team helper is configured
 - `lead = false` unless an explicit team helper and explicit lead mode are configured
-- `native_team = supported but disabled by QuickAI policy` by default
+- `native_team = supported but disabled by ClawBro policy` by default
 
 Important:
 
-- In QuickAI Team mode, OpenClaw is currently treated as one backend actor.
+- In ClawBro Team mode, OpenClaw is currently treated as one backend actor.
 - It becomes `SpecialistEligible` only when the backend config provides an explicit `team_helper_command`.
 - It becomes `LeadEligible` only when the backend config provides both:
   - `team_helper_command`
@@ -86,30 +86,30 @@ Important:
   - no bypass of `TaskRegistry / TeamOrchestrator`
 - The runtime transport itself is already real: `OpenClawBackendAdapter` now connects to the gateway WebSocket protocol and normalizes stream events into `RuntimeEvent`.
 - OpenClaw `exec.approval.requested` broadcasts are normalized into `RuntimeEvent::ApprovalRequest`.
-- QuickAI now exposes a WS approval surface (`ResolveApproval`) backed by a shared runtime `ApprovalBroker`.
+- ClawBro now exposes a WS approval surface (`ResolveApproval`) backed by a shared runtime `ApprovalBroker`.
 - Policy is still fail-closed: if no decision arrives before the approval expires, the runtime resolves it as `deny` to avoid indefinite hangs.
 - This keeps OpenClaw equal at the runtime layer without pretending it is ACP.
 
-### QuickAI Native
+### ClawBro Native
 
 Status: active, team-capable via canonical Team Tool RPC
 
 Implementation:
 
-- adapter: [`qai-runtime/src/native/adapter.rs`](/Users/fishers/Desktop/repo/quickai-openclaw/quickai-gateway/crates/qai-runtime/src/native/adapter.rs)
-- probe: [`qai-runtime/src/native/probe.rs`](/Users/fishers/Desktop/repo/quickai-openclaw/quickai-gateway/crates/qai-runtime/src/native/probe.rs)
-- rust agent bridge: [`runtime_bridge.rs`](/Users/fishers/Desktop/repo/quickai-openclaw/quickai-gateway/crates/quickai-agent-sdk/src/runtime_bridge.rs)
+- adapter: [`clawbro-runtime/src/native/adapter.rs`](/Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway/crates/clawbro-runtime/src/native/adapter.rs)
+- probe: [`clawbro-runtime/src/native/probe.rs`](/Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway/crates/clawbro-runtime/src/native/probe.rs)
+- rust agent bridge: [`runtime_bridge.rs`](/Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway/crates/clawbro-agent-sdk/src/runtime_bridge.rs)
 
 Important:
 
-- `quickai-rust-agent` is a first-class participant even though it is not ACP-first by design.
+- `clawbro-rust-agent` is a first-class participant even though it is not ACP-first by design.
 - Native family is no longer limited to `solo/relay`.
-- `quickai-rust-agent` now receives `RuntimeSessionSpec`, dynamically registers team tools by role, and calls back into the gateway through the canonical `/runtime/team-tools` endpoint.
+- `clawbro-rust-agent` now receives `RuntimeSessionSpec`, dynamically registers team tools by role, and calls back into the gateway through the canonical `/runtime/team-tools` endpoint.
 - This keeps native family on the same business contract as ACP family without forcing it through ACP MCP.
 
 Team contract note:
 
-- canonical team business semantics now live behind one shared executor in `qai-agent`
+- canonical team business semantics now live behind one shared executor in `clawbro-agent`
 - legacy ACP `SharedTeamMcpServer` remains a compatibility adapter only
 - adapter methods translate MCP parameters into canonical team tool execution, rather than carrying a second business logic branch
 
@@ -128,7 +128,7 @@ The `acp` family supports an optional `acp_backend` field that identifies the sp
 
 This is the active Claude product path.
 
-`quickai-claude-agent` is retained only as a deprecated legacy artifact and is not part of the standard runtime matrix.
+`clawbro-claude-agent` is retained only as a deprecated legacy artifact and is not part of the standard runtime matrix.
 
 ```toml
 [[backend]]
@@ -218,7 +218,7 @@ args = ["acp"]
 
 ### Generic or custom ACP backend (no explicit identity)
 
-When `acp_backend` is omitted, QuickAI uses the generic ACP CLI path with no special policy:
+When `acp_backend` is omitted, ClawBro uses the generic ACP CLI path with no special policy:
 
 ```toml
 [[backend]]
@@ -255,7 +255,7 @@ family = "open_claw_gateway"
 type = "gateway_ws"
 endpoint = "ws://127.0.0.1:18789"
 agent_id = "main"
-team_helper_command = "/usr/local/bin/qai-team-cli"
+team_helper_command = "/usr/local/bin/clawbro-team-cli"
 ```
 
 OpenClaw constrained leader example:
@@ -269,7 +269,7 @@ family = "open_claw_gateway"
 type = "gateway_ws"
 endpoint = "ws://127.0.0.1:18789"
 agent_id = "main"
-team_helper_command = "/usr/local/bin/qai-team-cli"
+team_helper_command = "/usr/local/bin/clawbro-team-cli"
 lead_helper_mode = true
 ```
 
@@ -341,9 +341,9 @@ url = "http://127.0.0.1:3002/sse"
 
 Contract behavior:
 
-- QuickAI normalizes these into `RuntimeSessionSpec.external_mcp_servers`
+- ClawBro normalizes these into `RuntimeSessionSpec.external_mcp_servers`
 - `ACP` merges them with the existing `team-tools` SSE bridge
-- `quick_ai_native` receives them over the native JSON runtime session contract and connects from inside `quickai-rust-agent`
+- `quick_ai_native` receives them over the native JSON runtime session contract and connects from inside `clawbro-rust-agent`
 - `OpenClaw` keeps its current protocol boundary and does not claim external MCP parity yet
 
 Important:
@@ -355,6 +355,6 @@ Important:
 
 Why not `OpenClaw` yet:
 
-- QuickAI can normalize OpenClaw runtime events and team helper callbacks
+- ClawBro can normalize OpenClaw runtime events and team helper callbacks
 - but current OpenClaw gateway integration still does not expose an equivalent external MCP registration surface for normal chat sessions
 - pretending parity here would be dishonest

@@ -1,19 +1,19 @@
-# QuickAI Gateway 从零开始
+# ClawBro Gateway 从零开始
 
-这份文档面向第一次使用 `quickai-gateway` 的开发者，目标是让你按当前代码实现，把系统从零配置到可运行，再逐步扩展到多 Agent、Team、Lark、DingTalk、Cron 和诊断面。
+这份文档面向第一次使用 `clawbro-gateway` 的开发者，目标是让你按当前代码实现，把系统从零配置到可运行，再逐步扩展到多 Agent、Team、Lark、DingTalk、Cron 和诊断面。
 
 本文基于当前代码路径：
 
-- 启动入口：[main.rs](/Users/fishers/Desktop/repo/quickai-openclaw/quickai-gateway/crates/qai-server/src/main.rs)
-- 配置结构：[config.rs](/Users/fishers/Desktop/repo/quickai-openclaw/quickai-gateway/crates/qai-server/src/config.rs)
-- Backend 家族：[runtime-backends.md](/Users/fishers/Desktop/repo/quickai-openclaw/quickai-gateway/docs/runtime-backends.md)
-- 上下文文件契约：[context-filesystem-contract.md](/Users/fishers/Desktop/repo/quickai-openclaw/quickai-gateway/docs/context-filesystem-contract.md)
-- 路由契约：[routing-contract.md](/Users/fishers/Desktop/repo/quickai-openclaw/quickai-gateway/docs/routing-contract.md)
-- 运维诊断面：[doctor-and-status.md](/Users/fishers/Desktop/repo/quickai-openclaw/quickai-gateway/docs/operations/doctor-and-status.md)
+- 启动入口：[main.rs](/Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway/crates/clawbro-server/src/main.rs)
+- 配置结构：[config.rs](/Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway/crates/clawbro-server/src/config.rs)
+- Backend 家族：[runtime-backends.md](/Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway/docs/runtime-backends.md)
+- 上下文文件契约：[context-filesystem-contract.md](/Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway/docs/context-filesystem-contract.md)
+- 路由契约：[routing-contract.md](/Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway/docs/routing-contract.md)
+- 运维诊断面：[doctor-and-status.md](/Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway/docs/operations/doctor-and-status.md)
 
 ## 1. 系统是什么
 
-`quickai-gateway` 当前是一个统一的 AI Gateway 和控制面，负责：
+`clawbro-gateway` 当前是一个统一的 AI Gateway 和控制面，负责：
 
 - 接收外部消息：WebSocket、Lark、DingTalk、Cron
 - 做会话、路由、绑定、memory、team orchestration
@@ -27,7 +27,7 @@
   - `/doctor`
   - `/diagnostics/*`
 
-当前 Claude 路径使用 `npx @zed-industries/claude-agent-acp`。`quickai-claude-agent` 仅保留为仓库内遗留实验产物，不属于标准产品接入路径。
+当前 Claude 路径使用 `npx @zed-industries/claude-agent-acp`。`clawbro-claude-agent` 仅保留为仓库内遗留实验产物，不属于标准产品接入路径。
 
 建议的上手顺序不是直接接 IM，而是：
 
@@ -39,33 +39,33 @@
 
 ## 2. 目录和运行时文件
 
-当前默认运行目录都在 `~/.quickai/` 下。
+当前默认运行目录都在 `~/.clawbro/` 下。
 
 关键文件和目录：
 
-- `~/.quickai/config.toml`
+- `~/.clawbro/config.toml`
   - 主配置文件
-- `~/.quickai/sessions/`
+- `~/.clawbro/sessions/`
   - 会话存储
-- `~/.quickai/shared/`
+- `~/.clawbro/shared/`
   - 共享 memory 存储
-- `~/.quickai/skills/`
+- `~/.clawbro/skills/`
   - skills 主目录
-- `~/.quickai/cron.db`
+- `~/.clawbro/cron.db`
   - cron SQLite 存储
-- `~/.quickai/gateway.port`
+- `~/.clawbro/gateway.port`
   - 启动后写入的 gateway 端口
-- `~/.quickai/allowlist.json`
+- `~/.clawbro/allowlist.json`
   - channel allowlist，可选
 
 建议先创建：
 
 ```bash
-mkdir -p ~/.quickai
-mkdir -p ~/.quickai/sessions
-mkdir -p ~/.quickai/shared
-mkdir -p ~/.quickai/skills
-mkdir -p ~/.quickai/personas
+mkdir -p ~/.clawbro
+mkdir -p ~/.clawbro/sessions
+mkdir -p ~/.clawbro/shared
+mkdir -p ~/.clawbro/skills
+mkdir -p ~/.clawbro/personas
 ```
 
 ## 3. 先准备什么
@@ -74,21 +74,21 @@ mkdir -p ~/.quickai/personas
 
 - Rust / Cargo
 - 一个可用模型 API Key
-- `quickai-rust-agent` 二进制
-- `quickai-gateway` 二进制
+- `clawbro-rust-agent` 二进制
+- `clawbro-gateway` 二进制
 
 推荐先编译：
 
 ```bash
-cd /Users/fishers/Desktop/repo/quickai-openclaw/quickai-gateway
-cargo build -p quickai-rust-agent
-cargo build -p qai-server --bin quickai-gateway
+cd /Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway
+cargo build -p clawbro-rust-agent
+cargo build -p clawbro-server --bin clawbro-gateway
 ```
 
-如果你使用 `quick_ai_native` family 的 `bundled_command` 启动方式，gateway 会默认尝试执行 QuickAI 管理的捆绑 shell：
+如果你使用 `quick_ai_native` family 的 `bundled_command` 启动方式，gateway 会默认尝试执行 ClawBro 管理的捆绑 shell：
 
 ```bash
-quickai-rust-agent --runtime-bridge
+clawbro-rust-agent --runtime-bridge
 ```
 
 默认情况下不再依赖 `PATH`。如果你需要覆盖捆绑路径，再改成显式 `external_command` 启动。
@@ -103,7 +103,7 @@ quickai-rust-agent --runtime-bridge
 
 ### 4.1 模型环境变量
 
-`quickai-rust-agent` 当前读取优先级是：
+`clawbro-rust-agent` 当前读取优先级是：
 
 1. `ANTHROPIC_API_KEY`
 2. `OPENAI_API_KEY`
@@ -112,14 +112,14 @@ quickai-rust-agent --runtime-bridge
 可选附加：
 
 - `OPENAI_API_BASE`
-- `QUICKAI_MODEL`
-- `QUICKAI_SYSTEM_PROMPT`
+- `CLAWBRO_MODEL`
+- `CLAWBRO_SYSTEM_PROMPT`
 
 最常见的两种写法：
 
 ```bash
 export OPENAI_API_KEY=sk-xxx
-export QUICKAI_MODEL=gpt-4o
+export CLAWBRO_MODEL=gpt-4o
 ```
 
 或：
@@ -127,7 +127,7 @@ export QUICKAI_MODEL=gpt-4o
 ```bash
 export OPENAI_API_KEY=sk-xxx
 export OPENAI_API_BASE=https://api.deepseek.com
-export QUICKAI_MODEL=deepseek-chat
+export CLAWBRO_MODEL=deepseek-chat
 ```
 
 ### 4.2 WebSocket 鉴权
@@ -163,13 +163,13 @@ Authorization: Bearer dev-token
 
 如果你不想用默认路径，可以设：
 
-- `QUICKAI_ALLOWLIST_PATH`
+- `CLAWBRO_ALLOWLIST_PATH`
 
 ## 5. 配置文件总规则
 
 主配置文件固定从这里读取：
 
-- `~/.quickai/config.toml`
+- `~/.clawbro/config.toml`
 
 当前没有命令行参数覆盖这个路径。
 
@@ -185,7 +185,7 @@ Authorization: Bearer dev-token
 
 这是最推荐的第一步。先不要接 IM。
 
-写入 `~/.quickai/config.toml`：
+写入 `~/.clawbro/config.toml`：
 
 ```toml
 [gateway]
@@ -208,22 +208,22 @@ family = "quick_ai_native"
 type = "bundled_command"
 
 [skills]
-dir = "/Users/yourname/.quickai/skills"
+dir = "/Users/yourname/.clawbro/skills"
 
 [session]
-dir = "/Users/yourname/.quickai/sessions"
+dir = "/Users/yourname/.clawbro/sessions"
 
 [memory]
-shared_dir = "/Users/yourname/.quickai/shared"
+shared_dir = "/Users/yourname/.clawbro/shared"
 distill_every_n = 20
-distiller_binary = "quickai-rust-agent"
+distiller_binary = "clawbro-rust-agent"
 ```
 
 启动：
 
 ```bash
-cd /Users/fishers/Desktop/repo/quickai-openclaw/quickai-gateway
-cargo run -p qai-server --bin quickai-gateway
+cd /Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway
+cargo run -p clawbro-server --bin clawbro-gateway
 ```
 
 如果你不想固定端口，也可以写：
@@ -235,17 +235,17 @@ port = 0
 
 这样系统会让操作系统分配随机端口，并把最终端口写入：
 
-- `~/.quickai/gateway.port`
+- `~/.clawbro/gateway.port`
 
 ### 启动后会发生什么
 
-- 读取 `~/.quickai/config.toml`
+- 读取 `~/.clawbro/config.toml`
 - 初始化 session 存储
 - 初始化 skills
 - 注册 runtime adapters
 - 注册 backend catalog
 - 启动 HTTP/WS gateway
-- 写端口到 `~/.quickai/gateway.port`
+- 写端口到 `~/.clawbro/gateway.port`
 - 如果配置了 cron / channel / team，也会一并启动
 
 ### 第一次验证
@@ -298,7 +298,7 @@ curl http://127.0.0.1:8080/doctor
 
 ## 8. 单 Agent 但不用 bundled_command
 
-如果你不想使用 QuickAI 管理的捆绑路径，可以显式写成 `external_command`：
+如果你不想使用 ClawBro 管理的捆绑路径，可以显式写成 `external_command`：
 
 ```toml
 [agent]
@@ -310,7 +310,7 @@ family = "quick_ai_native"
 
 [backend.launch]
 type = "external_command"
-command = "/Users/fishers/Desktop/repo/quickai-openclaw/quickai-gateway/target/debug/quickai-rust-agent"
+command = "/Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway/target/debug/clawbro-rust-agent"
 args = []
 ```
 
@@ -348,9 +348,9 @@ url = "http://127.0.0.1:3002/sse"
 当前行为：
 
 - 这些 server 会作为宿主级 `external_mcp_servers` 进入 `RuntimeSessionSpec`
-- `quickai-rust-agent` 会在 native runtime 内部通过 `rig/rmcp` 连接并注册工具
+- `clawbro-rust-agent` 会在 native runtime 内部通过 `rig/rmcp` 连接并注册工具
 - 这和 `team_tool_url` 是两条不同路径：
-  - `team_tool_url` 负责 QuickAI 自己的 team tools
+  - `team_tool_url` 负责 ClawBro 自己的 team tools
   - `external_mcp_servers` 负责用户配置的外部 MCP tools
 - 名称必须唯一，且不能使用保留名 `team-tools`
 
@@ -363,7 +363,7 @@ url = "http://127.0.0.1:3002/sse"
 **注意：**
 - `acp_backend` 只在 `family = "acp"` 时有效，其他 family 会拒绝该字段
 - `config.toml` 不支持 `${ENV_VAR}` 环境变量插值，所有值必须是字面字符串
-- Gemini 尚未作为 `acp_backend` 值在 QuickAI 中验证
+- Gemini 尚未作为 `acp_backend` 值在 ClawBro 中验证
 
 **Bridge-backed backends（需要 npx 适配器包）：**
 
@@ -476,7 +476,7 @@ agent_id = "main"
 如果你希望它参与 Team helper：
 
 ```toml
-team_helper_command = "/usr/local/bin/qai-team-cli"
+team_helper_command = "/usr/local/bin/clawbro-team-cli"
 team_helper_args = []
 ```
 
@@ -489,7 +489,7 @@ lead_helper_mode = true
 注意：
 
 - 这一阶段 `OpenClaw` 不支持像 `ACP / quick_ai_native` 那样的外部 MCP server parity
-- 原因不是 QuickAI 偷懒，而是当前 OpenClaw gateway chat/client 路径没有对等的外部 MCP 注入面
+- 原因不是 ClawBro 偷懒，而是当前 OpenClaw gateway chat/client 路径没有对等的外部 MCP 注入面
 - `OpenClaw` 当前仍然支持 team helper CLI bridge，这是另一条能力路径，不等同于外部 MCP
 
 ## 10. 多 Agent roster 场景
@@ -503,14 +503,14 @@ lead_helper_mode = true
 name = "claude"
 mentions = ["@claude"]
 backend_id = "native-main"
-persona_dir = "/Users/yourname/.quickai/personas/claude"
+persona_dir = "/Users/yourname/.clawbro/personas/claude"
 workspace_dir = "/Users/yourname/work/app1"
 
 [[agent_roster]]
 name = "reviewer"
 mentions = ["@reviewer"]
 backend_id = "codex-main"
-persona_dir = "/Users/yourname/.quickai/personas/reviewer"
+persona_dir = "/Users/yourname/.clawbro/personas/reviewer"
 workspace_dir = "/Users/yourname/work/app1"
 
 [[agent_roster]]
@@ -529,7 +529,7 @@ workspace_dir = "/Users/yourname/work/app1"
 
 ### 为什么 external MCP 放在 `[[backend]]` 而不是 `[[agent_roster]]`
 
-当前 QuickAI 把外部 MCP server 视为 backend execution capability，而不是 persona/roster 属性。
+当前 ClawBro 把外部 MCP server 视为 backend execution capability，而不是 persona/roster 属性。
 
 这意味着：
 
@@ -569,7 +569,7 @@ workspace_dir = "/Users/yourname/work/app1"
 最常见的 persona 目录示例：
 
 ```text
-~/.quickai/personas/claude/
+~/.clawbro/personas/claude/
   SOUL.md
   IDENTITY.md
   MEMORY.md
@@ -780,7 +780,7 @@ team runtime 会建立：
 
 ## 15. Cron 场景
 
-当前支持在配置里声明 `[[cron_jobs]]`，启动时会同步到 `~/.quickai/cron.db`。
+当前支持在配置里声明 `[[cron_jobs]]`，启动时会同步到 `~/.clawbro/cron.db`。
 
 例子：
 
@@ -891,7 +891,7 @@ require_mention_in_groups = true
 
 如果你要限制谁可以用 channel，写：
 
-- `~/.quickai/allowlist.json`
+- `~/.clawbro/allowlist.json`
 
 示例：
 
@@ -977,16 +977,16 @@ default_workspace = "/Users/yourname/work/app1"
 ws_token = "dev-token"
 
 [skills]
-dir = "/Users/yourname/.quickai/skills"
-global_dirs = ["/Users/yourname/.quickai/global-skills"]
+dir = "/Users/yourname/.clawbro/skills"
+global_dirs = ["/Users/yourname/.clawbro/global-skills"]
 
 [session]
-dir = "/Users/yourname/.quickai/sessions"
+dir = "/Users/yourname/.clawbro/sessions"
 
 [memory]
-shared_dir = "/Users/yourname/.quickai/shared"
+shared_dir = "/Users/yourname/.clawbro/shared"
 distill_every_n = 20
-distiller_binary = "quickai-rust-agent"
+distiller_binary = "clawbro-rust-agent"
 
 [[backend]]
 id = "native-main"
@@ -1012,21 +1012,21 @@ family = "open_claw_gateway"
 type = "gateway_ws"
 endpoint = "ws://127.0.0.1:18789"
 agent_id = "main"
-team_helper_command = "/usr/local/bin/qai-team-cli"
+team_helper_command = "/usr/local/bin/clawbro-team-cli"
 lead_helper_mode = true
 
 [[agent_roster]]
 name = "claude"
 mentions = ["@claude"]
 backend_id = "native-main"
-persona_dir = "/Users/yourname/.quickai/personas/claude"
+persona_dir = "/Users/yourname/.clawbro/personas/claude"
 workspace_dir = "/Users/yourname/work/app1"
 
 [[agent_roster]]
 name = "reviewer"
 mentions = ["@reviewer"]
 backend_id = "codex-main"
-persona_dir = "/Users/yourname/.quickai/personas/reviewer"
+persona_dir = "/Users/yourname/.clawbro/personas/reviewer"
 workspace_dir = "/Users/yourname/work/app1"
 
 [[agent_roster]]
@@ -1171,13 +1171,13 @@ agent = "claude"
 
 常见原因：
 
-- 捆绑路径下没有可执行的 `quickai-rust-agent`
+- 捆绑路径下没有可执行的 `clawbro-rust-agent`
 - 模型 API Key 没配
-- `QUICKAI_MODEL` 不可用
+- `CLAWBRO_MODEL` 不可用
 
 处理：
 
-- 先单独运行 `quickai-rust-agent --runtime-bridge` 验证
+- 先单独运行 `clawbro-rust-agent --runtime-bridge` 验证
 - 或改成显式 `external_command` 启动
 
 ### 22.5 Lark / DingTalk 配了但没收到消息
@@ -1214,10 +1214,10 @@ agent = "claude"
 
 如果你只想最快跑通，照这个做：
 
-1. 编译 `quickai-rust-agent`
+1. 编译 `clawbro-rust-agent`
 2. 导出 `OPENAI_API_KEY`
-3. 写最小 `~/.quickai/config.toml`
-4. 启动 `cargo run -p qai-server --bin quickai-gateway`
+3. 写最小 `~/.clawbro/config.toml`
+4. 启动 `cargo run -p clawbro-server --bin clawbro-gateway`
 5. 调 `curl /health`
 6. 连 `/ws`
 7. 发一条 `InboundMsg`
@@ -1234,7 +1234,7 @@ agent = "claude"
 
 ## 24. 相关文档
 
-- [runtime-backends.md](/Users/fishers/Desktop/repo/quickai-openclaw/quickai-gateway/docs/runtime-backends.md)
-- [routing-contract.md](/Users/fishers/Desktop/repo/quickai-openclaw/quickai-gateway/docs/routing-contract.md)
-- [context-filesystem-contract.md](/Users/fishers/Desktop/repo/quickai-openclaw/quickai-gateway/docs/context-filesystem-contract.md)
-- [doctor-and-status.md](/Users/fishers/Desktop/repo/quickai-openclaw/quickai-gateway/docs/operations/doctor-and-status.md)
+- [runtime-backends.md](/Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway/docs/runtime-backends.md)
+- [routing-contract.md](/Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway/docs/routing-contract.md)
+- [context-filesystem-contract.md](/Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway/docs/context-filesystem-contract.md)
+- [doctor-and-status.md](/Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway/docs/operations/doctor-and-status.md)

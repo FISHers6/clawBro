@@ -1,0 +1,40 @@
+[package]
+name = "clawbro-rust-agent"
+version = "0.1.0"
+publish = false
+edition = "2021"
+description = "ClawBro Rust Agent — ACP server binary powered by rig-core"
+license = "MIT"
+repository = "https://github.com/fishers/clawbro-openclaw"
+readme = "README.md"
+keywords = ["ai", "agent", "cli", "acp"]
+categories = ["command-line-utilities", "development-tools"]
+
+[lib]
+name = "clawbro_rust_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "clawbro-rust-agent"
+path = "src/main.rs"
+
+[dependencies]
+clawbro-agent-sdk = { version = "0.1", path = "../clawbro-agent-sdk" }
+clawbro-protocol = { version = "0.1", path = "../clawbro-protocol" }
+rig-core = { version = "0.20", path = "../../../vendor/rig-core-0.20.0", features = ["rmcp"] }
+agent-client-protocol = "0.9"
+# rustls with ring feature: needed to call install_default() in main() before HTTPS requests.
+rustls = { version = "0.23", features = ["ring"] }
+tokio = { version = "1", features = ["rt", "macros", "io-std", "process", "sync", "time", "fs"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+anyhow = "1"
+async-trait = "0.1"
+reqwest = { version = "0.12", features = ["rustls-tls", "json"], default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["compat"] }

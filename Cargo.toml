@@ -1,16 +1,16 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/qai-protocol",
-    "crates/quickai-agent-sdk",
-    "crates/quickai-rust-agent",
-    "crates/qai-runtime",
-    "crates/qai-session",
-    "crates/qai-agent",
-    "crates/qai-channels",
-    "crates/qai-skills",
-    "crates/qai-cron",
-    "crates/qai-server",
+    "crates/clawbro-protocol",
+    "crates/clawbro-agent-sdk",
+    "crates/clawbro-rust-agent",
+    "crates/clawbro-runtime",
+    "crates/clawbro-session",
+    "crates/clawbro-agent",
+    "crates/clawbro-channels",
+    "crates/clawbro-skills",
+    "crates/clawbro-cron",
+    "crates/clawbro-server",
 ]
 
 [workspace.dependencies]

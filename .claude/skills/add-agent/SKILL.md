@@ -7,7 +7,7 @@ description: 引导向 agent_roster 追加新 Agent，配置名称、触发 ment
 
 ## 关于本 Skill
 
-向 `~/.quickai/config.toml` 的 `[[agent_roster]]` 追加一个新 Agent。
+向 `~/.clawbro/config.toml` 的 `[[agent_roster]]` 追加一个新 Agent。
 每个 Agent 可以：
 - 有独立的名称和 @mention 触发词
 - 绑定不同的 Backend（native / claude-code / codex 等）
@@ -19,13 +19,13 @@ description: 引导向 agent_roster 追加新 Agent，配置名称、触发 ment
 ## Phase 0：前提确认
 
 ```bash
-[ -f ~/.quickai/config.toml ] && echo "✓ config.toml 存在" || echo "⚠ 请先运行 /setup"
+[ -f ~/.clawbro/config.toml ] && echo "✓ config.toml 存在" || echo "⚠ 请先运行 /setup"
 
 echo "--- 当前已有 Agents ---"
-grep -A 6 '\[\[agent_roster\]\]' ~/.quickai/config.toml 2>/dev/null || echo "（暂无 agent_roster）"
+grep -A 6 '\[\[agent_roster\]\]' ~/.clawbro/config.toml 2>/dev/null || echo "（暂无 agent_roster）"
 
 echo "--- 可用 Backends ---"
-grep -A 1 '\[\[backend\]\]' ~/.quickai/config.toml 2>/dev/null | grep '^id' | sed 's/id *= */  /' || echo "（无 backend 配置）"
+grep -A 1 '\[\[backend\]\]' ~/.clawbro/config.toml 2>/dev/null | grep '^id' | sed 's/id *= */  /' || echo "（无 backend 配置）"
 ```
 
 ---
@@ -59,10 +59,10 @@ grep -A 1 '\[\[backend\]\]' ~/.quickai/config.toml 2>/dev/null | grep '^id' | se
 显示可选列表：
 ```bash
 echo "可用 Backends："
-grep 'id = ' ~/.quickai/config.toml | grep -A0 'backend' | awk '{print "  " $3}' || true
+grep 'id = ' ~/.clawbro/config.toml | grep -A0 'backend' | awk '{print "  " $3}' || true
 
 # 以及内置选项
-echo "  native-main  （内置 quickai-rust-agent，默认）"
+echo "  native-main  （内置 clawbro-rust-agent，默认）"
 echo "  claude-code  （如果已通过 /add-acp-backend 添加）"
 echo "  codex        （如果已通过 /add-acp-backend 添加）"
 ```
@@ -97,7 +97,7 @@ Persona 目录下可以放：
   - IDENTITY.md    — Agent 的身份定义（包含 MBTI、名字、emoji 等）
   - soul-injection.md  — 注入到系统提示词的额外内容
 
-示例目录：~/.quickai/personas/rex
+示例目录：~/.clawbro/personas/rex
 
 如果不需要独立个性，留空（将使用全局 shared memory）。
 ```
@@ -144,10 +144,10 @@ agent   = "<name>"
 
 ```bash
 # 备份
-cp ~/.quickai/config.toml ~/.quickai/config.toml.bak.$(date +%Y%m%d%H%M%S)
+cp ~/.clawbro/config.toml ~/.clawbro/config.toml.bak.$(date +%Y%m%d%H%M%S)
 
 # 追加 agent_roster 配置
-cat >> ~/.quickai/config.toml << 'TOMLEOF'
+cat >> ~/.clawbro/config.toml << 'TOMLEOF'
 
 [[agent_roster]]
 name       = "<name>"
@@ -157,7 +157,7 @@ backend_id = "<backend-id>"
 <如有>persona_dir  = "<路径>"
 TOMLEOF
 
-<如有 binding>cat >> ~/.quickai/config.toml << 'TOMLEOF'
+<如有 binding>cat >> ~/.clawbro/config.toml << 'TOMLEOF'
 
 [[binding]]
 kind    = "channel"
@@ -174,14 +174,14 @@ echo "✓ Agent '<name>' 已添加到 roster"
 
 ```bash
 echo "--- 更新后的 agent_roster ---"
-grep -A 8 '\[\[agent_roster\]\]' ~/.quickai/config.toml
+grep -A 8 '\[\[agent_roster\]\]' ~/.clawbro/config.toml
 
 echo ""
 echo "--- 验证配置语法（重启 Gateway）---"
-source ~/.quickai/.env && quickai-gateway &
+source ~/.clawbro/.env && clawbro-gateway &
 GATEWAY_PID=$!
 sleep 2
-PORT=$(cat ~/.quickai/gateway.port 2>/dev/null || echo "8080")
+PORT=$(cat ~/.clawbro/gateway.port 2>/dev/null || echo "8080")
 curl -s http://127.0.0.1:$PORT/health
 kill $GATEWAY_PID
 ```
@@ -225,7 +225,7 @@ workspace_dir = "/Users/xxx/projects"
 name          = "rex"
 mentions      = ["@rex", "@Rex"]
 backend_id    = "native-main"
-persona_dir   = "/Users/xxx/.quickai/personas/rex"
+persona_dir   = "/Users/xxx/.clawbro/personas/rex"
 
 # 绑定：默认用 coder（无 mention 时）
 [[binding]]
