@@ -284,6 +284,13 @@ async fn run_dispatch_job(
             .unwrap_or("<none>"),
         "Runtime conductor execute_prepared_streaming completed"
     );
+    if turn.full_text.is_empty() {
+        tracing::warn!(
+            session_id = %session_id,
+            backend_id = %backend_id,
+            "Backend returned zero-length output; possible cold-start or subprocess initialization failure"
+        );
+    }
     tracing::debug!(
         session_id = %session_id,
         "Waiting for runtime event forwarder to finish"

@@ -5,9 +5,10 @@ use anyhow::Result;
 use qai_agent::team::completion_routing::{RoutingDeliveryStatus, TeamRoutingEnvelope};
 use qai_agent::team::milestone::TeamMilestoneEvent;
 use qai_agent::team::milestone_delivery::{milestone_dedupe_key, milestone_is_public};
-use qai_agent::team::session::{ChannelSendSourceKind, ChannelSendStatus};
+use qai_agent::team::registry::TaskStatus;
+use qai_agent::team::session::{ChannelSendSourceKind, ChannelSendStatus, TeamSession};
 use qai_agent::{SessionRegistry, TurnExecutionContext};
-use qai_protocol::{InboundMsg, MsgContent, MsgSource, SessionKey};
+use qai_protocol::{InboundMsg, MsgContent, MsgSource, OutboundMsg, SessionKey};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -27,6 +28,30 @@ fn default_channel_instance_for_scope(
             .as_ref()
             .map(|lark| lark.default_instance_id().to_string()),
         _ => None,
+    }
+}
+
+async fn send_with_reply_fallback(
+    channel: &Arc<dyn qai_channels::Channel>,
+    outbound: OutboundMsg,
+) -> (OutboundMsg, anyhow::Result<()>) {
+    match channel.send(&outbound).await {
+        Ok(()) => (outbound, Ok(())),
+        Err(error) if outbound.reply_to.is_some() => {
+            tracing::warn!(
+                channel = %channel.name(),
+                reply_to = outbound.reply_to.as_deref().unwrap_or(""),
+                error = %error,
+                "milestone reply_to send failed; retrying as direct scope send"
+            );
+            let mut fallback = outbound.clone();
+            fallback.reply_to = None;
+            match channel.send(&fallback).await {
+                Ok(()) => (fallback, Ok(())),
+                Err(fallback_error) => (fallback, Err(fallback_error)),
+            }
+        }
+        Err(error) => (outbound, Err(error)),
     }
 }
 
@@ -145,12 +170,28 @@ pub async fn wire_team_runtime(
                 let result = registry
                     .handle_with_context(msg, TurnExecutionContext::default())
                     .await;
-                let reply_excerpt = result.as_ref().ok().and_then(|reply| {
-                    reply
-                        .as_ref()
-                        .map(|text| truncate_for_missing_completion(text, 240))
+                let specialist_session_id = registry
+                    .session_manager_ref()
+                    .get_or_create(&team_session.specialist_session_key(&agent))
+                    .await?;
+                let captured_reply_text = capture_specialist_reply_text(
+                    registry.session_manager_ref().storage().as_ref(),
+                    specialist_session_id,
+                    &result,
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!(
+                        error = %error,
+                        task_id = %task.id,
+                        agent = %agent,
+                        "failed to capture specialist reply text for team diagnostics"
+                    );
+                    None
                 });
-                if let Ok(Some(ref reply_text)) = result {
+                let reply_excerpt =
+                    missing_completion_excerpt(&result, captured_reply_text.as_deref());
+                if let Some(ref reply_text) = captured_reply_text {
                     let _ = team_session.append_specialist_reply(&agent, &task.id, reply_text);
                 }
                 if let Some(team_orch) = team_orch_cell.get() {
@@ -160,18 +201,22 @@ pub async fn wire_team_runtime(
                         outcome,
                         qai_agent::team::specialist_turn::SpecialistTurnOutcome::MissingCompletion
                     ) {
+                        if let Some(ref reply_text) = captured_reply_text {
+                            let _ = persist_missing_completion_reply_artifacts(
+                                team_session.as_ref(),
+                                &task.id,
+                                &agent,
+                                reply_text,
+                            );
+                        }
                         team_orch.handle_specialist_missing_completion(
                             &task.id,
                             &agent,
                             reply_excerpt.as_deref(),
                         )?;
-                        let session_id = registry
-                            .session_manager_ref()
-                            .get_or_create(&team_session.specialist_session_key(&agent))
-                            .await?;
                         registry
                             .session_manager_ref()
-                            .reset_conversation(session_id)
+                            .reset_conversation(specialist_session_id)
                             .await?;
                     }
                 }
@@ -260,7 +305,8 @@ pub async fn wire_team_runtime(
                     if let Some(resolved) = resolved {
                         let sender_channel_instance = resolved.sender_channel_instance.clone();
                         let outbound = resolved.outbound_text(&msg);
-                        let send_result = resolved.sender.send(&outbound).await;
+                        let (outbound, send_result) =
+                            send_with_reply_fallback(&resolved.sender, outbound).await;
                         (outbound, send_result, sender_channel_instance)
                     } else if let Some(ch) = channels.resolve_for_session(&scope) {
                         let outbound = qai_protocol::OutboundMsg {
@@ -273,7 +319,7 @@ pub async fn wire_team_runtime(
                                 .as_ref()
                                 .and_then(|source| source.thread_ts.clone()),
                         };
-                        let send_result = ch.send(&outbound).await;
+                        let (outbound, send_result) = send_with_reply_fallback(&ch, outbound).await;
                         (outbound, send_result, None)
                     } else {
                         return;
@@ -383,6 +429,25 @@ pub async fn wire_team_runtime(
         let registry_for_notify = Arc::clone(&registry);
         tokio::spawn(async move {
             while let Some(request) = team_notify_rx.recv().await {
+                if let Some(team_orch) =
+                    registry_for_notify.get_team_orchestrator(&request.envelope.team_id)
+                {
+                    if routing_event_is_stale_for_delivery(team_orch.as_ref(), &request.envelope) {
+                        tracing::info!(
+                            team_id = %request.envelope.team_id,
+                            task_id = %request.envelope.event.task_id,
+                            kind = ?request.envelope.event.kind,
+                            "Suppressing stale team routing event before lead delivery"
+                        );
+                        team_orch.mark_routing_event_delivered(
+                            &request
+                                .envelope
+                                .clone()
+                                .with_delivery_status(RoutingDeliveryStatus::DirectDelivered),
+                        );
+                        continue;
+                    }
+                }
                 let text = request.envelope.event.render_for_parent();
                 let mut delivered = None;
 
@@ -503,6 +568,83 @@ fn truncate_for_missing_completion(text: &str, max_chars: usize) -> String {
     truncated
 }
 
+async fn capture_specialist_reply_text(
+    storage: &qai_session::SessionStorage,
+    specialist_session_id: uuid::Uuid,
+    result: &anyhow::Result<Option<String>>,
+) -> Result<Option<String>> {
+    if let Ok(Some(reply_text)) = result {
+        if !reply_text.trim().is_empty() {
+            return Ok(Some(reply_text.clone()));
+        }
+    }
+
+    let recent = storage
+        .load_recent_messages(specialist_session_id, 20)
+        .await
+        .unwrap_or_default();
+    Ok(recent
+        .iter()
+        .rev()
+        .find(|msg| msg.role == "assistant" && !msg.content.trim().is_empty())
+        .map(|msg| msg.content.clone()))
+}
+
+fn missing_completion_excerpt(
+    result: &anyhow::Result<Option<String>>,
+    captured_reply_text: Option<&str>,
+) -> Option<String> {
+    if let Some(reply_text) = captured_reply_text {
+        return Some(truncate_for_missing_completion(reply_text, 240));
+    }
+    match result {
+        Err(error) => Some(truncate_for_missing_completion(
+            &format!("runtime error: {error}"),
+            240,
+        )),
+        // Backend returned zero or empty text — no tool calls, no content.
+        // Most likely cause: ACP subprocess cold-start failure or MCP bridge unavailable.
+        Ok(None) => Some(
+            "zero-output turn: backend returned no text (possible cold-start, subprocess \
+             initialization failure, or MCP bridge unavailable)"
+                .to_string(),
+        ),
+        Ok(Some(text)) if text.trim().is_empty() => Some(
+            "zero-output turn: backend returned empty text (possible cold-start, subprocess \
+             initialization failure, or MCP bridge unavailable)"
+                .to_string(),
+        ),
+        Ok(Some(_)) => None,
+    }
+}
+
+fn persist_missing_completion_reply_artifacts(
+    team_session: &TeamSession,
+    task_id: &str,
+    agent: &str,
+    reply_text: &str,
+) -> Result<()> {
+    let result_path = team_session.task_dir(task_id).join("result.md");
+    let existing = std::fs::read_to_string(&result_path).unwrap_or_default();
+    if existing.trim().is_empty() {
+        team_session.write_task_result(
+            task_id,
+            &format!(
+                "# Draft Specialist Output\n\nThis task ended without a canonical team completion tool call.\nThe raw assistant reply from `{agent}` was preserved below for review/retry.\n\n---\n\n{reply_text}\n"
+            ),
+        )?;
+    }
+    team_session.append_task_progress(
+        task_id,
+        &format!(
+            "[{}] preserved raw reply text from {} before specialist session reset.",
+            chrono::Utc::now().to_rfc3339(),
+            agent
+        ),
+    )?;
+    Ok(())
+}
+
 fn routing_attempt_targets(envelope: &TeamRoutingEnvelope) -> Vec<SessionKey> {
     let mut targets = Vec::with_capacity(1 + envelope.fallback_session_keys.len());
     if let Some(requester) = &envelope.requester_session_key {
@@ -552,14 +694,72 @@ fn team_notify_turn_context(
     TurnExecutionContext { delivery_source }
 }
 
+fn routing_event_is_stale_for_delivery(
+    team_orch: &qai_agent::team::orchestrator::TeamOrchestrator,
+    envelope: &TeamRoutingEnvelope,
+) -> bool {
+    let task = match team_orch.registry.get_task(&envelope.event.task_id) {
+        Ok(Some(task)) => task,
+        Ok(None) | Err(_) => return false,
+    };
+
+    match envelope.event.kind {
+        qai_agent::team::completion_routing::TeamRoutingEventKind::TaskCheckpoint => matches!(
+            task.status_parsed(),
+            TaskStatus::Submitted { .. }
+                | TaskStatus::Accepted { .. }
+                | TaskStatus::Done
+                | TaskStatus::Failed(_)
+        ),
+        qai_agent::team::completion_routing::TeamRoutingEventKind::TaskSubmitted => matches!(
+            task.status_parsed(),
+            TaskStatus::Accepted { .. } | TaskStatus::Done | TaskStatus::Failed(_)
+        ),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{ChannelsSection, GatewayConfig, LarkSection, ProgressPresentationMode};
+    use anyhow::Result;
+    use async_trait::async_trait;
     use qai_agent::team::completion_routing::{RoutingDeliveryStatus, TeamRoutingEvent};
     use qai_agent::team::milestone::TeamMilestoneEvent;
     use qai_agent::team::milestone_delivery::{milestone_is_public, TeamPublicUpdatesMode};
-    use qai_agent::team::session::stable_team_id_for_session_key;
+    use qai_agent::team::orchestrator::TeamOrchestrator;
+    use qai_agent::team::registry::{CreateTask, TaskRegistry};
+    use qai_agent::team::session::{stable_team_id_for_session_key, TeamSession};
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use tempfile::tempdir;
+    use tokio::sync::mpsc;
+    use uuid::Uuid;
+
+    struct MockChannel {
+        sent: Mutex<Vec<OutboundMsg>>,
+        fail_when_reply_to: bool,
+    }
+
+    #[async_trait]
+    impl qai_channels::Channel for MockChannel {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        async fn send(&self, msg: &OutboundMsg) -> Result<()> {
+            if self.fail_when_reply_to && msg.reply_to.is_some() {
+                anyhow::bail!("reply target not found");
+            }
+            self.sent.lock().unwrap().push(msg.clone());
+            Ok(())
+        }
+
+        async fn listen(&self, _tx: mpsc::Sender<InboundMsg>) -> Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn routing_attempt_targets_dedupes_requester_and_fallbacks() {
@@ -615,6 +815,171 @@ mod tests {
     }
 
     #[test]
+    fn stale_checkpoint_is_suppressed_after_submission() {
+        let tmp = tempdir().unwrap();
+        let registry = Arc::new(TaskRegistry::new_in_memory().unwrap());
+        let session = Arc::new(TeamSession::from_dir("team-test", tmp.path().to_path_buf()));
+        let dispatch_fn: qai_agent::team::heartbeat::DispatchFn =
+            Arc::new(|_agent, _task| Box::pin(async { Ok(()) }));
+        let orch = TeamOrchestrator::new(
+            registry.clone(),
+            session,
+            dispatch_fn,
+            std::time::Duration::from_secs(60),
+        );
+        registry
+            .create_task(CreateTask {
+                id: "T004".into(),
+                title: "task".into(),
+                assignee_hint: Some("codex-beta".into()),
+                deps: vec![],
+                timeout_secs: 60,
+                spec: None,
+                success_criteria: None,
+            })
+            .unwrap();
+        registry.try_claim("T004", "codex-beta").unwrap();
+        registry
+            .submit_task_result("T004", "codex-beta", "done")
+            .unwrap();
+
+        let envelope = TeamRoutingEnvelope {
+            run_id: "run-1".into(),
+            parent_run_id: None,
+            requester_session_key: Some(SessionKey::new("lark", "group:test")),
+            fallback_session_keys: vec![],
+            team_id: "team-test".into(),
+            delivery_status: RoutingDeliveryStatus::NotRouted,
+            event: TeamRoutingEvent::checkpoint("T004", "codex-beta", "still working"),
+            delivery_source: None,
+        };
+
+        assert!(routing_event_is_stale_for_delivery(
+            orch.as_ref(),
+            &envelope
+        ));
+    }
+
+    #[tokio::test]
+    async fn capture_specialist_reply_text_prefers_direct_result() {
+        let dir = tempdir().unwrap();
+        let storage = qai_session::SessionStorage::new(dir.path().to_path_buf());
+        let session_id = Uuid::new_v4();
+
+        let captured = capture_specialist_reply_text(
+            &storage,
+            session_id,
+            &Ok(Some("direct result".to_string())),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(captured.as_deref(), Some("direct result"));
+    }
+
+    #[tokio::test]
+    async fn capture_specialist_reply_text_falls_back_to_persisted_assistant_message() {
+        let dir = tempdir().unwrap();
+        let storage = qai_session::SessionStorage::new(dir.path().to_path_buf());
+        let session_id = Uuid::new_v4();
+        let session_dir = dir.path().join(session_id.to_string());
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(
+            session_dir.join("messages.jsonl"),
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({
+                    "id": Uuid::new_v4(),
+                    "role": "user",
+                    "content": "spec",
+                    "timestamp": chrono::Utc::now(),
+                    "sender": "orchestrator",
+                    "tool_calls": null,
+                    "fragment_event_ids": null,
+                    "aggregation_mode": null,
+                }),
+                serde_json::json!({
+                    "id": Uuid::new_v4(),
+                    "role": "assistant",
+                    "content": "persisted assistant output",
+                    "timestamp": chrono::Utc::now(),
+                    "sender": "@codex-beta",
+                    "tool_calls": null,
+                    "fragment_event_ids": null,
+                    "aggregation_mode": null,
+                })
+            ),
+        )
+        .unwrap();
+
+        let captured = capture_specialist_reply_text(&storage, session_id, &Ok(None))
+            .await
+            .unwrap();
+
+        assert_eq!(captured.as_deref(), Some("persisted assistant output"));
+    }
+
+    #[test]
+    fn missing_completion_excerpt_falls_back_to_runtime_error() {
+        let excerpt =
+            missing_completion_excerpt(&Err(anyhow::anyhow!("tool bridge unavailable")), None)
+                .unwrap();
+        assert!(excerpt.contains("runtime error: tool bridge unavailable"));
+    }
+
+    #[test]
+    fn missing_completion_excerpt_zero_output_ok_none() {
+        let excerpt = missing_completion_excerpt(&Ok(None), None).unwrap();
+        assert!(
+            excerpt.contains("zero-output turn"),
+            "Ok(None) should produce zero-output diagnostic, got: {excerpt}"
+        );
+        assert!(excerpt.contains("cold-start"));
+    }
+
+    #[test]
+    fn missing_completion_excerpt_zero_output_ok_empty_string() {
+        let excerpt = missing_completion_excerpt(&Ok(Some(String::new())), None).unwrap();
+        assert!(
+            excerpt.contains("zero-output turn"),
+            "Ok(Some(\"\")) should produce zero-output diagnostic, got: {excerpt}"
+        );
+    }
+
+    #[test]
+    fn missing_completion_excerpt_nonempty_result_without_captured_returns_none() {
+        // If capture_specialist_reply_text errored and captured_reply_text is None,
+        // but result has actual text, we should NOT emit a misleading zero-output diagnostic.
+        let excerpt =
+            missing_completion_excerpt(&Ok(Some("actual output".to_string())), None);
+        assert!(
+            excerpt.is_none(),
+            "Non-empty Ok(Some) without captured text should yield None, got: {excerpt:?}"
+        );
+    }
+
+    #[test]
+    fn persist_missing_completion_reply_artifacts_writes_draft_result() {
+        let tmp = tempdir().unwrap();
+        let session = TeamSession::from_dir("team-test", tmp.path().to_path_buf());
+
+        persist_missing_completion_reply_artifacts(
+            &session,
+            "T005",
+            "codex-beta",
+            "raw specialist answer",
+        )
+        .unwrap();
+
+        let result = std::fs::read_to_string(session.task_dir("T005").join("result.md")).unwrap();
+        let progress =
+            std::fs::read_to_string(session.task_dir("T005").join("progress.md")).unwrap();
+        assert!(result.contains("Draft Specialist Output"));
+        assert!(result.contains("raw specialist answer"));
+        assert!(progress.contains("preserved raw reply text"));
+    }
+
+    #[test]
     fn public_milestone_visibility_respects_mode() {
         assert!(milestone_is_public(
             &TeamMilestoneEvent::LeadMessage {
@@ -648,6 +1013,28 @@ mod tests {
             },
             TeamPublicUpdatesMode::Normal
         ));
+    }
+
+    #[tokio::test]
+    async fn milestone_send_retries_without_reply_to() {
+        let channel = Arc::new(MockChannel {
+            sent: Mutex::new(Vec::new()),
+            fail_when_reply_to: true,
+        });
+        let outbound = OutboundMsg {
+            session_key: SessionKey::new("lark", "group:test"),
+            content: MsgContent::text("hello"),
+            reply_to: Some("reply-id".into()),
+            thread_ts: None,
+        };
+        let (sent, result) = send_with_reply_fallback(
+            &(channel.clone() as Arc<dyn qai_channels::Channel>),
+            outbound,
+        )
+        .await;
+        result.unwrap();
+        assert!(sent.reply_to.is_none());
+        assert_eq!(channel.sent.lock().unwrap().len(), 1);
     }
 
     #[test]

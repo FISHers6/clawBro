@@ -9,6 +9,7 @@
 //!     events.jsonl   — 事件日志（调试用）
 
 use anyhow::{Context, Result};
+use chrono::Utc;
 use qai_protocol::{normalize_conversation_identity, SessionKey};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -265,6 +266,54 @@ impl TeamSession {
         self.tasks_dir().join(task_id)
     }
 
+    pub fn archive_completed_cycle(&self, tasks: &[Task]) -> Result<Option<String>> {
+        if tasks.is_empty() {
+            return Ok(None);
+        }
+
+        let archive_rel = format!("cycles/cycle-{}", Utc::now().format("%Y%m%dT%H%M%SZ"));
+        let archive_dir = self.dir.join(&archive_rel);
+        std::fs::create_dir_all(&archive_dir)
+            .with_context(|| format!("Failed to create {}", archive_dir.display()))?;
+
+        let tasks_md = self.dir.join("TASKS.md");
+        if tasks_md.is_file() {
+            std::fs::rename(&tasks_md, archive_dir.join("TASKS.md"))
+                .with_context(|| format!("Failed to move {} into archive", tasks_md.display()))?;
+        }
+
+        let tasks_root = self.tasks_dir();
+        if tasks_root.is_dir() {
+            std::fs::rename(&tasks_root, archive_dir.join("tasks"))
+                .with_context(|| format!("Failed to move {} into archive", tasks_root.display()))?;
+        }
+
+        let manifest = serde_json::json!({
+            "archived_at": Utc::now().to_rfc3339(),
+            "team_id": self.team_id,
+            "task_count": tasks.len(),
+            "tasks": tasks.iter().map(|task| serde_json::json!({
+                "id": task.id,
+                "title": task.title,
+                "status": task.status_raw,
+                "created_at": task.created_at.to_rfc3339(),
+                "done_at": task.done_at.as_ref().map(chrono::DateTime::to_rfc3339),
+            })).collect::<Vec<_>>(),
+        });
+        std::fs::write(
+            archive_dir.join("cycle.json"),
+            serde_json::to_string_pretty(&manifest)?,
+        )
+        .with_context(|| {
+            format!(
+                "Failed to write {}",
+                archive_dir.join("cycle.json").display()
+            )
+        })?;
+
+        Ok(Some(archive_rel))
+    }
+
     pub fn write_task_meta(&self, task_id: &str, meta: &TaskArtifactMeta) -> Result<()> {
         self.ensure_task_dir(task_id)?;
         let body = serde_json::to_string_pretty(meta)?;
@@ -479,6 +528,17 @@ impl TeamSession {
             .lines()
             .filter(|line| !line.trim().is_empty())
             .count())
+    }
+
+    pub fn clear_delivery_dedupe_ledgers(&self) -> Result<()> {
+        for file in ["delivered-milestones.jsonl", "delivery-dedupe-hits.jsonl"] {
+            let path = self.dir.join(file);
+            if path.exists() {
+                std::fs::remove_file(&path)
+                    .with_context(|| format!("Failed to remove {}", path.display()))?;
+            }
+        }
+        Ok(())
     }
 
     pub fn record_leader_update(
@@ -1181,6 +1241,59 @@ mod tests {
         assert!(!session
             .remove_pending_completion_by_run_id("missing-run")
             .unwrap());
+    }
+
+    #[test]
+    fn test_archive_completed_cycle_moves_active_artifacts() {
+        let (session, _tmp) = make_session();
+        let registry = TaskRegistry::new_in_memory().unwrap();
+        registry
+            .create_task(CreateTask {
+                id: "T001".into(),
+                title: "Task".into(),
+                assignee_hint: Some("codex".into()),
+                deps: vec![],
+                timeout_secs: 60,
+                spec: None,
+                success_criteria: None,
+            })
+            .unwrap();
+        registry.try_claim("T001", "codex").unwrap();
+        registry
+            .submit_task_result("T001", "codex", "done")
+            .unwrap();
+        registry.accept_task("T001", "leader").unwrap();
+        session.sync_tasks_md(&registry).unwrap();
+        session.write_task_result("T001", "result").unwrap();
+
+        let tasks = registry.all_tasks().unwrap();
+        let archive_rel = session.archive_completed_cycle(&tasks).unwrap().unwrap();
+        let archive_dir = _tmp.path().join(archive_rel);
+
+        assert!(archive_dir.join("TASKS.md").is_file());
+        assert!(archive_dir
+            .join("tasks")
+            .join("T001")
+            .join("result.md")
+            .is_file());
+        assert!(!_tmp.path().join("TASKS.md").exists());
+        assert!(!_tmp.path().join("tasks").exists());
+    }
+
+    #[test]
+    fn test_clear_delivery_dedupe_ledgers_removes_files() {
+        let (session, _tmp) = make_session();
+        session
+            .mark_delivery_dedupe("group:team", "all_tasks_done")
+            .unwrap();
+        session
+            .record_delivery_dedupe_hit("group:team", "all_tasks_done")
+            .unwrap();
+
+        session.clear_delivery_dedupe_ledgers().unwrap();
+
+        assert!(!_tmp.path().join("delivered-milestones.jsonl").exists());
+        assert!(!_tmp.path().join("delivery-dedupe-hits.jsonl").exists());
     }
 
     #[test]

@@ -314,10 +314,15 @@ impl LarkChannel {
             MsgContent::Text { text } => text.clone(),
             _ => "[unsupported content type]".to_string(),
         };
-        let message_id = msg
+        let raw_reply_to = msg
             .reply_to
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("Lark send_and_get_id: no message_id in reply_to"))?;
+        // Strip internal fanout suffix (e.g. "om_xxx#target=alpha" → "om_xxx").
+        let message_id = raw_reply_to
+            .split_once('#')
+            .map(|(base, _)| base)
+            .unwrap_or(raw_reply_to);
 
         let token = self.get_access_token().await?;
         let content_json = serde_json::json!({"text": text}).to_string();
@@ -583,7 +588,13 @@ impl Channel for LarkChannel {
         let token = self.get_access_token().await?;
         let content_json = serde_json::json!({"text": text}).to_string();
 
-        if let Some(message_id) = &msg.reply_to {
+        if let Some(raw_reply_to) = &msg.reply_to {
+            // Strip the internal fanout suffix (e.g. "om_xxx#target=alpha" → "om_xxx").
+            // The "#target=..." suffix is a qai-gateway routing marker and is not a valid Lark message ID.
+            let message_id = raw_reply_to
+                .split_once('#')
+                .map(|(base, _)| base)
+                .unwrap_or(raw_reply_to.as_str());
             // Preferred: reply to the specific incoming message.
             let client = self.client.clone();
             let url = format!("{FEISHU_BASE}/im/v1/messages/{message_id}/reply");

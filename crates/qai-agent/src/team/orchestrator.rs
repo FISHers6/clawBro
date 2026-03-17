@@ -215,6 +215,39 @@ impl TeamOrchestrator {
         })
     }
 
+    fn task_is_terminal(task: &Task) -> bool {
+        matches!(
+            task.status_parsed(),
+            super::registry::TaskStatus::Accepted { .. }
+                | super::registry::TaskStatus::Done
+                | super::registry::TaskStatus::Failed(_)
+        )
+    }
+
+    fn archive_completed_cycle_if_needed(&self) -> Result<bool> {
+        let tasks = self.registry.all_tasks()?;
+        if tasks.is_empty() || !tasks.iter().all(Self::task_is_terminal) {
+            return Ok(false);
+        }
+
+        let archive_path = self.session.archive_completed_cycle(&tasks)?;
+        self.registry.clear_all_tasks()?;
+        self.session.sync_tasks_md(&self.registry)?;
+        self.session.clear_delivery_dedupe_ledgers()?;
+        *self.done_final_posted.lock().unwrap() = false;
+        *self.team_state_inner.lock().unwrap() = TeamState::Planning;
+
+        let event = serde_json::json!({
+            "event": "ARCHIVED_COMPLETED_CYCLE",
+            "ts": Utc::now().to_rfc3339(),
+            "task_count": tasks.len(),
+            "archive_path": archive_path,
+        })
+        .to_string();
+        let _ = self.session.append_event(&event);
+        Ok(true)
+    }
+
     // ── 里程碑通知接线 ────────────────────────────────────────────────────────
 
     /// 设置里程碑通知目标 IM scope（在 /team start 时调用）。
@@ -505,6 +538,7 @@ impl TeamOrchestrator {
 
     /// 在 Planning 阶段注册单个任务。只能在 state == Planning 或 AwaitingConfirm 时调用。
     pub fn register_task(&self, task: super::registry::CreateTask) -> Result<String> {
+        self.archive_completed_cycle_if_needed()?;
         let state = self.team_state_inner.lock().unwrap().clone();
         if !matches!(state, TeamState::Planning | TeamState::AwaitingConfirm) {
             anyhow::bail!("Cannot register task: team is already {:?}", state);
@@ -1771,6 +1805,45 @@ mod tests {
             ..Default::default()
         });
         assert!(result.is_ok(), "reopened team must accept new tasks");
+    }
+
+    #[test]
+    fn test_register_task_archives_completed_cycle_before_new_cycle() {
+        let (orch, tmp) = make_orchestrator();
+        orch.register_task(CreateTask {
+            id: "T001".into(),
+            title: "finished".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        orch.registry.try_claim("T001", "codex-beta").unwrap();
+        orch.registry
+            .submit_task_result("T001", "codex-beta", "done")
+            .unwrap();
+        orch.accept_submitted_task("T001", "leader").unwrap();
+        orch.session
+            .mark_delivery_dedupe("group:test", "all_tasks_done")
+            .unwrap();
+
+        orch.register_task(CreateTask {
+            id: "T001".into(),
+            title: "fresh cycle task".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let tasks = orch.registry.all_tasks().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].title, "fresh cycle task");
+        assert!(
+            tmp.path().join("cycles").exists(),
+            "completed cycle artifacts should be archived"
+        );
+        assert_eq!(
+            orch.session.delivery_dedupe_ledger_size().unwrap(),
+            0,
+            "new cycle should reset milestone dedupe ledger"
+        );
     }
 
     #[tokio::test]
