@@ -19,6 +19,7 @@ use chrono::Utc;
 use crate::protocol::SessionKey;
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 
@@ -165,6 +166,7 @@ pub struct TeamOrchestrator {
     pending_lead_fragments: std::sync::Mutex<Vec<PendingLeadFragment>>,
     done_final_posted: std::sync::Mutex<bool>,
     active_lead_review: std::sync::Mutex<Option<ActiveLeadReviewContext>>,
+    coordination_revision: AtomicU64,
     #[cfg(test)]
     test_mcp_start_result: std::sync::Mutex<Option<std::result::Result<u16, String>>>,
 }
@@ -190,6 +192,11 @@ pub struct PendingLeadFragment {
 }
 
 impl TeamOrchestrator {
+    fn ensure_task_sequence_initialized(&self) -> Result<()> {
+        let observed_max = self.session.highest_observed_task_number()?;
+        self.registry.ensure_task_sequence_at_least(observed_max)
+    }
+
     pub fn new(
         registry: Arc<TaskRegistry>,
         session: Arc<TeamSession>,
@@ -219,9 +226,18 @@ impl TeamOrchestrator {
             pending_lead_fragments: std::sync::Mutex::new(Vec::new()),
             done_final_posted: std::sync::Mutex::new(false),
             active_lead_review: std::sync::Mutex::new(None),
+            coordination_revision: AtomicU64::new(0),
             #[cfg(test)]
             test_mcp_start_result: std::sync::Mutex::new(None),
         })
+    }
+
+    pub fn coordination_revision(&self) -> u64 {
+        self.coordination_revision.load(Ordering::SeqCst)
+    }
+
+    pub fn record_coordination_side_effect(&self) {
+        self.coordination_revision.fetch_add(1, Ordering::SeqCst);
     }
 
     fn task_is_terminal(task: &Task) -> bool {
@@ -614,18 +630,24 @@ impl TeamOrchestrator {
     /// 在 Planning 阶段注册单个任务。只能在 state == Planning 或 AwaitingConfirm 时调用。
     pub fn register_task(&self, task: super::registry::CreateTask) -> Result<String> {
         self.archive_completed_cycle_if_needed()?;
+        self.ensure_task_sequence_initialized()?;
         let state = self.team_state_inner.lock().unwrap().clone();
         if !matches!(state, TeamState::Planning | TeamState::AwaitingConfirm) {
             anyhow::bail!("Cannot register task: team is already {:?}", state);
         }
         let id = task.id.clone();
         self.registry.create_task(task)?;
+        if let Some(num) = id.strip_prefix('T').and_then(|s| s.parse::<u32>().ok()) {
+            self.registry.ensure_task_sequence_at_least(num)?;
+        }
         self.sync_task_artifacts(&id)?;
+        self.record_coordination_side_effect();
         Ok(format!("Task {} registered.", id))
     }
 
     pub fn allocate_task_id(&self) -> Result<String> {
         self.archive_completed_cycle_if_needed()?;
+        self.ensure_task_sequence_initialized()?;
         self.registry.next_task_id()
     }
 
@@ -711,6 +733,7 @@ impl TeamOrchestrator {
         *self.heartbeat_handle.lock().unwrap() = Some(handle);
         *self.done_final_posted.lock().unwrap() = false;
         *self.team_state_inner.lock().unwrap() = TeamState::Running;
+        self.record_coordination_side_effect();
 
         tracing::info!(
             team_id = %self.session.team_id,
@@ -794,6 +817,52 @@ impl TeamOrchestrator {
             return body.to_string();
         }
         format!("# Result\n\nSubmitted by: {agent}\n\n{label}:\n{summary_or_note}\n")
+    }
+
+    fn validate_submitted_result_body(
+        &self,
+        task_id: &str,
+        summary: &str,
+        result_markdown: Option<&str>,
+    ) -> Result<String> {
+        let body = result_markdown
+            .map(str::trim)
+            .filter(|body| !body.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "submit_task_result requires non-empty result_markdown containing the full final deliverable body"
+                )
+            })?;
+
+        let lower = body.to_lowercase();
+        let summary_lower = summary.trim().to_lowercase();
+        let references_own_artifacts = body.contains(&format!("tasks/{task_id}/result.md"))
+            || body.contains(&format!("tasks/{task_id}/progress.md"));
+        let looks_like_delivery_wrapper = lower.contains("结果提交")
+            || lower.contains("产物路径")
+            || lower.contains("关键交付")
+            || lower.contains("已将 `tasks/")
+            || lower.contains("not a deliverable")
+            || lower.contains("delivers the following")
+            || lower.contains("delivered the following");
+        let body_without_markdown = body
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim();
+                !trimmed.is_empty() && !trimmed.starts_with('#') && !trimmed.starts_with('-')
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let too_close_to_summary = !summary_lower.is_empty()
+            && body_without_markdown.to_lowercase().contains(&summary_lower)
+            && body_without_markdown.chars().count() <= summary.chars().count() + 80;
+
+        anyhow::ensure!(
+            !references_own_artifacts && !looks_like_delivery_wrapper && !too_close_to_summary,
+            "submit_task_result result_markdown must be the actual final deliverable, not a delivery wrapper, artifact list, or metadata summary"
+        );
+
+        Ok(body.to_string())
     }
 
     /// 处理 Specialist 完成通知（由 MCP complete_task 工具触发）
@@ -923,11 +992,12 @@ impl TeamOrchestrator {
         summary: &str,
         result_markdown: Option<&str>,
     ) -> Result<()> {
+        let result_body =
+            self.validate_submitted_result_body(task_id, summary, result_markdown)?;
         self.registry.submit_task_result(task_id, agent, summary)?;
         self.record_specialist_action(task_id, agent, SpecialistActionKind::Submitted);
         self.sync_task_artifacts(task_id)?;
         let result_artifact_path = format!("tasks/{task_id}/result.md");
-        let result_body = self.resolve_result_body(agent, "Summary", summary, result_markdown);
         let _ = self.session.write_task_result(task_id, &result_body);
 
         let event = serde_json::json!({
@@ -944,17 +1014,8 @@ impl TeamOrchestrator {
             self.build_routing_envelope(
                 task_id,
                 agent,
-                if result_markdown
-                    .map(str::trim)
-                    .filter(|body| !body.is_empty())
-                    .is_some()
-                {
-                    TeamRoutingEvent::submitted(task_id, agent, summary)
-                        .with_result_payload(result_body, result_artifact_path)
-                } else {
-                    TeamRoutingEvent::submitted(task_id, agent, summary)
-                        .with_result_artifact_path(result_artifact_path)
-                },
+                TeamRoutingEvent::submitted(task_id, agent, summary)
+                    .with_result_payload(result_body, result_artifact_path),
             ),
         );
         let task_title = self
@@ -1056,6 +1117,13 @@ impl TeamOrchestrator {
     pub fn reopen_submitted_task(&self, task_id: &str, reason: &str, by: &str) -> Result<()> {
         self.registry.reopen_task(task_id, reason)?;
         self.sync_task_artifacts(task_id)?;
+        self.session.write_task_review_feedback(
+            task_id,
+            &format!(
+                "Reopened by: {by}\nTimestamp: {}\n\nLead feedback:\n{reason}\n\nPlease continue in the same specialist session, revise the actual deliverable body in tasks/{task_id}/result.md, and resubmit with a full `result_markdown` payload.",
+                Utc::now().to_rfc3339()
+            ),
+        )?;
         let _ = self.session.append_task_progress(
             task_id,
             &format!(
@@ -2034,7 +2102,8 @@ mod tests {
             .unwrap();
         orch.registry.try_claim("T004", "codex").unwrap();
 
-        orch.handle_specialist_submitted("T004", "codex", "ready for review", None)
+        let result_markdown = "# JWT Implementation\n\nImplemented JWT auth flow with middleware, login issuance, and verification tests.";
+        orch.handle_specialist_submitted("T004", "codex", "ready for review", Some(result_markdown))
             .unwrap();
 
         let task = orch.registry.get_task("T004").unwrap().unwrap();
@@ -2047,7 +2116,7 @@ mod tests {
         let result =
             std::fs::read_to_string(tmp.path().join("tasks").join("T004").join("result.md"))
                 .unwrap();
-        assert!(result.contains("ready for review"));
+        assert_eq!(result, result_markdown);
         let meta = std::fs::read_to_string(tmp.path().join("tasks").join("T004").join("meta.json"))
             .unwrap();
         assert!(meta.contains("submitted:codex:"));
@@ -2130,20 +2199,86 @@ mod tests {
             .unwrap();
         orch.registry.try_claim("T004A", "codex").unwrap();
 
-        orch.handle_specialist_submitted("T004A", "codex", "ready for review", None)
-            .unwrap();
+        let result_markdown = "# Result\n\nAdded JWT middleware and auth tests.";
+        orch.handle_specialist_submitted(
+            "T004A",
+            "codex",
+            "ready for review",
+            Some(result_markdown),
+        )
+        .unwrap();
 
         let pending = orch.session.load_pending_completions().unwrap();
         assert_eq!(pending.len(), 1);
-        // Only artifact path is set; inline payload is intentionally omitted.
+        // Submitted review always carries the actual deliverable payload for lead inspection.
+        assert_eq!(
+            pending[0].envelope.event.result_payload.as_deref(),
+            Some(result_markdown)
+        );
         assert_eq!(
             pending[0].envelope.event.result_artifact_path.as_deref(),
             Some("tasks/T004A/result.md")
         );
+    }
+
+    #[test]
+    fn test_handle_specialist_submitted_rejects_delivery_wrapper_result() {
+        let (orch, _tmp) = make_orchestrator();
+        orch.registry
+            .create_task(CreateTask {
+                id: "T004W".into(),
+                title: "Explain INTP".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        orch.registry.try_claim("T004W", "codex").unwrap();
+
+        let err = orch
+            .handle_specialist_submitted(
+                "T004W",
+                "codex",
+                "ready for review",
+                Some(
+                    "# T004W 结果提交\n\n已将 `tasks/T004W/result.md` 替换为完整文章。\n\n## 关键交付\n- 解释 INTP\n\n## 产物路径\n- tasks/T004W/result.md",
+                ),
+            )
+            .unwrap_err();
         assert!(
-            pending[0].envelope.event.result_payload.is_none(),
-            "submitted event should NOT carry inline payload (detail already contains the summary)"
+            err.to_string()
+                .contains("must be the actual final deliverable"),
+            "unexpected error: {err:#}"
         );
+    }
+
+    #[test]
+    fn test_reopen_submitted_task_writes_review_feedback_artifact() {
+        let (orch, tmp) = make_orchestrator();
+        orch.registry
+            .create_task(CreateTask {
+                id: "T004R".into(),
+                title: "Explain INTP".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        orch.registry.try_claim("T004R", "codex").unwrap();
+        orch.handle_specialist_submitted(
+            "T004R",
+            "codex",
+            "ready for review",
+            Some("# Result\n\nDraft explanation body.".into()),
+        )
+        .unwrap();
+
+        orch.reopen_submitted_task("T004R", "正文太短，请补成完整讲解", "leader")
+            .unwrap();
+
+        let feedback = std::fs::read_to_string(
+            tmp.path().join("tasks").join("T004R").join("review-feedback.md"),
+        )
+        .unwrap();
+        assert!(feedback.contains("正文太短"));
+        assert!(feedback.contains("same specialist session"));
+        assert!(feedback.contains("result_markdown"));
     }
 
     #[test]

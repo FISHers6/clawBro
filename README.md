@@ -1,152 +1,240 @@
-# ClawBro
+<div align="center">
+  <h1>🦀 clawBro: Let Coding CLI Agents Work Like OpenClaw in Chat and collaborating as a team at all times</h1>
+  <p>
+    <strong>Built around OpenClaw ideas, clawBro helps Claude Code, Codex, Qwen, Qoder, Gemini, and other coding agent CLIs work together and connect to Lark, DingTalk, and team workflows.</strong>
+  </p>
+  <p>
+    <a href="./README_ZH.md"><strong>中文</strong></a> ·
+    <a href="./README_JA.md"><strong>日本語</strong></a> ·
+    <a href="./README_KO.md"><strong>한국어</strong></a>
+  </p>
+  <p>
+    <a href="#-project-status">Project Status</a> ·
+    <a href="#️-architecture">Architecture</a> ·
+    <a href="#-use-cases">Use Cases</a> ·
+    <a href="#-quick-start">Quick Start</a> ·
+    <a href="#-team-modes">Team Modes</a> ·
+    <a href="#-coding-agent-integration">Coding Agent Integration</a> ·
+    <a href="./docs/setup.md">Setup Guide</a>
+  </p>
+  <p>
+    <img src="https://img.shields.io/badge/version-0.1.0-blue" alt="Version">
+    <img src="https://img.shields.io/badge/rust-1.90%2B-orange" alt="Rust">
+    <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
+    <img src="https://img.shields.io/badge/agents-Claude%20%7C%20Codex%20%7C%20Qwen%20%7C%20Qoder%20%7C%20Gemini-111827" alt="Agents">
+    <img src="https://img.shields.io/badge/channels-Lark%20%7C%20DingTalk-4EA1FF" alt="Channels">
+    <img src="https://img.shields.io/badge/runtime-Native%20%7C%20CLI%20Bridge%20%7C%20OpenClaw-8B5CF6" alt="Runtime">
+    <img src="https://img.shields.io/badge/modes-Solo%20%7C%20Multi%20%7C%20Team-111827" alt="Modes">
+  </p>
+</div>
 
-ClawBro 是一个把多种 CLI Agent、原生 Agent Runtime、Lark、DingTalk 和 Team 协作模式接到同一控制面的 AI 系统。
+`clawBro` is a Rust-based system for making coding agent CLIs work together across local workflows, chat apps, and long-running team collaboration.
 
-它的目标不是只做“再包一层聊天机器人”，而是把下面这些能力放进同一个系统里：
+It stays close to the OpenClaw spirit, but pushes toward practical teamwork: Claude Code, Codex, Qwen, Qoder, Gemini, and related coding agents can be organized into solo, role-based, and lead-plus-specialist workflows, then connected to Lark, DingTalk, and WebSocket entrypoints.
 
-- 一个统一入口：`clawbro`
-- 一个统一控制面：会话、路由、绑定、诊断、定时任务、Team orchestration
-- 多种执行后端：`claw_bro_native`、ACP、OpenClaw Gateway
-- 多种使用形态：单人助理、群聊 bot、研发协作工作台、研究型 Team
+## 📢 Project Status
 
----
+- **[03-19]** One `clawbro` surface now brings together multiple AI coding CLIs instead of forcing one tool per workflow.
+- **[03-19]** Team orchestration supports lead-driven workflows, specialist agents, milestone delivery, and named roles like `planner`, `coder`, `reviewer`, and `researcher`.
+- **[03-19]** Group and direct-message usage now fit the same routing model, with Lark, DingTalk, and WebSocket entrypoints.
+- **[03-19]** Operational controls include approvals, allowlists, memory-aware sessions, `/health`, `/status`, `/doctor`, and diagnostics surfaces.
 
-## Why ClawBro
+> `clawBro` is built for engineering, research, and workflow experimentation. It is meant for real agent collaboration, not just another chat wrapper.
 
-很多 AI 工具只能做一件事：
+## Key Features of clawBro:
 
-- 只能在本地 CLI 里跑
-- 只能对接一个 provider
-- 只能一对一聊天
-- 不能在群聊里稳定工作
-- 不能把“主 Agent + specialist”协作做成长期可运行系统
+🏛️ **Unified Control Plane**: One `clawbro` entrypoint for setup, routing, session management, diagnostics, and runtime dispatch.
 
-ClawBro 解决的是这几个问题叠在一起之后的工程现实：
+🤖 **Unified Coding Agents**: Bring Claude, Codex, Qwen, Qoder, Gemini, and other coding CLIs into one product surface instead of juggling separate entrypoints.
 
-| 需求 | ClawBro 的做法 |
-| --- | --- |
-| 想把多个 CLI Agent 接到同一入口 | 统一通过 runtime backend family 接入 |
-| 想把 AI 接到飞书 / 钉钉 | 内置 channel runtime |
-| 想从单 Agent 升级到 Team | 同一份配置里支持 `solo / multi / team` |
-| 想保留工程可控性 | 有 config validate、doctor/status、health、allowlist、approval |
-| 想做真正的“任务驱动协作” | Lead + Specialists + TaskRegistry + Team runtime |
+👥 **Team Orchestration**: Support `solo`, `multi`, and `team` interaction models with lead + specialists, scope-aware routing, and milestone-style collaboration.
 
----
+💬 **Group Chat Collaboration**: Connect workflows to Lark and DingTalk, route group mentions to named agents, and turn chat rooms into AI workbenches.
 
-## What It Feels Like
+🧠 **Memory and Habits**: Let agents accumulate working memory, repeated preferences, review standards, and recurring project context over time.
+
+🛡️ **Operationally Controllable**: Built-in config validation, approval flow, allowlists, doctor/status commands, and health endpoints.
+
+## 🏗️ Architecture
 
 ```text
-User / Group Chat
-        |
-        v
-    clawbro
-        |
-        +--> Routing / Session / Memory / Team
-        |
-        +--> claw_bro_native ----> clawbro runtime-bridge ----> clawbro-agent-sdk
-        |
-        +--> ACP backends --------> claude / codex / qwen / custom ACP CLI
-        |
-        +--> OpenClaw Gateway ----> remote agent gateway
+User / Group / WebSocket / Cron
+              |
+              v
+           clawbro
+              |
+              +--> Routing / Session / Memory / Bindings / Team
+              |
+              +--> ClawBro Native ------> runtime-bridge ------> clawbro-agent-sdk
+              |
+              +--> Coding CLI Bridge ---> Claude / Codex / Qwen / Qoder / Gemini / custom coding CLIs
+              |
+              +--> OpenClaw Gateway ----> remote agent runtime
+              |
+              +--> Channels ------------> Lark / DingTalk / WebSocket delivery
 ```
 
-或者从用户视角看，它更像这样：
+## Table of Contents
 
-```mermaid
-flowchart LR
-    U[User] --> C[clawbro]
-    C --> S[Solo Agent]
-    C --> M[Multi Agent by Mention]
-    C --> T[Team Mode]
-    T --> L[Lead Agent]
-    T --> W1[Specialist A]
-    T --> W2[Specialist B]
-    C --> Lark[Lark]
-    C --> Ding[DingTalk]
-```
+- [Project Status](#-project-status)
+- [Key Features](#key-features-of-clawbro)
+- [Architecture](#️-architecture)
+- [Features](#-features)
+- [Use Cases](#-use-cases)
+- [Install](#-install)
+- [Quick Start](#-quick-start)
+- [Team Modes](#-team-modes)
+- [Coding Agent Integration](#-coding-agent-integration)
+- [Chat Channels](#-chat-channels)
+- [Configuration & Operations](#️-configuration--operations)
+- [Project Structure](#️-project-structure)
+- [Documentation Map](#-documentation-map)
+- [Positioning](#-positioning)
 
----
+## ✨ Features
 
-## What You Can Build
+<table align="center">
+  <tr align="center">
+    <th><p align="center">🤖 Coding Agent Hub</p></th>
+    <th><p align="center">👥 Team Coordination</p></th>
+    <th><p align="center">🧠 Memory Habits</p></th>
+  </tr>
+  <tr>
+    <td align="center">One control plane for Claude, Codex, Qwen, Qoder, Gemini, and other coding-focused agents.</td>
+    <td align="center">Lead + specialists, scope-aware team routing, group mentions, milestone delivery, and task-oriented collaboration.</td>
+    <td align="center">Shared memory and agent memory help the system keep long-running habits, context, and preferences.</td>
+  </tr>
+</table>
 
-### 1. Personal AI workspace
+## 🌟 Use Cases
 
-- 单人使用
-- `clawbro setup --mode solo`
-- 适合：写作、代码、日常问答、研究摘要
+### 🚀 Full-Stack App Building
 
-### 2. Multi-agent group bot
+Turn one request into a coordinated build loop:
 
-- 群里 `@planner`、`@reviewer`、`@researcher`
-- 每个 agent 单独响应
-- 适合：角色助手、部门 bot、多人协作群
+- `@planner` breaks the product request into milestones
+- `@coder` implements API routes, UI flows, and data models
+- `@reviewer` checks quality, risks, and regressions
+- `@tester` fills in edge cases and missing validation
 
-### 3. Team mode orchestration
+In Team mode, the lead can keep the user-facing conversation clean while specialists work in the background. In group chat, the same setup can feel like an AI project room instead of a single bot window.
 
-- 一个 Lead 接收需求
-- 多个 Specialists 被分配任务
-- milestone 由 Lead 汇总输出
-- 适合：研发协作、论文研究、复杂任务拆分
+### 📚 Deep Research and Report Writing
 
-### 4. IM-connected AI workbench
+Use ClawBro as a research squad:
 
-- Lark / DingTalk 接入
-- 群聊和单聊都可配置
-- 可与 team scope、group routing、bindings 组合
+- `@researcher` collects source material
+- `@critic` looks for gaps, counterexamples, and weak assumptions
+- `@writer` turns the findings into a structured report
+- the lead agent summarizes progress and final conclusions
 
----
+This works especially well for technical reports, architecture comparisons, literature reviews, and long-form analysis that benefits from multiple perspectives before one final answer.
 
-## Real Scenarios
+### 🧑‍💻 PR Review and Design Review
 
-下面这些场景是当前这套系统特别合适的方向。
+Drop a patch, PR, or design note into a chat and route it to the right mix of agents:
 
-### Engineering Team
+- `@coder` focuses on implementation details
+- `@reviewer` checks correctness and maintainability
+- `@researcher` verifies outside dependencies or competing approaches
+- the lead returns a consolidated recommendation
 
-- Lead 负责任务拆分
-- `coder` 写实现
-- `reviewer` 做 code review
-- `tester` 补测试和边界条件
+This gives you something closer to an AI review room than a single one-shot answer.
 
-### Research Team
+### 💬 Group Chat With Multiple Named Agents
 
-- `planner` 拆研究问题
-- `searcher` 查材料
-- `critic` 找反例
-- `writer` 汇总输出
+ClawBro is a natural fit for role-based group workflows:
 
-### Group Chat Workbench
+- `@planner` for decomposition
+- `@coder` for implementation
+- `@reviewer` for criticism
+- `@researcher` for evidence gathering
 
-- 群里直接把需求发给 front bot
-- Lead 后台调度 specialist
-- milestone 持续对外汇报
+That pattern works for engineering teams, study groups, product discussions, and internal support rooms. Even when the strongest current Team path is still lead-driven, the group experience can already feel much more structured than a generic bot chat.
 
-### Fun Modes
+### 🧠 Memory-Driven Coding Habits
 
-- MBTI / 角色扮演群聊
-- 桌游主持 / 剧情分工
-- “产品经理 + 程序员 + 审稿人” 的 AI 对练
+ClawBro is not just about one conversation at a time. Over repeated use, it can preserve working context such as:
 
----
+- architecture preferences
+- recurring review standards
+- naming conventions
+- project-specific workflows
+- things a user repeatedly asks the system to remember
 
-## Quick Start
+That makes it useful for building a long-running coding habit, where your agents gradually become more aligned with how you actually work instead of resetting to zero every day.
 
-### 1. Build
+### 🎭 Fun Team Play: Werewolf, RPG, and Role Rooms
+
+The same role system also works for playful group scenarios:
+
+- a lead agent can act as the moderator in Werewolf
+- specialist agents can play judge, narrator, analyst, or character roles
+- role-based group chats can simulate product debates, mock trial rooms, or scripted multi-character conversations
+
+This is one of the most distinctive parts of the project: the architecture is serious enough for engineering work, but flexible enough for entertainment and social experiments.
+
+## 📦 Install
+
+**Build from source** (current recommended path)
 
 ```bash
 cd clawBro
 cargo build -p clawbro --bin clawbro
 ```
 
-### 2. Run setup
+**Run without installing globally**
 
 ```bash
-clawbro setup
+cd clawBro
+cargo run -p clawbro --bin clawbro -- --help
 ```
 
-或者直接非交互初始化一个 Team：
+## 🚀 Quick Start
+
+> [!TIP]
+> The recommended first path is `WebSocket + ClawBro Native`.
+> Add agent rosters, bindings, channels, and Team scopes after the base path is working.
+
+**1. Build**
 
 ```bash
-clawbro setup \
+cd clawBro
+cargo build -p clawbro --bin clawbro
+```
+
+**2. Initialize**
+
+```bash
+./target/debug/clawbro setup
+```
+
+This creates the default runtime layout under `~/.clawbro/`, including:
+
+- `config.toml`
+- `.env`
+- `sessions/`
+- `shared/`
+- `skills/`
+- `personas/`
+
+**3. Validate your config**
+
+```bash
+./target/debug/clawbro config validate
+```
+
+**4. Start the gateway**
+
+```bash
+source ~/.clawbro/.env
+./target/debug/clawbro serve
+```
+
+**5. Example: non-interactive Team setup**
+
+```bash
+./target/debug/clawbro setup \
   --lang en \
   --provider anthropic \
   --api-key sk-ant-xxx \
@@ -160,88 +248,167 @@ clawbro setup \
   --non-interactive
 ```
 
-### 3. Validate config
+## 👥 Team Modes
+
+ClawBro supports multiple interaction styles from the same control plane.
+
+| Mode | What it does | Current best fit |
+| --- | --- | --- |
+| **Solo** | Single-agent setup with one primary backend. | Personal assistant, local coding help, focused one-user workflows. |
+| **Multi** | Generates a starting point for named-agent configuration and bindings. | Role-based group rooms where you want `@planner`, `@coder`, `@reviewer`, or other named agents. |
+| **Team** | Lead agent delegates work to specialists and returns milestone-style output. | Engineering collaboration, deep research, review workflows, and group workbench patterns with one stable front door. |
+
+> Today, the strongest product path is lead-driven Team mode: specialists execute as focused workers while the lead remains the stable user-facing output surface.
+
+<details>
+<summary><b>Team mode examples</b></summary>
+
+<br>
+
+**Direct message Team**
 
 ```bash
-clawbro config validate
+./target/debug/clawbro setup \
+  --lang en \
+  --provider anthropic \
+  --api-key sk-ant-xxx \
+  --mode team \
+  --team-target direct-message \
+  --front-bot planner \
+  --specialist coder \
+  --specialist reviewer \
+  --team-scope user:ou_your_user_id \
+  --team-name my-team \
+  --non-interactive
 ```
 
-### 4. Start the gateway
+**Group Team**
 
 ```bash
-source ~/.clawbro/.env
-clawbro serve
+./target/debug/clawbro setup \
+  --lang en \
+  --provider anthropic \
+  --api-key sk-ant-xxx \
+  --mode team \
+  --team-target group \
+  --front-bot planner \
+  --specialist coder \
+  --specialist reviewer \
+  --team-scope group:lark:chat-123 \
+  --team-name ops-room \
+  --non-interactive
 ```
 
----
+</details>
 
-## CLI Experience
+## 🔌 Coding Agent Integration
 
-用户入口统一是：
+ClawBro separates the business control plane from the execution plane so you can bring multiple coding agents into the same system without turning the README into a protocol manual.
+
+| Integration path | Current role | Notes |
+| --- | --- | --- |
+| **ClawBro Native** | Default native execution path | Uses the internal runtime bridge and supports canonical Team Tool RPC. |
+| **Coding CLI bridge** | Compatibility layer for external coding CLIs | Unifies multiple AI coding agents behind one control plane. Internally this is where ACP-style compatibility helps, but users mainly feel a single product surface. |
+| **OpenClaw Gateway** | Remote runtime integration | Active backend family for OpenClaw WS-based execution with explicit helper constraints in Team mode. |
+
+Current documented agent examples include:
+
+- Claude
+- Codex
+- Qwen
+- Qoder
+- Gemini
+- custom coding CLIs
+
+For the implementation details inside `clawBro`, see:
+
+- [Runtime Backends](./docs/runtime-backends.md)
+- [Backend Support Matrix](./docs/backend-support-matrix.md)
+
+## 💬 Chat Channels
+
+ClawBro connects agent workflows to chat delivery surfaces while keeping transcript truth and runtime progress under host control.
+
+| Channel | Current status | Notes |
+| --- | --- | --- |
+| **Lark / Feishu** | Complete | Supports `final_only` and `progress_compact` presentation modes. |
+| **DingTalk** | Structured | Supports the same presentation direction, with current rollout still marked as structured. |
+| **WebSocket** | Structured | Recommended first setup path before adding IM integrations. |
+
+Typical deployment path:
+
+1. Start with WebSocket and one native backend.
+2. Add `agent_roster`, bindings, and named roles.
+3. Add Team scope and routing.
+4. Connect Lark or DingTalk.
+
+## ⚙️ Configuration & Operations
+
+The primary user entrypoint is:
 
 ```bash
 clawbro
 ```
 
-常用命令：
+Common commands:
 
-| 命令 | 作用 |
+| Command | Purpose |
 | --- | --- |
-| `clawbro setup` | 首次初始化 |
-| `clawbro serve` | 启动服务 |
-| `clawbro status` | 查看当前配置摘要 |
-| `clawbro doctor` | 诊断环境和运行时问题 |
-| `clawbro config validate` | 校验配置 |
-| `clawbro auth list` | 查看已配置 key |
-| `clawbro completions zsh` | 生成 shell 补全 |
+| `clawbro setup` | First-time initialization |
+| `clawbro serve` | Start the gateway |
+| `clawbro status` | Show the active config summary |
+| `clawbro doctor` | Diagnose environment and runtime issues |
+| `clawbro config validate` | Validate topology and config references |
+| `clawbro auth list` | List configured auth material |
+| `clawbro completions zsh` | Generate shell completions |
 
----
+Default runtime layout:
 
-## Integrations
+- `~/.clawbro/config.toml`
+- `~/.clawbro/.env`
+- `~/.clawbro/sessions/`
+- `~/.clawbro/shared/`
+- `~/.clawbro/skills/`
+- `~/.clawbro/personas/`
 
-### Native runtime
+Operational surfaces mentioned in the current docs:
 
-- family: `claw_bro_native`
-- 使用 `clawbro` 内置的 hidden runtime bridge / ACP agent
-- 对用户最省依赖
+- `/health`
+- `/status`
+- `/doctor`
+- `/diagnostics/*`
 
-### ACP CLI backends
+## 🗂️ Project Structure
 
-- Claude
-- Codex
-- Qwen
-- Goose
-- 自定义 ACP CLI
+```text
+clawBro/
+├── crates/clawbro-server/       # public clawbro CLI and gateway
+├── crates/clawbro-agent/        # routing, context, memory, team orchestration
+├── crates/clawbro-runtime/      # backend adapters and runtime contracts
+├── crates/clawbro-channels/     # Lark and DingTalk channel integration
+├── crates/clawbro-agent-sdk/    # runtime bridge and reusable agent shell
+├── crates/clawbro-session/      # session storage and queueing
+├── crates/clawbro-skills/       # skills and persona loading
+├── crates/clawbro-cron/         # cron scheduling support
+└── docs/                        # setup, routing, backend, and operations docs
+```
 
-### IM Channels
+## 📚 Documentation Map
 
-- Lark / Feishu
-- DingTalk
+- [Setup Guide](./docs/setup.md)
+- [Getting Started From Zero](./docs/getting-started-from-zero.md)
+- [Runtime Backends](./docs/runtime-backends.md)
+- [Backend Support Matrix](./docs/backend-support-matrix.md)
+- [Routing Contract](./docs/routing-contract.md)
+- [Doctor and Status Operations](./docs/operations/doctor-and-status.md)
+- [Context Filesystem Contract](./docs/context-filesystem-contract.md)
 
----
+## 🎯 Positioning
 
-## Documentation Map
+ClawBro currently fits best if you want one of these:
 
-- 完整安装与配置：
-  - [`docs/setup.md`](docs/setup.md)
-- 从零部署与运行时概览：
-  - [`docs/getting-started-from-zero.md`](docs/getting-started-from-zero.md)
-- Runtime backend 说明：
-  - [`docs/runtime-backends.md`](docs/runtime-backends.md)
-- Routing contract：
-  - [`docs/routing-contract.md`](docs/routing-contract.md)
-- Doctor / Status 运维面：
-  - [`docs/operations/doctor-and-status.md`](docs/operations/doctor-and-status.md)
+- An engineering control plane that brings multiple coding agents into group chat and workflow operations.
+- A lead-plus-specialists setup for complex coding, review, research, and report-generation tasks.
+- A unified surface that can sit above Claude, Codex, Qwen, Qoder, Gemini, and related coding CLIs without giving up operational control.
 
----
-
-## Current Positioning
-
-ClawBro 现在最适合这三类用户：
-
-- 想把 AI 接进群聊和工作流的工程团队
-- 想用 Lead + Specialists 做复杂任务的个人开发者
-- 想把不同 CLI Agent 和原生 runtime 接进统一控制面的系统设计者
-
-如果你只是想要一个单机对话 CLI，这个项目不是最轻的选择。  
-如果你想要一个可扩展、可接 IM、可做 Team orchestration 的控制面，这个项目就是为这个方向做的。
+If you want a configurable, IM-connected, team-aware control plane, this project is aimed directly at that problem.

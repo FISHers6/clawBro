@@ -162,7 +162,7 @@ pub async fn wire_team_runtime(
                     id: uuid::Uuid::new_v4().to_string(),
                     session_key: specialist_key,
                     content: crate::protocol::MsgContent::text(
-                        task.spec.as_deref().unwrap_or(&task.title),
+                        team_session.build_task_dispatch_message(&task),
                     ),
                     sender: "orchestrator".to_string(),
                     channel: specialist_channel,

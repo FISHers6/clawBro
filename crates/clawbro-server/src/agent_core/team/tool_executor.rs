@@ -169,6 +169,7 @@ pub async fn execute_team_tool_call(
             new_assignee,
         } => {
             team_orch.registry.reassign_task(&task_id, &new_assignee)?;
+            team_orch.record_coordination_side_effect();
             TeamToolResponse {
                 ok: true,
                 message: format!("Task {} reassigned to {}.", task_id, new_assignee),

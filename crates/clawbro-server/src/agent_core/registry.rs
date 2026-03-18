@@ -792,8 +792,80 @@ impl SessionRegistry {
         })
     }
 
+    fn team_coordination_side_effect_happened(
+        turn: &TurnResult,
+        team_orchestrator: Option<&Arc<TeamOrchestrator>>,
+        coordination_revision_before: Option<u64>,
+    ) -> bool {
+        if Self::turn_has_team_coordination_side_effect(turn) {
+            return true;
+        }
+        team_orchestrator
+            .zip(coordination_revision_before)
+            .is_some_and(|(orch, before)| orch.coordination_revision() > before)
+    }
+
     fn build_missing_team_coordination_side_effect_reply() -> String {
         "我这轮没有完成实际任务创建或分配，因此不会宣称任务已开始执行。请重试，或明确指定要委派的 bot 和目标。".to_string()
+    }
+
+    fn turn_started_team_execution(turn: &TurnResult) -> bool {
+        turn.events.iter().any(|event| {
+            matches!(
+                event,
+                RuntimeEvent::ToolCallback(TeamCallback::ExecutionStarted)
+            )
+        })
+    }
+
+    async fn ensure_frontstage_team_execution_started(
+        team_orchestrator: Option<&Arc<TeamOrchestrator>>,
+    ) -> Result<bool> {
+        let Some(orch) = team_orchestrator else {
+            return Ok(false);
+        };
+        if orch.team_state() != crate::agent_core::team::orchestrator::TeamState::Planning {
+            return Ok(matches!(
+                orch.team_state(),
+                crate::agent_core::team::orchestrator::TeamState::Running
+                    | crate::agent_core::team::orchestrator::TeamState::Done
+            ));
+        }
+        if orch.registry.all_tasks()?.is_empty() {
+            return Ok(false);
+        }
+        match orch.activate().await {
+            Ok(_) => Ok(true),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    team_id = %orch.session.team_id,
+                    "failed to auto-activate team execution after frontstage delegation"
+                );
+                Ok(false)
+            }
+        }
+    }
+
+    fn team_execution_is_actually_running(
+        turn: &TurnResult,
+        team_orchestrator: Option<&Arc<TeamOrchestrator>>,
+        auto_started: bool,
+    ) -> bool {
+        if auto_started || Self::turn_started_team_execution(turn) {
+            return true;
+        }
+        team_orchestrator.is_some_and(|orch| {
+            matches!(
+                orch.team_state(),
+                crate::agent_core::team::orchestrator::TeamState::Running
+                    | crate::agent_core::team::orchestrator::TeamState::Done
+            )
+        })
+    }
+
+    fn build_missing_team_execution_start_reply() -> String {
+        "我这轮虽然创建了任务，但还没有把团队执行真正启动，因此不会宣称 specialist 已开始处理。请重试，或要求我立即启动执行。".to_string()
     }
 
     /// Process one inbound message. Generic: works for any channel.
@@ -866,6 +938,9 @@ impl SessionRegistry {
         // Must be computed before any usage below (confirmation interceptor, roster, etc.).
         let session_team_orch: Option<Arc<TeamOrchestrator>> =
             self.get_orchestrator_for_session(&session_key);
+        let coordination_revision_before = session_team_orch
+            .as_ref()
+            .map(|orch| orch.coordination_revision());
 
         // ── Team Mode confirmation interceptor ──────────────────────────────────
         // When Lead called request_confirmation(), the next Human message is the user's yes/no.
@@ -1199,12 +1274,18 @@ impl SessionRegistry {
             }
         }
         let mut turn = turn_result?;
-        let team_delegation_guard_triggered = Self::lead_human_team_delegation_requires_side_effect(
+        let delegation_requested = Self::lead_human_team_delegation_requires_side_effect(
             &inbound,
             is_lead,
             session_team_orch.is_some(),
-        ) && !Self::turn_has_team_coordination_side_effect(&turn);
-        if team_delegation_guard_triggered {
+        );
+        let coordination_happened = Self::team_coordination_side_effect_happened(
+            &turn,
+            session_team_orch.as_ref(),
+            coordination_revision_before,
+        );
+        let missing_coordination = delegation_requested && !coordination_happened;
+        if missing_coordination {
             tracing::warn!(
                 session = ?session_key,
                 user_input = %user_text_for_log,
@@ -1213,6 +1294,25 @@ impl SessionRegistry {
             turn.full_text = Self::build_missing_team_coordination_side_effect_reply();
         } else {
             self.apply_runtime_events(&session_key, &turn).await?;
+            let auto_started = if delegation_requested {
+                Self::ensure_frontstage_team_execution_started(session_team_orch.as_ref()).await?
+            } else {
+                false
+            };
+            if delegation_requested
+                && !Self::team_execution_is_actually_running(
+                    &turn,
+                    session_team_orch.as_ref(),
+                    auto_started,
+                )
+            {
+                tracing::warn!(
+                    session = ?session_key,
+                    user_input = %user_text_for_log,
+                    "lead delegation turn created tasks but did not start execution; replacing assistant reply"
+                );
+                turn.full_text = Self::build_missing_team_execution_start_reply();
+            }
         }
         tracing::debug!(
             session_id = %session_id,
@@ -1385,6 +1485,38 @@ mod tests {
 
         async fn backend_resume_fingerprint(&self, _backend_id: &str) -> Result<Option<String>> {
             Ok(self.backend_resume_fingerprint.clone())
+        }
+    }
+
+    struct TeamSideEffectRuntimeDispatch {
+        calls: Arc<AtomicUsize>,
+        team_orchestrator: Arc<TeamOrchestrator>,
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeDispatch for TeamSideEffectRuntimeDispatch {
+        async fn dispatch(&self, request: RuntimeDispatchRequest) -> Result<TurnResult> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.team_orchestrator.register_task(
+                crate::agent_core::team::registry::CreateTask {
+                    id: "T999".into(),
+                    title: "Synthetic delegated task".into(),
+                    assignee_hint: Some("codex-beta".into()),
+                    ..Default::default()
+                },
+            )?;
+            Ok(TurnResult {
+                full_text: format!("fake-dispatch: {}", request.intent.user_text),
+                events: vec![],
+                emitted_backend_session_id: None,
+                backend_resume_fingerprint: None,
+                used_backend_id: request.intent.target_backend.clone(),
+                resume_recovery: None,
+            })
+        }
+
+        async fn backend_resume_fingerprint(&self, _backend_id: &str) -> Result<Option<String>> {
+            Ok(None)
         }
     }
 
@@ -2981,6 +3113,154 @@ mod tests {
             reply.as_deref(),
             Some("我这轮没有完成实际任务创建或分配，因此不会宣称任务已开始执行。请重试，或明确指定要委派的 bot 和目标。")
         );
+    }
+
+    #[tokio::test]
+    async fn lead_delegation_turn_with_orchestrator_side_effect_is_not_rewritten() {
+        use crate::agent_core::team::{
+            heartbeat::DispatchFn,
+            orchestrator::TeamOrchestrator,
+            registry::TaskRegistry,
+            session::{stable_team_id_for_session_key, TeamSession},
+        };
+        use tempfile::tempdir;
+
+        let dir = std::env::temp_dir()
+            .join(format!("test-registry-team-turn-side-effect-{}", uuid::Uuid::new_v4()));
+        let storage = SessionStorage::new(dir);
+        let session_manager = Arc::new(SessionManager::new(storage));
+
+        let tmp = tempdir().unwrap();
+        let task_registry = Arc::new(TaskRegistry::new_in_memory().unwrap());
+        let lead_key = SessionKey::new("lark", "group:team");
+        let team_id = stable_team_id_for_session_key(&lead_key);
+        let session = Arc::new(TeamSession::from_dir(&team_id, tmp.keep()));
+        let dispatch_fn: DispatchFn = Arc::new(|_, _| Box::pin(async { Ok(()) }));
+        let orch = TeamOrchestrator::new(
+            task_registry,
+            session,
+            dispatch_fn,
+            std::time::Duration::from_secs(60),
+        );
+        orch.set_test_mcp_start_result(Ok(32125));
+        orch.set_lead_session_key(lead_key.clone());
+        orch.set_scope(lead_key.clone());
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (registry, _rx) = SessionRegistry::with_runtime_dispatch(
+            Some("native-main".to_string()),
+            session_manager,
+            String::new(),
+            None,
+            None,
+            None,
+            None,
+            vec![],
+            Arc::new(TeamSideEffectRuntimeDispatch {
+                calls: Arc::clone(&calls),
+                team_orchestrator: Arc::clone(&orch),
+            }),
+        );
+        registry.register_team_orchestrator(team_id, Arc::clone(&orch));
+
+        let inbound = InboundMsg {
+            id: "team-delegation-real-side-effect".to_string(),
+            session_key: lead_key,
+            content: MsgContent::text("让其他bot做个任务：讲解一下clawbro"),
+            sender: "user".to_string(),
+            channel: "lark".to_string(),
+            timestamp: chrono::Utc::now(),
+            thread_ts: None,
+            target_agent: None,
+            source: crate::protocol::MsgSource::Human,
+        };
+
+        let reply = registry.handle(inbound).await.unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            reply.as_deref(),
+            Some("fake-dispatch: 让其他bot做个任务：讲解一下clawbro")
+        );
+        assert!(orch.registry.get_task("T999").unwrap().is_some());
+        assert!(matches!(
+            orch.team_state(),
+            crate::agent_core::team::orchestrator::TeamState::Running
+        ));
+    }
+
+    #[tokio::test]
+    async fn lead_delegation_turn_that_creates_tasks_but_cannot_start_execution_is_rewritten() {
+        use crate::agent_core::team::{
+            heartbeat::DispatchFn,
+            orchestrator::TeamOrchestrator,
+            registry::TaskRegistry,
+            session::{stable_team_id_for_session_key, TeamSession},
+        };
+        use tempfile::tempdir;
+
+        let dir = std::env::temp_dir()
+            .join(format!("test-registry-team-turn-activation-fail-{}", uuid::Uuid::new_v4()));
+        let storage = SessionStorage::new(dir);
+        let session_manager = Arc::new(SessionManager::new(storage));
+
+        let tmp = tempdir().unwrap();
+        let task_registry = Arc::new(TaskRegistry::new_in_memory().unwrap());
+        let lead_key = SessionKey::new("lark", "group:team");
+        let team_id = stable_team_id_for_session_key(&lead_key);
+        let session = Arc::new(TeamSession::from_dir(&team_id, tmp.keep()));
+        let dispatch_fn: DispatchFn = Arc::new(|_, _| Box::pin(async { Ok(()) }));
+        let orch = TeamOrchestrator::new(
+            task_registry,
+            session,
+            dispatch_fn,
+            std::time::Duration::from_secs(60),
+        );
+        orch.set_test_mcp_start_result(Err("synthetic mcp failure".to_string()));
+        orch.set_lead_session_key(lead_key.clone());
+        orch.set_scope(lead_key.clone());
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (registry, _rx) = SessionRegistry::with_runtime_dispatch(
+            Some("native-main".to_string()),
+            session_manager,
+            String::new(),
+            None,
+            None,
+            None,
+            None,
+            vec![],
+            Arc::new(TeamSideEffectRuntimeDispatch {
+                calls: Arc::clone(&calls),
+                team_orchestrator: Arc::clone(&orch),
+            }),
+        );
+        registry.register_team_orchestrator(team_id, Arc::clone(&orch));
+
+        let inbound = InboundMsg {
+            id: "team-delegation-activation-fail".to_string(),
+            session_key: lead_key,
+            content: MsgContent::text("让其他bot做个任务：讲解一下clawbro"),
+            sender: "user".to_string(),
+            channel: "lark".to_string(),
+            timestamp: chrono::Utc::now(),
+            thread_ts: None,
+            target_agent: None,
+            source: crate::protocol::MsgSource::Human,
+        };
+
+        let reply = registry.handle(inbound).await.unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            reply.as_deref(),
+            Some("我这轮虽然创建了任务，但还没有把团队执行真正启动，因此不会宣称 specialist 已开始处理。请重试，或要求我立即启动执行。")
+        );
+        assert!(orch.registry.get_task("T999").unwrap().is_some());
+        assert!(matches!(
+            orch.team_state(),
+            crate::agent_core::team::orchestrator::TeamState::Planning
+        ));
     }
 
     #[test]

@@ -182,6 +182,10 @@ impl TaskRegistry {
                 completion_note  TEXT,
                 created_at       TEXT NOT NULL,
                 done_at          TEXT
+            );
+            CREATE TABLE IF NOT EXISTS meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
             );",
         )
         .context("task table migration failed")
@@ -231,16 +235,52 @@ impl TaskRegistry {
 
     pub fn next_task_id(&self) -> Result<String> {
         let conn = self.conn.lock().unwrap();
+        let persisted_max = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'task_seq_max'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(0);
         let mut stmt = conn.prepare("SELECT id FROM tasks")?;
         let mut rows = stmt.query([])?;
-        let mut max_num = 0u32;
+        let mut max_num = persisted_max;
         while let Some(row) = rows.next()? {
             let id: String = row.get(0)?;
             if let Some(num) = id.strip_prefix('T').and_then(|s| s.parse::<u32>().ok()) {
                 max_num = max_num.max(num);
             }
         }
-        Ok(format!("T{:03}", max_num + 1))
+        let next = max_num + 1;
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES('task_seq_max', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![next.to_string()],
+        )?;
+        Ok(format!("T{:03}", next))
+    }
+
+    pub fn ensure_task_sequence_at_least(&self, observed_max: u32) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let current = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'task_seq_max'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(0);
+        if observed_max > current {
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES('task_seq_max', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![observed_max.to_string()],
+            )?;
+        }
+        Ok(())
     }
 
     /// 原子认领任务（乐观锁：只有 status='pending' 时才能认领）
@@ -1192,5 +1232,22 @@ mod tests {
             registry.all_done().unwrap(),
             "all_done must be true after both tasks done"
         );
+    }
+
+    #[test]
+    fn test_next_task_id_remains_monotonic_across_clear_all_tasks() {
+        let registry = TaskRegistry::new_in_memory().unwrap();
+        assert_eq!(registry.next_task_id().unwrap(), "T001");
+        registry.clear_all_tasks().unwrap();
+        assert_eq!(registry.next_task_id().unwrap(), "T002");
+        registry.clear_all_tasks().unwrap();
+        assert_eq!(registry.next_task_id().unwrap(), "T003");
+    }
+
+    #[test]
+    fn test_ensure_task_sequence_at_least_advances_next_task_id() {
+        let registry = TaskRegistry::new_in_memory().unwrap();
+        registry.ensure_task_sequence_at_least(7).unwrap();
+        assert_eq!(registry.next_task_id().unwrap(), "T008");
     }
 }

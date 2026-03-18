@@ -13,6 +13,7 @@ use chrono::Utc;
 use crate::protocol::{normalize_conversation_identity, SessionKey};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -268,6 +269,46 @@ impl TeamSession {
         self.tasks_dir().join(task_id)
     }
 
+    pub fn highest_observed_task_number(&self) -> Result<u32> {
+        fn update_from_dir(root: &std::path::Path, current_max: &mut u32) -> Result<()> {
+            if !root.is_dir() {
+                return Ok(());
+            }
+            for entry in fs::read_dir(root)
+                .with_context(|| format!("Failed to read {}", root.display()))?
+            {
+                let entry = entry?;
+                if !entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if let Some(num) = name.strip_prefix('T').and_then(|s| s.parse::<u32>().ok()) {
+                    *current_max = (*current_max).max(num);
+                }
+            }
+            Ok(())
+        }
+
+        let mut max_num = 0u32;
+        update_from_dir(&self.tasks_dir(), &mut max_num)?;
+
+        let cycles_dir = self.dir.join("cycles");
+        if cycles_dir.is_dir() {
+            for cycle in fs::read_dir(&cycles_dir)
+                .with_context(|| format!("Failed to read {}", cycles_dir.display()))?
+            {
+                let cycle = cycle?;
+                if !cycle.file_type()?.is_dir() {
+                    continue;
+                }
+                update_from_dir(&cycle.path().join("tasks"), &mut max_num)?;
+            }
+        }
+
+        Ok(max_num)
+    }
+
     pub fn archive_completed_cycle(&self, tasks: &[Task]) -> Result<Option<String>> {
         if tasks.is_empty() {
             return Ok(None);
@@ -352,6 +393,15 @@ impl TeamSession {
     pub fn write_task_result(&self, task_id: &str, content: &str) -> Result<()> {
         self.ensure_task_dir(task_id)?;
         self.write_task_file(task_id, "result.md", content)
+    }
+
+    pub fn write_task_review_feedback(&self, task_id: &str, content: &str) -> Result<()> {
+        self.ensure_task_dir(task_id)?;
+        self.write_task_file(task_id, "review-feedback.md", content)
+    }
+
+    pub fn read_task_review_feedback(&self, task_id: &str) -> String {
+        self.read_task_file(task_id, "review-feedback.md")
     }
 
     /// 从 TaskRegistry 导出任务快照到 TASKS.md
@@ -760,6 +810,16 @@ impl TeamSession {
             _ => String::new(),
         };
 
+        let review_feedback = self.read_task_review_feedback(&task.id);
+        let review_feedback_section = if review_feedback.trim().is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\n── 最新 Lead 验收反馈 ───────────────────\n{}\n─────────────────────────────────────────",
+                review_feedback.trim()
+            )
+        };
+
         format!(
             "══════ 当前任务（自动注入，最高优先级）══════\n\
              任务ID: {id}\n\
@@ -773,12 +833,12 @@ impl TeamSession {
              \n\
              ── 必须遵守 ──\n\
              1. 阶段性进展可调用 `checkpoint_task(task_id, note)` 向 Lead 发送检查点\n\
-             2. 完成任务后优先调用 `submit_task_result(task_id, summary)`，等待 Lead 验收\n\
+             2. 完成任务后优先调用 `submit_task_result(task_id, summary)`，并在 `result_markdown` 中提交完整最终交付正文；不要提交“产物说明/元数据摘要/文件路径列表”来代替正文\n\
              3. 遇到阻塞时调用 `block_task(task_id, reason)` 释放任务并上报；仅需协助时调用 `request_help(task_id, message)`，保留 claim\n\
              4. 兼容旧路径时仍可调用 `complete_task(task_id, note)`，但新语义优先使用 submit_task_result\n\
              5. 重要产出（文件路径、关键发现）写在 summary / note 参数中\n\
              6. 在结束本轮前，必须至少调用一个 canonical team tool：`submit_task_result`、`complete_task`、`checkpoint_task`、`request_help` 或 `block_task`\n\
-             ══════════════════════════════════════════{resume_note}{upstream_section}",
+             ══════════════════════════════════════════{resume_note}{review_feedback_section}{upstream_section}",
             id = task.id,
             title = task.title,
             spec = task.spec.as_deref().unwrap_or("（无详细说明）"),
@@ -789,8 +849,24 @@ impl TeamSession {
                 .as_deref()
                 .unwrap_or("完成任务说明中描述的工作"),
             resume_note = resume_note,
+            review_feedback_section = review_feedback_section,
             upstream_section = upstream_section,
         )
+    }
+
+    pub fn build_task_dispatch_message(&self, task: &Task) -> String {
+        let review_feedback = self.read_task_review_feedback(&task.id);
+        if !review_feedback.trim().is_empty() {
+            return format!(
+                "任务 {} 已被 lead 重新打开。请在当前 specialist 会话中继续处理，优先阅读 Layer 0 task reminder 与 tasks/{}/review-feedback.md，修正后再重新提交。",
+                task.id, task.id
+            );
+        }
+        task.spec
+            .as_deref()
+            .filter(|spec| !spec.trim().is_empty())
+            .unwrap_or(&task.title)
+            .to_string()
     }
 
     // ── 归档 ────────────────────────────────────────────────────────────────
@@ -842,6 +918,10 @@ impl TeamSession {
 
     fn read_file(&self, name: &str) -> String {
         std::fs::read_to_string(self.dir.join(name)).unwrap_or_default()
+    }
+
+    fn read_task_file(&self, task_id: &str, name: &str) -> String {
+        std::fs::read_to_string(self.task_dir(task_id).join(name)).unwrap_or_default()
     }
 
     fn append_jsonl<T: Serialize>(&self, name: &str, value: &T) -> Result<()> {
@@ -1220,6 +1300,54 @@ mod tests {
     }
 
     #[test]
+    fn test_build_task_reminder_includes_review_feedback() {
+        let (session, _tmp) = make_session();
+        let registry = TaskRegistry::new_in_memory().unwrap();
+        registry
+            .create_task(CreateTask {
+                id: "T900".into(),
+                title: "Explain INTP".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        session
+            .write_task_review_feedback(
+                "T900",
+                "Lead feedback:\n正文太短，请直接给最终讲解，不要写产物说明。",
+            )
+            .unwrap();
+
+        let task = registry.get_task("T900").unwrap().unwrap();
+        let reminder = session.build_task_reminder(&task, &registry);
+        assert!(reminder.contains("最新 Lead 验收反馈"));
+        assert!(reminder.contains("正文太短"));
+        assert!(reminder.contains("result_markdown"));
+    }
+
+    #[test]
+    fn test_build_task_dispatch_message_prefers_review_feedback_resume() {
+        let (session, _tmp) = make_session();
+        let registry = TaskRegistry::new_in_memory().unwrap();
+        registry
+            .create_task(CreateTask {
+                id: "T901".into(),
+                title: "Explain INTP".into(),
+                spec: Some("详细讲解 INTP".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        session
+            .write_task_review_feedback("T901", "Lead feedback:\n请补充完整正文。")
+            .unwrap();
+
+        let task = registry.get_task("T901").unwrap().unwrap();
+        let dispatch_message = session.build_task_dispatch_message(&task);
+        assert!(dispatch_message.contains("已被 lead 重新打开"));
+        assert!(dispatch_message.contains("review-feedback.md"));
+        assert!(!dispatch_message.contains("详细讲解 INTP"));
+    }
+
+    #[test]
     fn test_append_specialist_reply_creates_jsonl_entry() {
         let (session, _tmp) = make_session();
         session
@@ -1401,6 +1529,30 @@ mod tests {
             .is_file());
         assert!(!_tmp.path().join("TASKS.md").exists());
         assert!(!_tmp.path().join("tasks").exists());
+    }
+
+    #[test]
+    fn test_highest_observed_task_number_scans_active_and_archived_cycles() {
+        let (session, tmp) = make_session();
+        std::fs::create_dir_all(tmp.path().join("tasks").join("T004")).unwrap();
+        std::fs::create_dir_all(
+            tmp.path()
+                .join("cycles")
+                .join("cycle-1")
+                .join("tasks")
+                .join("T009"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(
+            tmp.path()
+                .join("cycles")
+                .join("cycle-2")
+                .join("tasks")
+                .join("T002"),
+        )
+        .unwrap();
+
+        assert_eq!(session.highest_observed_task_number().unwrap(), 9);
     }
 
     #[test]

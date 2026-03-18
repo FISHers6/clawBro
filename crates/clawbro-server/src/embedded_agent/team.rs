@@ -152,6 +152,7 @@ struct CheckpointTaskArgs {
 struct SubmitTaskResultArgs {
     task_id: String,
     summary: String,
+    result_markdown: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -330,19 +331,20 @@ define_team_tool!(
     SubmitTaskResultTool,
     "submit_task_result",
     SubmitTaskResultArgs,
-    "Specialist. Submit task results for lead acceptance.",
+    "Specialist. Submit task results for lead acceptance. `result_markdown` must contain the actual final deliverable body, not a wrapper or artifact summary.",
     json!({
         "type": "object",
         "properties": {
             "task_id": {"type": "string"},
-            "summary": {"type": "string"}
+            "summary": {"type": "string"},
+            "result_markdown": {"type": "string", "description": "Full final deliverable body for tasks/Txxx/result.md. Do not send only metadata, artifact paths, or delivery notes."}
         },
-        "required": ["task_id", "summary"]
+        "required": ["task_id", "summary", "result_markdown"]
     }),
     |args: SubmitTaskResultArgs| TeamToolCall::SubmitTaskResult {
         task_id: args.task_id,
         summary: args.summary,
-        result_markdown: None,
+        result_markdown: Some(args.result_markdown),
         agent: None,
     }
 );

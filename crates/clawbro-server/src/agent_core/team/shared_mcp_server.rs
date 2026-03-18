@@ -105,6 +105,8 @@ pub struct CheckpointTaskParams {
 pub struct SubmitTaskResultParams {
     pub task_id: String,
     pub summary: String,
+    /// Full final deliverable body that will become tasks/Txxx/result.md.
+    /// This must be the actual content for lead review, not artifact metadata or a delivery note.
     pub result_markdown: Option<String>,
     pub agent: Option<String>,
 }
@@ -409,7 +411,7 @@ impl SharedTeamToolServer {
 
     /// Submit a completed task result for lead acceptance.
     #[tool(
-        description = "Specialist only. Submit task results for lead review. Provide task_id, a short summary, optionally a richer result_markdown body, and optionally your agent name."
+        description = "Specialist only. Submit task results for lead review. Provide task_id, a short summary, and a full result_markdown body containing the actual final deliverable. Do not submit only artifact paths, delivery notes, or metadata wrappers."
     )]
     async fn submit_task_result(
         &self,
