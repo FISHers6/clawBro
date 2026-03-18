@@ -1,8 +1,8 @@
 use anyhow::Result;
-use clawbro_agent::bindings::{BindingPeerKind, BindingRule};
-use clawbro_agent::roster::AgentEntry;
-use clawbro_agent::team::milestone_delivery::TeamPublicUpdatesMode;
-use clawbro_runtime::{AcpBackend, ApprovalMode, BackendFamily, BackendSpec, LaunchSpec};
+use crate::agent_core::bindings::{BindingPeerKind, BindingRule};
+use crate::agent_core::roster::AgentEntry;
+use crate::agent_core::team::milestone_delivery::TeamPublicUpdatesMode;
+use crate::runtime::{AcpBackend, ApprovalMode, BackendFamily, BackendSpec, LaunchSpec};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -31,7 +31,7 @@ fn default_distill_n() -> u64 {
     20
 }
 fn default_distiller_binary() -> String {
-    "clawbro-rust-agent".to_string()
+    "clawbro".to_string()
 }
 fn default_shared_dir() -> PathBuf {
     dirs::home_dir()
@@ -448,7 +448,7 @@ impl GatewayConfig {
     pub fn resolve_provider_profile(
         &self,
         provider_profile_id: Option<&str>,
-    ) -> Result<Option<clawbro_runtime::ConfiguredProviderProfile>> {
+    ) -> Result<Option<crate::runtime::ConfiguredProviderProfile>> {
         let Some(id) = provider_profile_id else {
             return Ok(None);
         };
@@ -472,7 +472,8 @@ pub struct AgentSection {
 pub enum BackendFamilyConfig {
     Acp,
     OpenClawGateway,
-    QuickAiNative,
+    #[serde(alias = "quick_ai_native")]
+    ClawBroNative,
 }
 
 impl BackendFamilyConfig {
@@ -480,7 +481,7 @@ impl BackendFamilyConfig {
         match self {
             Self::Acp => BackendFamily::Acp,
             Self::OpenClawGateway => BackendFamily::OpenClawGateway,
-            Self::QuickAiNative => BackendFamily::QuickAiNative,
+            Self::ClawBroNative => BackendFamily::ClawBroNative,
         }
     }
 }
@@ -488,8 +489,8 @@ impl BackendFamilyConfig {
 /// Config-layer alias for the runtime ACP backend identity type.
 /// Re-exported from `clawbro_runtime` so TOML deserialization and runtime use share the same type.
 pub type AcpBackendConfig = AcpBackend;
-pub type AcpAuthMethodConfig = clawbro_runtime::AcpAuthMethod;
-pub type CodexProjectionModeConfig = clawbro_runtime::CodexProjectionMode;
+pub type AcpAuthMethodConfig = crate::runtime::AcpAuthMethod;
+pub type CodexProjectionModeConfig = crate::runtime::CodexProjectionMode;
 
 /// Config-layer alias for backend approval mode.
 pub type ApprovalModeConfig = ApprovalMode;
@@ -593,13 +594,13 @@ impl BackendCatalogEntry {
         self.adapter_key.as_deref().unwrap_or(match self.family {
             BackendFamilyConfig::Acp => "acp",
             BackendFamilyConfig::OpenClawGateway => "openclaw",
-            BackendFamilyConfig::QuickAiNative => "native",
+            BackendFamilyConfig::ClawBroNative => "native",
         })
     }
 
     pub fn to_backend_spec(
         &self,
-        provider_profile: Option<clawbro_runtime::ConfiguredProviderProfile>,
+        provider_profile: Option<crate::runtime::ConfiguredProviderProfile>,
     ) -> BackendSpec {
         BackendSpec {
             backend_id: self.id.clone(),
@@ -674,19 +675,19 @@ impl ProviderProfileConfig {
         }
     }
 
-    fn to_runtime_profile(&self) -> clawbro_runtime::ConfiguredProviderProfile {
-        clawbro_runtime::ConfiguredProviderProfile {
+    fn to_runtime_profile(&self) -> crate::runtime::ConfiguredProviderProfile {
+        crate::runtime::ConfiguredProviderProfile {
             id: self.id.clone(),
             protocol: match &self.protocol {
                 ProviderProfileProtocolConfig::OfficialSession => {
-                    clawbro_runtime::ConfiguredProviderProtocol::OfficialSession
+                    crate::runtime::ConfiguredProviderProtocol::OfficialSession
                 }
                 ProviderProfileProtocolConfig::AnthropicCompatible {
                     base_url,
                     auth_token_env,
                     default_model,
                     small_fast_model,
-                } => clawbro_runtime::ConfiguredProviderProtocol::AnthropicCompatible {
+                } => crate::runtime::ConfiguredProviderProtocol::AnthropicCompatible {
                     base_url: base_url.clone(),
                     auth_token_env: auth_token_env.clone(),
                     default_model: default_model.clone(),
@@ -696,7 +697,7 @@ impl ProviderProfileConfig {
                     base_url,
                     auth_token_env,
                     default_model,
-                } => clawbro_runtime::ConfiguredProviderProtocol::OpenaiCompatible {
+                } => crate::runtime::ConfiguredProviderProtocol::OpenaiCompatible {
                     base_url: base_url.clone(),
                     auth_token_env: auth_token_env.clone(),
                     default_model: default_model.clone(),
@@ -731,10 +732,10 @@ pub struct ExternalMcpServerConfig {
 }
 
 impl ExternalMcpServerConfig {
-    fn into_runtime_spec(self) -> clawbro_runtime::ExternalMcpServerSpec {
-        clawbro_runtime::ExternalMcpServerSpec {
+    fn into_runtime_spec(self) -> crate::runtime::ExternalMcpServerSpec {
+        crate::runtime::ExternalMcpServerSpec {
             name: self.name,
-            transport: clawbro_runtime::ExternalMcpTransport::Sse { url: self.url },
+            transport: crate::runtime::ExternalMcpTransport::Sse { url: self.url },
         }
     }
 }
@@ -814,22 +815,30 @@ impl LarkSection {
     pub fn resolved_trigger_policy(
         &self,
         gateway: &GatewaySection,
-    ) -> clawbro_channels::LarkTriggerPolicy {
-        let fallback = clawbro_channels::LarkTriggerPolicy::from_require_mention_in_groups(
+    ) -> crate::channels_internal::LarkTriggerPolicy {
+        let fallback = crate::channels_internal::LarkTriggerPolicy::from_require_mention_in_groups(
             gateway.require_mention_in_groups,
         );
         let Some(policy) = self.trigger_policy else {
             return fallback;
         };
 
-        clawbro_channels::LarkTriggerPolicy {
+        crate::channels_internal::LarkTriggerPolicy {
             group: match policy.group.mode {
-                ChannelTriggerModeConfig::AllMessages => clawbro_channels::LarkTriggerMode::AllMessages,
-                ChannelTriggerModeConfig::MentionOnly => clawbro_channels::LarkTriggerMode::MentionOnly,
+                ChannelTriggerModeConfig::AllMessages => {
+                    crate::channels_internal::LarkTriggerMode::AllMessages
+                }
+                ChannelTriggerModeConfig::MentionOnly => {
+                    crate::channels_internal::LarkTriggerMode::MentionOnly
+                }
             },
             dm: match policy.dm.mode {
-                ChannelTriggerModeConfig::AllMessages => clawbro_channels::LarkTriggerMode::AllMessages,
-                ChannelTriggerModeConfig::MentionOnly => clawbro_channels::LarkTriggerMode::MentionOnly,
+                ChannelTriggerModeConfig::AllMessages => {
+                    crate::channels_internal::LarkTriggerMode::AllMessages
+                }
+                ChannelTriggerModeConfig::MentionOnly => {
+                    crate::channels_internal::LarkTriggerMode::MentionOnly
+                }
             },
         }
     }
@@ -1152,22 +1161,54 @@ impl BindingConfig {
 impl GatewayConfig {
     /// 从 ~/.clawbro/config.toml 加载，不存在则用默认值
     pub fn load() -> Result<Self> {
-        let path = dirs::home_dir()
-            .unwrap_or_default()
-            .join(".clawbro")
-            .join("config.toml");
+        let path = std::env::var("CLAWBRO_CONFIG")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                dirs::home_dir()
+                    .unwrap_or_default()
+                    .join(".clawbro")
+                    .join("config.toml")
+            });
 
         if !path.exists() {
-            return Ok(Self::default());
+            let mut cfg = Self::default();
+            apply_env_overrides(&mut cfg);
+            return Ok(cfg);
         }
         let content = std::fs::read_to_string(&path)?;
-        Ok(toml::from_str(&content)?)
+        let mut cfg: Self = toml::from_str(&content)?;
+        apply_env_overrides(&mut cfg);
+        Ok(cfg)
+    }
+}
+
+fn apply_env_overrides(cfg: &mut GatewayConfig) {
+    if let Ok(port) = std::env::var("CLAWBRO_PORT") {
+        if let Ok(parsed) = port.parse::<u16>() {
+            cfg.gateway.port = parsed;
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_apply_env_overrides_updates_gateway_port() {
+        let old = std::env::var("CLAWBRO_PORT").ok();
+        std::env::set_var("CLAWBRO_PORT", "19090");
+
+        let mut cfg = GatewayConfig::default();
+        apply_env_overrides(&mut cfg);
+
+        match old {
+            Some(v) => std::env::set_var("CLAWBRO_PORT", v),
+            None => std::env::remove_var("CLAWBRO_PORT"),
+        }
+
+        assert_eq!(cfg.gateway.port, 19090);
+    }
 
     #[test]
     fn test_gateway_config_agent_roster_deserializes() {
@@ -1289,7 +1330,10 @@ lead_helper_mode = true
                 lead_helper_mode,
                 ..
             } => {
-                assert_eq!(team_helper_command.as_deref(), Some("/bin/clawbro_team_cli"));
+                assert_eq!(
+                    team_helper_command.as_deref(),
+                    Some("/bin/clawbro_team_cli")
+                );
                 assert!(lead_helper_mode);
             }
             other => panic!("unexpected launch spec: {other:?}"),
@@ -1308,7 +1352,7 @@ type = "bundled_command"
         "#;
         let cfg: GatewayConfig = toml::from_str(toml).unwrap();
         let spec = cfg.backends[0].to_backend_spec(None);
-        assert_eq!(spec.family, BackendFamily::QuickAiNative);
+        assert_eq!(spec.family, BackendFamily::ClawBroNative);
         assert_eq!(spec.adapter_key, "native");
         assert!(matches!(spec.launch, LaunchSpec::BundledCommand));
     }
@@ -1334,7 +1378,7 @@ url = "http://127.0.0.1:3001/sse"
         let spec = cfg.backends[0].to_backend_spec(None);
         assert_eq!(spec.external_mcp_servers.len(), 1);
         match &spec.external_mcp_servers[0].transport {
-            clawbro_runtime::ExternalMcpTransport::Sse { url } => {
+            crate::runtime::ExternalMcpTransport::Sse { url } => {
                 assert_eq!(url, "http://127.0.0.1:3001/sse");
             }
         }
@@ -1568,7 +1612,7 @@ backend_id = " native-main "
         let toml_str = "[memory]\ndistill_every_n = 5";
         let cfg: GatewayConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.memory.distill_every_n, 5);
-        assert_eq!(cfg.memory.distiller_binary, "clawbro-rust-agent");
+        assert_eq!(cfg.memory.distiller_binary, "clawbro");
         assert_eq!(cfg.memory.shared_memory_max_words, 300);
         assert_eq!(cfg.memory.agent_memory_max_words, 500);
     }
@@ -1724,8 +1768,8 @@ enabled = true
             .as_ref()
             .unwrap()
             .resolved_trigger_policy(&cfg.gateway);
-        assert_eq!(policy.group, clawbro_channels::LarkTriggerMode::MentionOnly);
-        assert_eq!(policy.dm, clawbro_channels::LarkTriggerMode::AllMessages);
+        assert_eq!(policy.group, crate::channels_internal::LarkTriggerMode::MentionOnly);
+        assert_eq!(policy.dm, crate::channels_internal::LarkTriggerMode::AllMessages);
     }
 
     #[test]
@@ -1751,8 +1795,8 @@ mode = "all_messages"
             .as_ref()
             .unwrap()
             .resolved_trigger_policy(&cfg.gateway);
-        assert_eq!(policy.group, clawbro_channels::LarkTriggerMode::MentionOnly);
-        assert_eq!(policy.dm, clawbro_channels::LarkTriggerMode::AllMessages);
+        assert_eq!(policy.group, crate::channels_internal::LarkTriggerMode::MentionOnly);
+        assert_eq!(policy.dm, crate::channels_internal::LarkTriggerMode::AllMessages);
     }
 
     #[test]

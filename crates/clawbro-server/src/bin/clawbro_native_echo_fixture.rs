@@ -1,4 +1,4 @@
-use clawbro_runtime::{RuntimeEvent, RuntimeSessionSpec};
+use clawbro::runtime::{RuntimeEvent, RuntimeSessionSpec};
 use std::io::{self, Read};
 
 fn main() {

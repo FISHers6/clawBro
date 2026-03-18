@@ -1,7 +1,12 @@
 use crate::cli::args::LangArg;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Language { Zh, En, Ja, Ko }
+pub enum Language {
+    Zh,
+    En,
+    Ja,
+    Ko,
+}
 
 impl Language {
     pub fn from_arg(arg: Option<&LangArg>) -> Self {
@@ -25,6 +30,13 @@ pub struct Messages {
     pub mode_solo: &'static str,
     pub mode_multi: &'static str,
     pub mode_team: &'static str,
+    pub enter_front_bot_name: &'static str,
+    pub enter_specialist_name: &'static str,
+    pub specialist_name_conflict: &'static str,
+    pub specialist_name_duplicate: &'static str,
+    pub specialist_name_required: &'static str,
+    pub enter_team_scope: &'static str,
+    pub enter_team_name: &'static str,
     pub enter_port: &'static str,
     pub enter_workspace: &'static str,
     pub enter_ws_token: &'static str,
@@ -61,7 +73,7 @@ impl Messages {
 }
 
 static ZH: Messages = Messages {
-    welcome: "════════════════════════════════════\n  ClawBro Gateway 初始化向导\n════════════════════════════════════",
+    welcome: "════════════════════════════════════\n  ClawBro 初始化向导\n════════════════════════════════════",
     select_provider: "选择 AI Provider",
     enter_api_key: "请输入 API Key",
     enter_api_key_hint: "（输入内容不会显示）",
@@ -71,6 +83,13 @@ static ZH: Messages = Messages {
     mode_solo: "Solo — 单 Agent，适合个人使用",
     mode_multi: "Multi-agent — 多 Agent，通过 @mention 切换",
     mode_team: "Team — Lead + Specialists 编排协作",
+    enter_front_bot_name: "Team front bot 名称（默认 lead）",
+    enter_specialist_name: "输入 specialist 名称（留空结束添加）",
+    specialist_name_conflict: "specialist 名称不能与 front bot 相同，请重新输入。",
+    specialist_name_duplicate: "specialist 名称重复，请重新输入。",
+    specialist_name_required: "至少需要一个 specialist，已保留默认值 specialist。",
+    enter_team_scope: "输入 Team scope（留空使用默认值）",
+    enter_team_name: "输入 Team 显示名称（留空使用默认值）",
     enter_port: "Gateway 监听端口（0 = 随机，默认 8080）",
     enter_workspace: "默认工作目录（留空 = 不设置）",
     enter_ws_token: "WebSocket 认证 Token（留空 = 开放模式，无需鉴权）",
@@ -96,7 +115,7 @@ static ZH: Messages = Messages {
 };
 
 static EN: Messages = Messages {
-    welcome: "════════════════════════════════════\n  ClawBro Gateway Setup Wizard\n════════════════════════════════════",
+    welcome: "════════════════════════════════════\n  ClawBro Setup Wizard\n════════════════════════════════════",
     select_provider: "Select AI Provider",
     enter_api_key: "Enter API Key",
     enter_api_key_hint: "(input is hidden)",
@@ -106,6 +125,13 @@ static EN: Messages = Messages {
     mode_solo: "Solo — single agent, great for personal use",
     mode_multi: "Multi-agent — multiple agents, switch via @mention",
     mode_team: "Team — Lead + Specialists for complex tasks",
+    enter_front_bot_name: "Team front bot name (default: lead)",
+    enter_specialist_name: "Enter specialist name (leave empty to finish)",
+    specialist_name_conflict: "Specialist name cannot match the front bot. Try again.",
+    specialist_name_duplicate: "Specialist name already exists. Try again.",
+    specialist_name_required: "At least one specialist is required. Keeping default specialist.",
+    enter_team_scope: "Enter Team scope (leave empty to use the default)",
+    enter_team_name: "Enter Team display name (leave empty to use the default)",
     enter_port: "Gateway port (0 = random, default 8080)",
     enter_workspace: "Default workspace directory (leave empty to skip)",
     enter_ws_token: "WebSocket auth token (leave empty = open mode, no auth)",
@@ -131,7 +157,7 @@ static EN: Messages = Messages {
 };
 
 static JA: Messages = Messages {
-    welcome: "════════════════════════════════════\n  ClawBro Gateway セットアップ\n════════════════════════════════════",
+    welcome: "════════════════════════════════════\n  ClawBro セットアップ\n════════════════════════════════════",
     select_provider: "AIプロバイダーを選択",
     enter_api_key: "APIキーを入力",
     enter_api_key_hint: "（入力内容は非表示）",
@@ -141,6 +167,13 @@ static JA: Messages = Messages {
     mode_solo: "Solo — シングルエージェント",
     mode_multi: "Multi-agent — 複数エージェント（@mentionで切替）",
     mode_team: "Team — リード＋スペシャリスト編成",
+    enter_front_bot_name: "Team front bot 名（デフォルト: lead）",
+    enter_specialist_name: "specialist 名を入力（空欄で追加終了）",
+    specialist_name_conflict: "specialist 名は front bot と同じにできません。再入力してください。",
+    specialist_name_duplicate: "specialist 名が重複しています。再入力してください。",
+    specialist_name_required: "少なくとも 1 つの specialist が必要です。既定値 specialist を使用します。",
+    enter_team_scope: "Team scope を入力（空欄で既定値）",
+    enter_team_name: "Team 表示名を入力（空欄で既定値）",
     enter_port: "Gatewayポート（0=ランダム、デフォルト8080）",
     enter_workspace: "デフォルト作業ディレクトリ（任意）",
     enter_ws_token: "WebSocket認証トークン（空欄=認証なし）",
@@ -166,7 +199,7 @@ static JA: Messages = Messages {
 };
 
 static KO: Messages = Messages {
-    welcome: "════════════════════════════════════\n  ClawBro Gateway 설정 마법사\n════════════════════════════════════",
+    welcome: "════════════════════════════════════\n  ClawBro 설정 마법사\n════════════════════════════════════",
     select_provider: "AI 공급자 선택",
     enter_api_key: "API 키 입력",
     enter_api_key_hint: "（입력 내용 비표시）",
@@ -176,6 +209,13 @@ static KO: Messages = Messages {
     mode_solo: "Solo — 단일 에이전트",
     mode_multi: "Multi-agent — 다중 에이전트（@mention 전환）",
     mode_team: "Team — Lead + Specialists 협업",
+    enter_front_bot_name: "Team front bot 이름（기본값: lead）",
+    enter_specialist_name: "specialist 이름 입력（비워두면 추가 종료）",
+    specialist_name_conflict: "specialist 이름은 front bot 과 같을 수 없습니다. 다시 입력하세요.",
+    specialist_name_duplicate: "specialist 이름이 중복됩니다. 다시 입력하세요.",
+    specialist_name_required: "최소 하나의 specialist 가 필요합니다. 기본값 specialist 를 사용합니다.",
+    enter_team_scope: "Team scope 입력（비워두면 기본값 사용）",
+    enter_team_name: "Team 표시 이름 입력（비워두면 기본값 사용）",
     enter_port: "Gateway 포트（0=랜덤, 기본 8080）",
     enter_workspace: "기본 작업 디렉토리（선택사항）",
     enter_ws_token: "WebSocket 인증 토큰（빈칸=인증 없음）",

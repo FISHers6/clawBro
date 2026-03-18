@@ -8,7 +8,7 @@ use axum::{
     routing::get,
     Router,
 };
-use clawbro_runtime::openclaw::client::GatewayFrame;
+use clawbro::runtime::openclaw::client::GatewayFrame;
 use serde_json::{json, Value};
 use std::{
     net::SocketAddr,
@@ -94,7 +94,7 @@ async fn handle_socket(mut socket: WebSocket, state: FixtureState) {
                     id: Uuid::new_v4().to_string(),
                     ok: false,
                     payload: None,
-                    error: Some(clawbro_runtime::openclaw::client::GatewayErrorShape {
+                    error: Some(clawbro::runtime::openclaw::client::GatewayErrorShape {
                         code: Some("fixture_error".into()),
                         message: Some(err.to_string()),
                     }),

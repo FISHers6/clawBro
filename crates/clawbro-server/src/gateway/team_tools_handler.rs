@@ -5,7 +5,7 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use clawbro_runtime::{TeamToolRequest, TeamToolResponse};
+use crate::runtime::{TeamToolRequest, TeamToolResponse};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -50,15 +50,15 @@ pub async fn invoke_team_tool(
 mod tests {
     use super::*;
     use crate::{config::GatewayConfig, gateway, state::AppState};
-    use clawbro_agent::SessionRegistry;
-    use clawbro_runtime::{TeamToolCall, TeamToolRequest};
-    use clawbro_session::{SessionManager, SessionStorage};
-    use clawbro_skills::SkillLoader;
+    use crate::agent_core::SessionRegistry;
+    use crate::runtime::{TeamToolCall, TeamToolRequest};
+    use crate::session::{SessionManager, SessionStorage};
+    use crate::skills_internal::SkillLoader;
     use std::sync::Arc;
 
     #[tokio::test]
     async fn team_tools_endpoint_executes_real_registry_call() {
-        use clawbro_agent::team::{
+        use crate::agent_core::team::{
             heartbeat::DispatchFn, orchestrator::TeamOrchestrator, registry::TaskRegistry,
             session::TeamSession,
         };
@@ -94,21 +94,21 @@ mod tests {
             dispatch_fn,
             std::time::Duration::from_secs(60),
         );
-        let lead_key = clawbro_protocol::SessionKey::new("lark", "group:server");
+        let lead_key = crate::protocol::SessionKey::new("lark", "group:server");
         orch.set_lead_session_key(lead_key.clone());
         orch.set_scope(lead_key.clone());
         registry.register_team_orchestrator(
-            clawbro_agent::team::session::stable_team_id_for_session_key(&lead_key),
+            crate::agent_core::team::session::stable_team_id_for_session_key(&lead_key),
             Arc::clone(&orch),
         );
 
         let state = AppState {
             registry: Arc::clone(&registry),
-            runtime_registry: Arc::new(clawbro_runtime::BackendRegistry::new()),
+            runtime_registry: Arc::new(crate::runtime::BackendRegistry::new()),
             event_tx: registry.global_sender(),
             cfg: Arc::new(cfg),
             runtime_token: Arc::new("test-token".to_string()),
-            approvals: clawbro_runtime::ApprovalBroker::default(),
+            approvals: crate::runtime::ApprovalBroker::default(),
         };
         let addr = gateway::server::start(state, "127.0.0.1", 0).await.unwrap();
 

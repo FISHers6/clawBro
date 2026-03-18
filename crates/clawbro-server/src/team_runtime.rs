@@ -2,13 +2,16 @@ use crate::channel_registry::ChannelRegistry;
 use crate::config::{GatewayConfig, InteractionMode};
 use crate::delivery_resolver::resolve_delivery;
 use anyhow::Result;
-use clawbro_agent::team::completion_routing::{RoutingDeliveryStatus, TeamRoutingEnvelope};
-use clawbro_agent::team::milestone::TeamMilestoneEvent;
-use clawbro_agent::team::milestone_delivery::{milestone_dedupe_key, milestone_is_public};
-use clawbro_agent::team::registry::TaskStatus;
-use clawbro_agent::team::session::{ChannelSendSourceKind, ChannelSendStatus, TeamSession};
-use clawbro_agent::{SessionRegistry, TurnExecutionContext};
-use clawbro_protocol::{InboundMsg, MsgContent, MsgSource, OutboundMsg, SessionKey};
+use crate::agent_core::team::completion_routing::{
+    PendingRoutingRecord, ReviewAttemptDiagnostic, ReviewFailureClassification,
+    RoutingDeliveryStatus, TeamRoutingEnvelope,
+};
+use crate::agent_core::team::milestone::TeamMilestoneEvent;
+use crate::agent_core::team::milestone_delivery::{milestone_dedupe_key, milestone_is_public};
+use crate::agent_core::team::registry::TaskStatus;
+use crate::agent_core::team::session::{ChannelSendSourceKind, ChannelSendStatus, TeamSession};
+use crate::agent_core::{SessionRegistry, TurnExecutionContext};
+use crate::protocol::{InboundMsg, MsgContent, MsgSource, OutboundMsg, SessionKey};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -32,7 +35,7 @@ fn default_channel_instance_for_scope(
 }
 
 async fn send_with_reply_fallback(
-    channel: &Arc<dyn clawbro_channels::Channel>,
+    channel: &Arc<dyn crate::channels_internal::Channel>,
     outbound: OutboundMsg,
 ) -> (OutboundMsg, anyhow::Result<()>) {
     match channel.send(&outbound).await {
@@ -61,7 +64,7 @@ pub async fn wire_team_runtime(
     channel_map: Arc<ChannelRegistry>,
     heartbeat_interval: Duration,
 ) -> Result<()> {
-    use clawbro_agent::team::{
+    use crate::agent_core::team::{
         completion_routing::{RoutingDeliveryStatus, TeamNotifyRequest},
         heartbeat::DispatchFn,
         orchestrator::TeamOrchestrator,
@@ -72,6 +75,7 @@ pub async fn wire_team_runtime(
     let (team_notify_tx, mut team_notify_rx) = mpsc::channel::<TeamNotifyRequest>(256);
     let team_notify_tx_for_orch = team_notify_tx.clone();
     let team_scopes = cfg.normalized_team_scopes();
+    let mut review_retry_orchestrators = Vec::new();
     let cfg_for_delivery = Arc::new(cfg.clone());
     tracing::info!(
         count = team_scopes.len(),
@@ -103,7 +107,7 @@ pub async fn wire_team_runtime(
         };
         let lead_channel_instance =
             default_channel_instance_for_scope(cfg, &channel_name, &team_scope.scope);
-        let lead_key = clawbro_protocol::SessionKey {
+        let lead_key = crate::protocol::SessionKey {
             channel: channel_name.clone(),
             channel_instance: lead_channel_instance.clone(),
             scope: team_scope.scope.clone(),
@@ -154,10 +158,10 @@ pub async fn wire_team_runtime(
                         team_orch.lead_delivery_source(),
                     );
                 }
-                let msg = clawbro_protocol::InboundMsg {
+                let msg = crate::protocol::InboundMsg {
                     id: uuid::Uuid::new_v4().to_string(),
                     session_key: specialist_key,
-                    content: clawbro_protocol::MsgContent::text(
+                    content: crate::protocol::MsgContent::text(
                         task.spec.as_deref().unwrap_or(&task.title),
                     ),
                     sender: "orchestrator".to_string(),
@@ -165,7 +169,7 @@ pub async fn wire_team_runtime(
                     timestamp: chrono::Utc::now(),
                     thread_ts: None,
                     target_agent: Some(format!("@{}", agent)),
-                    source: clawbro_protocol::MsgSource::Heartbeat,
+                    source: crate::protocol::MsgSource::Heartbeat,
                 };
                 let result = registry
                     .handle_with_context(msg, TurnExecutionContext::default())
@@ -199,7 +203,7 @@ pub async fn wire_team_runtime(
                         team_orch.classify_specialist_turn(&task.id, &agent, dispatch_started_at);
                     if matches!(
                         outcome,
-                        clawbro_agent::team::specialist_turn::SpecialistTurnOutcome::MissingCompletion
+                        crate::agent_core::team::specialist_turn::SpecialistTurnOutcome::MissingCompletion
                     ) {
                         if let Some(ref reply_text) = captured_reply_text {
                             let _ = persist_missing_completion_reply_artifacts(
@@ -244,74 +248,76 @@ pub async fn wire_team_runtime(
         let lead_agent_name_for_notify = team_scope.mode.front_bot.clone();
         let cfg_for_milestone = Arc::clone(&cfg_for_delivery);
         let team_orch_for_milestone_in_closure = Arc::clone(&team_orch_for_milestone);
-        team_orch.set_milestone_fn(Arc::new(move |scope: clawbro_protocol::SessionKey, event| {
-            use clawbro_agent::team::milestone::render_for_im;
-            if !milestone_is_public(&event, public_updates_mode) {
-                tracing::debug!(
-                    scope = %scope.scope,
-                    kind = %event.kind_str(),
-                    "Suppressing internal-only team milestone from direct channel delivery"
-                );
-                return;
-            }
-            if let Some(dedupe_key) = milestone_dedupe_key(&event) {
-                match session_for_notify.mark_delivery_dedupe(&scope.scope, &dedupe_key) {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        let _ = session_for_notify
-                            .record_delivery_dedupe_hit(&scope.scope, &dedupe_key);
-                        tracing::debug!(
-                            scope = %scope.scope,
-                            kind = %event.kind_str(),
-                            "Suppressing duplicate team milestone channel delivery"
-                        );
-                        return;
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            scope = %scope.scope,
-                            kind = %event.kind_str(),
-                            error = %err,
-                            "Failed to persist milestone delivery dedupe key"
-                        );
+        team_orch.set_milestone_fn(Arc::new(
+            move |scope: crate::protocol::SessionKey, event| {
+                use crate::agent_core::team::milestone::render_for_im;
+                if !milestone_is_public(&event, public_updates_mode) {
+                    tracing::debug!(
+                        scope = %scope.scope,
+                        kind = %event.kind_str(),
+                        "Suppressing internal-only team milestone from direct channel delivery"
+                    );
+                    return;
+                }
+                if let Some(dedupe_key) = milestone_dedupe_key(&event) {
+                    match session_for_notify.mark_delivery_dedupe(&scope.scope, &dedupe_key) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            let _ = session_for_notify
+                                .record_delivery_dedupe_hit(&scope.scope, &dedupe_key);
+                            tracing::debug!(
+                                scope = %scope.scope,
+                                kind = %event.kind_str(),
+                                "Suppressing duplicate team milestone channel delivery"
+                            );
+                            return;
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                scope = %scope.scope,
+                                kind = %event.kind_str(),
+                                error = %err,
+                                "Failed to persist milestone delivery dedupe key"
+                            );
+                        }
                     }
                 }
-            }
-            let msg = render_for_im(&event);
-            let channels = Arc::clone(&channels_for_notify);
-            let session_for_record = Arc::clone(&session_for_notify);
-            let lead_agent_name = lead_agent_name_for_notify.clone();
-            let dedupe_key_for_record = milestone_dedupe_key(&event);
-            let cfg = Arc::clone(&cfg_for_milestone);
-            let team_orch_cell = Arc::clone(&team_orch_for_milestone_in_closure);
-            tokio::spawn(async move {
-                let stored_source = team_orch_cell
-                    .get()
-                    .and_then(|team_orch| team_orch.lead_delivery_source());
-                let (source_kind, source_agent) =
-                    milestone_channel_origin(&event, lead_agent_name.as_deref());
-                let resolved = resolve_delivery(
-                    cfg.as_ref(),
-                    channels.as_ref(),
-                    milestone_delivery_purpose(&event),
-                    &scope,
-                    None,
-                    stored_source.as_ref(),
-                    Some(&source_agent),
-                    None,
-                    None,
-                );
-                let (outbound, send_result, sender_channel_instance) =
-                    if let Some(resolved) = resolved {
+                let msg = render_for_im(&event);
+                let channels = Arc::clone(&channels_for_notify);
+                let session_for_record = Arc::clone(&session_for_notify);
+                let lead_agent_name = lead_agent_name_for_notify.clone();
+                let dedupe_key_for_record = milestone_dedupe_key(&event);
+                let cfg = Arc::clone(&cfg_for_milestone);
+                let team_orch_cell = Arc::clone(&team_orch_for_milestone_in_closure);
+                tokio::spawn(async move {
+                    let stored_source = team_orch_cell
+                        .get()
+                        .and_then(|team_orch| team_orch.lead_delivery_source());
+                    let (source_kind, source_agent) =
+                        milestone_channel_origin(&event, lead_agent_name.as_deref());
+                    let resolved = resolve_delivery(
+                        cfg.as_ref(),
+                        channels.as_ref(),
+                        milestone_delivery_purpose(&event),
+                        &scope,
+                        None,
+                        stored_source.as_ref(),
+                        Some(&source_agent),
+                        None,
+                        None,
+                    );
+                    let (outbound, send_result, sender_channel_instance) = if let Some(resolved) =
+                        resolved
+                    {
                         let sender_channel_instance = resolved.sender_channel_instance.clone();
                         let outbound = resolved.outbound_text(&msg);
                         let (outbound, send_result) =
                             send_with_reply_fallback(&resolved.sender, outbound).await;
                         (outbound, send_result, sender_channel_instance)
                     } else if let Some(ch) = channels.resolve_for_session(&scope) {
-                        let outbound = clawbro_protocol::OutboundMsg {
+                        let outbound = crate::protocol::OutboundMsg {
                             session_key: scope.clone(),
-                            content: clawbro_protocol::MsgContent::text(msg),
+                            content: crate::protocol::MsgContent::text(msg),
                             reply_to: stored_source
                                 .as_ref()
                                 .and_then(|source| source.reply_to.clone()),
@@ -324,38 +330,39 @@ pub async fn wire_team_runtime(
                     } else {
                         return;
                     };
-                if let Err(e) = &send_result {
-                    tracing::error!("Milestone notify send error: {e}");
-                }
-                let (status, error) = match send_result {
-                    Ok(()) => (ChannelSendStatus::Sent, None),
-                    Err(err) => (ChannelSendStatus::SendFailed, Some(err.to_string())),
-                };
-                if let Err(err) = session_for_record.record_channel_send(
-                    &outbound.session_key.channel,
-                    sender_channel_instance.as_deref(),
-                    outbound.session_key.channel_instance.as_deref(),
-                    &outbound.session_key.scope,
-                    None,
-                    stored_source.as_ref(),
-                    outbound.reply_to.as_deref(),
-                    outbound.thread_ts.as_deref(),
-                    source_kind,
-                    &source_agent,
-                    milestone_task_id(&event),
-                    dedupe_key_for_record.as_deref(),
-                    outbound.content.as_text().unwrap_or_default(),
-                    status,
-                    error.as_deref(),
-                ) {
-                    tracing::warn!(
-                        team_id = %session_for_record.team_id,
-                        error = %err,
-                        "Failed to append milestone channel send ledger entry"
-                    );
-                }
-            });
-        }));
+                    if let Err(e) = &send_result {
+                        tracing::error!("Milestone notify send error: {e}");
+                    }
+                    let (status, error) = match send_result {
+                        Ok(()) => (ChannelSendStatus::Sent, None),
+                        Err(err) => (ChannelSendStatus::SendFailed, Some(err.to_string())),
+                    };
+                    if let Err(err) = session_for_record.record_channel_send(
+                        &outbound.session_key.channel,
+                        sender_channel_instance.as_deref(),
+                        outbound.session_key.channel_instance.as_deref(),
+                        &outbound.session_key.scope,
+                        None,
+                        stored_source.as_ref(),
+                        outbound.reply_to.as_deref(),
+                        outbound.thread_ts.as_deref(),
+                        source_kind,
+                        &source_agent,
+                        milestone_task_id(&event),
+                        dedupe_key_for_record.as_deref(),
+                        outbound.content.as_text().unwrap_or_default(),
+                        status,
+                        error.as_deref(),
+                    ) {
+                        tracing::warn!(
+                            team_id = %session_for_record.team_id,
+                            error = %err,
+                            "Failed to append milestone channel send ledger entry"
+                        );
+                    }
+                });
+            },
+        ));
 
         team_orch.set_lead_session_key(lead_key.clone());
         team_orch.set_scope(lead_key);
@@ -376,6 +383,14 @@ pub async fn wire_team_runtime(
 
         team_orch.set_team_notify_tx(team_notify_tx_for_orch.clone());
 
+        team_orch.bootstrap_workspace_artifacts().map_err(|e| {
+            anyhow::anyhow!(
+                "failed to bootstrap team workspace for scope '{}' (team '{}'): {e:#}",
+                team_scope.scope,
+                team_id
+            )
+        })?;
+
         team_orch.start_mcp_server().await.map_err(|e| {
             anyhow::anyhow!(
                 "failed to start SharedTeamMcpServer for scope '{}' (team '{}'): {e:#}",
@@ -386,7 +401,26 @@ pub async fn wire_team_runtime(
         tracing::info!(scope = %team_scope.scope, team_id = %team_id, "SharedTeamMcpServer started");
 
         registry.register_team_orchestrator(team_id.clone(), team_orch);
+        review_retry_orchestrators.push(
+            registry
+                .get_team_orchestrator(&team_id)
+                .expect("team orchestrator should be immediately retrievable after registration"),
+        );
         tracing::info!(scope = %team_scope.scope, team_id = %team_id, "TeamOrchestrator registered");
+    }
+
+    if !review_retry_orchestrators.is_empty() {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                for team_orch in &review_retry_orchestrators {
+                    team_orch.retry_due_pending_routing_events();
+                }
+            }
+        });
+        tracing::info!("Team review retry task started");
     }
 
     for group in cfg.groups.iter().filter(|g| g.mode.auto_promote) {
@@ -429,6 +463,7 @@ pub async fn wire_team_runtime(
         let registry_for_notify = Arc::clone(&registry);
         tokio::spawn(async move {
             while let Some(request) = team_notify_rx.recv().await {
+                let base_record = request.clone().into_pending_record();
                 if let Some(team_orch) =
                     registry_for_notify.get_team_orchestrator(&request.envelope.team_id)
                 {
@@ -448,8 +483,9 @@ pub async fn wire_team_runtime(
                         continue;
                     }
                 }
-                let text = request.envelope.event.render_for_parent();
+                let text = render_routing_event_for_delivery(&base_record);
                 let mut delivered = None;
+                let mut pending_record: Option<PendingRoutingRecord> = None;
 
                 for (attempt_index, target) in routing_attempt_targets(&request.envelope)
                     .into_iter()
@@ -465,11 +501,73 @@ pub async fn wire_team_runtime(
                             .as_ref()
                             .and_then(|source| source.thread_ts.clone()),
                     );
-                    match registry_for_notify
-                        .handle_with_context(inbound, turn_ctx)
-                        .await
+                    if let Some(team_orch) =
+                        registry_for_notify.get_team_orchestrator(&request.envelope.team_id)
                     {
-                        Ok(Some(_)) | Ok(None) => {
+                        if base_record.review.is_some() {
+                            team_orch.begin_lead_review_attempt(
+                                &request.envelope.run_id,
+                                &request.envelope.event.task_id,
+                                request.envelope.event.kind.clone(),
+                            );
+                        }
+                    }
+                    let delivery_result =
+                        registry_for_notify.handle_with_context(inbound, turn_ctx).await;
+                    if let Some(team_orch) =
+                        registry_for_notify.get_team_orchestrator(&request.envelope.team_id)
+                    {
+                        if base_record.review.is_some() {
+                            team_orch.end_lead_review_attempt(&request.envelope.run_id);
+                        }
+                    }
+                    match delivery_result {
+                        Ok(result_text) => {
+                            if let Some(team_orch) =
+                                registry_for_notify.get_team_orchestrator(&request.envelope.team_id)
+                            {
+                                if routing_event_still_requires_resolution_after_delivery(
+                                    team_orch.as_ref(),
+                                    &request.envelope,
+                                    base_record.review.as_ref(),
+                                ) {
+                                    let (classification, reason) =
+                                        unresolved_review_failure_from_turn_result(
+                                            result_text.as_deref(),
+                                            &request.envelope,
+                                        );
+                                    let record = base_record
+                                        .clone()
+                                        .with_delivery_status(RoutingDeliveryStatus::PersistedPending)
+                                    .note_failed_attempt(
+                                        classification,
+                                        reason,
+                                        Some(next_review_retry_at(
+                                            base_record
+                                                .review
+                                                .as_ref()
+                                                .map(|review| review.attempt_count + 1)
+                                                .unwrap_or(1),
+                                        )),
+                                    );
+                                    if let Some(diagnostic) =
+                                        review_attempt_diagnostic(&record)
+                                    {
+                                        let _ = team_orch
+                                            .session
+                                            .append_review_attempt_diagnostic(&diagnostic);
+                                    }
+                                    pending_record = Some(record);
+                                    tracing::warn!(
+                                        team_id = %request.envelope.team_id,
+                                        task_id = %request.envelope.event.task_id,
+                                        kind = ?request.envelope.event.kind,
+                                        target = %target.scope,
+                                        "TeamNotify turn completed without resolving required team action; treating delivery as incomplete"
+                                    );
+                                    continue;
+                                }
+                            }
                             delivered = Some(request.envelope.clone().with_delivery_status(
                                 delivery_status_for_attempt(attempt_index, busy),
                             ));
@@ -489,6 +587,30 @@ pub async fn wire_team_runtime(
                                 attempt_index,
                                 "TeamNotify delivery attempt failed: {e}"
                             );
+                            if let Some(team_orch) =
+                                registry_for_notify.get_team_orchestrator(&request.envelope.team_id)
+                            {
+                                let record = base_record
+                                    .clone()
+                                    .with_delivery_status(RoutingDeliveryStatus::PersistedPending)
+                                .note_failed_attempt(
+                                    ReviewFailureClassification::RuntimeError,
+                                    e.to_string(),
+                                    Some(next_review_retry_at(
+                                        base_record
+                                            .review
+                                            .as_ref()
+                                            .map(|review| review.attempt_count + 1)
+                                            .unwrap_or(1),
+                                    )),
+                                );
+                                if let Some(diagnostic) = review_attempt_diagnostic(&record) {
+                                    let _ = team_orch
+                                        .session
+                                        .append_review_attempt_diagnostic(&diagnostic);
+                                }
+                                pending_record = Some(record);
+                            }
                         }
                     }
                 }
@@ -499,11 +621,12 @@ pub async fn wire_team_runtime(
                     if let Some(delivered) = delivered {
                         team_orch.mark_routing_event_delivered(&delivered);
                     } else {
-                        let pending = request
-                            .envelope
-                            .clone()
-                            .with_delivery_status(RoutingDeliveryStatus::PersistedPending);
-                        team_orch.persist_pending_routing_event(pending);
+                        let pending = pending_record.unwrap_or_else(|| {
+                            base_record
+                                .clone()
+                                .with_delivery_status(RoutingDeliveryStatus::PersistedPending)
+                        });
+                        team_orch.persist_pending_routing_record(pending);
                     }
                 }
             }
@@ -569,7 +692,7 @@ fn truncate_for_missing_completion(text: &str, max_chars: usize) -> String {
 }
 
 async fn capture_specialist_reply_text(
-    storage: &clawbro_session::SessionStorage,
+    storage: &crate::session::SessionStorage,
     specialist_session_id: uuid::Uuid,
     result: &anyhow::Result<Option<String>>,
 ) -> Result<Option<String>> {
@@ -695,7 +818,7 @@ fn team_notify_turn_context(
 }
 
 fn routing_event_is_stale_for_delivery(
-    team_orch: &clawbro_agent::team::orchestrator::TeamOrchestrator,
+    team_orch: &crate::agent_core::team::orchestrator::TeamOrchestrator,
     envelope: &TeamRoutingEnvelope,
 ) -> bool {
     let task = match team_orch.registry.get_task(&envelope.event.task_id) {
@@ -704,19 +827,180 @@ fn routing_event_is_stale_for_delivery(
     };
 
     match envelope.event.kind {
-        clawbro_agent::team::completion_routing::TeamRoutingEventKind::TaskCheckpoint => matches!(
+        crate::agent_core::team::completion_routing::TeamRoutingEventKind::TaskCheckpoint => matches!(
             task.status_parsed(),
             TaskStatus::Submitted { .. }
                 | TaskStatus::Accepted { .. }
                 | TaskStatus::Done
                 | TaskStatus::Failed(_)
         ),
-        clawbro_agent::team::completion_routing::TeamRoutingEventKind::TaskSubmitted => matches!(
+        crate::agent_core::team::completion_routing::TeamRoutingEventKind::TaskSubmitted => matches!(
             task.status_parsed(),
             TaskStatus::Accepted { .. } | TaskStatus::Done | TaskStatus::Failed(_)
         ),
         _ => false,
     }
+}
+
+fn render_routing_event_for_delivery(record: &PendingRoutingRecord) -> String {
+    let mut rendered = record.envelope.event.render_for_parent();
+    let Some(review) = record.review.as_ref() else {
+        return rendered;
+    };
+    if review.attempt_count == 0 {
+        return rendered;
+    }
+
+    let failure_label = review
+        .last_failure_classification
+        .map(review_failure_label)
+        .unwrap_or("未分类失败");
+    let failure_reason = review
+        .last_failure_reason
+        .as_deref()
+        .unwrap_or("上一轮未留下明确失败原因");
+    let corrective_contract = review_retry_corrective_contract(review.review_kind, &record.envelope.event.task_id);
+
+    rendered = format!(
+        "[系统纠偏提醒]\n此前同一控制面事件已失败 {attempts} 次。\n最近一次失败分类：{failure_label}\n最近一次失败原因：{failure_reason}\n\n{corrective_contract}\n\n{rendered}",
+        attempts = review.attempt_count,
+    );
+    rendered
+}
+
+fn review_failure_label(classification: ReviewFailureClassification) -> &'static str {
+    match classification {
+        ReviewFailureClassification::NoOp => "NoOp",
+        ReviewFailureClassification::RuntimeError => "RuntimeError",
+        ReviewFailureClassification::DeliveryFailure => "DeliveryFailure",
+        ReviewFailureClassification::StillRequiresResolution => "StillRequiresResolution",
+    }
+}
+
+fn review_retry_corrective_contract(
+    review_kind: crate::agent_core::team::completion_routing::ReviewRequiredKind,
+    task_id: &str,
+) -> String {
+    match review_kind {
+        crate::agent_core::team::completion_routing::ReviewRequiredKind::Submitted => format!(
+            "这是 submitted 验收纠偏回合，不是新的用户请求。不要再输出解释性文字作为结束。先检查结果工件，然后在本轮结束前恰好调用一个工具：accept_task(task_id=\"{task_id}\") 或 reopen_task(task_id=\"{task_id}\", reason=\"...\")。"
+        ),
+        crate::agent_core::team::completion_routing::ReviewRequiredKind::Blocked => format!(
+            "这是 blocked 处理纠偏回合，不是新的用户请求。你必须明确处理 {task_id}：优先用内部动作继续推进；只有在确实需要用户决策时，才调用 post_update(...) 向用户说明阻塞并请求决策。"
+        ),
+        crate::agent_core::team::completion_routing::ReviewRequiredKind::Failed => format!(
+            "这是 failed 处理纠偏回合，不是新的用户请求。你必须明确处理 {task_id}：若要交还用户决策，调用 post_update(...) 说明失败、原因以及“重试 / 终止 / 改派”的选择；不要静默结束。"
+        ),
+        crate::agent_core::team::completion_routing::ReviewRequiredKind::MissingCompletion => format!(
+            "这是 missing-completion 纠偏回合，不是新的用户请求。你必须对 {task_id} 采取内部动作继续推进，例如 reopen_task(...) 或 assign_task(...)；仅 post_update(...) 不能算完成。"
+        ),
+    }
+}
+
+fn routing_event_still_requires_resolution_after_delivery(
+    team_orch: &crate::agent_core::team::orchestrator::TeamOrchestrator,
+    envelope: &TeamRoutingEnvelope,
+    review: Option<&crate::agent_core::team::completion_routing::ReviewAttemptMetadata>,
+) -> bool {
+    let task = match team_orch.registry.get_task(&envelope.event.task_id) {
+        Ok(Some(task)) => task,
+        Ok(None) | Err(_) => return false,
+    };
+
+    match envelope.event.kind {
+        crate::agent_core::team::completion_routing::TeamRoutingEventKind::TaskSubmitted => {
+            matches!(task.status_parsed(), TaskStatus::Submitted { .. })
+        }
+        crate::agent_core::team::completion_routing::TeamRoutingEventKind::TaskBlocked
+        | crate::agent_core::team::completion_routing::TeamRoutingEventKind::TaskMissingCompletion => {
+            let still_held = matches!(task.status_parsed(), TaskStatus::Held { .. });
+            if !still_held {
+                return false;
+            }
+            if matches!(
+                envelope.event.kind,
+                crate::agent_core::team::completion_routing::TeamRoutingEventKind::TaskBlocked
+            ) && review_terminal_post_update_recorded(team_orch, &envelope.event.task_id, review)
+            {
+                return false;
+            }
+            true
+        }
+        crate::agent_core::team::completion_routing::TeamRoutingEventKind::TaskFailed => {
+            !review_terminal_post_update_recorded(team_orch, &envelope.event.task_id, review)
+        }
+        _ => false,
+    }
+}
+
+fn review_terminal_post_update_recorded(
+    team_orch: &crate::agent_core::team::orchestrator::TeamOrchestrator,
+    task_id: &str,
+    review: Option<&crate::agent_core::team::completion_routing::ReviewAttemptMetadata>,
+) -> bool {
+    let Some(review) = review else {
+        return false;
+    };
+    team_orch
+        .session
+        .has_post_update_for_task_since(task_id, &review.first_pending_at)
+        .unwrap_or(false)
+}
+
+fn unresolved_review_failure_from_turn_result(
+    result_text: Option<&str>,
+    envelope: &TeamRoutingEnvelope,
+) -> (ReviewFailureClassification, String) {
+    match result_text {
+        None => (
+            ReviewFailureClassification::NoOp,
+            format!(
+                "lead review turn for {:?} produced no output and did not resolve the task state",
+                envelope.event.kind
+            ),
+        ),
+        Some(text) if text.trim().is_empty() => (
+            ReviewFailureClassification::NoOp,
+            format!(
+                "lead review turn for {:?} produced empty output and did not resolve the task state",
+                envelope.event.kind
+            ),
+        ),
+        Some(text) => (
+            ReviewFailureClassification::StillRequiresResolution,
+            format!(
+                "lead review turn for {:?} produced output without resolving the task state: {}",
+                envelope.event.kind,
+                truncate_for_missing_completion(text, 160)
+            ),
+        ),
+    }
+}
+
+fn next_review_retry_at(attempt_count: u32) -> String {
+    let backoff_seconds = match attempt_count {
+        0 | 1 => 5,
+        2 => 15,
+        3 => 30,
+        _ => 60,
+    };
+    (chrono::Utc::now() + chrono::Duration::seconds(backoff_seconds)).to_rfc3339()
+}
+
+fn review_attempt_diagnostic(record: &PendingRoutingRecord) -> Option<ReviewAttemptDiagnostic> {
+    let review = record.review.as_ref()?;
+    let classification = review.last_failure_classification?;
+    let reason = review.last_failure_reason.clone()?;
+    Some(ReviewAttemptDiagnostic {
+        ts: chrono::Utc::now().to_rfc3339(),
+        run_id: record.envelope.run_id.clone(),
+        team_id: record.envelope.team_id.clone(),
+        task_id: record.envelope.event.task_id.clone(),
+        event_kind: record.envelope.event.kind.clone(),
+        attempt_count: review.attempt_count,
+        classification,
+        reason,
+    })
 }
 
 #[cfg(test)]
@@ -725,12 +1009,12 @@ mod tests {
     use crate::config::{ChannelsSection, GatewayConfig, LarkSection, ProgressPresentationMode};
     use anyhow::Result;
     use async_trait::async_trait;
-    use clawbro_agent::team::completion_routing::{RoutingDeliveryStatus, TeamRoutingEvent};
-    use clawbro_agent::team::milestone::TeamMilestoneEvent;
-    use clawbro_agent::team::milestone_delivery::{milestone_is_public, TeamPublicUpdatesMode};
-    use clawbro_agent::team::orchestrator::TeamOrchestrator;
-    use clawbro_agent::team::registry::{CreateTask, TaskRegistry};
-    use clawbro_agent::team::session::{stable_team_id_for_session_key, TeamSession};
+    use crate::agent_core::team::completion_routing::{RoutingDeliveryStatus, TeamRoutingEvent};
+    use crate::agent_core::team::milestone::TeamMilestoneEvent;
+    use crate::agent_core::team::milestone_delivery::{milestone_is_public, TeamPublicUpdatesMode};
+    use crate::agent_core::team::orchestrator::TeamOrchestrator;
+    use crate::agent_core::team::registry::{CreateTask, TaskRegistry};
+    use crate::agent_core::team::session::{stable_team_id_for_session_key, TeamSession};
     use std::sync::Arc;
     use std::sync::Mutex;
     use tempfile::tempdir;
@@ -743,7 +1027,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl clawbro_channels::Channel for MockChannel {
+    impl crate::channels_internal::Channel for MockChannel {
         fn name(&self) -> &str {
             "mock"
         }
@@ -819,7 +1103,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let registry = Arc::new(TaskRegistry::new_in_memory().unwrap());
         let session = Arc::new(TeamSession::from_dir("team-test", tmp.path().to_path_buf()));
-        let dispatch_fn: clawbro_agent::team::heartbeat::DispatchFn =
+        let dispatch_fn: crate::agent_core::team::heartbeat::DispatchFn =
             Arc::new(|_agent, _task| Box::pin(async { Ok(()) }));
         let orch = TeamOrchestrator::new(
             registry.clone(),
@@ -860,10 +1144,294 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn submitted_delivery_requires_explicit_resolution_until_status_changes() {
+        let tmp = tempdir().unwrap();
+        let registry = Arc::new(TaskRegistry::new_in_memory().unwrap());
+        let session = Arc::new(TeamSession::from_dir("team-test", tmp.path().to_path_buf()));
+        let dispatch_fn: crate::agent_core::team::heartbeat::DispatchFn =
+            Arc::new(|_agent, _task| Box::pin(async { Ok(()) }));
+        let orch = TeamOrchestrator::new(
+            registry.clone(),
+            session,
+            dispatch_fn,
+            std::time::Duration::from_secs(60),
+        );
+        registry
+            .create_task(CreateTask {
+                id: "T006".into(),
+                title: "task".into(),
+                assignee_hint: Some("codex-beta".into()),
+                deps: vec![],
+                timeout_secs: 60,
+                spec: None,
+                success_criteria: None,
+            })
+            .unwrap();
+        registry.try_claim("T006", "codex-beta").unwrap();
+        registry
+            .submit_task_result("T006", "codex-beta", "done")
+            .unwrap();
+
+        let envelope = TeamRoutingEnvelope {
+            run_id: "run-6".into(),
+            parent_run_id: None,
+            requester_session_key: Some(SessionKey::new("lark", "group:test")),
+            fallback_session_keys: vec![],
+            team_id: "team-test".into(),
+            delivery_status: RoutingDeliveryStatus::NotRouted,
+            event: TeamRoutingEvent::submitted("T006", "codex-beta", "done"),
+            delivery_source: None,
+        };
+
+        assert!(routing_event_still_requires_resolution_after_delivery(
+            orch.as_ref(),
+            &envelope
+            , None
+        ));
+
+        registry.accept_task("T006", "lead").unwrap();
+
+        assert!(!routing_event_still_requires_resolution_after_delivery(
+            orch.as_ref(),
+            &envelope
+            , None
+        ));
+    }
+
+    #[test]
+    fn blocked_and_missing_completion_delivery_require_explicit_resolution_while_task_is_held() {
+        let tmp = tempdir().unwrap();
+        let registry = Arc::new(TaskRegistry::new_in_memory().unwrap());
+        let session = Arc::new(TeamSession::from_dir("team-test", tmp.path().to_path_buf()));
+        let dispatch_fn: crate::agent_core::team::heartbeat::DispatchFn =
+            Arc::new(|_agent, _task| Box::pin(async { Ok(()) }));
+        let orch = TeamOrchestrator::new(
+            registry.clone(),
+            session,
+            dispatch_fn,
+            std::time::Duration::from_secs(60),
+        );
+        registry
+            .create_task(CreateTask {
+                id: "T007".into(),
+                title: "task".into(),
+                assignee_hint: Some("codex-beta".into()),
+                deps: vec![],
+                timeout_secs: 60,
+                spec: None,
+                success_criteria: None,
+            })
+            .unwrap();
+        registry.try_claim("T007", "codex-beta").unwrap();
+        registry
+            .hold_claim("T007", "codex-beta", "missing_completion")
+            .unwrap();
+
+        let blocked = TeamRoutingEnvelope {
+            run_id: "run-7b".into(),
+            parent_run_id: None,
+            requester_session_key: Some(SessionKey::new("lark", "group:test")),
+            fallback_session_keys: vec![],
+            team_id: "team-test".into(),
+            delivery_status: RoutingDeliveryStatus::NotRouted,
+            event: TeamRoutingEvent::blocked("T007", "codex-beta", "blocked"),
+            delivery_source: None,
+        };
+        let missing = TeamRoutingEnvelope {
+            run_id: "run-7m".into(),
+            parent_run_id: None,
+            requester_session_key: Some(SessionKey::new("lark", "group:test")),
+            fallback_session_keys: vec![],
+            team_id: "team-test".into(),
+            delivery_status: RoutingDeliveryStatus::NotRouted,
+            event: TeamRoutingEvent::missing_completion("T007", "codex-beta"),
+            delivery_source: None,
+        };
+
+        assert!(routing_event_still_requires_resolution_after_delivery(
+            orch.as_ref(),
+            &blocked,
+            None
+        ));
+        assert!(routing_event_still_requires_resolution_after_delivery(
+            orch.as_ref(),
+            &missing,
+            None
+        ));
+
+        registry.reassign_task("T007", "worker").unwrap();
+
+        assert!(!routing_event_still_requires_resolution_after_delivery(
+            orch.as_ref(),
+            &blocked,
+            None
+        ));
+        assert!(!routing_event_still_requires_resolution_after_delivery(
+            orch.as_ref(),
+            &missing,
+            None
+        ));
+    }
+
+    #[test]
+    fn unresolved_review_failure_classification_distinguishes_noop_from_textful_turn() {
+        let envelope = TeamRoutingEnvelope {
+            run_id: "run-review".into(),
+            parent_run_id: None,
+            requester_session_key: Some(SessionKey::new("lark", "group:test")),
+            fallback_session_keys: vec![],
+            team_id: "team-test".into(),
+            delivery_status: RoutingDeliveryStatus::NotRouted,
+            event: TeamRoutingEvent::submitted("T008", "codex-beta", "done"),
+            delivery_source: None,
+        };
+
+        let (classification, reason) =
+            unresolved_review_failure_from_turn_result(None, &envelope);
+        assert_eq!(classification, ReviewFailureClassification::NoOp);
+        assert!(reason.contains("produced no output"));
+
+        let (classification, reason) = unresolved_review_failure_from_turn_result(
+            Some("I reviewed it but won't accept yet"),
+            &envelope,
+        );
+        assert_eq!(
+            classification,
+            ReviewFailureClassification::StillRequiresResolution
+        );
+        assert!(reason.contains("produced output without resolving"));
+    }
+
+    #[test]
+    fn render_review_retry_delivery_text_includes_previous_failure_context() {
+        let envelope = TeamRoutingEnvelope {
+            run_id: "run-review".into(),
+            parent_run_id: None,
+            requester_session_key: Some(SessionKey::new("lark", "group:test")),
+            fallback_session_keys: vec![],
+            team_id: "team-test".into(),
+            delivery_status: RoutingDeliveryStatus::PersistedPending,
+            event: TeamRoutingEvent::submitted("T010", "codex-beta", "done"),
+            delivery_source: None,
+        };
+        let record = PendingRoutingRecord::from_envelope(envelope).note_failed_attempt(
+            ReviewFailureClassification::StillRequiresResolution,
+            "lead review turn completed without accept_task/reopen_task",
+            None,
+        );
+
+        let rendered = render_routing_event_for_delivery(&record);
+        assert!(rendered.contains("[系统纠偏提醒]"));
+        assert!(rendered.contains("此前同一控制面事件已失败 1 次"));
+        assert!(rendered.contains("StillRequiresResolution"));
+        assert!(rendered.contains("accept_task(task_id=\"T010\")"));
+        assert!(rendered.contains("reopen_task(task_id=\"T010\", reason=\"...\")"));
+    }
+
+    #[test]
+    fn failed_and_blocked_reviews_can_resolve_via_post_update_after_user_notification() {
+        let tmp = tempdir().unwrap();
+        let registry = Arc::new(TaskRegistry::new_in_memory().unwrap());
+        let session = Arc::new(TeamSession::from_dir("team-test", tmp.path().to_path_buf()));
+        let dispatch_fn: crate::agent_core::team::heartbeat::DispatchFn =
+            Arc::new(|_agent, _task| Box::pin(async { Ok(()) }));
+        let orch = TeamOrchestrator::new(
+            registry.clone(),
+            session,
+            dispatch_fn,
+            std::time::Duration::from_secs(60),
+        );
+        orch.set_lead_agent_name("claude-alpha".into());
+
+        registry
+            .create_task(CreateTask {
+                id: "T009".into(),
+                title: "failed-task".into(),
+                assignee_hint: Some("codex-beta".into()),
+                deps: vec![],
+                timeout_secs: 60,
+                spec: None,
+                success_criteria: None,
+            })
+            .unwrap();
+        registry.mark_failed("T009", "quota").unwrap();
+
+        let failed = TeamRoutingEnvelope {
+            run_id: "run-9f".into(),
+            parent_run_id: None,
+            requester_session_key: Some(SessionKey::new("lark", "group:test")),
+            fallback_session_keys: vec![],
+            team_id: "team-test".into(),
+            delivery_status: RoutingDeliveryStatus::NotRouted,
+            event: TeamRoutingEvent::failed("T009", "quota"),
+            delivery_source: None,
+        };
+        let failed_review = crate::agent_core::team::completion_routing::PendingRoutingRecord::from_envelope(
+            failed.clone(),
+        );
+        assert!(routing_event_still_requires_resolution_after_delivery(
+            orch.as_ref(),
+            &failed,
+            failed_review.review.as_ref(),
+        ));
+        orch.begin_lead_review_attempt("run-9f", "T009", failed.event.kind.clone());
+        assert!(orch.post_message("任务失败，是否重试请用户决定"));
+        orch.end_lead_review_attempt("run-9f");
+        assert!(!routing_event_still_requires_resolution_after_delivery(
+            orch.as_ref(),
+            &failed,
+            failed_review.review.as_ref(),
+        ));
+
+        registry
+            .create_task(CreateTask {
+                id: "T010".into(),
+                title: "blocked-task".into(),
+                assignee_hint: Some("codex-beta".into()),
+                deps: vec![],
+                timeout_secs: 60,
+                spec: None,
+                success_criteria: None,
+            })
+            .unwrap();
+        registry.try_claim("T010", "codex-beta").unwrap();
+        registry
+            .hold_claim("T010", "codex-beta", "waiting_user")
+            .unwrap();
+
+        let blocked = TeamRoutingEnvelope {
+            run_id: "run-10b".into(),
+            parent_run_id: None,
+            requester_session_key: Some(SessionKey::new("lark", "group:test")),
+            fallback_session_keys: vec![],
+            team_id: "team-test".into(),
+            delivery_status: RoutingDeliveryStatus::NotRouted,
+            event: TeamRoutingEvent::blocked("T010", "codex-beta", "waiting_user"),
+            delivery_source: None,
+        };
+        let blocked_review = crate::agent_core::team::completion_routing::PendingRoutingRecord::from_envelope(
+            blocked.clone(),
+        );
+        assert!(routing_event_still_requires_resolution_after_delivery(
+            orch.as_ref(),
+            &blocked,
+            blocked_review.review.as_ref(),
+        ));
+        orch.begin_lead_review_attempt("run-10b", "T010", blocked.event.kind.clone());
+        assert!(orch.post_message("任务阻塞，需要用户决定下一步"));
+        orch.end_lead_review_attempt("run-10b");
+        assert!(!routing_event_still_requires_resolution_after_delivery(
+            orch.as_ref(),
+            &blocked,
+            blocked_review.review.as_ref(),
+        ));
+    }
+
     #[tokio::test]
     async fn capture_specialist_reply_text_prefers_direct_result() {
         let dir = tempdir().unwrap();
-        let storage = clawbro_session::SessionStorage::new(dir.path().to_path_buf());
+        let storage = crate::session::SessionStorage::new(dir.path().to_path_buf());
         let session_id = Uuid::new_v4();
 
         let captured = capture_specialist_reply_text(
@@ -880,7 +1448,7 @@ mod tests {
     #[tokio::test]
     async fn capture_specialist_reply_text_falls_back_to_persisted_assistant_message() {
         let dir = tempdir().unwrap();
-        let storage = clawbro_session::SessionStorage::new(dir.path().to_path_buf());
+        let storage = crate::session::SessionStorage::new(dir.path().to_path_buf());
         let session_id = Uuid::new_v4();
         let session_dir = dir.path().join(session_id.to_string());
         std::fs::create_dir_all(&session_dir).unwrap();
@@ -1027,7 +1595,7 @@ mod tests {
             thread_ts: None,
         };
         let (sent, result) = send_with_reply_fallback(
-            &(channel.clone() as Arc<dyn clawbro_channels::Channel>),
+            &(channel.clone() as Arc<dyn crate::channels_internal::Channel>),
             outbound,
         )
         .await;

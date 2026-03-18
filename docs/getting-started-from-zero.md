@@ -1,24 +1,33 @@
-# ClawBro Gateway 从零开始
+# ClawBro 从零开始
 
-这份文档面向第一次使用 `clawbro-gateway` 的开发者，目标是让你按当前代码实现，把系统从零配置到可运行，再逐步扩展到多 Agent、Team、Lark、DingTalk、Cron 和诊断面。
+这份文档面向第一次使用 `clawbro` / `ClawBro` 的开发者，目标是让你按当前代码实现，把系统从零配置到可运行，再逐步扩展到多 Agent、Team、Lark、DingTalk、Cron 和诊断面。
+
+如果你优先想从用户视角快速安装和配置，先看：
+
+- [`setup.md`](setup.md)
+
+如果你优先想了解产品定位和案例，再看：
+
+- [`../README.md`](../README.md)
 
 本文基于当前代码路径：
 
-- 启动入口：[main.rs](/Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway/crates/clawbro-server/src/main.rs)
-- 配置结构：[config.rs](/Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway/crates/clawbro-server/src/config.rs)
-- Backend 家族：[runtime-backends.md](/Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway/docs/runtime-backends.md)
-- 上下文文件契约：[context-filesystem-contract.md](/Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway/docs/context-filesystem-contract.md)
-- 路由契约：[routing-contract.md](/Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway/docs/routing-contract.md)
-- 运维诊断面：[doctor-and-status.md](/Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway/docs/operations/doctor-and-status.md)
+- CLI 入口：[clawbro_cli.rs](/Users/fishers/Desktop/repo/quickai-openclaw/clawBro/crates/clawbro-server/src/bin/clawbro_cli.rs)
+- 服务入口：[gateway_process.rs](/Users/fishers/Desktop/repo/quickai-openclaw/clawBro/crates/clawbro-server/src/gateway_process.rs)
+- 配置结构：[config.rs](/Users/fishers/Desktop/repo/quickai-openclaw/clawBro/crates/clawbro-server/src/config.rs)
+- Backend 家族：[runtime-backends.md](/Users/fishers/Desktop/repo/quickai-openclaw/clawBro/docs/runtime-backends.md)
+- 上下文文件契约：[context-filesystem-contract.md](/Users/fishers/Desktop/repo/quickai-openclaw/clawBro/docs/context-filesystem-contract.md)
+- 路由契约：[routing-contract.md](/Users/fishers/Desktop/repo/quickai-openclaw/clawBro/docs/routing-contract.md)
+- 运维诊断面：[doctor-and-status.md](/Users/fishers/Desktop/repo/quickai-openclaw/clawBro/docs/operations/doctor-and-status.md)
 
 ## 1. 系统是什么
 
-`clawbro-gateway` 当前是一个统一的 AI Gateway 和控制面，负责：
+`ClawBro` 当前是一个统一的 AI Gateway 和控制面，负责：
 
 - 接收外部消息：WebSocket、Lark、DingTalk、Cron
 - 做会话、路由、绑定、memory、team orchestration
 - 把实际执行分发给不同 backend family：
-  - `quick_ai_native`
+  - `claw_bro_native`
   - `acp`
   - `open_claw_gateway`
 - 暴露统一诊断接口：
@@ -31,7 +40,7 @@
 
 建议的上手顺序不是直接接 IM，而是：
 
-1. 先跑 `WS + quick_ai_native`
+1. 先跑 `WS + claw_bro_native`
 2. 再加 `agent_roster`
 3. 再加 `binding`
 4. 再加 `group/team`
@@ -74,21 +83,19 @@ mkdir -p ~/.clawbro/personas
 
 - Rust / Cargo
 - 一个可用模型 API Key
-- `clawbro-rust-agent` 二进制
-- `clawbro-gateway` 二进制
+- `clawbro` 二进制
 
 推荐先编译：
 
 ```bash
-cd /Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway
-cargo build -p clawbro-rust-agent
-cargo build -p clawbro-server --bin clawbro-gateway
+cd /Users/fishers/Desktop/repo/quickai-openclaw/clawBro
+cargo build -p clawbro --bin clawbro
 ```
 
-如果你使用 `quick_ai_native` family 的 `bundled_command` 启动方式，gateway 会默认尝试执行 ClawBro 管理的捆绑 shell：
+如果你使用 `claw_bro_native` family 的 `bundled_command` 启动方式，gateway 会默认尝试执行 ClawBro 管理的捆绑 shell：
 
 ```bash
-clawbro-rust-agent --runtime-bridge
+clawbro runtime-bridge
 ```
 
 默认情况下不再依赖 `PATH`。如果你需要覆盖捆绑路径，再改成显式 `external_command` 启动。
@@ -103,7 +110,7 @@ clawbro-rust-agent --runtime-bridge
 
 ### 4.1 模型环境变量
 
-`clawbro-rust-agent` 当前读取优先级是：
+`clawbro` 内置 runtime bridge 当前读取优先级是：
 
 1. `ANTHROPIC_API_KEY`
 2. `OPENAI_API_KEY`
@@ -167,11 +174,16 @@ Authorization: Bearer dev-token
 
 ## 5. 配置文件总规则
 
-主配置文件固定从这里读取：
+默认主配置文件路径：
 
 - `~/.clawbro/config.toml`
 
-当前没有命令行参数覆盖这个路径。
+用户入口 `clawbro serve` 支持覆盖：
+
+- `--config /path/to/config.toml`
+- `--port 18080`
+- `CLAWBRO_CONFIG`
+- `CLAWBRO_PORT`
 
 启动前会先做拓扑校验。几个最重要的规则：
 
@@ -202,7 +214,7 @@ backend_id = "native-main"
 
 [[backend]]
 id = "native-main"
-family = "quick_ai_native"
+family = "claw_bro_native"
 
 [backend.launch]
 type = "bundled_command"
@@ -216,14 +228,14 @@ dir = "/Users/yourname/.clawbro/sessions"
 [memory]
 shared_dir = "/Users/yourname/.clawbro/shared"
 distill_every_n = 20
-distiller_binary = "clawbro-rust-agent"
+distiller_binary = "clawbro"
 ```
 
 启动：
 
 ```bash
-cd /Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway
-cargo run -p clawbro-server --bin clawbro-gateway
+cd /Users/fishers/Desktop/repo/quickai-openclaw/clawBro
+cargo run -p clawbro --bin clawbro -- serve
 ```
 
 如果你不想固定端口，也可以写：
@@ -236,6 +248,73 @@ port = 0
 这样系统会让操作系统分配随机端口，并把最终端口写入：
 
 - `~/.clawbro/gateway.port`
+
+## 6.1 用 `clawbro setup` 快速初始化
+
+如果你不想手写 `config.toml`，可以直接用 CLI 向导：
+
+```bash
+clawbro setup
+```
+
+最常见的非交互示例：
+
+单 Agent：
+
+```bash
+clawbro setup \
+  --lang en \
+  --provider anthropic \
+  --api-key sk-ant-xxx \
+  --mode solo \
+  --non-interactive
+```
+
+Team（DM 工作台）：
+
+```bash
+clawbro setup \
+  --lang en \
+  --provider anthropic \
+  --api-key sk-ant-xxx \
+  --mode team \
+  --front-bot planner \
+  --specialist coder \
+  --specialist reviewer \
+  --team-target direct-message \
+  --team-scope user:ou_your_user_id \
+  --team-name my-team \
+  --non-interactive
+```
+
+Team（群聊协作）：
+
+```bash
+clawbro setup \
+  --lang en \
+  --provider anthropic \
+  --api-key sk-ant-xxx \
+  --mode team \
+  --front-bot planner \
+  --specialist coder \
+  --specialist reviewer \
+  --team-target group \
+  --team-scope group:lark:chat-123 \
+  --team-name ops-room \
+  --non-interactive
+```
+
+交互模式下：
+
+- `front_bot` 会单独询问
+- specialist 会逐个输入，留空结束
+- Team 的 `scope/name` 会在拿到 channel 后再询问
+
+所有 setup 生成的 Team skeleton 都应直接通过：
+
+```bash
+clawbro config validate
+```
 
 ### 启动后会发生什么
 
@@ -306,34 +385,34 @@ backend_id = "native-main"
 
 [[backend]]
 id = "native-main"
-family = "quick_ai_native"
+family = "claw_bro_native"
 
 [backend.launch]
 type = "external_command"
-command = "/Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway/target/debug/clawbro-rust-agent"
+command = "/Users/fishers/Desktop/repo/quickai-openclaw/clawBro/target/debug/clawbro"
 args = []
 ```
 
-`quick_ai_native` adapter 会自动插入 `--runtime-bridge`，不需要你手动写。
+`claw_bro_native` adapter 会在内部为 `clawbro` 注入 `runtime-bridge` 子命令，不需要你手动写。
 
 ## 9. 多 backend 场景
 
 当前 backend family 有 3 类。
 
-### 9.1 `quick_ai_native`
+### 9.1 `claw_bro_native`
 
 适合本地默认原生执行。
 
 ```toml
 [[backend]]
 id = "native-main"
-family = "quick_ai_native"
+family = "claw_bro_native"
 
 [backend.launch]
 type = "bundled_command"
 ```
 
-如果你要给 `quick_ai_native` 挂外部 MCP SSE server，可以直接配在 backend 下：
+如果你要给 `claw_bro_native` 挂外部 MCP SSE server，可以直接配在 backend 下：
 
 ```toml
 [[backend.external_mcp_servers]]
@@ -348,7 +427,7 @@ url = "http://127.0.0.1:3002/sse"
 当前行为：
 
 - 这些 server 会作为宿主级 `external_mcp_servers` 进入 `RuntimeSessionSpec`
-- `clawbro-rust-agent` 会在 native runtime 内部通过 `rig/rmcp` 连接并注册工具
+- `clawbro runtime-bridge` 会在 native runtime 内部通过 `rig/rmcp` 连接并注册工具
 - 这和 `team_tool_url` 是两条不同路径：
   - `team_tool_url` 负责 ClawBro 自己的 team tools
   - `external_mcp_servers` 负责用户配置的外部 MCP tools
@@ -488,7 +567,7 @@ lead_helper_mode = true
 
 注意：
 
-- 这一阶段 `OpenClaw` 不支持像 `ACP / quick_ai_native` 那样的外部 MCP server parity
+- 这一阶段 `OpenClaw` 不支持像 `ACP / claw_bro_native` 那样的外部 MCP server parity
 - 原因不是 ClawBro 偷懒，而是当前 OpenClaw gateway chat/client 路径没有对等的外部 MCP 注入面
 - `OpenClaw` 当前仍然支持 team helper CLI bridge，这是另一条能力路径，不等同于外部 MCP
 
@@ -986,11 +1065,11 @@ dir = "/Users/yourname/.clawbro/sessions"
 [memory]
 shared_dir = "/Users/yourname/.clawbro/shared"
 distill_every_n = 20
-distiller_binary = "clawbro-rust-agent"
+distiller_binary = "clawbro"
 
 [[backend]]
 id = "native-main"
-family = "quick_ai_native"
+family = "claw_bro_native"
 
 [backend.launch]
 type = "bundled_command"
@@ -1079,7 +1158,7 @@ agent = "claude"
 
 只做这些：
 
-- `quick_ai_native`
+- `claw_bro_native`
 - `[agent].backend_id`
 - `ws_token`
 - 不接 IM
@@ -1167,17 +1246,17 @@ agent = "claude"
 
 - 先定义 roster，再定义 binding
 
-### 22.4 `quick_ai_native` 启动失败
+### 22.4 `claw_bro_native` 启动失败
 
 常见原因：
 
-- 捆绑路径下没有可执行的 `clawbro-rust-agent`
+- 捆绑路径下没有可执行的 `clawbro`
 - 模型 API Key 没配
 - `CLAWBRO_MODEL` 不可用
 
 处理：
 
-- 先单独运行 `clawbro-rust-agent --runtime-bridge` 验证
+- 先单独运行 `clawbro runtime-bridge` 验证
 - 或改成显式 `external_command` 启动
 
 ### 22.5 Lark / DingTalk 配了但没收到消息
@@ -1214,10 +1293,10 @@ agent = "claude"
 
 如果你只想最快跑通，照这个做：
 
-1. 编译 `clawbro-rust-agent`
+1. 编译 `clawbro`
 2. 导出 `OPENAI_API_KEY`
 3. 写最小 `~/.clawbro/config.toml`
-4. 启动 `cargo run -p clawbro-server --bin clawbro-gateway`
+4. 启动 `cargo run -p clawbro --bin clawbro -- serve`
 5. 调 `curl /health`
 6. 连 `/ws`
 7. 发一条 `InboundMsg`
@@ -1234,7 +1313,7 @@ agent = "claude"
 
 ## 24. 相关文档
 
-- [runtime-backends.md](/Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway/docs/runtime-backends.md)
-- [routing-contract.md](/Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway/docs/routing-contract.md)
-- [context-filesystem-contract.md](/Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway/docs/context-filesystem-contract.md)
-- [doctor-and-status.md](/Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway/docs/operations/doctor-and-status.md)
+- [runtime-backends.md](/Users/fishers/Desktop/repo/quickai-openclaw/clawBro/docs/runtime-backends.md)
+- [routing-contract.md](/Users/fishers/Desktop/repo/quickai-openclaw/clawBro/docs/routing-contract.md)
+- [context-filesystem-contract.md](/Users/fishers/Desktop/repo/quickai-openclaw/clawBro/docs/context-filesystem-contract.md)
+- [doctor-and-status.md](/Users/fishers/Desktop/repo/quickai-openclaw/clawBro/docs/operations/doctor-and-status.md)

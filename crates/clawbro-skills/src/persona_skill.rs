@@ -1,4 +1,4 @@
-// clawbro-gateway/crates/clawbro-skills/src/persona_skill.rs
+// clawBro-gateway/crates/clawbro-skills/src/persona_skill.rs
 
 use crate::identity::IdentityData;
 use crate::mbti::MbtiType;

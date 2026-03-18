@@ -4,6 +4,8 @@ pub mod completions;
 pub mod config_cmd;
 pub mod doctor;
 pub mod i18n;
+pub mod internal_agent;
 pub mod serve;
 pub mod setup;
 pub mod status;
+pub mod team_helper;

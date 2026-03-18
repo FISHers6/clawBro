@@ -33,7 +33,7 @@ impl acp::Agent for EchoFixtureAgent {
         Ok(
             acp::InitializeResponse::new(arguments.protocol_version).agent_info(
                 acp::Implementation::new("clawbro-acp-echo-fixture", "0.1.0")
-                    .title("QAI ACP Echo Fixture"),
+                    .title("ClawBro ACP Echo Fixture"),
             ),
         )
     }

@@ -6,13 +6,16 @@ use std::collections::HashMap;
 pub async fn run(args: AuthArgs) -> Result<()> {
     match args.command {
         AuthCommands::Set { provider, key } => cmd_set(&provider, &key),
-        AuthCommands::List                  => cmd_list(),
-        AuthCommands::Check                 => cmd_check().await,
+        AuthCommands::List => cmd_list(),
+        AuthCommands::Check { provider } => cmd_check(provider.as_deref()).await,
     }
 }
 
 fn env_path() -> std::path::PathBuf {
-    dirs::home_dir().unwrap_or_default().join(".clawbro").join(".env")
+    dirs::home_dir()
+        .unwrap_or_default()
+        .join(".clawbro")
+        .join(".env")
 }
 
 fn load_env_map() -> HashMap<String, String> {
@@ -47,18 +50,21 @@ fn save_env_map(map: &HashMap<String, String>) -> Result<()> {
 fn provider_env_var(provider: &str) -> &'static str {
     match provider.to_lowercase().as_str() {
         "anthropic" | "claude" => "ANTHROPIC_API_KEY",
-        "openai" | "gpt"       => "OPENAI_API_KEY",
-        "deepseek"             => "OPENAI_API_KEY",
-        "azure"                => "OPENAI_API_KEY",
-        "ollama"               => "",
-        _                      => "OPENAI_API_KEY",
+        "openai" | "gpt" => "OPENAI_API_KEY",
+        "deepseek" => "OPENAI_API_KEY",
+        "azure" => "OPENAI_API_KEY",
+        "ollama" => "",
+        _ => "OPENAI_API_KEY",
     }
 }
 
 fn cmd_set(provider: &str, key: &str) -> Result<()> {
     let var = provider_env_var(provider);
     if var.is_empty() {
-        println!("{} Ollama typically does not require an API key", style("ℹ").cyan());
+        println!(
+            "{} Ollama typically does not require an API key",
+            style("ℹ").cyan()
+        );
         return Ok(());
     }
     let mut map = load_env_map();
@@ -97,27 +103,71 @@ fn cmd_list() -> Result<()> {
     Ok(())
 }
 
-async fn cmd_check() -> Result<()> {
+async fn cmd_check(provider: Option<&str>) -> Result<()> {
     println!("{}", style("Checking API key validity…").bold());
     let map = load_env_map();
 
-    if let Some(key) = map.get("ANTHROPIC_API_KEY") {
-        let ok = check_anthropic(key).await;
-        let icon = if ok { style("✓").green() } else { style("✗").red() };
-        println!("  {} Anthropic: {}", icon, if ok { "valid" } else { "invalid or network error" });
-    } else {
-        println!("  {} Anthropic: not configured", style("–").yellow());
-    }
-
-    if let Some(key) = map.get("OPENAI_API_KEY") {
-        let ok = check_openai(key).await;
-        let icon = if ok { style("✓").green() } else { style("✗").red() };
-        println!("  {} OpenAI: {}", icon, if ok { "valid" } else { "invalid or network error" });
-    } else {
-        println!("  {} OpenAI: not configured", style("–").yellow());
+    match provider.map(|p| p.to_ascii_lowercase()) {
+        Some(p) if p == "anthropic" || p == "claude" => {
+            if let Some(key) = map.get("ANTHROPIC_API_KEY") {
+                print_check("Anthropic", check_anthropic(key).await);
+            } else {
+                print_missing("Anthropic");
+            }
+        }
+        Some(p)
+            if matches!(
+                p.as_str(),
+                "openai" | "gpt" | "deepseek" | "azure" | "custom"
+            ) =>
+        {
+            if let Some(key) = map.get("OPENAI_API_KEY") {
+                print_check(&p, check_openai(key).await);
+            } else {
+                print_missing(&p);
+            }
+        }
+        Some(p) if p == "ollama" => {
+            println!("  {} Ollama: no API key required", style("✓").green());
+        }
+        Some(p) => anyhow::bail!("unsupported provider `{p}`"),
+        None => {
+            if let Some(key) = map.get("ANTHROPIC_API_KEY") {
+                print_check("Anthropic", check_anthropic(key).await);
+            } else {
+                print_missing("Anthropic");
+            }
+            if let Some(key) = map.get("OPENAI_API_KEY") {
+                print_check("OpenAI", check_openai(key).await);
+            } else {
+                print_missing("OpenAI");
+            }
+        }
     }
 
     Ok(())
+}
+
+fn print_check(label: &str, ok: bool) {
+    let icon = if ok {
+        style("✓").green()
+    } else {
+        style("✗").red()
+    };
+    println!(
+        "  {} {}: {}",
+        icon,
+        label,
+        if ok {
+            "valid"
+        } else {
+            "invalid or network error"
+        }
+    );
+}
+
+fn print_missing(label: &str) {
+    println!("  {} {}: not configured", style("–").yellow(), label);
 }
 
 async fn check_anthropic(key: &str) -> bool {
@@ -188,12 +238,27 @@ mod tests {
         assert_eq!(provider_env_var("ollama"), "");
     }
 
+    #[tokio::test]
+    async fn check_ollama_succeeds_without_key() {
+        let result = cmd_check(Some("ollama")).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn check_unknown_provider_errors() {
+        let result = cmd_check(Some("bogus")).await;
+        assert!(result.is_err());
+    }
+
     #[test]
     fn save_and_reload_env_map() {
         // Test round-trip without touching real fs
         let mut map = HashMap::new();
         map.insert("TEST_KEY".to_string(), "test_val".to_string());
-        let lines: Vec<String> = map.iter().map(|(k, v)| format!("export {}={}", k, v)).collect();
+        let lines: Vec<String> = map
+            .iter()
+            .map(|(k, v)| format!("export {}={}", k, v))
+            .collect();
         let content = lines.join("\n") + "\n";
         // Parse it back
         let mut loaded = HashMap::new();

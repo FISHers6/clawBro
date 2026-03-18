@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use clawbro_server::cli::args::{Cli, Commands};
+use clawbro::cli::args::{Cli, Commands};
 
 #[tokio::main]
 async fn main() {
@@ -13,12 +13,15 @@ async fn main() {
 async fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Setup(args)       => clawbro_server::cli::setup::run(args).await,
-        Commands::Auth(args)        => clawbro_server::cli::auth::run(args).await,
-        Commands::Config(args)      => clawbro_server::cli::config_cmd::run(args).await,
-        Commands::Serve(args)       => clawbro_server::cli::serve::run(args).await,
-        Commands::Doctor            => clawbro_server::cli::doctor::run().await,
-        Commands::Status            => clawbro_server::cli::status::run().await,
-        Commands::Completions(args) => clawbro_server::cli::completions::run(args),
+        Commands::Setup(args) => clawbro::cli::setup::run(args).await,
+        Commands::Auth(args) => clawbro::cli::auth::run(args).await,
+        Commands::Config(args) => clawbro::cli::config_cmd::run(args).await,
+        Commands::Serve(args) => clawbro::cli::serve::run(args).await,
+        Commands::TeamHelper(args) => clawbro::cli::team_helper::run(args).await,
+        Commands::RuntimeBridge => clawbro::cli::internal_agent::run_runtime_bridge().await,
+        Commands::AcpAgent => clawbro::cli::internal_agent::run_acp_agent().await,
+        Commands::Doctor => clawbro::cli::doctor::run().await,
+        Commands::Status => clawbro::cli::status::run().await,
+        Commands::Completions(args) => clawbro::cli::completions::run(args),
     }
 }

@@ -4,10 +4,10 @@ use crate::prompt_builder::SystemPromptBuilder;
 use crate::routing::RosterMatchData;
 use crate::team::orchestrator::TeamOrchestrator;
 use crate::traits::{AgentCtx, AgentRole, HistoryMsg};
-use dashmap::DashSet;
 use clawbro_protocol::{InboundMsg, MsgSource, SessionKey};
 use clawbro_session::StoredMessage;
 use clawbro_skills::{PersonaSkillData, SkillLoader};
+use dashmap::DashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -361,9 +361,9 @@ fn resolve_persona_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dashmap::DashSet;
     use clawbro_protocol::SessionKey;
     use clawbro_protocol::{InboundMsg, MsgContent, MsgSource};
+    use dashmap::DashSet;
     use uuid::Uuid;
 
     #[test]

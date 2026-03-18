@@ -1,7 +1,7 @@
 use crate::team::orchestrator::TeamOrchestrator;
 use crate::team::session::{parse_specialist_session_scope, stable_team_id_for_session_key};
-use dashmap::DashMap;
 use clawbro_protocol::SessionKey;
+use dashmap::DashMap;
 use std::sync::Arc;
 
 pub(crate) fn get_orchestrator_for_session(

@@ -35,12 +35,12 @@ fn family_profile(family: BackendFamily, lead: bool, specialist: bool) -> Capabi
         workspace_native_contract: !matches!(family, BackendFamily::Acp),
         tool_bridge: match family {
             BackendFamily::Acp => ToolBridgeKind::Mcp,
-            BackendFamily::OpenClawGateway | BackendFamily::QuickAiNative => {
+            BackendFamily::OpenClawGateway | BackendFamily::ClawBroNative => {
                 ToolBridgeKind::BackendNative
             }
         },
         native_team: match family {
-            BackendFamily::QuickAiNative => NativeTeamCapability::Unsupported,
+            BackendFamily::ClawBroNative => NativeTeamCapability::Unsupported,
             BackendFamily::Acp | BackendFamily::OpenClawGateway => {
                 NativeTeamCapability::SupportedButDisabled
             }
@@ -371,7 +371,7 @@ async fn mixed_backend_smoke_acp_lead_native_specialist_submit_and_accept() {
         },
     ));
     let specialist_adapter = Arc::new(ScriptedAdapter::new(
-        family_profile(BackendFamily::QuickAiNative, false, true),
+        family_profile(BackendFamily::ClawBroNative, false, true),
         |_spec, _session| {
             Ok(ScriptedTurn {
                 full_text: "native-worker:submitted:T001".into(),
@@ -389,7 +389,7 @@ async fn mixed_backend_smoke_acp_lead_native_specialist_submit_and_accept() {
         backend_spec("leader-main", BackendFamily::Acp, "acp"),
         "acp",
         Arc::clone(&lead_adapter),
-        backend_spec("worker-main", BackendFamily::QuickAiNative, "native"),
+        backend_spec("worker-main", BackendFamily::ClawBroNative, "native"),
         "native",
         Arc::clone(&specialist_adapter),
     )
@@ -499,7 +499,7 @@ async fn mixed_backend_smoke_acp_lead_native_specialist_submit_and_accept() {
 #[tokio::test]
 async fn mixed_backend_smoke_native_lead_acp_specialist_submit_and_accept() {
     let lead_adapter = Arc::new(ScriptedAdapter::new(
-        family_profile(BackendFamily::QuickAiNative, true, false),
+        family_profile(BackendFamily::ClawBroNative, true, false),
         |_spec, session| {
             let input = session.context.user_input.as_deref().unwrap_or_default();
             if input.contains("kickoff reverse flow") {
@@ -544,7 +544,7 @@ async fn mixed_backend_smoke_native_lead_acp_specialist_submit_and_accept() {
     ));
 
     let harness = build_team_harness(
-        backend_spec("leader-main", BackendFamily::QuickAiNative, "native"),
+        backend_spec("leader-main", BackendFamily::ClawBroNative, "native"),
         "native",
         Arc::clone(&lead_adapter),
         backend_spec("worker-main", BackendFamily::Acp, "acp"),
@@ -621,7 +621,7 @@ async fn mixed_backend_smoke_native_lead_acp_specialist_submit_and_accept() {
 #[tokio::test]
 async fn mixed_backend_smoke_openclaw_specialist_uses_canonical_team_surface_and_escalates() {
     let lead_adapter = Arc::new(ScriptedAdapter::new(
-        family_profile(BackendFamily::QuickAiNative, true, false),
+        family_profile(BackendFamily::ClawBroNative, true, false),
         |_spec, session| {
             let input = session.context.user_input.as_deref().unwrap_or_default();
             if input.contains("kickoff escalation flow") {
@@ -685,7 +685,7 @@ async fn mixed_backend_smoke_openclaw_specialist_uses_canonical_team_surface_and
     ));
 
     let harness = build_team_harness(
-        backend_spec("leader-main", BackendFamily::QuickAiNative, "native"),
+        backend_spec("leader-main", BackendFamily::ClawBroNative, "native"),
         "native",
         Arc::clone(&lead_adapter),
         backend_spec("worker-main", BackendFamily::OpenClawGateway, "openclaw"),

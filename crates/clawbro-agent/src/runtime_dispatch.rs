@@ -5,7 +5,7 @@ use clawbro_protocol::{render_scope_storage_key, AgentEvent};
 use clawbro_runtime::contract::RuntimeToolCall;
 use clawbro_runtime::{
     acp::AcpBackendAdapter, fingerprint_backend_spec, ApprovalBroker, BackendRegistry,
-    OpenClawBackendAdapter, QuickAiNativeBackendAdapter, RuntimeConductor, RuntimeContext,
+    ClawBroNativeBackendAdapter, OpenClawBackendAdapter, RuntimeConductor, RuntimeContext,
     RuntimeEvent, RuntimeHistoryMessage, RuntimePruningPolicy, RuntimeRole, RuntimeSessionSpec,
     RuntimeTranscriptSemantics, ToolSurfaceSpec, TranscriptCompactionMode, TranscriptPruningMode,
     TurnIntent, TurnResult,
@@ -56,7 +56,7 @@ pub fn default_runtime_dispatch() -> Arc<dyn RuntimeDispatch> {
             )
             .await;
         rt_registry
-            .register_adapter("native", Arc::new(QuickAiNativeBackendAdapter))
+            .register_adapter("native", Arc::new(ClawBroNativeBackendAdapter))
             .await;
     });
     Arc::new(ConductorRuntimeDispatch::new(registry))
@@ -378,7 +378,10 @@ fn runtime_context_from_ctx(
         agent_memory: ctx.agent_memory.clone(),
         team_manifest: ctx.team_manifest.clone(),
         task_reminder: ctx.task_reminder.clone(),
-        history_lines: clawbro_runtime::render_history_lines(&history_messages, &transcript_semantics),
+        history_lines: clawbro_runtime::render_history_lines(
+            &history_messages,
+            &transcript_semantics,
+        ),
         history_messages,
         transcript_semantics,
         user_input: Some(ctx.user_text.clone()),
@@ -390,7 +393,7 @@ fn transcript_semantics_for_family(
     family: clawbro_runtime::backend::BackendFamily,
 ) -> RuntimeTranscriptSemantics {
     let pruning = match family {
-        clawbro_runtime::backend::BackendFamily::QuickAiNative => TranscriptPruningMode::Off,
+        clawbro_runtime::backend::BackendFamily::ClawBroNative => TranscriptPruningMode::Off,
         clawbro_runtime::backend::BackendFamily::Acp
         | clawbro_runtime::backend::BackendFamily::OpenClawGateway => {
             TranscriptPruningMode::RequestLocal
@@ -407,7 +410,7 @@ fn default_pruning_policy_for_family(
     family: clawbro_runtime::backend::BackendFamily,
 ) -> RuntimePruningPolicy {
     match family {
-        clawbro_runtime::backend::BackendFamily::QuickAiNative => RuntimePruningPolicy::default(),
+        clawbro_runtime::backend::BackendFamily::ClawBroNative => RuntimePruningPolicy::default(),
         clawbro_runtime::backend::BackendFamily::Acp
         | clawbro_runtime::backend::BackendFamily::OpenClawGateway => RuntimePruningPolicy {
             keep_last_assistants: 3,
@@ -1152,7 +1155,8 @@ mod tests {
             }]),
         }];
 
-        let projected = runtime_context_from_ctx(&ctx, clawbro_runtime::BackendFamily::QuickAiNative);
+        let projected =
+            runtime_context_from_ctx(&ctx, clawbro_runtime::BackendFamily::ClawBroNative);
         assert_eq!(
             projected.transcript_semantics.pruning,
             TranscriptPruningMode::Off
@@ -1176,7 +1180,8 @@ mod tests {
     #[test]
     fn compatibility_families_default_to_request_local_pruning_policy() {
         let acp = transcript_semantics_for_family(clawbro_runtime::BackendFamily::Acp);
-        let openclaw = transcript_semantics_for_family(clawbro_runtime::BackendFamily::OpenClawGateway);
+        let openclaw =
+            transcript_semantics_for_family(clawbro_runtime::BackendFamily::OpenClawGateway);
 
         assert_eq!(acp.pruning, TranscriptPruningMode::RequestLocal);
         assert_eq!(openclaw.pruning, TranscriptPruningMode::RequestLocal);

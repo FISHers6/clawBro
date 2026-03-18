@@ -423,6 +423,48 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
+name = "clawbro"
+version = "0.1.0"
+dependencies = [
+ "agent-client-protocol 0.10.2",
+ "anyhow",
+ "async-trait",
+ "axum",
+ "chrono",
+ "clap",
+ "clap_complete",
+ "console",
+ "cron",
+ "dashmap",
+ "dialoguer",
+ "dirs",
+ "futures",
+ "futures-util",
+ "glob",
+ "prost",
+ "regex",
+ "reqwest 0.11.27",
+ "rig-core",
+ "rmcp 0.6.4",
+ "rmcp 0.8.5",
+ "rusqlite",
+ "rustls 0.23.37",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite 0.26.2",
+ "tokio-util",
+ "toml 0.9.12+spec-1.1.0",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "walkdir",
+ "which",
+]
+
+[[package]]
 name = "clawbro-agent"
 version = "0.1.0"
 dependencies = [
@@ -558,46 +600,6 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "clawbro-server"
-version = "0.1.0"
-dependencies = [
- "agent-client-protocol 0.10.2",
- "anyhow",
- "async-trait",
- "axum",
- "chrono",
- "clap",
- "clap_complete",
- "clawbro-agent",
- "clawbro-channels",
- "clawbro-cron",
- "clawbro-protocol",
- "clawbro-runtime",
- "clawbro-session",
- "clawbro-skills",
- "console",
- "dialoguer",
- "dirs",
- "futures",
- "futures-util",
- "reqwest 0.11.27",
- "rmcp 0.8.5",
- "rustls 0.23.37",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-tungstenite 0.26.2",
- "tokio-util",
- "toml 0.9.12+spec-1.1.0",
- "tower",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "which",
 ]
 
 [[package]]

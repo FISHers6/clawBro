@@ -7,9 +7,9 @@ use axum::{
     http::{header::AUTHORIZATION, HeaderMap, StatusCode},
     response::IntoResponse,
 };
-use clawbro_agent::TurnExecutionContext;
-use clawbro_protocol::{normalize_conversation_identity, AgentEvent, InboundMsg, SessionKey};
-use clawbro_runtime::ApprovalDecision;
+use crate::agent_core::TurnExecutionContext;
+use crate::protocol::{normalize_conversation_identity, AgentEvent, InboundMsg, SessionKey};
+use crate::runtime::ApprovalDecision;
 use serde::Deserialize;
 use std::collections::HashMap;
 use tokio::sync::mpsc;

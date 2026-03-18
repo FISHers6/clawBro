@@ -2,7 +2,7 @@
 
 ## Purpose
 
-`clawbro-gateway` now treats routing as a small contract instead of an implicit side effect of `@mention` parsing.
+`ClawBro` now treats routing as a small contract instead of an implicit side effect of `@mention` parsing.
 
 This document defines the current routing precedence and the compatibility rules that the code is expected to preserve.
 

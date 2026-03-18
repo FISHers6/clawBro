@@ -1,4 +1,4 @@
-// clawbro-gateway/crates/clawbro-agent/src/persona.rs
+// clawBro-gateway/crates/clawbro-agent/src/persona.rs
 //! AgentPersona: loads per-agent identity configuration from disk.
 //! Based on OpenClaw's SOUL.md / IDENTITY.md / MEMORY.md design.
 //!

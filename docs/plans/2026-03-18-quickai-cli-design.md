@@ -402,7 +402,7 @@ mv clawbro-rust-agent ~/.local/bin/
 
 ```bash
 git clone https://github.com/fishers/clawbro-openclaw
-cd clawbro-openclaw/clawbro-gateway
+cd clawbro-openclaw/clawBro-gateway
 cargo build -r -p clawbro-server --bin clawbro
 cargo build -r -p clawbro-server --bin clawbro-gateway
 cargo build -r -p clawbro-rust-agent

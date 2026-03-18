@@ -78,7 +78,7 @@ fn backend_family_name(family: crate::backend::BackendFamily) -> &'static str {
     match family {
         crate::backend::BackendFamily::Acp => "acp",
         crate::backend::BackendFamily::OpenClawGateway => "openclaw_gateway",
-        crate::backend::BackendFamily::QuickAiNative => "quick_ai_native",
+        crate::backend::BackendFamily::ClawBroNative => "quick_ai_native",
     }
 }
 

@@ -7,9 +7,9 @@ use crate::traits::Channel;
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
+use clawbro_protocol::{InboundMsg, MsgContent, OutboundMsg, SessionKey};
 use futures::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
-use clawbro_protocol::{InboundMsg, MsgContent, OutboundMsg, SessionKey};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
@@ -590,7 +590,7 @@ impl Channel for LarkChannel {
 
         if let Some(raw_reply_to) = &msg.reply_to {
             // Strip the internal fanout suffix (e.g. "om_xxx#target=alpha" → "om_xxx").
-            // The "#target=..." suffix is a clawbro-gateway routing marker and is not a valid Lark message ID.
+            // The "#target=..." suffix is a ClawBro routing marker and is not a valid Lark message ID.
             let message_id = raw_reply_to
                 .split_once('#')
                 .map(|(base, _)| base)

@@ -8,7 +8,7 @@
 //!   OPENAI_API_BASE=https://api.deepseek.com \
 //!   CLAWBRO_MODEL=deepseek-chat \
 //!   CLAWBRO_RUST_AGENT_BIN=/path/to/clawbro-rust-agent \
-//!   cargo test -p clawbro-server --test e2e_gateway -- --nocapture
+//!   cargo test -p clawbro --test e2e_gateway -- --nocapture
 //!
 //! ## legacy test_gateway_e2e_clawbro_claude_agent
 //! Legacy coverage only. The active Claude product path uses `claude-agent-acp`.
@@ -17,17 +17,19 @@
 //! To run:
 //!   LEGACY_CLAWBRO_CLAUDE_AGENT=1 \
 //!   CLAWBRO_CLAUDE_AGENT_BIN=/path/to/clawbro-claude-agent \
-//!   cargo test -p clawbro-server --test e2e_gateway -- test_gateway_e2e_legacy_clawbro_claude_agent --ignored --nocapture
+//!   cargo test -p clawbro --test e2e_gateway -- test_gateway_e2e_legacy_clawbro_claude_agent --ignored --nocapture
 
-use futures_util::{SinkExt, StreamExt};
-use clawbro_agent::roster::AgentEntry;
-use clawbro_protocol::{AgentEvent, InboundMsg, MsgContent, SessionKey};
-use clawbro_runtime::{AcpBackend, ApprovalMode, BackendFamily, BackendSpec, LaunchSpec};
-use clawbro_server::{
+use clawbro::{
+    agent_core::{roster::AgentEntry, team::session::stable_team_id},
     build_test_state_with_config,
     config::{BackendCatalogEntry, BackendFamilyConfig, BackendLaunchConfig, GatewayConfig},
     gateway, start_test_gateway, start_test_gateway_with_backend, start_test_gateway_with_config,
+    protocol::{AgentEvent, InboundMsg, MsgContent, MsgSource, SessionKey},
+    runtime::{
+        AcpBackend, ApprovalMode, BackendFamily, BackendSpec, CodexProjectionMode, LaunchSpec,
+    },
 };
+use futures_util::{SinkExt, StreamExt};
 use std::collections::BTreeSet;
 use std::time::Duration;
 use tokio::process::{Child, Command};
@@ -94,7 +96,7 @@ impl TurnTrace {
 }
 
 #[tokio::test]
-#[ignore = "requires OPENAI_API_KEY - run with: cargo test -p clawbro-server --test e2e_gateway -- --ignored --nocapture"]
+#[ignore = "requires OPENAI_API_KEY - run with: cargo test -p clawbro --test e2e_gateway -- --ignored --nocapture"]
 async fn test_gateway_e2e_deepseek() {
     // Guard: skip if no API key
     let api_key = match std::env::var("OPENAI_API_KEY") {
@@ -135,7 +137,7 @@ async fn test_gateway_e2e_deepseek() {
         timestamp: chrono::Utc::now(),
         thread_ts: None,
         target_agent: None,
-        source: clawbro_protocol::MsgSource::Human,
+        source: MsgSource::Human,
     };
 
     let json = serde_json::to_string(&inbound).unwrap();
@@ -181,7 +183,7 @@ async fn test_gateway_e2e_deepseek() {
 /// To run:
 ///   LEGACY_CLAWBRO_CLAUDE_AGENT=1 \
 ///   CLAWBRO_CLAUDE_AGENT_BIN=/path/to/clawbro-claude-agent \
-///   cargo test -p clawbro-server --test e2e_gateway -- test_gateway_e2e_legacy_clawbro_claude_agent --ignored --nocapture
+///   cargo test -p clawbro --test e2e_gateway -- test_gateway_e2e_legacy_clawbro_claude_agent --ignored --nocapture
 #[tokio::test]
 #[ignore = "requires claude CLI authenticated with Anthropic account"]
 async fn test_gateway_e2e_legacy_clawbro_claude_agent() {
@@ -256,7 +258,7 @@ async fn test_gateway_e2e_legacy_clawbro_claude_agent() {
         timestamp: chrono::Utc::now(),
         thread_ts: None,
         target_agent: None,
-        source: clawbro_protocol::MsgSource::Human,
+        source: MsgSource::Human,
     };
 
     let json = serde_json::to_string(&inbound).unwrap();
@@ -304,7 +306,7 @@ async fn test_gateway_e2e_legacy_clawbro_claude_agent() {
 /// - network access for `npx @zed-industries/codex-acp@0.9.5`
 ///
 /// To run:
-///   cargo test -p clawbro-server --test e2e_gateway -- test_gateway_e2e_codex_bridge --ignored --nocapture
+///   cargo test -p clawbro --test e2e_gateway -- test_gateway_e2e_codex_bridge --ignored --nocapture
 #[tokio::test]
 #[ignore = "requires codex CLI authenticated locally and codex-acp bridge via npx"]
 async fn test_gateway_e2e_codex_bridge() {
@@ -325,7 +327,7 @@ async fn test_gateway_e2e_codex_bridge() {
         let mut env = std::collections::BTreeMap::new();
         env.insert("OPENAI_API_KEY".into(), api_key);
         (
-            Some(clawbro_server::config::AcpAuthMethodConfig::OpenaiApiKey),
+            Some(clawbro::config::AcpAuthMethodConfig::OpenaiApiKey),
             env,
         )
     } else if let Ok(api_key) = std::env::var("CODEX_API_KEY") {
@@ -335,19 +337,22 @@ async fn test_gateway_e2e_codex_bridge() {
         let mut env = std::collections::BTreeMap::new();
         env.insert("CODEX_API_KEY".into(), api_key);
         (
-            Some(clawbro_server::config::AcpAuthMethodConfig::CodexApiKey),
+            Some(clawbro::config::AcpAuthMethodConfig::CodexApiKey),
             env,
         )
     } else {
         let mut env = std::collections::BTreeMap::new();
         env.insert("HOME".into(), "/Users/fishers".into());
-        (Some(clawbro_server::config::AcpAuthMethodConfig::Chatgpt), env)
+        (
+            Some(clawbro::config::AcpAuthMethodConfig::Chatgpt),
+            env,
+        )
     };
     cfg.backends.push(BackendCatalogEntry {
         id: "codex-main".into(),
         family: BackendFamilyConfig::Acp,
         adapter_key: None,
-        acp_backend: Some(clawbro_server::config::AcpBackendConfig::Codex),
+        acp_backend: Some(clawbro::config::AcpBackendConfig::Codex),
         acp_auth_method,
         codex: None,
         provider_profile: None,
@@ -377,7 +382,7 @@ async fn test_gateway_e2e_codex_bridge() {
         timestamp: chrono::Utc::now(),
         thread_ts: None,
         target_agent: None,
-        source: clawbro_protocol::MsgSource::Human,
+        source: MsgSource::Human,
     };
     send_inbound(&mut ws_write, &inbound).await;
 
@@ -429,7 +434,7 @@ async fn test_gateway_e2e_codex_bridge() {
         timestamp: chrono::Utc::now(),
         thread_ts: None,
         target_agent: None,
-        source: clawbro_protocol::MsgSource::Human,
+        source: MsgSource::Human,
     };
     send_inbound(&mut ws_write, &tool_inbound).await;
 
@@ -487,7 +492,7 @@ async fn test_gateway_e2e_codex_bridge() {
 ///
 /// To run:
 ///   DEEPSEEK_API_KEY=sk-xxx \
-///   cargo test -p clawbro-server --test e2e_gateway -- test_gateway_e2e_codex_local_config_deepseek --ignored --nocapture
+///   cargo test -p clawbro --test e2e_gateway -- test_gateway_e2e_codex_local_config_deepseek --ignored --nocapture
 #[tokio::test]
 #[ignore = "requires codex CLI plus DEEPSEEK_API_KEY for local_config_projection"]
 async fn test_gateway_e2e_codex_local_config_deepseek() {
@@ -513,9 +518,9 @@ async fn test_gateway_e2e_codex_local_config_deepseek() {
     cfg.gateway.default_workspace = Some(workspace.clone());
     cfg.agent.backend_id = "codex-main".to_string();
     cfg.provider_profiles
-        .push(clawbro_server::config::ProviderProfileConfig {
+        .push(clawbro::config::ProviderProfileConfig {
             id: "deepseek-openai".into(),
-            protocol: clawbro_server::config::ProviderProfileProtocolConfig::OpenaiCompatible {
+            protocol: clawbro::config::ProviderProfileProtocolConfig::OpenaiCompatible {
                 base_url: "https://api.deepseek.com/v1".into(),
                 auth_token_env: "DEEPSEEK_API_KEY".into(),
                 default_model: "deepseek-chat".into(),
@@ -525,10 +530,10 @@ async fn test_gateway_e2e_codex_local_config_deepseek() {
         id: "codex-main".into(),
         family: BackendFamilyConfig::Acp,
         adapter_key: None,
-        acp_backend: Some(clawbro_server::config::AcpBackendConfig::Codex),
+        acp_backend: Some(clawbro::config::AcpBackendConfig::Codex),
         acp_auth_method: None,
-        codex: Some(clawbro_server::config::BackendCodexConfig {
-            projection: clawbro_runtime::CodexProjectionMode::LocalConfig,
+        codex: Some(clawbro::config::BackendCodexConfig {
+            projection: CodexProjectionMode::LocalConfig,
         }),
         provider_profile: Some("deepseek-openai".into()),
         approval: Default::default(),
@@ -557,7 +562,7 @@ async fn test_gateway_e2e_codex_local_config_deepseek() {
         timestamp: chrono::Utc::now(),
         thread_ts: None,
         target_agent: None,
-        source: clawbro_protocol::MsgSource::Human,
+        source: MsgSource::Human,
     };
     send_inbound(&mut ws_write, &inbound).await;
 
@@ -609,7 +614,7 @@ async fn test_gateway_e2e_codex_local_config_deepseek() {
         timestamp: chrono::Utc::now(),
         thread_ts: None,
         target_agent: None,
-        source: clawbro_protocol::MsgSource::Human,
+        source: MsgSource::Human,
     };
     send_inbound(&mut ws_write, &tool_inbound).await;
 
@@ -658,7 +663,7 @@ async fn test_gateway_e2e_codex_local_config_deepseek() {
 }
 
 /// Run manually with:
-///   OPENAI_API_KEY=... cargo test -p clawbro-server --test e2e_gateway -- test_gateway_e2e_codex_local_config_aicodewith --ignored --nocapture
+///   OPENAI_API_KEY=... cargo test -p clawbro --test e2e_gateway -- test_gateway_e2e_codex_local_config_aicodewith --ignored --nocapture
 #[tokio::test]
 #[ignore = "requires codex CLI plus OPENAI_API_KEY for local_config_projection"]
 async fn test_gateway_e2e_codex_local_config_aicodewith() {
@@ -687,9 +692,9 @@ async fn test_gateway_e2e_codex_local_config_aicodewith() {
     cfg.gateway.default_workspace = Some(workspace.clone());
     cfg.agent.backend_id = "codex-main".to_string();
     cfg.provider_profiles
-        .push(clawbro_server::config::ProviderProfileConfig {
+        .push(clawbro::config::ProviderProfileConfig {
             id: "aicodewith-openai".into(),
-            protocol: clawbro_server::config::ProviderProfileProtocolConfig::OpenaiCompatible {
+            protocol: clawbro::config::ProviderProfileProtocolConfig::OpenaiCompatible {
                 base_url: "https://api.aicodewith.com/chatgpt/v1".into(),
                 auth_token_env: "OPENAI_API_KEY".into(),
                 default_model: "gpt-5.3-codex".into(),
@@ -699,13 +704,13 @@ async fn test_gateway_e2e_codex_local_config_aicodewith() {
         id: "codex-main".into(),
         family: BackendFamilyConfig::Acp,
         adapter_key: None,
-        acp_backend: Some(clawbro_server::config::AcpBackendConfig::Codex),
+        acp_backend: Some(clawbro::config::AcpBackendConfig::Codex),
         // local_config projection pre-writes CODEX_HOME/auth.json and also injects
         // OPENAI_API_KEY into the child process env so that the authenticate() call
         // (openai_api_key) can confirm auth to codex-acp before it starts processing.
-        acp_auth_method: Some(clawbro_server::config::AcpAuthMethodConfig::OpenaiApiKey),
-        codex: Some(clawbro_server::config::BackendCodexConfig {
-            projection: clawbro_runtime::CodexProjectionMode::LocalConfig,
+        acp_auth_method: Some(clawbro::config::AcpAuthMethodConfig::OpenaiApiKey),
+        codex: Some(clawbro::config::BackendCodexConfig {
+            projection: CodexProjectionMode::LocalConfig,
         }),
         provider_profile: Some("aicodewith-openai".into()),
         approval: Default::default(),
@@ -739,7 +744,7 @@ async fn test_gateway_e2e_codex_local_config_aicodewith() {
         timestamp: chrono::Utc::now(),
         thread_ts: None,
         target_agent: None,
-        source: clawbro_protocol::MsgSource::Human,
+        source: MsgSource::Human,
     };
     send_inbound(&mut ws_write, &inbound).await;
 
@@ -800,7 +805,7 @@ async fn test_gateway_e2e_codex_local_config_aicodewith() {
         timestamp: chrono::Utc::now(),
         thread_ts: None,
         target_agent: None,
-        source: clawbro_protocol::MsgSource::Human,
+        source: MsgSource::Human,
     };
     send_inbound(&mut ws_write, &tool_inbound).await;
 
@@ -872,7 +877,7 @@ async fn test_gateway_ws_inbound_auto_subscribes_socket_to_session() {
     let fixture = native_echo_fixture_bin();
     let addr = start_test_gateway_with_backend(BackendSpec {
         backend_id: "native-echo".to_string(),
-        family: BackendFamily::QuickAiNative,
+        family: BackendFamily::ClawBroNative,
         adapter_key: "native".into(),
         launch: LaunchSpec::ExternalCommand {
             command: fixture,
@@ -900,7 +905,7 @@ async fn test_gateway_ws_inbound_auto_subscribes_socket_to_session() {
         timestamp: chrono::Utc::now(),
         thread_ts: None,
         target_agent: None,
-        source: clawbro_protocol::MsgSource::Human,
+        source: MsgSource::Human,
     };
     send_inbound(&mut ws_write, &inbound).await;
 
@@ -1065,16 +1070,18 @@ fn native_team_fixture_bin() -> String {
 }
 
 fn native_team_missing_completion_fixture_bin() -> String {
-    std::env::var("CARGO_BIN_EXE_clawbro_native_team_missing_completion_fixture").unwrap_or_else(|_| {
-        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let candidate =
-            manifest_dir.join("../../target/debug/clawbro_native_team_missing_completion_fixture");
-        candidate
-            .canonicalize()
-            .unwrap_or(candidate)
-            .to_string_lossy()
-            .to_string()
-    })
+    std::env::var("CARGO_BIN_EXE_clawbro_native_team_missing_completion_fixture").unwrap_or_else(
+        |_| {
+            let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            let candidate = manifest_dir
+                .join("../../target/debug/clawbro_native_team_missing_completion_fixture");
+            candidate
+                .canonicalize()
+                .unwrap_or(candidate)
+                .to_string_lossy()
+                .to_string()
+        },
+    )
 }
 
 fn team_cli_bin() -> String {
@@ -1090,7 +1097,7 @@ fn team_cli_bin() -> String {
 }
 
 fn team_id_for_scope(scope: &str) -> String {
-    clawbro_agent::team::session::stable_team_id("ws", scope)
+    stable_team_id("ws", scope)
 }
 
 fn openclaw_gateway_fixture_bin() -> String {
@@ -1188,7 +1195,7 @@ async fn test_gateway_e2e_custom_acp_approval_via_ws_resolution() {
         timestamp: chrono::Utc::now(),
         thread_ts: None,
         target_agent: None,
-        source: clawbro_protocol::MsgSource::Human,
+        source: MsgSource::Human,
     };
     send_inbound(&mut ws_write, &inbound).await;
 
@@ -1272,7 +1279,7 @@ async fn test_gateway_e2e_custom_acp_approval_via_slash_command() {
         timestamp: chrono::Utc::now(),
         thread_ts: None,
         target_agent: None,
-        source: clawbro_protocol::MsgSource::Human,
+        source: MsgSource::Human,
     };
     send_inbound(&mut ws_write, &inbound).await;
 
@@ -1300,7 +1307,7 @@ async fn test_gateway_e2e_custom_acp_approval_via_slash_command() {
         timestamp: chrono::Utc::now(),
         thread_ts: None,
         target_agent: None,
-        source: clawbro_protocol::MsgSource::Human,
+        source: MsgSource::Human,
     };
     send_inbound(&mut ws_write, &slash).await;
 
@@ -1361,7 +1368,7 @@ async fn test_gateway_e2e_codex_auto_allow_projects_mode_on_new_and_load_session
             timestamp: chrono::Utc::now(),
             thread_ts: None,
             target_agent: None,
-            source: clawbro_protocol::MsgSource::Human,
+            source: MsgSource::Human,
         };
         send_inbound(&mut ws_write, &inbound).await;
 
@@ -1400,7 +1407,7 @@ async fn test_gateway_e2e_mixed_backends_route_by_target_agent() {
             provider_profile: None,
             approval: Default::default(),
             id: "native-main".into(),
-            family: BackendFamilyConfig::QuickAiNative,
+            family: BackendFamilyConfig::ClawBroNative,
             adapter_key: None,
             external_mcp_servers: vec![],
             launch: BackendLaunchConfig::ExternalCommand {
@@ -1462,7 +1469,7 @@ async fn test_gateway_e2e_mixed_backends_route_by_target_agent() {
         timestamp: chrono::Utc::now(),
         thread_ts: None,
         target_agent: Some("@native".into()),
-        source: clawbro_protocol::MsgSource::Human,
+        source: MsgSource::Human,
     };
     send_inbound(&mut ws_write, &native_inbound).await;
 
@@ -1486,7 +1493,7 @@ async fn test_gateway_e2e_mixed_backends_route_by_target_agent() {
         timestamp: chrono::Utc::now(),
         thread_ts: None,
         target_agent: Some("@acp".into()),
-        source: clawbro_protocol::MsgSource::Human,
+        source: MsgSource::Human,
     };
     send_inbound(&mut ws_write, &acp_inbound).await;
 
@@ -1517,7 +1524,7 @@ async fn test_gateway_e2e_native_team_pipeline() {
             provider_profile: None,
             approval: Default::default(),
             id: "leader-main".into(),
-            family: BackendFamilyConfig::QuickAiNative,
+            family: BackendFamilyConfig::ClawBroNative,
             adapter_key: None,
             external_mcp_servers: vec![],
             launch: BackendLaunchConfig::ExternalCommand {
@@ -1533,7 +1540,7 @@ async fn test_gateway_e2e_native_team_pipeline() {
             provider_profile: None,
             approval: Default::default(),
             id: "worker-main".into(),
-            family: BackendFamilyConfig::QuickAiNative,
+            family: BackendFamilyConfig::ClawBroNative,
             adapter_key: None,
             external_mcp_servers: vec![],
             launch: BackendLaunchConfig::ExternalCommand {
@@ -1561,16 +1568,16 @@ async fn test_gateway_e2e_native_team_pipeline() {
             extra_skills_dirs: vec![],
         },
     ];
-    cfg.groups = vec![clawbro_server::config::GroupConfig {
+    cfg.groups = vec![clawbro::config::GroupConfig {
         scope: scope.clone(),
         name: Some("team-e2e".into()),
-        mode: clawbro_server::config::GroupModeConfig {
-            interaction: clawbro_server::config::InteractionMode::Team,
+        mode: clawbro::config::GroupModeConfig {
+            interaction: clawbro::config::InteractionMode::Team,
             auto_promote: false,
             front_bot: Some("leader".into()),
             channel: Some("ws".into()),
         },
-        team: clawbro_server::config::GroupTeamConfig {
+        team: clawbro::config::GroupTeamConfig {
             roster: vec!["worker".into()],
             ..Default::default()
         },
@@ -1593,7 +1600,7 @@ async fn test_gateway_e2e_native_team_pipeline() {
         timestamp: chrono::Utc::now(),
         thread_ts: None,
         target_agent: None,
-        source: clawbro_protocol::MsgSource::Human,
+        source: MsgSource::Human,
     };
     send_inbound(&mut ws_write, &inbound).await;
 
@@ -1636,7 +1643,7 @@ async fn test_gateway_e2e_native_dm_team_pipeline() {
             provider_profile: None,
             approval: Default::default(),
             id: "leader-main".into(),
-            family: BackendFamilyConfig::QuickAiNative,
+            family: BackendFamilyConfig::ClawBroNative,
             adapter_key: None,
             external_mcp_servers: vec![],
             launch: BackendLaunchConfig::ExternalCommand {
@@ -1652,7 +1659,7 @@ async fn test_gateway_e2e_native_dm_team_pipeline() {
             provider_profile: None,
             approval: Default::default(),
             id: "worker-main".into(),
-            family: BackendFamilyConfig::QuickAiNative,
+            family: BackendFamilyConfig::ClawBroNative,
             adapter_key: None,
             external_mcp_servers: vec![],
             launch: BackendLaunchConfig::ExternalCommand {
@@ -1680,16 +1687,16 @@ async fn test_gateway_e2e_native_dm_team_pipeline() {
             extra_skills_dirs: vec![],
         },
     ];
-    cfg.team_scopes = vec![clawbro_server::config::TeamScopeConfig {
+    cfg.team_scopes = vec![clawbro::config::TeamScopeConfig {
         scope: scope.clone(),
         name: Some("dm-team-e2e".into()),
-        mode: clawbro_server::config::GroupModeConfig {
-            interaction: clawbro_server::config::InteractionMode::Team,
+        mode: clawbro::config::GroupModeConfig {
+            interaction: clawbro::config::InteractionMode::Team,
             auto_promote: false,
             front_bot: Some("leader".into()),
             channel: Some("ws".into()),
         },
-        team: clawbro_server::config::GroupTeamConfig {
+        team: clawbro::config::GroupTeamConfig {
             roster: vec!["worker".into()],
             ..Default::default()
         },
@@ -1712,7 +1719,7 @@ async fn test_gateway_e2e_native_dm_team_pipeline() {
         timestamp: chrono::Utc::now(),
         thread_ts: None,
         target_agent: None,
-        source: clawbro_protocol::MsgSource::Human,
+        source: MsgSource::Human,
     };
     send_inbound(&mut ws_write, &inbound).await;
 
@@ -1764,7 +1771,7 @@ async fn test_gateway_e2e_mixed_team_native_leader_acp_specialist() {
             provider_profile: None,
             approval: Default::default(),
             id: "leader-main".into(),
-            family: BackendFamilyConfig::QuickAiNative,
+            family: BackendFamilyConfig::ClawBroNative,
             adapter_key: None,
             external_mcp_servers: vec![],
             launch: BackendLaunchConfig::ExternalCommand {
@@ -1808,16 +1815,16 @@ async fn test_gateway_e2e_mixed_team_native_leader_acp_specialist() {
             extra_skills_dirs: vec![],
         },
     ];
-    cfg.groups = vec![clawbro_server::config::GroupConfig {
+    cfg.groups = vec![clawbro::config::GroupConfig {
         scope: scope.clone(),
         name: Some("team-mixed-e2e".into()),
-        mode: clawbro_server::config::GroupModeConfig {
-            interaction: clawbro_server::config::InteractionMode::Team,
+        mode: clawbro::config::GroupModeConfig {
+            interaction: clawbro::config::InteractionMode::Team,
             auto_promote: false,
             front_bot: Some("leader".into()),
             channel: Some("ws".into()),
         },
-        team: clawbro_server::config::GroupTeamConfig {
+        team: clawbro::config::GroupTeamConfig {
             roster: vec!["worker".into()],
             ..Default::default()
         },
@@ -1840,7 +1847,7 @@ async fn test_gateway_e2e_mixed_team_native_leader_acp_specialist() {
         timestamp: chrono::Utc::now(),
         thread_ts: None,
         target_agent: None,
-        source: clawbro_protocol::MsgSource::Human,
+        source: MsgSource::Human,
     };
     send_inbound(&mut ws_write, &inbound).await;
 
@@ -1885,7 +1892,7 @@ async fn test_gateway_e2e_mixed_team_native_leader_openclaw_specialist() {
             provider_profile: None,
             approval: Default::default(),
             id: "leader-main".into(),
-            family: BackendFamilyConfig::QuickAiNative,
+            family: BackendFamilyConfig::ClawBroNative,
             adapter_key: None,
             external_mcp_servers: vec![],
             launch: BackendLaunchConfig::ExternalCommand {
@@ -1935,16 +1942,16 @@ async fn test_gateway_e2e_mixed_team_native_leader_openclaw_specialist() {
             extra_skills_dirs: vec![],
         },
     ];
-    cfg.groups = vec![clawbro_server::config::GroupConfig {
+    cfg.groups = vec![clawbro::config::GroupConfig {
         scope: scope.clone(),
         name: Some("team-openclaw-e2e".into()),
-        mode: clawbro_server::config::GroupModeConfig {
-            interaction: clawbro_server::config::InteractionMode::Team,
+        mode: clawbro::config::GroupModeConfig {
+            interaction: clawbro::config::InteractionMode::Team,
             auto_promote: false,
             front_bot: Some("leader".into()),
             channel: Some("ws".into()),
         },
-        team: clawbro_server::config::GroupTeamConfig {
+        team: clawbro::config::GroupTeamConfig {
             roster: vec!["worker".into()],
             ..Default::default()
         },
@@ -1967,7 +1974,7 @@ async fn test_gateway_e2e_mixed_team_native_leader_openclaw_specialist() {
         timestamp: chrono::Utc::now(),
         thread_ts: None,
         target_agent: None,
-        source: clawbro_protocol::MsgSource::Human,
+        source: MsgSource::Human,
     };
     send_inbound(&mut ws_write, &inbound).await;
 
@@ -2045,7 +2052,7 @@ async fn test_gateway_e2e_mixed_team_openclaw_leader_native_specialist() {
             provider_profile: None,
             approval: Default::default(),
             id: "worker-native".into(),
-            family: BackendFamilyConfig::QuickAiNative,
+            family: BackendFamilyConfig::ClawBroNative,
             adapter_key: None,
             external_mcp_servers: vec![],
             launch: BackendLaunchConfig::ExternalCommand {
@@ -2073,16 +2080,16 @@ async fn test_gateway_e2e_mixed_team_openclaw_leader_native_specialist() {
             extra_skills_dirs: vec![],
         },
     ];
-    cfg.groups = vec![clawbro_server::config::GroupConfig {
+    cfg.groups = vec![clawbro::config::GroupConfig {
         scope: scope.clone(),
         name: Some("team-openclaw-lead-native".into()),
-        mode: clawbro_server::config::GroupModeConfig {
-            interaction: clawbro_server::config::InteractionMode::Team,
+        mode: clawbro::config::GroupModeConfig {
+            interaction: clawbro::config::InteractionMode::Team,
             auto_promote: false,
             front_bot: Some("leader".into()),
             channel: Some("ws".into()),
         },
-        team: clawbro_server::config::GroupTeamConfig {
+        team: clawbro::config::GroupTeamConfig {
             roster: vec!["worker".into()],
             ..Default::default()
         },
@@ -2105,7 +2112,7 @@ async fn test_gateway_e2e_mixed_team_openclaw_leader_native_specialist() {
         timestamp: chrono::Utc::now(),
         thread_ts: None,
         target_agent: None,
-        source: clawbro_protocol::MsgSource::Human,
+        source: MsgSource::Human,
     };
     send_inbound(&mut ws_write, &inbound).await;
 
@@ -2206,16 +2213,16 @@ async fn test_gateway_e2e_mixed_team_openclaw_leader_acp_specialist() {
             extra_skills_dirs: vec![],
         },
     ];
-    cfg.groups = vec![clawbro_server::config::GroupConfig {
+    cfg.groups = vec![clawbro::config::GroupConfig {
         scope: scope.clone(),
         name: Some("team-openclaw-lead-acp".into()),
-        mode: clawbro_server::config::GroupModeConfig {
-            interaction: clawbro_server::config::InteractionMode::Team,
+        mode: clawbro::config::GroupModeConfig {
+            interaction: clawbro::config::InteractionMode::Team,
             auto_promote: false,
             front_bot: Some("leader".into()),
             channel: Some("ws".into()),
         },
-        team: clawbro_server::config::GroupTeamConfig {
+        team: clawbro::config::GroupTeamConfig {
             roster: vec!["worker".into()],
             ..Default::default()
         },
@@ -2238,7 +2245,7 @@ async fn test_gateway_e2e_mixed_team_openclaw_leader_acp_specialist() {
         timestamp: chrono::Utc::now(),
         thread_ts: None,
         target_agent: None,
-        source: clawbro_protocol::MsgSource::Human,
+        source: MsgSource::Human,
     };
     send_inbound(&mut ws_write, &inbound).await;
 
@@ -2288,7 +2295,7 @@ async fn test_registry_mixed_team_native_leader_acp_specialist_pipeline() {
             provider_profile: None,
             approval: Default::default(),
             id: "leader-main".into(),
-            family: BackendFamilyConfig::QuickAiNative,
+            family: BackendFamilyConfig::ClawBroNative,
             adapter_key: None,
             external_mcp_servers: vec![],
             launch: BackendLaunchConfig::ExternalCommand {
@@ -2332,16 +2339,16 @@ async fn test_registry_mixed_team_native_leader_acp_specialist_pipeline() {
             extra_skills_dirs: vec![],
         },
     ];
-    cfg.groups = vec![clawbro_server::config::GroupConfig {
+    cfg.groups = vec![clawbro::config::GroupConfig {
         scope: scope.clone(),
         name: Some("team-mixed-registry".into()),
-        mode: clawbro_server::config::GroupModeConfig {
-            interaction: clawbro_server::config::InteractionMode::Team,
+        mode: clawbro::config::GroupModeConfig {
+            interaction: clawbro::config::InteractionMode::Team,
             auto_promote: false,
             front_bot: Some("leader".into()),
             channel: Some("ws".into()),
         },
-        team: clawbro_server::config::GroupTeamConfig {
+        team: clawbro::config::GroupTeamConfig {
             roster: vec!["worker".into()],
             ..Default::default()
         },
@@ -2369,7 +2376,7 @@ async fn test_registry_mixed_team_native_leader_acp_specialist_pipeline() {
         timestamp: chrono::Utc::now(),
         thread_ts: None,
         target_agent: None,
-        source: clawbro_protocol::MsgSource::Human,
+        source: MsgSource::Human,
     };
 
     let handle_result = state.registry.handle(inbound).await;
@@ -2421,7 +2428,7 @@ async fn test_registry_team_missing_completion_resets_claim_and_specialist_sessi
             provider_profile: None,
             approval: Default::default(),
             id: "leader-main".into(),
-            family: BackendFamilyConfig::QuickAiNative,
+            family: BackendFamilyConfig::ClawBroNative,
             adapter_key: None,
             external_mcp_servers: vec![],
             launch: BackendLaunchConfig::ExternalCommand {
@@ -2437,7 +2444,7 @@ async fn test_registry_team_missing_completion_resets_claim_and_specialist_sessi
             provider_profile: None,
             approval: Default::default(),
             id: "worker-main".into(),
-            family: BackendFamilyConfig::QuickAiNative,
+            family: BackendFamilyConfig::ClawBroNative,
             adapter_key: None,
             external_mcp_servers: vec![],
             launch: BackendLaunchConfig::ExternalCommand {
@@ -2465,16 +2472,16 @@ async fn test_registry_team_missing_completion_resets_claim_and_specialist_sessi
             extra_skills_dirs: vec![],
         },
     ];
-    cfg.groups = vec![clawbro_server::config::GroupConfig {
+    cfg.groups = vec![clawbro::config::GroupConfig {
         scope: scope.clone(),
         name: Some("team-missing-completion".into()),
-        mode: clawbro_server::config::GroupModeConfig {
-            interaction: clawbro_server::config::InteractionMode::Team,
+        mode: clawbro::config::GroupModeConfig {
+            interaction: clawbro::config::InteractionMode::Team,
             auto_promote: false,
             front_bot: Some("leader".into()),
             channel: Some("ws".into()),
         },
-        team: clawbro_server::config::GroupTeamConfig {
+        team: clawbro::config::GroupTeamConfig {
             roster: vec!["worker".into()],
             ..Default::default()
         },
@@ -2502,7 +2509,7 @@ async fn test_registry_team_missing_completion_resets_claim_and_specialist_sessi
         timestamp: chrono::Utc::now(),
         thread_ts: None,
         target_agent: None,
-        source: clawbro_protocol::MsgSource::Human,
+        source: MsgSource::Human,
     };
 
     let handle_result = state.registry.handle(inbound).await;
@@ -2604,7 +2611,7 @@ async fn test_registry_mixed_team_native_leader_openclaw_specialist_pipeline() {
             provider_profile: None,
             approval: Default::default(),
             id: "leader-main".into(),
-            family: BackendFamilyConfig::QuickAiNative,
+            family: BackendFamilyConfig::ClawBroNative,
             adapter_key: None,
             external_mcp_servers: vec![],
             launch: BackendLaunchConfig::ExternalCommand {
@@ -2654,16 +2661,16 @@ async fn test_registry_mixed_team_native_leader_openclaw_specialist_pipeline() {
             extra_skills_dirs: vec![],
         },
     ];
-    cfg.groups = vec![clawbro_server::config::GroupConfig {
+    cfg.groups = vec![clawbro::config::GroupConfig {
         scope: scope.clone(),
         name: Some("team-openclaw-registry".into()),
-        mode: clawbro_server::config::GroupModeConfig {
-            interaction: clawbro_server::config::InteractionMode::Team,
+        mode: clawbro::config::GroupModeConfig {
+            interaction: clawbro::config::InteractionMode::Team,
             auto_promote: false,
             front_bot: Some("leader".into()),
             channel: Some("ws".into()),
         },
-        team: clawbro_server::config::GroupTeamConfig {
+        team: clawbro::config::GroupTeamConfig {
             roster: vec!["worker".into()],
             ..Default::default()
         },
@@ -2691,7 +2698,7 @@ async fn test_registry_mixed_team_native_leader_openclaw_specialist_pipeline() {
         timestamp: chrono::Utc::now(),
         thread_ts: None,
         target_agent: None,
-        source: clawbro_protocol::MsgSource::Human,
+        source: MsgSource::Human,
     };
 
     let handle_result = state.registry.handle(inbound).await;

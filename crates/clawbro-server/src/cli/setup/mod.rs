@@ -4,7 +4,10 @@ pub mod mode;
 pub mod provider;
 pub mod writer;
 
-use crate::cli::{args::SetupArgs, i18n::{Language, Messages}};
+use crate::cli::{
+    args::SetupArgs,
+    i18n::{Language, Messages},
+};
 use anyhow::Result;
 use console::style;
 use dialoguer::{theme::ColorfulTheme, Confirm, Select};
@@ -22,7 +25,12 @@ pub async fn run(args: SetupArgs) -> Result<()> {
             .items(&choices)
             .default(0)
             .interact()?;
-        match idx { 1 => Language::En, 2 => Language::Ja, 3 => Language::Ko, _ => Language::Zh }
+        match idx {
+            1 => Language::En,
+            2 => Language::Ja,
+            3 => Language::Ko,
+            _ => Language::Zh,
+        }
     };
     let m = Messages::for_lang(lang);
     println!("\n{}\n", style(m.welcome).bold().cyan());
@@ -48,7 +56,7 @@ pub async fn run(args: SetupArgs) -> Result<()> {
     let provider_cfg = provider::collect(&args, lang)?;
 
     // Step 4: Mode + port + workspace
-    let mode_cfg = mode::collect(&args, lang)?;
+    let mut mode_cfg = mode::collect(&args, lang)?;
 
     // Step 5: Auth (ws_token)
     let auth_cfg = auth_cfg::collect(&args, lang)?;
@@ -60,13 +68,16 @@ pub async fn run(args: SetupArgs) -> Result<()> {
         channel::collect(lang)?
     };
 
-    // Step 7: Create runtime directories
+    // Step 7: Team scope details (requires knowing the channel)
+    mode::collect_team_scope_details(&args, &mut mode_cfg, &channel_cfg, lang)?;
+
+    // Step 8: Create runtime directories
     let qdir = dirs::home_dir().unwrap_or_default().join(".clawbro");
     for sub in ["sessions", "shared", "skills", "personas"] {
         std::fs::create_dir_all(qdir.join(sub))?;
     }
 
-    // Step 8: Write files
+    // Step 9: Write files
     let inputs = writer::WriteInputs {
         provider: &provider_cfg,
         mode: &mode_cfg,
@@ -85,7 +96,7 @@ pub async fn run(args: SetupArgs) -> Result<()> {
         println!("{}", style(m.written_env).green());
     }
 
-    // Step 9: Done
+    // Step 10: Done
     println!("\n{}", style(m.done).bold().green());
     println!("\n{}", m.next_steps);
     Ok(())

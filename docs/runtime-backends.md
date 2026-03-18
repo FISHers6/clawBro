@@ -2,7 +2,7 @@
 
 ## Purpose
 
-`clawbro-gateway` now separates:
+`ClawBro` now separates:
 
 - `Business Control Plane`
 - `Agent Runtime / Conductor Plane`
@@ -41,9 +41,9 @@ Status: active
 
 Implementation:
 
-- adapter: [`clawbro-runtime/src/acp/adapter.rs`](/Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway/crates/clawbro-runtime/src/acp/adapter.rs)
-- probe: [`clawbro-runtime/src/acp/probe.rs`](/Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway/crates/clawbro-runtime/src/acp/probe.rs)
-- session driver: [`clawbro-runtime/src/acp/session_driver.rs`](/Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway/crates/clawbro-runtime/src/acp/session_driver.rs)
+- adapter: [`clawbro-runtime/src/acp/adapter.rs`](/Users/fishers/Desktop/repo/quickai-openclaw/clawBro/crates/clawbro-runtime/src/acp/adapter.rs)
+- probe: [`clawbro-runtime/src/acp/probe.rs`](/Users/fishers/Desktop/repo/quickai-openclaw/clawBro/crates/clawbro-runtime/src/acp/probe.rs)
+- session driver: [`clawbro-runtime/src/acp/session_driver.rs`](/Users/fishers/Desktop/repo/quickai-openclaw/clawBro/crates/clawbro-runtime/src/acp/session_driver.rs)
 
 Notes:
 
@@ -57,9 +57,9 @@ Status: active
 
 Implementation:
 
-- adapter: [`clawbro-runtime/src/openclaw/adapter.rs`](/Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway/crates/clawbro-runtime/src/openclaw/adapter.rs)
-- client: [`clawbro-runtime/src/openclaw/client.rs`](/Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway/crates/clawbro-runtime/src/openclaw/client.rs)
-- probe: [`clawbro-runtime/src/openclaw/probe.rs`](/Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway/crates/clawbro-runtime/src/openclaw/probe.rs)
+- adapter: [`clawbro-runtime/src/openclaw/adapter.rs`](/Users/fishers/Desktop/repo/quickai-openclaw/clawBro/crates/clawbro-runtime/src/openclaw/adapter.rs)
+- client: [`clawbro-runtime/src/openclaw/client.rs`](/Users/fishers/Desktop/repo/quickai-openclaw/clawBro/crates/clawbro-runtime/src/openclaw/client.rs)
+- probe: [`clawbro-runtime/src/openclaw/probe.rs`](/Users/fishers/Desktop/repo/quickai-openclaw/clawBro/crates/clawbro-runtime/src/openclaw/probe.rs)
 
 Default eligibility:
 
@@ -96,15 +96,15 @@ Status: active, team-capable via canonical Team Tool RPC
 
 Implementation:
 
-- adapter: [`clawbro-runtime/src/native/adapter.rs`](/Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway/crates/clawbro-runtime/src/native/adapter.rs)
-- probe: [`clawbro-runtime/src/native/probe.rs`](/Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway/crates/clawbro-runtime/src/native/probe.rs)
-- rust agent bridge: [`runtime_bridge.rs`](/Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway/crates/clawbro-agent-sdk/src/runtime_bridge.rs)
+- adapter: [`clawbro-runtime/src/native/adapter.rs`](/Users/fishers/Desktop/repo/quickai-openclaw/clawBro/crates/clawbro-runtime/src/native/adapter.rs)
+- probe: [`clawbro-runtime/src/native/probe.rs`](/Users/fishers/Desktop/repo/quickai-openclaw/clawBro/crates/clawbro-runtime/src/native/probe.rs)
+- rust agent bridge: [`runtime_bridge.rs`](/Users/fishers/Desktop/repo/quickai-openclaw/clawBro/crates/clawbro-agent-sdk/src/runtime_bridge.rs)
 
 Important:
 
-- `clawbro-rust-agent` is a first-class participant even though it is not ACP-first by design.
+- `clawbro` ships with an internal native runtime bridge and ACP agent entrypoint even though the public install surface is a single binary.
 - Native family is no longer limited to `solo/relay`.
-- `clawbro-rust-agent` now receives `RuntimeSessionSpec`, dynamically registers team tools by role, and calls back into the gateway through the canonical `/runtime/team-tools` endpoint.
+- `clawbro runtime-bridge` now receives `RuntimeSessionSpec`, dynamically registers team tools by role, and calls back into the gateway through the canonical `/runtime/team-tools` endpoint.
 - This keeps native family on the same business contract as ACP family without forcing it through ACP MCP.
 
 Team contract note:
@@ -343,7 +343,7 @@ Contract behavior:
 
 - ClawBro normalizes these into `RuntimeSessionSpec.external_mcp_servers`
 - `ACP` merges them with the existing `team-tools` SSE bridge
-- `quick_ai_native` receives them over the native JSON runtime session contract and connects from inside `clawbro-rust-agent`
+- `quick_ai_native` receives them over the native JSON runtime session contract and connects from inside `clawbro runtime-bridge`
 - `OpenClaw` keeps its current protocol boundary and does not claim external MCP parity yet
 
 Important:

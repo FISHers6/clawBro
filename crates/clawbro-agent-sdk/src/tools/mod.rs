@@ -1,6 +1,9 @@
 //! Built-in tools for the ClawBro Agent.
 //! All tools implement rig-core's `Tool` trait directly (no Tauri dependencies).
 
+use crate::bridge::{
+    AgentEvent, AgentTurnRequest, ApprovalMode, ExternalMcpServerSpec, ExternalMcpTransport,
+};
 use anyhow::Result;
 use rig::{
     agent::AgentBuilder,
@@ -16,9 +19,6 @@ use rmcp::{
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
-};
-use crate::bridge::{
-    AgentEvent, AgentTurnRequest, ApprovalMode, ExternalMcpServerSpec, ExternalMcpTransport,
 };
 pub mod bash;
 pub mod fileio;
@@ -484,15 +484,14 @@ mod tests {
         let (url, server_ct) = spawn_echo_external_server(calls.clone()).await.unwrap();
 
         let session = runtime_session_with_external_mcp(url);
-        let registration =
-            register_runtime_tools(
-                AgentBuilder::new(ToolThenTextModel::new()),
-                &session,
-                None,
-                &NoopToolAugmentor,
-            )
-                .await
-                .unwrap();
+        let registration = register_runtime_tools(
+            AgentBuilder::new(ToolThenTextModel::new()),
+            &session,
+            None,
+            &NoopToolAugmentor,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(registration.external_mcp_clients.len(), 1);
 
@@ -512,15 +511,14 @@ mod tests {
     #[tokio::test]
     async fn register_runtime_tools_skips_broken_external_mcp_server() {
         let session = runtime_session_with_external_mcp("http://127.0.0.1:9/sse".to_string());
-        let registration =
-            register_runtime_tools(
-                AgentBuilder::new(ToolThenTextModel::new()),
-                &session,
-                None,
-                &NoopToolAugmentor,
-            )
-                .await
-                .unwrap();
+        let registration = register_runtime_tools(
+            AgentBuilder::new(ToolThenTextModel::new()),
+            &session,
+            None,
+            &NoopToolAugmentor,
+        )
+        .await
+        .unwrap();
 
         assert!(registration.external_mcp_clients.is_empty());
     }

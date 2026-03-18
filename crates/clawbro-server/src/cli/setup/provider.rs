@@ -19,47 +19,47 @@ impl ProviderKind {
     pub fn display_name(&self) -> &'static str {
         match self {
             ProviderKind::Anthropic => "Anthropic (Claude)",
-            ProviderKind::OpenAI    => "OpenAI (GPT)",
-            ProviderKind::DeepSeek  => "DeepSeek",
-            ProviderKind::Azure     => "Azure OpenAI",
-            ProviderKind::Ollama    => "Ollama (local model)",
-            ProviderKind::Custom    => "Other OpenAI-compatible endpoint",
+            ProviderKind::OpenAI => "OpenAI (GPT)",
+            ProviderKind::DeepSeek => "DeepSeek",
+            ProviderKind::Azure => "Azure OpenAI",
+            ProviderKind::Ollama => "Ollama (local model)",
+            ProviderKind::Custom => "Other OpenAI-compatible endpoint",
         }
     }
 
     pub fn env_var(&self) -> &'static str {
         match self {
             ProviderKind::Anthropic => "ANTHROPIC_API_KEY",
-            ProviderKind::Ollama    => "",
-            _                       => "OPENAI_API_KEY",
+            ProviderKind::Ollama => "",
+            _ => "OPENAI_API_KEY",
         }
     }
 
     pub fn protocol_tag(&self) -> &'static str {
         match self {
             ProviderKind::Anthropic => "anthropic_compatible",
-            _                       => "openai_compatible",
+            _ => "openai_compatible",
         }
     }
 
     pub fn default_base_url(&self) -> Option<&'static str> {
         match self {
             ProviderKind::Anthropic => Some("https://api.anthropic.com"),
-            ProviderKind::OpenAI    => Some("https://api.openai.com"),
-            ProviderKind::DeepSeek  => Some("https://api.deepseek.com"),
-            ProviderKind::Ollama    => Some("http://localhost:11434"),
-            _                       => None,
+            ProviderKind::OpenAI => Some("https://api.openai.com"),
+            ProviderKind::DeepSeek => Some("https://api.deepseek.com"),
+            ProviderKind::Ollama => Some("http://localhost:11434"),
+            _ => None,
         }
     }
 
     pub fn default_model(&self) -> &'static str {
         match self {
             ProviderKind::Anthropic => "claude-sonnet-4-6",
-            ProviderKind::OpenAI    => "gpt-4o",
-            ProviderKind::DeepSeek  => "deepseek-chat",
-            ProviderKind::Azure     => "gpt-4o",
-            ProviderKind::Ollama    => "llama3",
-            ProviderKind::Custom    => "gpt-4o",
+            ProviderKind::OpenAI => "gpt-4o",
+            ProviderKind::DeepSeek => "deepseek-chat",
+            ProviderKind::Azure => "gpt-4o",
+            ProviderKind::Ollama => "llama3",
+            ProviderKind::Custom => "gpt-4o",
         }
     }
 
@@ -70,11 +70,11 @@ impl ProviderKind {
     pub fn slug(&self) -> &'static str {
         match self {
             ProviderKind::Anthropic => "anthropic",
-            ProviderKind::OpenAI    => "openai",
-            ProviderKind::DeepSeek  => "deepseek",
-            ProviderKind::Azure     => "azure",
-            ProviderKind::Ollama    => "ollama",
-            ProviderKind::Custom    => "custom",
+            ProviderKind::OpenAI => "openai",
+            ProviderKind::DeepSeek => "deepseek",
+            ProviderKind::Azure => "azure",
+            ProviderKind::Ollama => "ollama",
+            ProviderKind::Custom => "custom",
         }
     }
 }
@@ -101,11 +101,11 @@ pub fn collect(args: &SetupArgs, lang: Language) -> Result<ProviderConfig> {
     let kind = if let Some(p) = &args.provider {
         match p {
             ProviderArg::Anthropic => ProviderKind::Anthropic,
-            ProviderArg::Openai    => ProviderKind::OpenAI,
-            ProviderArg::Deepseek  => ProviderKind::DeepSeek,
-            ProviderArg::Azure     => ProviderKind::Azure,
-            ProviderArg::Ollama    => ProviderKind::Ollama,
-            ProviderArg::Custom    => ProviderKind::Custom,
+            ProviderArg::Openai => ProviderKind::OpenAI,
+            ProviderArg::Deepseek => ProviderKind::DeepSeek,
+            ProviderArg::Azure => ProviderKind::Azure,
+            ProviderArg::Ollama => ProviderKind::Ollama,
+            ProviderArg::Custom => ProviderKind::Custom,
         }
     } else {
         let choices = [
@@ -154,7 +154,11 @@ pub fn collect(args: &SetupArgs, lang: Language) -> Result<ProviderConfig> {
                 .default(default.clone())
                 .allow_empty(true)
                 .interact_text()?;
-            if entered.trim().is_empty() { default } else { entered.trim().to_string() }
+            if entered.trim().is_empty() {
+                default
+            } else {
+                entered.trim().to_string()
+            }
         } else {
             default
         }
@@ -170,7 +174,11 @@ pub fn collect(args: &SetupArgs, lang: Language) -> Result<ProviderConfig> {
                 .default(default_m.clone())
                 .allow_empty(true)
                 .interact_text()?;
-            if entered.trim().is_empty() { default_m } else { entered.trim().to_string() }
+            if entered.trim().is_empty() {
+                default_m
+            } else {
+                entered.trim().to_string()
+            }
         } else {
             default_m
         }
@@ -178,7 +186,13 @@ pub fn collect(args: &SetupArgs, lang: Language) -> Result<ProviderConfig> {
 
     let profile_id = format!("{}-main", kind.slug());
 
-    Ok(ProviderConfig { kind, api_key, base_url, model, profile_id })
+    Ok(ProviderConfig {
+        kind,
+        api_key,
+        base_url,
+        model,
+        profile_id,
+    })
 }
 
 #[cfg(test)]
@@ -196,13 +210,19 @@ mod tests {
 
     #[test]
     fn deepseek_base_url() {
-        assert_eq!(ProviderKind::DeepSeek.default_base_url(), Some("https://api.deepseek.com"));
+        assert_eq!(
+            ProviderKind::DeepSeek.default_base_url(),
+            Some("https://api.deepseek.com")
+        );
     }
 
     #[test]
     fn ollama_no_key() {
         assert!(!ProviderKind::Ollama.needs_api_key());
-        assert_eq!(ProviderKind::Ollama.default_base_url(), Some("http://localhost:11434"));
+        assert_eq!(
+            ProviderKind::Ollama.default_base_url(),
+            Some("http://localhost:11434")
+        );
     }
 
     #[test]

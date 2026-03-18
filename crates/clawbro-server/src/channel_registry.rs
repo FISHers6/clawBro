@@ -1,11 +1,11 @@
-use clawbro_protocol::SessionKey;
+use crate::protocol::SessionKey;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 #[derive(Clone, Default)]
 pub struct ChannelRegistry {
-    channels: HashMap<(String, Option<String>), Arc<dyn clawbro_channels::Channel>>,
-    defaults: HashMap<String, Arc<dyn clawbro_channels::Channel>>,
+    channels: HashMap<(String, Option<String>), Arc<dyn crate::channels_internal::Channel>>,
+    defaults: HashMap<String, Arc<dyn crate::channels_internal::Channel>>,
 }
 
 impl ChannelRegistry {
@@ -17,7 +17,7 @@ impl ChannelRegistry {
         &mut self,
         channel: impl Into<String>,
         channel_instance: Option<impl Into<String>>,
-        sender: Arc<dyn clawbro_channels::Channel>,
+        sender: Arc<dyn crate::channels_internal::Channel>,
         is_default: bool,
     ) {
         let channel = channel.into();
@@ -35,7 +35,7 @@ impl ChannelRegistry {
         &self,
         channel: &str,
         channel_instance: Option<&str>,
-    ) -> Option<Arc<dyn clawbro_channels::Channel>> {
+    ) -> Option<Arc<dyn crate::channels_internal::Channel>> {
         let requested_instance = channel_instance.map(str::to_string);
         self.channels
             .get(&(channel.to_string(), requested_instance))
@@ -46,7 +46,7 @@ impl ChannelRegistry {
     pub fn resolve_for_session(
         &self,
         session_key: &SessionKey,
-    ) -> Option<Arc<dyn clawbro_channels::Channel>> {
+    ) -> Option<Arc<dyn crate::channels_internal::Channel>> {
         self.resolve(
             &session_key.channel,
             session_key.channel_instance.as_deref(),
@@ -59,7 +59,7 @@ mod tests {
     use super::*;
     use anyhow::Result;
     use async_trait::async_trait;
-    use clawbro_protocol::{InboundMsg, OutboundMsg};
+    use crate::protocol::{InboundMsg, OutboundMsg};
     use tokio::sync::mpsc;
 
     struct TestChannel {
@@ -67,7 +67,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl clawbro_channels::Channel for TestChannel {
+    impl crate::channels_internal::Channel for TestChannel {
         fn name(&self) -> &str {
             self.name
         }

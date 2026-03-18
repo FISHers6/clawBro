@@ -52,7 +52,7 @@ rmcp = { version = "0.8.3", features = ["server", "transport-sse-server"] }
 
 Run:
 ```bash
-cd /path/to/clawbro-gateway && cargo doc -p clawbro-agent --no-deps 2>&1 | tail -20
+cd /path/to/clawBro-gateway && cargo doc -p clawbro-agent --no-deps 2>&1 | tail -20
 ```
 
 Then check the rmcp types by running:

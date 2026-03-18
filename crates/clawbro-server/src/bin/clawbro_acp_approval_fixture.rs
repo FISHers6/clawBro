@@ -40,7 +40,7 @@ impl acp::Agent for ApprovalFixtureAgent {
         Ok(acp::InitializeResponse::new(arguments.protocol_version)
             .agent_info(
                 acp::Implementation::new("clawbro-acp-approval-fixture", "0.1.0")
-                    .title("QAI ACP Approval Fixture"),
+                    .title("ClawBro ACP Approval Fixture"),
             )
             .agent_capabilities(acp::AgentCapabilities::new().load_session(true)))
     }

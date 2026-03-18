@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This document answers a narrower question than [`runtime-backends.md`](/Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway/docs/runtime-backends.md):
+This document answers a narrower question than [`runtime-backends.md`](/Users/fishers/Desktop/repo/quickai-openclaw/clawBro/docs/runtime-backends.md):
 
 - Which backend families are supported today?
 - Which runtime capabilities are truly implemented vs only architecturally planned?
@@ -93,7 +93,7 @@ ACP update compatibility:
 Validated by:
 
 - `cargo test -p clawbro-runtime`
-- `cargo test -p clawbro-server`
+- `cargo test -p clawbro`
 - Echo fixture emits `UsageUpdate` + `SessionInfoUpdate` before text; all ACP E2E tests pass
 
 Current limitation:
@@ -161,7 +161,7 @@ Status: `Structured`
 Validated by:
 
 - `cargo test -p clawbro-runtime`
-- `cargo test -p clawbro-server`
+- `cargo test -p clawbro`
 - OpenClaw source tests run locally after installing dependencies:
   - `src/gateway/server-chat.agent-events.test.ts`
   - `src/tui/tui-event-handlers.test.ts`

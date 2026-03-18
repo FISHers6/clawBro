@@ -1,8 +1,8 @@
-use clawbro_protocol::{parse_session_key_text, TeamToolCall, TeamToolRequest, TeamToolResponse};
 use clawbro_agent_sdk::{
     bridge::{AgentTurnRequest, ApprovalMode, ExecutionRole},
     tools::{EventedTool, RuntimeToolAugmentor, ToolProgressTracker},
 };
+use clawbro_protocol::{parse_session_key_text, TeamToolCall, TeamToolRequest, TeamToolResponse};
 use rig::{
     agent::AgentBuilder,
     completion::{CompletionModel, ToolDefinition},
@@ -62,11 +62,11 @@ struct TeamToolOutput {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct QuickAiTeamToolAugmentor {
+pub struct ClawBroTeamToolAugmentor {
     endpoint: Option<String>,
 }
 
-impl QuickAiTeamToolAugmentor {
+impl ClawBroTeamToolAugmentor {
     pub fn from_endpoint(endpoint: Option<String>) -> Self {
         Self { endpoint }
     }
@@ -76,7 +76,7 @@ impl QuickAiTeamToolAugmentor {
     }
 }
 
-impl RuntimeToolAugmentor for QuickAiTeamToolAugmentor {
+impl RuntimeToolAugmentor for ClawBroTeamToolAugmentor {
     fn augment<M: CompletionModel>(
         &self,
         builder: AgentBuilder<M>,

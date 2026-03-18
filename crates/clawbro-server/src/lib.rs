@@ -1,28 +1,40 @@
-//! clawbro-server library target.
+//! ClawBro server library target.
 //! Exposes modules and test helpers for integration tests.
 
 pub mod channel_registry;
+pub mod channels_internal;
+pub mod cli;
 pub mod config;
+pub mod cron_internal;
 pub mod delivery_resolver;
 pub mod diagnostics;
+pub mod embedded_agent;
 pub mod gateway;
+pub mod gateway_process;
 pub mod im_sink;
 pub mod progress_presentation;
+pub mod protocol;
+pub mod runtime;
+pub mod agent_sdk_internal;
+pub mod agent_core;
+pub mod session;
+pub mod skills_internal;
 pub mod state;
 pub mod team_runtime;
-pub mod cli;
+
+pub use gateway_process::run as run_gateway_process;
 
 pub use config::GatewayConfig;
 pub use state::{AppState, BrokerApprovalResolver};
 
 use anyhow::Result;
-use clawbro_agent::{ConductorRuntimeDispatch, SessionRegistry};
-use clawbro_runtime::{
+use crate::skills_internal::SkillLoader;
+use crate::agent_core::{ConductorRuntimeDispatch, SessionRegistry};
+use crate::runtime::{
     acp::AcpBackendAdapter, ApprovalBroker, BackendFamily, BackendRegistry, BackendSpec,
-    LaunchSpec, OpenClawBackendAdapter, QuickAiNativeBackendAdapter,
+    ClawBroNativeBackendAdapter, LaunchSpec, OpenClawBackendAdapter,
 };
-use clawbro_session::{SessionManager, SessionStorage};
-use clawbro_skills::SkillLoader;
+use crate::session::{SessionManager, SessionStorage};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -97,7 +109,7 @@ pub async fn build_test_state_with_config(cfg: GatewayConfig) -> Result<AppState
         )
         .await;
     runtime_registry
-        .register_adapter("native", Arc::new(QuickAiNativeBackendAdapter))
+        .register_adapter("native", Arc::new(ClawBroNativeBackendAdapter))
         .await;
     for backend in &cfg.backends {
         runtime_registry
@@ -115,7 +127,7 @@ pub async fn build_test_state_with_config(cfg: GatewayConfig) -> Result<AppState
         if cfg.agent_roster.is_empty() {
             None
         } else {
-            Some(clawbro_agent::AgentRoster::new(cfg.agent_roster.clone()))
+            Some(crate::agent_core::AgentRoster::new(cfg.agent_roster.clone()))
         },
         None,
         None,
@@ -150,7 +162,7 @@ fn backend_catalog_entry(spec: BackendSpec) -> config::BackendCatalogEntry {
     let family = match spec.family {
         BackendFamily::Acp => config::BackendFamilyConfig::Acp,
         BackendFamily::OpenClawGateway => config::BackendFamilyConfig::OpenClawGateway,
-        BackendFamily::QuickAiNative => config::BackendFamilyConfig::QuickAiNative,
+        BackendFamily::ClawBroNative => config::BackendFamilyConfig::ClawBroNative,
     };
     let launch = match spec.launch {
         LaunchSpec::ExternalCommand { command, args, env } => {
@@ -205,7 +217,7 @@ fn backend_catalog_entry(spec: BackendSpec) -> config::BackendCatalogEntry {
             .map(|server| config::ExternalMcpServerConfig {
                 name: server.name,
                 url: match server.transport {
-                    clawbro_runtime::ExternalMcpTransport::Sse { url } => url,
+                    crate::runtime::ExternalMcpTransport::Sse { url } => url,
                 },
             })
             .collect(),

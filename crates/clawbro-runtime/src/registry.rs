@@ -253,7 +253,7 @@ mod tests {
         registry
             .register_backend(BackendSpec {
                 backend_id: "native-main".into(),
-                family: BackendFamily::QuickAiNative,
+                family: BackendFamily::ClawBroNative,
                 adapter_key: "fake".into(),
                 launch: LaunchSpec::BundledCommand,
                 approval_mode: Default::default(),
@@ -277,7 +277,7 @@ mod tests {
         registry
             .register_backend(BackendSpec {
                 backend_id: "native-main".into(),
-                family: BackendFamily::QuickAiNative,
+                family: BackendFamily::ClawBroNative,
                 adapter_key: "native".into(),
                 launch: LaunchSpec::ExternalCommand {
                     command: "clawbro-rust-agent".into(),
@@ -365,7 +365,7 @@ mod tests {
         registry
             .register_backend(BackendSpec {
                 backend_id: "native-main".into(),
-                family: BackendFamily::QuickAiNative,
+                family: BackendFamily::ClawBroNative,
                 adapter_key: "native".into(),
                 launch: LaunchSpec::BundledCommand,
                 approval_mode: Default::default(),

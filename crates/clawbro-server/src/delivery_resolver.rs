@@ -2,13 +2,13 @@ use crate::channel_registry::ChannelRegistry;
 use crate::config::{
     DeliveryPurposeConfig, DeliverySenderBindingConfig, DeliveryTargetOverrideConfig, GatewayConfig,
 };
-use clawbro_agent::TurnDeliverySource;
-use clawbro_protocol::{OutboundMsg, SessionKey};
+use crate::agent_core::TurnDeliverySource;
+use crate::protocol::{OutboundMsg, SessionKey};
 use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct ResolvedDelivery {
-    pub sender: Arc<dyn clawbro_channels::Channel>,
+    pub sender: Arc<dyn crate::channels_internal::Channel>,
     pub sender_channel: String,
     pub sender_channel_instance: Option<String>,
     pub session_key: SessionKey,
@@ -20,7 +20,7 @@ impl ResolvedDelivery {
     pub fn outbound_text(&self, text: impl AsRef<str>) -> OutboundMsg {
         OutboundMsg {
             session_key: self.session_key.clone(),
-            content: clawbro_protocol::MsgContent::text(text.as_ref()),
+            content: crate::protocol::MsgContent::text(text.as_ref()),
             reply_to: self.reply_to.clone(),
             thread_ts: self.thread_ts.clone(),
         }
@@ -133,7 +133,7 @@ mod tests {
     use crate::channel_registry::ChannelRegistry;
     use anyhow::Result;
     use async_trait::async_trait;
-    use clawbro_protocol::{InboundMsg, SessionKey};
+    use crate::protocol::{InboundMsg, SessionKey};
     use tokio::sync::mpsc;
 
     struct TestChannel {
@@ -141,7 +141,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl clawbro_channels::Channel for TestChannel {
+    impl crate::channels_internal::Channel for TestChannel {
         fn name(&self) -> &str {
             self.name
         }

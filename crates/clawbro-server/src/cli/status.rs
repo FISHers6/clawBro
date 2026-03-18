@@ -2,26 +2,39 @@ use anyhow::Result;
 use console::style;
 
 pub async fn run() -> Result<()> {
-    let cfg_path = dirs::home_dir().unwrap_or_default().join(".clawbro").join("config.toml");
+    let cfg_path = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".clawbro")
+        .join("config.toml");
 
-    println!("{}", style("ClawBro Gateway — Status").bold().cyan());
+    println!("{}", style("ClawBro — Status").bold().cyan());
     println!("{}", "─".repeat(40));
 
     if !cfg_path.exists() {
-        println!("{} config.toml not found — run: clawbro setup", style("⚠").yellow());
+        println!(
+            "{} config.toml not found — run: clawbro setup",
+            style("⚠").yellow()
+        );
         return Ok(());
     }
 
     let content = std::fs::read_to_string(&cfg_path)?;
-    let val: toml::Value = toml::from_str(&content)
-        .unwrap_or(toml::Value::Table(toml::map::Map::new()));
+    let val: toml::Value =
+        toml::from_str(&content).unwrap_or(toml::Value::Table(toml::map::Map::new()));
 
     let port = val
         .get("gateway")
         .and_then(|g| g.get("port"))
         .and_then(|p| p.as_integer())
         .unwrap_or(0);
-    println!("  Port         {}", if port == 0 { "random".into() } else { port.to_string() });
+    println!(
+        "  Port         {}",
+        if port == 0 {
+            "random".into()
+        } else {
+            port.to_string()
+        }
+    );
 
     let roster_n = val
         .get("agent_roster")
@@ -48,7 +61,11 @@ pub async fn run() -> Result<()> {
         .unwrap_or_default();
     println!(
         "  Backends     {}",
-        if backends.is_empty() { "(none configured)".into() } else { backends.join(", ") }
+        if backends.is_empty() {
+            "(none configured)".into()
+        } else {
+            backends.join(", ")
+        }
     );
 
     let profiles: Vec<&str> = val
@@ -62,16 +79,23 @@ pub async fn run() -> Result<()> {
         .unwrap_or_default();
     println!(
         "  Providers    {}",
-        if profiles.is_empty() { "(none configured)".into() } else { profiles.join(", ") }
+        if profiles.is_empty() {
+            "(none configured)".into()
+        } else {
+            profiles.join(", ")
+        }
     );
 
     let lark = val.get("channels").and_then(|c| c.get("lark")).is_some();
-    let dt   = val.get("channels").and_then(|c| c.get("dingtalk")).is_some();
+    let dt = val
+        .get("channels")
+        .and_then(|c| c.get("dingtalk"))
+        .is_some();
     let ch_str = match (lark, dt) {
-        (true, true)  => "Lark + DingTalk",
+        (true, true) => "Lark + DingTalk",
         (true, false) => "Lark",
         (false, true) => "DingTalk",
-        _             => "WebSocket only",
+        _ => "WebSocket only",
     };
     println!("  Channel      {}", ch_str);
 
@@ -98,11 +122,16 @@ pub async fn run() -> Result<()> {
         if has_key {
             style("set").green().to_string()
         } else {
-            style("not set (source ~/.clawbro/.env)").yellow().to_string()
+            style("not set (source ~/.clawbro/.env)")
+                .yellow()
+                .to_string()
         }
     );
 
-    let port_file = dirs::home_dir().unwrap_or_default().join(".clawbro").join("gateway.port");
+    let port_file = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".clawbro")
+        .join("gateway.port");
     println!(
         "  Gateway      {}",
         if port_file.exists() {

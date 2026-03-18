@@ -4,7 +4,7 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(
     name = "clawbro",
-    about = "ClawBro Gateway — AI Agent 配置与运行",
+    about = "ClawBro — AI Agent 配置与运行",
     version,
     propagate_version = true
 )]
@@ -23,6 +23,15 @@ pub enum Commands {
     Config(ConfigArgs),
     /// 启动 Gateway 服务
     Serve(ServeArgs),
+    /// OpenClaw 团队工具内部辅助命令
+    #[command(hide = true)]
+    TeamHelper(TeamHelperArgs),
+    /// 内部 native runtime bridge
+    #[command(hide = true)]
+    RuntimeBridge,
+    /// 内部 ACP agent server
+    #[command(hide = true)]
+    AcpAgent,
     /// 诊断配置和运行环境
     Doctor,
     /// 显示当前配置摘要
@@ -51,6 +60,21 @@ pub struct SetupArgs {
     /// 运行模式
     #[arg(long, value_enum)]
     pub mode: Option<ModeArg>,
+    /// Team 模式下的 front bot 名称（默认: lead）
+    #[arg(long)]
+    pub front_bot: Option<String>,
+    /// Team 模式下的目标类型（direct-message 或 group）
+    #[arg(long, value_enum)]
+    pub team_target: Option<TeamTargetArg>,
+    /// Team 模式下的 specialist 名称，可重复传入
+    #[arg(long)]
+    pub specialist: Vec<String>,
+    /// Team 模式下的 scope（例如 user:ou_xxx 或 group:lark:chat-123）
+    #[arg(long)]
+    pub team_scope: Option<String>,
+    /// Team 模式下的可读名称
+    #[arg(long)]
+    pub team_name: Option<String>,
     /// WebSocket 认证 Token（留空 = 开放模式）
     #[arg(long)]
     pub ws_token: Option<String>,
@@ -80,7 +104,10 @@ pub enum AuthCommands {
     /// 列出已配置的 provider（key 脱敏显示）
     List,
     /// 检查 API Key 是否有效
-    Check,
+    Check {
+        /// 可选 provider 名称: anthropic | openai | deepseek | azure | ollama | custom
+        provider: Option<String>,
+    },
 }
 
 #[derive(clap::Args, Debug)]
@@ -110,13 +137,31 @@ pub struct ServeArgs {
 }
 
 #[derive(clap::Args, Debug)]
+#[command(trailing_var_arg = true)]
+pub struct TeamHelperArgs {
+    #[arg(long)]
+    pub url: String,
+    #[arg(long = "session-channel")]
+    pub session_channel: String,
+    #[arg(long = "session-scope")]
+    pub session_scope: String,
+    #[arg(value_name = "ARGS", allow_hyphen_values = true, num_args = 1..)]
+    pub command: Vec<String>,
+}
+
+#[derive(clap::Args, Debug)]
 pub struct CompletionsArgs {
     #[arg(value_enum)]
     pub shell: ShellArg,
 }
 
 #[derive(Debug, Clone, ValueEnum)]
-pub enum LangArg { Zh, En, Ja, Ko }
+pub enum LangArg {
+    Zh,
+    En,
+    Ja,
+    Ko,
+}
 
 #[derive(Debug, Clone, ValueEnum)]
 pub enum ProviderArg {
@@ -129,7 +174,22 @@ pub enum ProviderArg {
 }
 
 #[derive(Debug, Clone, ValueEnum)]
-pub enum ModeArg { Solo, Multi, Team }
+pub enum ModeArg {
+    Solo,
+    Multi,
+    Team,
+}
 
 #[derive(Debug, Clone, ValueEnum)]
-pub enum ShellArg { Bash, Zsh, Fish, PowerShell }
+pub enum TeamTargetArg {
+    DirectMessage,
+    Group,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+pub enum ShellArg {
+    Bash,
+    Zsh,
+    Fish,
+    PowerShell,
+}

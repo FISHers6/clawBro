@@ -11,11 +11,11 @@ use crate::{
     tools::{NoopToolAugmentor, RuntimeToolAugmentor},
 };
 
-pub struct QuickAiRuntimeBridge {
+pub struct ClawBroRuntimeBridge {
     config: AgentConfig,
 }
 
-impl QuickAiRuntimeBridge {
+impl ClawBroRuntimeBridge {
     pub fn new(config: AgentConfig) -> Self {
         Self { config }
     }
@@ -223,7 +223,7 @@ mod tests {
 
     #[test]
     fn runtime_bridge_constructs() {
-        let bridge = QuickAiRuntimeBridge::new(test_config());
+        let bridge = ClawBroRuntimeBridge::new(test_config());
         let _ = bridge;
     }
 

@@ -1,8 +1,10 @@
 use crate::config::GatewayConfig;
 use async_trait::async_trait;
-use clawbro_agent::{ApprovalDecision as AgentApprovalDecision, ApprovalResolver, SessionRegistry};
-use clawbro_protocol::AgentEvent;
-use clawbro_runtime::{ApprovalBroker, ApprovalDecision as RuntimeApprovalDecision, BackendRegistry};
+use crate::agent_core::{ApprovalDecision as AgentApprovalDecision, ApprovalResolver, SessionRegistry};
+use crate::protocol::AgentEvent;
+use crate::runtime::{
+    ApprovalBroker, ApprovalDecision as RuntimeApprovalDecision, BackendRegistry,
+};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 

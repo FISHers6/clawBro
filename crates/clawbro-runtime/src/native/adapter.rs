@@ -10,9 +10,9 @@ use crate::{
 use std::path::PathBuf;
 
 #[derive(Debug, Default, Clone, Copy)]
-pub struct QuickAiNativeBackendAdapter;
+pub struct ClawBroNativeBackendAdapter;
 
-impl QuickAiNativeBackendAdapter {
+impl ClawBroNativeBackendAdapter {
     fn resolve_bundled_shell_path() -> PathBuf {
         if let Ok(current_exe) = std::env::current_exe() {
             if let Some(dir) = current_exe.parent() {
@@ -27,16 +27,16 @@ impl QuickAiNativeBackendAdapter {
             .join("../../..")
             .canonicalize()
             .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.."));
-        let dev_debug = repo_root.join("clawbro-gateway/target/debug/clawbro-rust-agent");
+        let dev_debug = repo_root.join("clawBro/target/debug/clawbro-rust-agent");
         if dev_debug.exists() {
             return dev_debug;
         }
-        let dev_release = repo_root.join("clawbro-gateway/target/release/clawbro-rust-agent");
+        let dev_release = repo_root.join("clawBro/target/release/clawbro-rust-agent");
         if dev_release.exists() {
             return dev_release;
         }
 
-        repo_root.join("clawbro-gateway/target/debug/clawbro-rust-agent")
+        repo_root.join("clawBro/target/debug/clawbro-rust-agent")
     }
 
     fn command_config(spec: &BackendSpec) -> anyhow::Result<NativeCommandConfig> {
@@ -76,11 +76,11 @@ impl QuickAiNativeBackendAdapter {
 }
 
 #[async_trait::async_trait(?Send)]
-impl BackendAdapter for QuickAiNativeBackendAdapter {
+impl BackendAdapter for ClawBroNativeBackendAdapter {
     async fn probe(&self, spec: &BackendSpec) -> anyhow::Result<CapabilityProfile> {
-        if spec.family != BackendFamily::QuickAiNative {
+        if spec.family != BackendFamily::ClawBroNative {
             anyhow::bail!(
-                "native adapter requires QuickAiNative backend family, got {:?}",
+                "native adapter requires ClawBroNative backend family, got {:?}",
                 spec.family
             );
         }
@@ -93,9 +93,9 @@ impl BackendAdapter for QuickAiNativeBackendAdapter {
         session: RuntimeSessionSpec,
         sink: RuntimeEventSink,
     ) -> anyhow::Result<TurnResult> {
-        if spec.family != BackendFamily::QuickAiNative {
+        if spec.family != BackendFamily::ClawBroNative {
             anyhow::bail!(
-                "native adapter requires QuickAiNative backend family, got {:?}",
+                "native adapter requires ClawBroNative backend family, got {:?}",
                 spec.family
             );
         }
@@ -115,7 +115,7 @@ mod tests {
     fn native_spec() -> BackendSpec {
         BackendSpec {
             backend_id: "clawbro-native".into(),
-            family: BackendFamily::QuickAiNative,
+            family: BackendFamily::ClawBroNative,
             adapter_key: "native".into(),
             launch: LaunchSpec::BundledCommand,
             approval_mode: Default::default(),
@@ -129,7 +129,7 @@ mod tests {
 
     #[tokio::test]
     async fn native_adapter_probe_reports_default_profile() {
-        let adapter = QuickAiNativeBackendAdapter;
+        let adapter = ClawBroNativeBackendAdapter;
         let profile = adapter.probe(&native_spec()).await.unwrap();
 
         assert!(profile.workspace_native_contract);
@@ -140,13 +140,13 @@ mod tests {
 
     #[tokio::test]
     async fn native_adapter_run_turn_rejects_unsupported_launch_spec() {
-        let adapter = QuickAiNativeBackendAdapter;
+        let adapter = ClawBroNativeBackendAdapter;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let err = adapter
             .run_turn(
                 &BackendSpec {
                     backend_id: "clawbro-native".into(),
-                    family: BackendFamily::QuickAiNative,
+                    family: BackendFamily::ClawBroNative,
                     adapter_key: "native".into(),
                     launch: LaunchSpec::GatewayWs {
                         endpoint: "ws://127.0.0.1:18789".into(),
@@ -194,7 +194,7 @@ mod tests {
 
     #[test]
     fn native_adapter_bundled_launch_maps_to_default_runtime_bridge() {
-        let cfg = QuickAiNativeBackendAdapter::command_config(&native_spec()).unwrap();
+        let cfg = ClawBroNativeBackendAdapter::command_config(&native_spec()).unwrap();
         assert!(cfg.command.ends_with("clawbro-rust-agent"));
         assert!(cfg.args.iter().any(|a| a == "--runtime-bridge"));
     }

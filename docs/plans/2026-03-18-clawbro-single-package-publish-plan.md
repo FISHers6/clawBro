@@ -121,19 +121,36 @@ Target package surface:
 
 ## Migration Strategy
 
-The migration must be done bottom-up. Do not start by moving CLI or gateway entrypoints. Remove external crate boundaries from the lowest-level shared types first, then lift runtime and orchestration layers.
+The migration must be done by **type boundary**, not just by dependency depth. Shared crates that only provide package-local utilities can be folded in early. Crates whose types are still consumed by other internal crates must move together with those consumers.
 
-Recommended order:
+Validated constraint from implementation:
 
-1. Protocol
-2. Session
-3. Runtime
-4. Agent core
-5. Channels
-6. Skills
-7. Cron
-8. Top-level package manifest cleanup
-9. Packaging and dry-run publish validation
+- `clawbro-session` and `clawbro-protocol` cannot be folded into the top-level package first while `clawbro-agent` and `clawbro-runtime` still depend on the external crate versions.
+- Doing that creates duplicate nominal types (`SessionManager`, `SessionKey`, `TurnResult`, etc.) and breaks `clawbro` immediately.
+
+Correct migration order:
+
+1. Package surface and metadata (`clawbro` package/lib/bin naming)
+2. Leaf utility crates with no cross-crate public type coupling:
+   - `clawbro-skills`
+   - `clawbro-cron`
+3. Coupled runtime contract group, migrated as one batch:
+   - `clawbro-protocol`
+   - `clawbro-session`
+   - `clawbro-runtime`
+   - `clawbro-agent`
+   - `clawbro-channels`
+   - `clawbro-agent-sdk` if it remains internal and unpublished
+4. Top-level package manifest cleanup
+5. Packaging and dry-run publish validation
+
+Additional validated constraint:
+
+- If `clawbro-agent-sdk` is not published separately, the single-package publish path must also fold its code into `clawbro`, because copied runtime code still depends on `clawbro-agent-sdk` directly.
+- Therefore the final single-package target is either:
+  - publish `clawbro-agent-sdk`, or
+  - fold `clawbro-agent-sdk` into `clawbro`
+- Current product direction for this plan assumes the second path.
 
 ---
 
@@ -206,32 +223,154 @@ git commit -m "refactor: prepare clawbro package publish surface"
 
 ---
 
-## Chunk 2: Fold Protocol and Session into the Top-Level Package
+## Chunk 2: Fold Leaf Utility Crates into the Top-Level Package
 
-### Task 2: Internalize protocol and session code as package modules
+### Task 2: Internalize `clawbro-skills` as a package-local module
+
+**Files:**
+- Create: `clawBro/crates/clawbro-server/src/skills_internal/`
+- Modify: `clawBro/crates/clawbro-server/src/lib.rs`
+- Modify: `clawBro/crates/clawbro-server/Cargo.toml`
+- Read from: `clawBro/crates/clawbro-skills/src/**`
+
+- [ ] **Step 1: Copy `clawbro-skills` sources into `src/skills_internal/`**
+
+Preserve the current module split:
+- `identity.rs`
+- `loader.rs`
+- `manifest.rs`
+- `mbti.rs`
+- `persona_skill.rs`
+
+- [ ] **Step 2: Export `skills_internal` from top-level `lib.rs`**
+
+Add:
+
+```rust
+pub mod skills_internal;
+```
+
+- [ ] **Step 3: Rewrite top-level package imports**
+
+Only update imports inside `clawbro` package source from:
+
+```rust
+use clawbro_skills::...
+```
+
+to:
+
+```rust
+use crate::skills_internal::...
+```
+
+Do **not** modify `clawbro-agent` in this chunk.
+
+- [ ] **Step 4: Remove the direct `clawbro-skills` dependency from `clawbro`**
+
+Delete the dependency entry from `clawBro/crates/clawbro-server/Cargo.toml`.
+
+- [ ] **Step 5: Verify**
+
+Run:
+
+```bash
+cargo build -p clawbro --bin clawbro
+```
+
+Expected:
+- PASS
+
+### Task 3: Internalize `clawbro-cron` as a package-local module
+
+**Files:**
+- Create: `clawBro/crates/clawbro-server/src/cron_internal/`
+- Modify: `clawBro/crates/clawbro-server/src/lib.rs`
+- Modify: `clawBro/crates/clawbro-server/Cargo.toml`
+- Read from: `clawBro/crates/clawbro-cron/src/**`
+
+- [ ] **Step 1: Copy `clawbro-cron` sources into `src/cron_internal/`**
+
+Preserve the current module split:
+- `condition.rs`
+- `scheduler.rs`
+- `store.rs`
+
+- [ ] **Step 2: Export `cron_internal` from top-level `lib.rs`**
+
+Add:
+
+```rust
+pub mod cron_internal;
+```
+
+- [ ] **Step 3: Rewrite top-level package imports**
+
+Only update imports inside `clawbro` package source from:
+
+```rust
+use clawbro_cron::...
+```
+
+to:
+
+```rust
+use crate::cron_internal::...
+```
+
+- [ ] **Step 4: Add direct third-party dependencies now carried by `clawbro`**
+
+Add to `clawBro/crates/clawbro-server/Cargo.toml`:
+- `rusqlite`
+- `cron`
+
+with the same versions/features currently used by `clawbro-cron`.
+
+- [ ] **Step 5: Remove the direct `clawbro-cron` dependency from `clawbro`**
+
+- [ ] **Step 6: Verify**
+
+Run:
+
+```bash
+cargo build -p clawbro --bin clawbro
+```
+
+Expected:
+- PASS
+
+## Chunk 3: Fold the Coupled Runtime Contract Group into the Top-Level Package
+
+### Task 4: Internalize protocol, session, runtime, agent, channels, and SDK together
 
 **Files:**
 - Create: `clawBro/crates/clawbro-server/src/protocol/mod.rs`
 - Create: `clawBro/crates/clawbro-server/src/session/mod.rs`
+- Create: `clawBro/crates/clawbro-server/src/runtime/`
+- Create: `clawBro/crates/clawbro-server/src/agent_core/`
+- Create: `clawBro/crates/clawbro-server/src/channels_internal/`
 - Modify: `clawBro/crates/clawbro-server/src/lib.rs`
 - Modify: `clawBro/crates/clawbro-server/Cargo.toml`
 - Read from: `clawBro/crates/clawbro-protocol/src/**`
 - Read from: `clawBro/crates/clawbro-session/src/**`
+ - Read from: `clawBro/crates/clawbro-runtime/src/**`
+ - Read from: `clawBro/crates/clawbro-agent/src/**`
+ - Read from: `clawBro/crates/clawbro-channels/src/**`
+ - Read from: `clawBro/crates/clawbro-agent-sdk/src/**`
 
-- [ ] **Step 1: Copy protocol sources into `src/protocol/`**
+- [ ] **Step 1: Migrate this group in a single commit batch**
 
-Move the implementation, not the dependency:
-- `clawbro-protocol/src/lib.rs`
-- supporting files under that crate
+Do not split protocol/session away from runtime/agent/channels.
 
-Preserve module boundaries where possible.
+- [ ] **Step 2: Copy sources into top-level module trees**
 
-- [ ] **Step 2: Copy session sources into `src/session/`**
-
-Move:
-- `clawbro-session/src/lib.rs`
-- `manager.rs`
-- storage-related files
+Move the implementation, not the dependency boundary:
+- `clawbro-protocol` -> `src/protocol/`
+- `clawbro-session` -> `src/session/`
+- `clawbro-runtime` -> `src/runtime/`
+- `clawbro-agent` -> `src/agent_core/`
+- `clawbro-channels` -> `src/channels_internal/`
+ - `clawbro-agent-sdk` -> `src/agent_sdk_internal/`
 
 - [ ] **Step 3: Expose the modules from top-level `lib.rs`**
 
@@ -240,23 +379,24 @@ Add:
 ```rust
 pub mod protocol;
 pub mod session;
+pub mod runtime;
+pub mod agent_core;
+pub mod channels_internal;
 ```
 
-- [ ] **Step 4: Replace external imports**
+- [ ] **Step 4: Rewrite imports consistently**
 
-Rewrite imports from:
-
-```rust
-use clawbro_protocol::...
-use clawbro_session::...
-```
-
-to:
+Use:
 
 ```rust
 use crate::protocol::...
 use crate::session::...
+use crate::runtime::...
+use crate::agent_core::...
+use crate::channels_internal::...
 ```
+
+Avoid compatibility shims unless required to keep the chunk compiling.
 
 - [ ] **Step 5: Remove protocol/session path dependencies from Cargo.toml**
 

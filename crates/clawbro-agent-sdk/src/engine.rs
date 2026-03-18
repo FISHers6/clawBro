@@ -231,12 +231,7 @@ impl RigEngine {
         match &self.config.provider {
             Provider::Anthropic { base_url } => {
                 let registration = self
-                    .build_anthropic_agent(
-                        session,
-                        base_url.as_deref(),
-                        Some(tracker),
-                        augmentor,
-                    )
+                    .build_anthropic_agent(session, base_url.as_deref(), Some(tracker), augmentor)
                     .await?;
                 let agent = registration.builder.build();
                 let external_mcp_clients = registration.external_mcp_clients;
@@ -246,9 +241,10 @@ impl RigEngine {
             // OpenAI (with or without custom base URL) falls back to non-streaming for now.
             // on_delta is NOT called here — the caller (agent.rs) handles delivery via send_chunk_await
             // to avoid double-sending the response.
-            _ => self
-                .chat_with_augmentor(history, session, user_message, augmentor)
-                .await,
+            _ => {
+                self.chat_with_augmentor(history, session, user_message, augmentor)
+                    .await
+            }
         }
     }
 }

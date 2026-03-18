@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clawbro_runtime::{
+use clawbro::runtime::{
     RuntimeEvent, RuntimeRole, RuntimeSessionSpec, TeamToolCall, TeamToolRequest, TeamToolResponse,
 };
 use std::io::{self, Read};
@@ -116,7 +116,7 @@ async fn run_specialist(session: &RuntimeSessionSpec) -> Result<()> {
 
 async fn invoke_team_tool(
     url: &str,
-    session_key: &clawbro_protocol::SessionKey,
+    session_key: &clawbro::protocol::SessionKey,
     call: TeamToolCall,
 ) -> Result<()> {
     let response = reqwest::Client::new()

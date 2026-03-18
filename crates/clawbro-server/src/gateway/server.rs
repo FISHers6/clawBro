@@ -90,7 +90,7 @@ mod tests {
     use super::*;
     use crate::{config, state::AppState};
     use axum::{body::Body, http::Request};
-    use clawbro_agent::{
+    use crate::agent_core::{
         roster::AgentEntry,
         team::{
             heartbeat::DispatchFn, orchestrator::TeamOrchestrator, registry::TaskRegistry,
@@ -98,10 +98,10 @@ mod tests {
         },
         SessionRegistry,
     };
-    use clawbro_runtime::{
-        BackendFamily, BackendRegistry, BackendSpec, LaunchSpec, QuickAiNativeBackendAdapter,
+    use crate::runtime::{
+        BackendFamily, BackendRegistry, BackendSpec, ClawBroNativeBackendAdapter, LaunchSpec,
     };
-    use clawbro_session::{SessionManager, SessionStorage};
+    use crate::session::{SessionManager, SessionStorage};
     use std::sync::Arc;
     use tempfile::tempdir;
     use tower::util::ServiceExt;
@@ -110,7 +110,7 @@ mod tests {
         let cfg = config::GatewayConfig {
             backends: vec![config::BackendCatalogEntry {
                 id: "native-main".to_string(),
-                family: config::BackendFamilyConfig::QuickAiNative,
+                family: config::BackendFamilyConfig::ClawBroNative,
                 adapter_key: Some("native".to_string()),
                 acp_backend: None,
                 acp_auth_method: None,
@@ -173,12 +173,12 @@ mod tests {
 
         let runtime_registry = Arc::new(BackendRegistry::new());
         runtime_registry
-            .register_adapter("native", Arc::new(QuickAiNativeBackendAdapter))
+            .register_adapter("native", Arc::new(ClawBroNativeBackendAdapter))
             .await;
         runtime_registry
             .register_backend(BackendSpec {
                 backend_id: "native-main".into(),
-                family: BackendFamily::QuickAiNative,
+                family: BackendFamily::ClawBroNative,
                 adapter_key: "native".into(),
                 launch: LaunchSpec::BundledCommand,
                 approval_mode: Default::default(),
@@ -197,7 +197,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(8).0,
             cfg: Arc::new(cfg),
             runtime_token: Arc::new("status-token".to_string()),
-            approvals: clawbro_runtime::ApprovalBroker::default(),
+            approvals: crate::runtime::ApprovalBroker::default(),
         }
     }
 
@@ -241,8 +241,8 @@ mod tests {
             dispatch_fn,
             std::time::Duration::from_secs(60),
         );
-        orch.set_lead_session_key(clawbro_protocol::SessionKey::new("lark", "group:status"));
-        orch.set_scope(clawbro_protocol::SessionKey::new("lark", "group:status"));
+        orch.set_lead_session_key(crate::protocol::SessionKey::new("lark", "group:status"));
+        orch.set_scope(crate::protocol::SessionKey::new("lark", "group:status"));
         orch.set_lead_agent_name("claude".to_string());
         orch.set_available_specialists(vec!["codex".to_string()]);
         state

@@ -46,7 +46,7 @@ impl acp::Agent for TeamFixtureAgent {
         Ok(acp::InitializeResponse::new(arguments.protocol_version)
             .agent_info(
                 acp::Implementation::new("clawbro-acp-team-fixture", "0.1.0")
-                    .title("QAI ACP Team Fixture"),
+                    .title("ClawBro ACP Team Fixture"),
             )
             .agent_capabilities(
                 acp::AgentCapabilities::default()

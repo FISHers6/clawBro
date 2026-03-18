@@ -11,8 +11,8 @@ use std::collections::HashMap;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::config::AgentConfig;
-use crate::runtime_bridge::QuickAiRuntimeBridge;
-use crate::team::QuickAiTeamToolAugmentor;
+use crate::runtime_bridge::ClawBroRuntimeBridge;
+use crate::team::ClawBroTeamToolAugmentor;
 use clawbro_agent_sdk::bridge::{
     AgentEvent, AgentTurnRequest, ExecutionRole, RuntimeContext, RuntimeHistoryMessage,
     ToolSurfaceSpec,
@@ -20,7 +20,7 @@ use clawbro_agent_sdk::bridge::{
 
 pub type NotifTx = mpsc::UnboundedSender<(acp::SessionNotification, oneshot::Sender<()>)>;
 
-pub struct QuickAiAgent {
+pub struct ClawBroAgent {
     next_session_id: Cell<u64>,
     notif_tx: NotifTx,
     config: Option<AgentConfig>,
@@ -28,7 +28,7 @@ pub struct QuickAiAgent {
     sessions: RefCell<HashMap<String, Vec<RuntimeHistoryMessage>>>,
 }
 
-impl QuickAiAgent {
+impl ClawBroAgent {
     pub fn new(notif_tx: NotifTx, config: Option<AgentConfig>) -> Self {
         Self {
             next_session_id: Cell::new(0),
@@ -69,7 +69,7 @@ impl QuickAiAgent {
 }
 
 #[async_trait::async_trait(?Send)]
-impl acp::Agent for QuickAiAgent {
+impl acp::Agent for ClawBroAgent {
     async fn initialize(
         &self,
         _args: acp::InitializeRequest,
@@ -134,8 +134,8 @@ impl acp::Agent for QuickAiAgent {
                     .cloned()
                     .unwrap_or_default();
 
-                let bridge = QuickAiRuntimeBridge::new(config.clone());
-                let team_tools = QuickAiTeamToolAugmentor::from_env();
+                let bridge = ClawBroRuntimeBridge::new(config.clone());
+                let team_tools = ClawBroTeamToolAugmentor::from_env();
                 let notif_tx = self.notif_tx.clone();
                 let session_id_for_delta = args.session_id.clone();
 
@@ -239,7 +239,7 @@ mod tests {
     #[test]
     fn test_agent_new_stub_mode() {
         let (tx, _rx) = mpsc::unbounded_channel();
-        let agent = QuickAiAgent::new(tx, None);
+        let agent = ClawBroAgent::new(tx, None);
         assert_eq!(agent.next_session_id.get(), 0);
         assert!(agent.config.is_none());
         assert!(agent.sessions.borrow().is_empty());
@@ -255,7 +255,7 @@ mod tests {
             model: "claude-opus-4-6".to_string(),
             system_prompt: "test".to_string(),
         };
-        let agent = QuickAiAgent::new(tx, Some(config));
+        let agent = ClawBroAgent::new(tx, Some(config));
         assert!(agent.config.is_some());
     }
 
@@ -267,7 +267,7 @@ mod tests {
             model: "gpt-4o".to_string(),
             system_prompt: "test".to_string(),
         };
-        assert!(QuickAiAgent::should_send_final_chunk(&openai_default));
+        assert!(ClawBroAgent::should_send_final_chunk(&openai_default));
 
         let openai_deepseek = AgentConfig {
             provider: Provider::OpenAI {
@@ -277,7 +277,7 @@ mod tests {
             model: "deepseek-chat".to_string(),
             system_prompt: "test".to_string(),
         };
-        assert!(!QuickAiAgent::should_send_final_chunk(&openai_deepseek));
+        assert!(!ClawBroAgent::should_send_final_chunk(&openai_deepseek));
 
         let native_deepseek = AgentConfig {
             provider: Provider::DeepSeek,
@@ -285,6 +285,6 @@ mod tests {
             model: "deepseek-chat".to_string(),
             system_prompt: "test".to_string(),
         };
-        assert!(!QuickAiAgent::should_send_final_chunk(&native_deepseek));
+        assert!(!ClawBroAgent::should_send_final_chunk(&native_deepseek));
     }
 }

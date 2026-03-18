@@ -4,20 +4,26 @@ use console::style;
 
 pub async fn run(args: ConfigArgs) -> Result<()> {
     match args.command {
-        ConfigCommands::Show     => cmd_show(),
+        ConfigCommands::Show => cmd_show(),
         ConfigCommands::Validate => cmd_validate(),
-        ConfigCommands::Edit     => cmd_edit(),
+        ConfigCommands::Edit => cmd_edit(),
     }
 }
 
 fn config_path() -> std::path::PathBuf {
-    dirs::home_dir().unwrap_or_default().join(".clawbro").join("config.toml")
+    dirs::home_dir()
+        .unwrap_or_default()
+        .join(".clawbro")
+        .join("config.toml")
 }
 
 fn cmd_show() -> Result<()> {
     let path = config_path();
     if !path.exists() {
-        println!("{} config.toml not found — run: clawbro setup", style("✗").red());
+        println!(
+            "{} config.toml not found — run: clawbro setup",
+            style("✗").red()
+        );
         return Ok(());
     }
     let content = std::fs::read_to_string(&path)?;
@@ -53,15 +59,22 @@ fn cmd_validate() -> Result<()> {
     let content = std::fs::read_to_string(&path)?;
     let _: toml::Value = toml::from_str(&content).context("TOML syntax error")?;
     let cfg = crate::config::GatewayConfig::load().context("config load failed")?;
-    cfg.validate_runtime_topology().context("topology validation failed")?;
-    println!("{} Config syntax and topology are valid", style("✓").green());
+    cfg.validate_runtime_topology()
+        .context("topology validation failed")?;
+    println!(
+        "{} Config syntax and topology are valid",
+        style("✓").green()
+    );
     Ok(())
 }
 
 fn cmd_edit() -> Result<()> {
     let path = config_path();
     if !path.exists() {
-        println!("{} config.toml not found — run: clawbro setup", style("✗").red());
+        println!(
+            "{} config.toml not found — run: clawbro setup",
+            style("✗").red()
+        );
         return Ok(());
     }
     let editor = std::env::var("EDITOR")
@@ -99,7 +112,8 @@ mod tests {
 
     #[test]
     fn redact_api_key_field() {
-        let toml = "auth_token_env = \"ANTHROPIC_API_KEY\"\nbase_url = \"https://api.anthropic.com\"";
+        let toml =
+            "auth_token_env = \"ANTHROPIC_API_KEY\"\nbase_url = \"https://api.anthropic.com\"";
         let out = redact_secrets(toml);
         // auth_token_env contains "api_key" in the value name but it's the env var NAME, not the actual key
         // The field name doesn't contain secret/token/password/api_key — so it won't be redacted

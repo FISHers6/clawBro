@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clawbro_runtime::{RuntimeEvent, RuntimeRole, RuntimeSessionSpec};
+use clawbro::runtime::{RuntimeEvent, RuntimeRole, RuntimeSessionSpec};
 use std::io::{self, Read};
 
 #[tokio::main(flavor = "current_thread")]

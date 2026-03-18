@@ -327,7 +327,7 @@ pub mod cli;
 - [ ] **1.9 验证编译 + --help**
 
 ```bash
-cd /Users/fishers/Desktop/repo/clawbro-openclaw/clawbro-gateway
+cd /Users/fishers/Desktop/repo/clawbro-openclaw/clawBro-gateway
 cargo build -p clawbro-server --bin clawbro 2>&1 | grep -E "^error" | head -20
 cargo run -p clawbro-server --bin clawbro -- --help 2>&1
 ```

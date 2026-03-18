@@ -1,4 +1,4 @@
-// clawbro-gateway/crates/clawbro-agent/src/registry.rs
+// clawBro-gateway/crates/clawbro-agent/src/registry.rs
 //! SessionRegistry: per-session backend routing + generic @mention routing.
 //! Architectural role: Gateway orchestration layer (not platform-specific).
 //! - Channels extract @mentions → InboundMsg.target_agent
@@ -23,7 +23,6 @@ use crate::team::tool_executor::{execute_team_tool_call, resolve_team_tool_role}
 use crate::turn_context::{TurnDeliverySource, TurnExecutionContext};
 use crate::ApprovalResolver;
 use anyhow::Result;
-use dashmap::DashMap;
 use clawbro_channels::mention_trigger::MentionTrigger;
 use clawbro_protocol::{
     normalize_conversation_identity, parse_session_key_text, AgentEvent, InboundMsg, SessionKey,
@@ -31,6 +30,7 @@ use clawbro_protocol::{
 use clawbro_runtime::contract::{ResumeRecoveryAction, TeamCallback, TurnResult};
 use clawbro_runtime::{RuntimeEvent, TeamToolCall, TeamToolResponse};
 use clawbro_session::{ResumableBackendSession, ResumeDropReason, SessionManager, StoredMessage};
+use dashmap::DashMap;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
 use uuid::Uuid;

@@ -5,7 +5,7 @@
 //! To run:
 //!   LARK_APP_ID=cli_YOUR_APP_ID \
 //!   LARK_APP_SECRET=YOUR_APP_SECRET \
-//!   cargo test -p clawbro-server --test e2e_lark -- --ignored --nocapture
+//!   cargo test -p clawbro --test e2e_lark -- --ignored --nocapture
 //!
 //! For send test, also set:
 //!   LARK_TEST_OPEN_ID=ou_xxx  (open_id of the user to DM)
@@ -63,7 +63,7 @@ async fn get_feishu_ws_url(app_id: &str, app_secret: &str) -> String {
 }
 
 #[tokio::test]
-#[ignore = "requires LARK_APP_ID + LARK_APP_SECRET - run with: cargo test -p clawbro-server --test e2e_lark -- --ignored --nocapture"]
+#[ignore = "requires LARK_APP_ID + LARK_APP_SECRET - run with: cargo test -p clawbro --test e2e_lark -- --ignored --nocapture"]
 async fn test_lark_auth_and_connect() {
     let app_id = match std::env::var("LARK_APP_ID") {
         Ok(v) if !v.is_empty() => v,

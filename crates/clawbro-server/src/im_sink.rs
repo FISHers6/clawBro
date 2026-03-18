@@ -3,14 +3,14 @@ use crate::config::{DeliveryPurposeConfig, GatewayConfig, ProgressPresentationMo
 use crate::delivery_resolver::{resolve_delivery, ResolvedDelivery};
 use crate::progress_presentation;
 use async_trait::async_trait;
-use clawbro_agent::team::orchestrator::TeamOrchestrator;
-use clawbro_agent::team::session::{ChannelSendSourceKind, ChannelSendStatus};
-use clawbro_agent::{
+use crate::agent_core::team::orchestrator::TeamOrchestrator;
+use crate::agent_core::team::session::{ChannelSendSourceKind, ChannelSendStatus};
+use crate::agent_core::{
     throttled_stream, OutputSink, SessionRegistry, StreamControl, TurnDeliverySource,
     TurnExecutionContext,
 };
-use clawbro_channels::Channel;
-use clawbro_protocol::{AgentEvent, InboundMsg, OutboundMsg, SessionKey};
+use crate::channels_internal::Channel;
+use crate::protocol::{AgentEvent, InboundMsg, OutboundMsg, SessionKey};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -89,7 +89,7 @@ impl OutputSink for ImProgressSink {
         recent.insert(progress.to_string(), now);
         let msg = OutboundMsg {
             session_key: self.session_key.clone(),
-            content: clawbro_protocol::MsgContent::text(progress),
+            content: crate::protocol::MsgContent::text(progress),
             reply_to: self.reply_to.clone(),
             thread_ts: self.thread_ts.clone(),
         };
@@ -113,7 +113,7 @@ impl OutputSink for ImProgressSink {
     async fn send_final(&self, text: &str, _placeholder_id: Option<&str>) {
         let msg = OutboundMsg {
             session_key: self.session_key.clone(),
-            content: clawbro_protocol::MsgContent::text(text),
+            content: crate::protocol::MsgContent::text(text),
             reply_to: self.reply_to.clone(),
             thread_ts: self.thread_ts.clone(),
         };
@@ -205,8 +205,9 @@ fn record_team_channel_send(
     };
     if record_leader_fragment && source_kind == ChannelSendSourceKind::LeadText {
         team_orchestrator.record_leader_fragment(
-            clawbro_agent::team::session::LeaderUpdateKind::FinalAnswerFragment,
+            crate::agent_core::team::session::LeaderUpdateKind::FinalAnswerFragment,
             text,
+            None,
         );
     }
     let source_agent = team_orchestrator
@@ -408,7 +409,7 @@ pub fn spawn_im_turn(
                         );
                         let msg = OutboundMsg {
                             session_key: send_session_key.clone(),
-                            content: clawbro_protocol::MsgContent::text(&reply),
+                            content: crate::protocol::MsgContent::text(&reply),
                             reply_to: send_reply_to,
                             thread_ts: send_thread_ts,
                         };
@@ -449,11 +450,11 @@ pub fn spawn_im_turn(
 mod tests {
     use super::*;
     use anyhow::Result;
-    use clawbro_agent::team::heartbeat::DispatchFn;
-    use clawbro_agent::team::orchestrator::TeamOrchestrator;
-    use clawbro_agent::team::registry::TaskRegistry;
-    use clawbro_agent::team::session::TeamSession;
-    use clawbro_protocol::MsgContent;
+    use crate::agent_core::team::heartbeat::DispatchFn;
+    use crate::agent_core::team::orchestrator::TeamOrchestrator;
+    use crate::agent_core::team::registry::TaskRegistry;
+    use crate::agent_core::team::session::TeamSession;
+    use crate::protocol::MsgContent;
     use std::sync::{Arc, Mutex as StdMutex};
     use tempfile::tempdir;
     use tokio::sync::mpsc;

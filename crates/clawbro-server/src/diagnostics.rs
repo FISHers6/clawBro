@@ -1,9 +1,9 @@
 use crate::{config, state::AppState};
-use clawbro_agent::team::orchestrator::{
+use crate::agent_core::team::orchestrator::{
     TeamArtifactHealthSummary, TeamRoutingStats, TeamRuntimeSummary, TeamState, TeamTaskCounts,
 };
-use clawbro_agent::team::session::{ChannelSendRecord, LeaderUpdateRecord};
-use clawbro_runtime::{
+use crate::agent_core::team::session::{ChannelSendRecord, LeaderUpdateRecord};
+use crate::runtime::{
     provider_profiles::ConfiguredProviderProtocol, AcpBackend, BackendFamily, CapabilityProfile,
 };
 use serde::Serialize;
@@ -192,7 +192,7 @@ pub async fn collect_backend_diagnostics(state: &AppState) -> Vec<BackendDiagnos
 
         let acp_backend = spec.acp_backend;
         let acp_support_category = AcpSupportCategory::for_backend(acp_backend);
-        if spec.family == BackendFamily::QuickAiNative {
+        if spec.family == BackendFamily::ClawBroNative {
             if let Some(profile) = &spec.provider_profile {
                 if let ConfiguredProviderProtocol::AnthropicCompatible { base_url, .. } =
                     &profile.protocol
@@ -721,7 +721,7 @@ fn binding_summary(binding: &config::BindingConfig) -> BindingSummary {
 mod tests {
     use super::*;
     use crate::{config, state::AppState};
-    use clawbro_agent::{
+    use crate::agent_core::{
         team::{
             heartbeat::DispatchFn,
             orchestrator::TeamOrchestrator,
@@ -730,8 +730,8 @@ mod tests {
         },
         SessionRegistry, TurnDeliverySource,
     };
-    use clawbro_runtime::{ApprovalBroker, BackendRegistry, BackendSpec, LaunchSpec};
-    use clawbro_session::{SessionManager, SessionStorage};
+    use crate::runtime::{ApprovalBroker, BackendRegistry, BackendSpec, LaunchSpec};
+    use crate::session::{SessionManager, SessionStorage};
     use std::sync::Arc;
     use tempfile::tempdir;
 
@@ -739,7 +739,7 @@ mod tests {
         let cfg = config::GatewayConfig {
             backends: vec![config::BackendCatalogEntry {
                 id: "native-main".to_string(),
-                family: config::BackendFamilyConfig::QuickAiNative,
+                family: config::BackendFamilyConfig::ClawBroNative,
                 adapter_key: Some("native".to_string()),
                 acp_backend: None,
                 acp_auth_method: None,
@@ -790,13 +790,16 @@ mod tests {
         let runtime_registry = Arc::new(BackendRegistry::new());
         if register_adapter {
             runtime_registry
-                .register_adapter("native", Arc::new(clawbro_runtime::QuickAiNativeBackendAdapter))
+                .register_adapter(
+                    "native",
+                    Arc::new(crate::runtime::ClawBroNativeBackendAdapter),
+                )
                 .await;
         }
         runtime_registry
             .register_backend(BackendSpec {
                 backend_id: "native-main".into(),
-                family: BackendFamily::QuickAiNative,
+                family: BackendFamily::ClawBroNative,
                 adapter_key: "native".into(),
                 launch: LaunchSpec::BundledCommand,
                 approval_mode: Default::default(),
@@ -821,7 +824,7 @@ mod tests {
     #[test]
     fn acp_support_category_bridge_backed_for_claude_codex_codebuddy() {
         use super::AcpSupportCategory;
-        use clawbro_runtime::AcpBackend;
+        use crate::runtime::AcpBackend;
         assert_eq!(
             AcpSupportCategory::for_backend(Some(AcpBackend::Claude)),
             Some(AcpSupportCategory::SupportedWithBridge)
@@ -839,7 +842,7 @@ mod tests {
     #[test]
     fn acp_support_category_generic_for_qwen_goose_etc() {
         use super::AcpSupportCategory;
-        use clawbro_runtime::AcpBackend;
+        use crate::runtime::AcpBackend;
         assert_eq!(
             AcpSupportCategory::for_backend(Some(AcpBackend::Qwen)),
             Some(AcpSupportCategory::GenericAcpCli)
@@ -918,7 +921,7 @@ mod tests {
         session.write_team_md("manifest").unwrap();
         let registry = Arc::new(TaskRegistry::new_in_memory().unwrap());
         registry
-            .create_task(clawbro_agent::team::registry::CreateTask {
+            .create_task(crate::agent_core::team::registry::CreateTask {
                 id: "T001".into(),
                 title: "Do work".into(),
                 ..Default::default()
@@ -964,15 +967,15 @@ mod tests {
             std::time::Duration::from_secs(60),
         );
         session
-            .append_pending_completion(&clawbro_agent::team::completion_routing::TeamRoutingEnvelope {
+            .append_pending_completion(&crate::agent_core::team::completion_routing::TeamRoutingEnvelope {
                 run_id: "run-1".into(),
                 parent_run_id: None,
-                requester_session_key: Some(clawbro_protocol::SessionKey::new("ws", "group:routing")),
+                requester_session_key: Some(crate::protocol::SessionKey::new("ws", "group:routing")),
                 fallback_session_keys: vec![],
                 team_id: "team-routing".into(),
                 delivery_status:
-                    clawbro_agent::team::completion_routing::RoutingDeliveryStatus::PersistedPending,
-                event: clawbro_agent::team::completion_routing::TeamRoutingEvent::failed(
+                    crate::agent_core::team::completion_routing::RoutingDeliveryStatus::PersistedPending,
+                event: crate::agent_core::team::completion_routing::TeamRoutingEvent::failed(
                     "T001", "pending",
                 ),
                 delivery_source: None,
@@ -1023,7 +1026,7 @@ mod tests {
             dispatch_fn,
             std::time::Duration::from_secs(60),
         );
-        let lead_key = clawbro_protocol::SessionKey::with_instance("lark", "alpha", "group:diag");
+        let lead_key = crate::protocol::SessionKey::with_instance("lark", "alpha", "group:diag");
         let lead_source = TurnDeliverySource::from_session_key(&lead_key)
             .with_reply_context(Some("om_1".into()), Some("th_1".into()));
         session

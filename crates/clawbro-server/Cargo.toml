@@ -1,37 +1,70 @@
 [package]
-name = "clawbro-server"
+name = "clawbro"
 version = "0.1.0"
-publish = false
 edition = "2021"
+rust-version = "1.90"
+autobins = false
+description = "ClawBro AI runtime and CLI"
+license = "MIT"
+repository = "https://github.com/fishers/clawbro"
+readme = "README.md"
+keywords = ["ai", "agent", "cli", "runtime"]
+categories = ["command-line-utilities"]
+
+[features]
+default = []
+internal-bins = []
+internal-sdk-tests = []
 
 [lib]
-name = "clawbro_server"
+name = "clawbro"
 path = "src/lib.rs"
-
-[[bin]]
-name = "clawbro-gateway"
-path = "src/main.rs"
 
 [[bin]]
 name = "clawbro-team-cli"
 path = "src/bin/clawbro_team_cli.rs"
+required-features = ["internal-bins"]
 
 [[bin]]
 name = "clawbro_acp_approval_fixture"
 path = "src/bin/clawbro_acp_approval_fixture.rs"
+required-features = ["internal-bins"]
 
 [[bin]]
 name = "clawbro"
 path = "src/bin/clawbro_cli.rs"
 
+[[bin]]
+name = "clawbro_acp_echo_fixture"
+path = "src/bin/clawbro_acp_echo_fixture.rs"
+required-features = ["internal-bins"]
+
+[[bin]]
+name = "clawbro_acp_team_fixture"
+path = "src/bin/clawbro_acp_team_fixture.rs"
+required-features = ["internal-bins"]
+
+[[bin]]
+name = "clawbro_native_echo_fixture"
+path = "src/bin/clawbro_native_echo_fixture.rs"
+required-features = ["internal-bins"]
+
+[[bin]]
+name = "clawbro_native_team_fixture"
+path = "src/bin/clawbro_native_team_fixture.rs"
+required-features = ["internal-bins"]
+
+[[bin]]
+name = "clawbro_native_team_missing_completion_fixture"
+path = "src/bin/clawbro_native_team_missing_completion_fixture.rs"
+required-features = ["internal-bins"]
+
+[[bin]]
+name = "clawbro_openclaw_gateway_fixture"
+path = "src/bin/clawbro_openclaw_gateway_fixture.rs"
+required-features = ["internal-bins"]
+
 [dependencies]
-clawbro-protocol  = { path = "../clawbro-protocol", version = "0.1.0" }
-clawbro-session   = { path = "../clawbro-session", version = "0.1.0" }
-clawbro-agent     = { path = "../clawbro-agent", version = "0.1.0" }
-clawbro-runtime   = { path = "../clawbro-runtime", version = "0.1.0" }
-clawbro-channels  = { path = "../clawbro-channels", version = "0.1.0" }
-clawbro-skills    = { path = "../clawbro-skills", version = "0.1.0" }
-clawbro-cron      = { path = "../clawbro-cron", version = "0.1.0" }
 tokio.workspace    = true
 chrono.workspace   = true
 futures.workspace  = true
@@ -46,23 +79,31 @@ toml.workspace     = true
 dirs.workspace     = true
 async-trait.workspace = true
 reqwest.workspace = true
-agent-client-protocol = { version = "0.10.2" }
+dashmap.workspace = true
+prost.workspace = true
+agent-client-protocol = { version = "0.10.2", features = ["unstable_session_usage"] }
 clap.workspace          = true
 clap_complete.workspace = true
 dialoguer.workspace     = true
 console.workspace       = true
 which.workspace         = true
 tokio-util = { version = "0.7", features = ["compat"] }
-rmcp = { version = "=0.8.5", features = ["client", "transport-sse-client-reqwest"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
+rmcp = { version = "=0.8.5", features = ["client", "server", "transport-sse-client-reqwest", "transport-sse-server", "transport-streamable-http-server"] }
+rmcp06 = { package = "rmcp", version = "0.6.4", features = ["client", "transport-sse-client-reqwest"] }
+rig = { package = "rig-core", version = "0.20", path = "../../../vendor/rig-core-0.20.0", features = ["rmcp"] }
 rustls = { version = "0.23", features = ["ring"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+cron = "0.12"
+glob = "0.3"
+walkdir = "2.5"
+regex = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
 futures-util = "0.3"
 reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }
-clawbro-channels = { path = "../clawbro-channels", version = "0.1.0" }
-clawbro-protocol = { path = "../clawbro-protocol", version = "0.1.0" }
 chrono = { version = "0.4", features = ["serde"] }
 serde_json = "1"
 uuid = { version = "1.6", features = ["v4"] }

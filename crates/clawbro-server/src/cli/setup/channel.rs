@@ -55,7 +55,11 @@ fn collect_lark(m: &Messages, theme: &ColorfulTheme) -> Result<ChannelConfig> {
         .with_prompt(m.enter_lark_bot_name)
         .allow_empty(true)
         .interact_text()?;
-    let bot_name = if bot_raw.trim().is_empty() { None } else { Some(bot_raw.trim().to_string()) };
+    let bot_name = if bot_raw.trim().is_empty() {
+        None
+    } else {
+        Some(bot_raw.trim().to_string())
+    };
     Ok(ChannelConfig::Lark(LarkCfg {
         app_id: app_id.trim().to_string(),
         app_secret,
@@ -80,7 +84,11 @@ fn collect_dingtalk(m: &Messages, theme: &ColorfulTheme) -> Result<ChannelConfig
         .with_prompt(m.enter_dingtalk_bot_name)
         .allow_empty(true)
         .interact_text()?;
-    let bot_name = if bot_raw.trim().is_empty() { None } else { Some(bot_raw.trim().to_string()) };
+    let bot_name = if bot_raw.trim().is_empty() {
+        None
+    } else {
+        Some(bot_raw.trim().to_string())
+    };
     Ok(ChannelConfig::DingTalk(DingTalkCfg {
         client_id: client_id.trim().to_string(),
         client_secret,

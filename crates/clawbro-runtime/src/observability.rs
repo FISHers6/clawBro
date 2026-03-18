@@ -7,7 +7,7 @@ pub fn backend_family_name(family: BackendFamily) -> &'static str {
     match family {
         BackendFamily::Acp => "acp",
         BackendFamily::OpenClawGateway => "openclaw_gateway",
-        BackendFamily::QuickAiNative => "clawbro_native",
+        BackendFamily::ClawBroNative => "clawbro_native",
     }
 }
 

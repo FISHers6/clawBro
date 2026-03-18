@@ -47,7 +47,7 @@ async fn main() -> anyhow::Result<()> {
             let (notif_tx, mut notif_rx) = tokio::sync::mpsc::unbounded_channel();
 
             let (conn, handle_io) = acp::AgentSideConnection::new(
-                agent::QuickAiAgent::new(notif_tx, agent_config),
+                agent::ClawBroAgent::new(notif_tx, agent_config),
                 outgoing,
                 incoming,
                 |fut| {

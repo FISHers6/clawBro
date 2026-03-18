@@ -1,4 +1,4 @@
-// clawbro-gateway/crates/clawbro-agent/src/prompt_builder.rs
+// clawBro-gateway/crates/clawbro-agent/src/prompt_builder.rs
 //! SystemPromptBuilder: assembles the 7-layer system prompt in the canonical order
 //! defined in docs/人格实现研究.md.
 
