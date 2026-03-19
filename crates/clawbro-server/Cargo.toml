@@ -21,48 +21,8 @@ name = "clawbro"
 path = "src/lib.rs"
 
 [[bin]]
-name = "clawbro-team-cli"
-path = "src/bin/clawbro_team_cli.rs"
-required-features = ["internal-bins"]
-
-[[bin]]
-name = "clawbro_acp_approval_fixture"
-path = "src/bin/clawbro_acp_approval_fixture.rs"
-required-features = ["internal-bins"]
-
-[[bin]]
 name = "clawbro"
 path = "src/bin/clawbro_cli.rs"
-
-[[bin]]
-name = "clawbro_acp_echo_fixture"
-path = "src/bin/clawbro_acp_echo_fixture.rs"
-required-features = ["internal-bins"]
-
-[[bin]]
-name = "clawbro_acp_team_fixture"
-path = "src/bin/clawbro_acp_team_fixture.rs"
-required-features = ["internal-bins"]
-
-[[bin]]
-name = "clawbro_native_echo_fixture"
-path = "src/bin/clawbro_native_echo_fixture.rs"
-required-features = ["internal-bins"]
-
-[[bin]]
-name = "clawbro_native_team_fixture"
-path = "src/bin/clawbro_native_team_fixture.rs"
-required-features = ["internal-bins"]
-
-[[bin]]
-name = "clawbro_native_team_missing_completion_fixture"
-path = "src/bin/clawbro_native_team_missing_completion_fixture.rs"
-required-features = ["internal-bins"]
-
-[[bin]]
-name = "clawbro_openclaw_gateway_fixture"
-path = "src/bin/clawbro_openclaw_gateway_fixture.rs"
-required-features = ["internal-bins"]
 
 [dependencies]
 tokio.workspace    = true
