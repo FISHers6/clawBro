@@ -3,12 +3,12 @@ use crate::channel_registry::ChannelRegistry;
 use crate::config;
 use crate::delivery_resolver::resolve_delivery;
 use crate::protocol::{parse_session_key_text, InboundMsg, MsgContent, MsgSource, SessionKey};
-use anyhow::Result;
-use clawbro_cron::{
+use crate::scheduler::{
     DeliveryMessageTarget, ExecutionFn, ExecutionOutcome, ExecutionPrecondition, RunStatus,
     ScheduledJob, ScheduledTarget, Scheduler, SchedulerConfig, SchedulerService, SchedulerStore,
     StoreConfig,
 };
+use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::Arc;
 

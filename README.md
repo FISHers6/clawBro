@@ -433,7 +433,7 @@ clawBro/
 ├── crates/clawbro-agent-sdk/    # runtime bridge and reusable agent shell
 ├── crates/clawbro-session/      # session storage and queueing
 ├── crates/clawbro-skills/       # skills and persona loading
-├── crates/clawbro-cron/         # cron scheduling support
+├── crates/clawbro-server/src/scheduler/  # internal scheduler modules
 └── docs/                        # setup, routing, backend, and operations docs
 ```
 

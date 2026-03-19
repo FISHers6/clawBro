@@ -8,8 +8,8 @@ use crate::protocol::AgentEvent;
 use crate::runtime::{
     ApprovalBroker, ApprovalDecision as RuntimeApprovalDecision, BackendRegistry,
 };
+use crate::scheduler::SchedulerService;
 use async_trait::async_trait;
-use clawbro_cron::SchedulerService;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 

@@ -424,7 +424,7 @@ clawBro/
 ├── crates/clawbro-agent-sdk/    # runtime bridge 和通用 agent shell
 ├── crates/clawbro-session/      # session 存储和排队
 ├── crates/clawbro-skills/       # skills / persona 加载
-├── crates/clawbro-cron/         # cron 调度
+├── crates/clawbro-server/src/scheduler/  # 内部调度模块
 └── docs/                        # 安装、路由、backend、运维文档
 ```
 

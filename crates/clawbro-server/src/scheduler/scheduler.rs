@@ -1,5 +1,5 @@
-use crate::models::{RunStatus, ScheduledJob};
-use crate::service::SchedulerService;
+use super::models::{RunStatus, ScheduledJob};
+use super::service::SchedulerService;
 use anyhow::Result;
 use chrono::Utc;
 use std::future::Future;
@@ -110,11 +110,11 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{
+    use crate::scheduler::{
         CreateJobRequest, CreateTargetRequest, RequestedTargetKind, ScheduleInput,
         SessionTargetRequest, SourceKind,
     };
-    use crate::store::{SchedulerStore, StoreConfig};
+    use crate::scheduler::{SchedulerStore, StoreConfig};
     use anyhow::anyhow;
     use chrono::Duration as ChronoDuration;
     use std::sync::atomic::{AtomicUsize, Ordering};

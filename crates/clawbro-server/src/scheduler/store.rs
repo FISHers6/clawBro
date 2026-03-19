@@ -1,9 +1,9 @@
-use crate::models::{
+use super::models::{
     AgentTurnTarget, CreateJobRequest, CreateTargetRequest, DeliveryMessageTarget,
     RequestedTargetKind, RunStatus, ScheduleKind, ScheduleSpec, ScheduledJob, ScheduledRun,
     ScheduledTarget, SessionTargetRequest, SourceKind, TriggerReason,
 };
-use crate::schedule::{
+use super::schedule::{
     default_timezone, initial_next_run_at, next_run_after, normalize_schedule_input,
 };
 use anyhow::{Context, Result};
@@ -795,7 +795,7 @@ fn to_sql_conversion_err(msg: impl Into<String>) -> rusqlite::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{
+    use crate::scheduler::{
         CreateTargetRequest, ExecutionPrecondition, RequestedTargetKind, ScheduleInput,
         SessionTargetRequest,
     };
@@ -908,7 +908,7 @@ mod tests {
         let store = SchedulerStore::in_memory().unwrap();
         let now = Utc::now();
         let req = CreateJobRequest {
-            schedule: crate::models::ScheduleInput::At {
+            schedule: ScheduleInput::At {
                 run_at: now + Duration::minutes(1),
             },
             ..create_req("once")

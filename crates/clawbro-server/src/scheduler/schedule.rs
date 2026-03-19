@@ -1,4 +1,4 @@
-use crate::models::{ScheduleInput, ScheduleSpec};
+use super::models::{ScheduleInput, ScheduleSpec};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use chrono_tz::Tz;
@@ -80,7 +80,7 @@ pub fn next_run_after(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::ExecutionPrecondition;
+    use crate::scheduler::ExecutionPrecondition;
     use chrono::TimeZone;
 
     #[test]

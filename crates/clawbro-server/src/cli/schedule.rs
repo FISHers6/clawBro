@@ -6,13 +6,13 @@ use crate::cli::args::{
 };
 use crate::config::GatewayConfig;
 use crate::protocol::parse_session_key_text;
+use crate::scheduler::{
+    CreateJobRequest, CreateTargetRequest, ExecutionPrecondition, JobQuery,
+    RequestedTargetKind, ScheduleInput, SchedulerService, SessionTargetRequest, SourceKind,
+};
 use crate::scheduler_runtime;
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
-use clawbro_cron::{
-    CreateJobRequest, CreateTargetRequest, ExecutionPrecondition, JobQuery,
-    RequestedTargetKind, ScheduleInput, SessionTargetRequest, SourceKind,
-};
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -387,7 +387,7 @@ fn build_request(target: ScheduleTargetArgs, schedule: ScheduleInput) -> Result<
     })
 }
 
-async fn load_scheduler_service() -> Result<std::sync::Arc<clawbro_cron::SchedulerService>> {
+async fn load_scheduler_service() -> Result<std::sync::Arc<SchedulerService>> {
     let cfg = GatewayConfig::load()?;
     let (service, _) = scheduler_runtime::build_scheduler_service(&cfg).await?;
     Ok(service)
@@ -464,7 +464,7 @@ mod tests {
             ScheduleInput::Delay { delay_ms: 1_000 },
         )
         .unwrap();
-        let clawbro_cron::CreateTargetRequest::Session(target) = req.target;
+        let CreateTargetRequest::Session(target) = req.target;
         assert_eq!(target.session_key, "dingtalk:user:alice");
     }
 

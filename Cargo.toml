@@ -9,7 +9,6 @@ members = [
     "crates/clawbro-agent",
     "crates/clawbro-channels",
     "crates/clawbro-skills",
-    "crates/clawbro-cron",
     "crates/clawbro-server",
 ]
 

@@ -16,6 +16,7 @@ pub mod im_sink;
 pub mod progress_presentation;
 pub mod protocol;
 pub mod runtime;
+pub mod scheduler;
 pub mod scheduler_runtime;
 pub mod session;
 pub mod skills_internal;
