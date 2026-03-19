@@ -1,12 +1,12 @@
 [package]
 name = "clawbro"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.90"
 autobins = false
 description = "ClawBro AI runtime and CLI"
 license = "MIT"
-repository = "https://github.com/fishers/clawbro"
+repository = "https://github.com/fishers6/clawbro"
 readme = "README.md"
 keywords = ["ai", "agent", "cli", "runtime"]
 categories = ["command-line-utilities"]

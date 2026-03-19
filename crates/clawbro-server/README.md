@@ -4,9 +4,9 @@
     <strong>Built around OpenClaw ideas, clawBro helps Claude Code, Codex, Qwen, Qoder, Gemini, and other coding agent CLIs work together and connect to Lark, DingTalk, and team workflows.</strong>
   </p>
   <p>
-    <a href="https://github.com/fishers/clawbro/blob/main/README_ZH.md"><strong>中文</strong></a> ·
-    <a href="https://github.com/fishers/clawbro/blob/main/README_JA.md"><strong>日本語</strong></a> ·
-    <a href="https://github.com/fishers/clawbro/blob/main/README_KO.md"><strong>한국어</strong></a>
+    <a href="https://github.com/fishers6/clawbro/blob/main/README_ZH.md"><strong>中文</strong></a> ·
+    <a href="https://github.com/fishers6/clawbro/blob/main/README_JA.md"><strong>日本語</strong></a> ·
+    <a href="https://github.com/fishers6/clawbro/blob/main/README_KO.md"><strong>한국어</strong></a>
   </p>
   <p>
     <a href="#-project-status">Project Status</a> ·
@@ -15,10 +15,10 @@
     <a href="#-quick-start">Quick Start</a> ·
     <a href="#-team-modes">Team Modes</a> ·
     <a href="#-coding-agent-integration">Coding Agent Integration</a> ·
-    <a href="https://github.com/fishers/clawbro/blob/main/docs/setup.md">Setup Guide</a>
+    <a href="https://github.com/fishers6/clawbro/blob/main/docs/setup.md">Setup Guide</a>
   </p>
   <p>
-    <img src="https://img.shields.io/badge/version-0.1.1-blue" alt="Version">
+    <img src="https://img.shields.io/badge/version-0.1.2-blue" alt="Version">
     <img src="https://img.shields.io/badge/rust-1.90%2B-orange" alt="Rust">
     <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
     <img src="https://img.shields.io/badge/agents-Claude%20%7C%20Codex%20%7C%20Qwen%20%7C%20Qoder%20%7C%20Gemini-111827" alt="Agents">
@@ -185,7 +185,7 @@ cargo install clawbro
 **Build from source**
 
 ```bash
-git clone https://github.com/fishers/clawbro.git
+git clone https://github.com/fishers6/clawbro.git
 cd clawbro
 cargo build -p clawbro --bin clawbro
 ```
