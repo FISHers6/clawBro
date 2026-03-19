@@ -57,9 +57,9 @@ impl ChannelRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::{InboundMsg, OutboundMsg};
     use anyhow::Result;
     use async_trait::async_trait;
-    use crate::protocol::{InboundMsg, OutboundMsg};
     use tokio::sync::mpsc;
 
     struct TestChannel {

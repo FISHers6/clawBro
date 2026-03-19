@@ -1,3 +1,4 @@
+use crate::runtime::{TeamToolRequest, TeamToolResponse};
 use crate::state::AppState;
 use axum::{
     extract::{Query, State},
@@ -5,7 +6,6 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use crate::runtime::{TeamToolRequest, TeamToolResponse};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -49,11 +49,11 @@ pub async fn invoke_team_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{config::GatewayConfig, gateway, state::AppState};
     use crate::agent_core::SessionRegistry;
     use crate::runtime::{TeamToolCall, TeamToolRequest};
     use crate::session::{SessionManager, SessionStorage};
     use crate::skills_internal::SkillLoader;
+    use crate::{config::GatewayConfig, gateway, state::AppState};
     use std::sync::Arc;
 
     #[tokio::test]
@@ -111,6 +111,7 @@ mod tests {
             dingtalk_webhook_channel: None,
             runtime_token: Arc::new("test-token".to_string()),
             approvals: crate::runtime::ApprovalBroker::default(),
+            scheduler_service: crate::scheduler_runtime::build_test_scheduler_service(),
         };
         let addr = gateway::server::start(state, "127.0.0.1", 0).await.unwrap();
 

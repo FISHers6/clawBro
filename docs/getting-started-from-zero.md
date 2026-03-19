@@ -1,6 +1,6 @@
 # ClawBro 从零开始
 
-这份文档面向第一次使用 `clawbro` / `ClawBro` 的开发者，目标是让你按当前代码实现，把系统从零配置到可运行，再逐步扩展到多 Agent、Team、Lark、DingTalk、Cron 和诊断面。
+这份文档面向第一次使用 `clawbro` / `ClawBro` 的开发者，目标是让你按当前代码实现，把系统从零配置到可运行，再逐步扩展到多 Agent、Team、Lark、DingTalk、runtime scheduler 和诊断面。
 
 如果你优先想从用户视角快速安装和配置，先看：
 
@@ -24,7 +24,7 @@
 
 `ClawBro` 当前是一个统一的 AI Gateway 和控制面，负责：
 
-- 接收外部消息：WebSocket、Lark、DingTalk、Cron
+- 接收外部消息：WebSocket、Lark、DingTalk、scheduler 触发执行
 - 做会话、路由、绑定、memory、team orchestration
 - 把实际执行分发给不同 backend family：
   - `claw_bro_native`
@@ -60,8 +60,8 @@
   - 共享 memory 存储
 - `~/.clawbro/skills/`
   - skills 主目录
-- `~/.clawbro/cron.db`
-  - cron SQLite 存储
+- `~/.clawbro/scheduler.db`
+  - runtime scheduler SQLite 存储
 - `~/.clawbro/gateway.port`
   - 启动后写入的 gateway 端口
 - `~/.clawbro/allowlist.json`
@@ -857,39 +857,54 @@ team runtime 会建立：
 - backend 必须支持其被分配的 role
 - 如果 OpenClaw family 参与 Team，通常要配置 `team_helper_command`
 
-## 15. Cron 场景
+## 15. Scheduler 场景
 
-当前支持在配置里声明 `[[cron_jobs]]`，启动时会同步到 `~/.clawbro/cron.db`。
+当前通用定时任务不再通过配置文件里的 `[[cron_jobs]]` 声明。
+正确入口是运行时 scheduler：
+
+- 本地操作入口：`clawbro schedule ...`
+- agent 入口：内置 `scheduler` skill + 宿主命令桥 `clawbro schedule ...`
+- 持久化位置：默认 `~/.clawbro/scheduler.db`
+
+支持四种创建形式：
+
+- `add-cron`
+  - 标准 cron 表达式
+- `add-at`
+  - 绝对时间，一次执行
+- `add-every`
+  - 固定间隔
+- `add-delay`
+  - 从现在起延迟一次执行
 
 例子：
 
-```toml
-[[cron_jobs]]
-name = "daily-standup"
-expr = "0 9 * * 1-5"
-prompt = "请总结今天的工作安排"
-session_key = "lark:group:chat-123"
-enabled = true
-agent = "claude"
-condition = "idle_gt_seconds:300"
+```bash
+clawbro schedule add-cron \
+  --name daily-standup \
+  --expr "0 9 * * 1-5" \
+  --session-key "lark:group:lark:chat-123" \
+  --prompt "请总结今天的工作安排" \
+  --agent claude \
+  --idle-gt-seconds 300
 ```
 
-### 字段说明
+常用命令：
 
-- `name`
-  - 任务名
-- `expr`
-  - cron 表达式
-- `prompt`
-  - 触发时注入的消息
-- `session_key`
-  - 目标会话，格式是 `channel:scope`
-- `enabled`
-  - 是否启用
-- `agent`
-  - 可选，指定目标 agent
-- `condition`
-  - 可选，目前支持空闲条件
+- `clawbro schedule list`
+- `clawbro schedule pause --job-id <id>`
+- `clawbro schedule resume --job-id <id>`
+- `clawbro schedule delete --job-id <id>`
+- `clawbro schedule run-now --job-id <id>`
+- `clawbro schedule history [--job-id <id>]`
+
+说明：
+
+- `session_key` 是目标会话
+- `prompt` 是触发时注入的消息
+- `agent` 可选，指定目标 agent
+- `--idle-gt-seconds` 是当前 Phase 1 支持的 typed precondition
+- `HEARTBEAT.md` 不是通用 scheduler 定义文件，它只保留 Team/workspace checklist 语义
 
 ## 16. Lark 场景
 
@@ -1138,19 +1153,19 @@ max_parallel = 3
 [channels.lark]
 enabled = true
 
-[[cron_jobs]]
-name = "daily-standup"
-expr = "0 9 * * 1-5"
-prompt = "请总结今天工作安排"
-session_key = "lark:group:lark:chat-123"
+[scheduler]
 enabled = true
-agent = "claude"
+poll_secs = 15
+max_concurrent = 4
+max_fetch_per_tick = 64
+default_timezone = "UTC"
+# db_path = "/absolute/path/to/scheduler.db"
 ```
 
 注意：
 
-- `session_key` 当前按 `channel:scope` 解析，如果 `scope` 自身也带冒号，建议你在实际环境里先验证它与目标会话一致
-- 生产环境里更稳妥的做法，是先跑起来并观察实际 scope 形式，再写 cron 目标
+- 运行时 scheduler job 不再写在 TOML 里，TOML 只保留 scheduler engine 参数
+- `session_key` 仍然建议先在实际环境里验证与目标会话一致，再创建 durable schedule
 
 ## 21. 推荐的上手路径
 

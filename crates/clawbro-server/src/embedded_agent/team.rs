@@ -2,8 +2,13 @@ use crate::agent_sdk_internal::{
     bridge::{AgentTurnRequest, ApprovalMode, ExecutionRole},
     tools::{ConfiguredAgentBuilder, EventedTool, RuntimeToolAugmentor, ToolProgressTracker},
 };
-use crate::protocol::{parse_session_key_text, TeamTool, TeamToolCall, TeamToolRequest, TeamToolResponse};
-use rig::{completion::{CompletionModel, ToolDefinition}, tool::{Tool, ToolError}};
+use crate::protocol::{
+    parse_session_key_text, TeamTool, TeamToolCall, TeamToolRequest, TeamToolResponse,
+};
+use rig::{
+    completion::{CompletionModel, ToolDefinition},
+    tool::{Tool, ToolError},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 

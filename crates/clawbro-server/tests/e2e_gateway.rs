@@ -23,11 +23,12 @@ use clawbro::{
     agent_core::{roster::AgentEntry, team::session::stable_team_id},
     build_test_state_with_config,
     config::{BackendCatalogEntry, BackendFamilyConfig, BackendLaunchConfig, GatewayConfig},
-    gateway, start_test_gateway, start_test_gateway_with_backend, start_test_gateway_with_config,
+    gateway,
     protocol::{AgentEvent, InboundMsg, MsgContent, MsgSource, SessionKey},
     runtime::{
         AcpBackend, ApprovalMode, BackendFamily, BackendSpec, CodexProjectionMode, LaunchSpec,
     },
+    start_test_gateway, start_test_gateway_with_backend, start_test_gateway_with_config,
 };
 use futures_util::{SinkExt, StreamExt};
 use std::collections::BTreeSet;
@@ -336,17 +337,11 @@ async fn test_gateway_e2e_codex_bridge() {
         }
         let mut env = std::collections::BTreeMap::new();
         env.insert("CODEX_API_KEY".into(), api_key);
-        (
-            Some(clawbro::config::AcpAuthMethodConfig::CodexApiKey),
-            env,
-        )
+        (Some(clawbro::config::AcpAuthMethodConfig::CodexApiKey), env)
     } else {
         let mut env = std::collections::BTreeMap::new();
         env.insert("HOME".into(), "/Users/fishers".into());
-        (
-            Some(clawbro::config::AcpAuthMethodConfig::Chatgpt),
-            env,
-        )
+        (Some(clawbro::config::AcpAuthMethodConfig::Chatgpt), env)
     };
     cfg.backends.push(BackendCatalogEntry {
         id: "codex-main".into(),

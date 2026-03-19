@@ -4,7 +4,8 @@ use crate::agent_core::prompt_builder::SystemPromptBuilder;
 use crate::agent_core::routing::RosterMatchData;
 use crate::agent_core::team::orchestrator::TeamOrchestrator;
 use crate::agent_core::traits::{AgentCtx, AgentRole, HistoryMsg};
-use crate::protocol::{InboundMsg, MsgSource, SessionKey, TeamTool};
+use crate::protocol::{InboundMsg, MsgSource, ScheduleTool, SessionKey, TeamTool};
+use crate::runtime::{visible_schedule_tools_for_role, RuntimeRole};
 use crate::session::StoredMessage;
 use crate::skills_internal::{PersonaSkillData, SkillLoader};
 use dashmap::DashSet;
@@ -94,7 +95,10 @@ pub(crate) async fn assemble_context(request: ContextAssemblyRequest<'_>) -> Con
         let (soul_md, identity_raw, agent_memory) =
             load_persona_layers(resolved_persona_dir.as_ref(), request.session_key);
         canonical_agent_memory = (!agent_memory.trim().is_empty()).then_some(agent_memory);
-        let combined_skills = combine_persona_skills(&skill_injection, first_persona.as_ref());
+        let gateway_and_workspace_skills =
+            combine_gateway_and_workspace_injection(request.system_injection, &skill_injection);
+        let combined_skills =
+            combine_persona_skills(&gateway_and_workspace_skills, first_persona.as_ref());
         SystemPromptBuilder {
             persona: first_persona.as_ref(),
             soul_md: &soul_md,
@@ -156,6 +160,8 @@ pub(crate) async fn assemble_context(request: ContextAssemblyRequest<'_>) -> Con
     let team_tool_url = request
         .session_team_orch
         .and_then(|_| request.team_tool_url.clone());
+    let allowed_schedule_tools =
+        resolve_schedule_tool_allowlist(request.inbound.source.clone(), request.agent_role);
 
     ContextAssemblyResult {
         persona_prefix: request
@@ -178,6 +184,7 @@ pub(crate) async fn assemble_context(request: ContextAssemblyRequest<'_>) -> Con
             mcp_server_url,
             team_tool_url,
             allowed_team_tools: request.allowed_team_tools,
+            allowed_schedule_tools,
             shared_memory: canonical_shared_memory,
             agent_memory: canonical_agent_memory,
             team_manifest: canonical_team_manifest,
@@ -189,6 +196,19 @@ pub(crate) async fn assemble_context(request: ContextAssemblyRequest<'_>) -> Con
 
 fn is_frontstage_human_turn(source: MsgSource, channel: &str, agent_role: AgentRole) -> bool {
     source == MsgSource::Human && channel == "lark" && !matches!(agent_role, AgentRole::Specialist)
+}
+
+fn resolve_schedule_tool_allowlist(source: MsgSource, agent_role: AgentRole) -> Vec<ScheduleTool> {
+    if source != MsgSource::Human || agent_role == AgentRole::Specialist {
+        return vec![];
+    }
+
+    let role = match agent_role {
+        AgentRole::Solo => RuntimeRole::Solo,
+        AgentRole::Lead => RuntimeRole::Leader,
+        AgentRole::Specialist => RuntimeRole::Specialist,
+    };
+    visible_schedule_tools_for_role(role).visible
 }
 
 pub(crate) fn build_history(recent_messages: &[StoredMessage]) -> Vec<HistoryMsg> {
@@ -744,5 +764,86 @@ mod tests {
             .ctx
             .system_injection
             .contains("Use create_task first."));
+    }
+
+    #[tokio::test]
+    async fn default_agent_keeps_gateway_builtin_scheduler_injection() {
+        let session_key = SessionKey::new("ws", "solo:test");
+        let inbound = inbound(session_key.clone());
+        let initialized = DashSet::new();
+        let result = assemble_context(ContextAssemblyRequest {
+            session_id: Uuid::new_v4(),
+            session_key: &session_key,
+            inbound: &inbound,
+            recent_messages: &[],
+            roster_match: None,
+            agent_role: AgentRole::Solo,
+            task_reminder: None,
+            session_team_orch: None,
+            system_injection: "builtin scheduler skill marker",
+            memory_system: None,
+            default_persona_dir: None,
+            default_workspace: None,
+            session_workspace: None,
+            skill_loader_dirs: &[],
+            initialized_persona_dirs: &initialized,
+            team_tool_url: None,
+            allowed_team_tools: vec![],
+        })
+        .await;
+
+        assert!(result
+            .ctx
+            .system_injection
+            .contains("builtin scheduler skill marker"));
+    }
+
+    #[tokio::test]
+    async fn roster_agent_keeps_gateway_builtin_scheduler_injection_alongside_workspace_skills() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let skill_dir = workspace.path().join(".agents").join("skills").join("demo");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: demo\ndescription: demo\n---\nUse demo skill.",
+        )
+        .unwrap();
+
+        let session_key = SessionKey::new("ws", "solo:test");
+        let inbound = inbound(session_key.clone());
+        let initialized = DashSet::new();
+        let roster_match = RosterMatchData {
+            agent_name: "alpha".into(),
+            backend_id: "native-main".into(),
+            persona_dir: None,
+            workspace_dir: Some(workspace.path().to_path_buf()),
+            extra_skills_dirs: vec![],
+        };
+        let result = assemble_context(ContextAssemblyRequest {
+            session_id: Uuid::new_v4(),
+            session_key: &session_key,
+            inbound: &inbound,
+            recent_messages: &[],
+            roster_match: Some(&roster_match),
+            agent_role: AgentRole::Solo,
+            task_reminder: None,
+            session_team_orch: None,
+            system_injection: "builtin scheduler skill marker",
+            memory_system: None,
+            default_persona_dir: None,
+            default_workspace: None,
+            session_workspace: None,
+            skill_loader_dirs: &[],
+            initialized_persona_dirs: &initialized,
+            team_tool_url: None,
+            allowed_team_tools: vec![],
+        })
+        .await;
+
+        assert!(result
+            .ctx
+            .system_injection
+            .contains("builtin scheduler skill marker"));
+        assert!(result.ctx.system_injection.contains("demo"));
     }
 }

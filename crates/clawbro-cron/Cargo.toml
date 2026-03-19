@@ -1,15 +1,22 @@
 [package]
 name = "clawbro-cron"
 version = "0.1.0"
-publish = false
 edition = "2021"
+rust-version = "1.90"
+description = "Durable scheduler core for ClawBro runtime jobs and reminders"
+license = "MIT"
+repository = "https://github.com/fishers6/clawbro"
+keywords = ["ai", "agent", "scheduler", "cron"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 rusqlite = { version = "0.31", features = ["bundled"] }
 cron = "0.12"
-tokio = { version = "1", features = ["rt", "time", "sync"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "sync", "macros"] }
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.9"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"

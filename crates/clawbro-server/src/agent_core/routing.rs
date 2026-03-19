@@ -219,7 +219,9 @@ fn resolve_auto_promote_orchestrator(
         || !no_session_orchestrator
         || inbound.source != MsgSource::Human
         || !auto_promote_scopes.contains(&inbound.session_key.scope)
-        || !crate::agent_core::mode_selector::is_team_trigger(inbound.content.as_text().unwrap_or(""))
+        || !crate::agent_core::mode_selector::is_team_trigger(
+            inbound.content.as_text().unwrap_or(""),
+        )
     {
         return None;
     }
@@ -366,14 +368,19 @@ fn extract_team_notify_task_id(text: &str) -> Option<&str> {
 }
 
 fn extract_result_artifact_path(text: &str) -> Option<&str> {
-    text.split("完整结果工件：").nth(1).map(str::trim).filter(|s| !s.is_empty())
+    text.split("完整结果工件：")
+        .nth(1)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::agent_core::roster::AgentEntry;
-    use crate::agent_core::team::{heartbeat::DispatchFn, registry::TaskRegistry, session::TeamSession};
+    use crate::agent_core::team::{
+        heartbeat::DispatchFn, registry::TaskRegistry, session::TeamSession,
+    };
     use crate::protocol::{MsgContent, SessionKey};
     use std::time::Duration;
 

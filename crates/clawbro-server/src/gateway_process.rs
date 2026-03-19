@@ -1,21 +1,20 @@
-use crate::channel_registry::ChannelRegistry;
-use crate::config;
-use crate::cron_internal::{CronCondition, CronScheduler, CronStore, TriggerFn};
-use crate::delivery_resolver::resolve_delivery;
-use crate::gateway;
-use crate::im_sink::spawn_im_turn;
-use crate::skills_internal::SkillLoader;
-use crate::state::{AppState, BrokerApprovalResolver};
-use anyhow::Result;
 use crate::agent_core::{
     ConductorRuntimeDispatch, SessionRegistry, TurnDeliverySource, TurnExecutionContext,
 };
-use crate::protocol::parse_session_key_text;
+use crate::channel_registry::ChannelRegistry;
+use crate::config;
+use crate::delivery_resolver::resolve_delivery;
+use crate::gateway;
+use crate::im_sink::spawn_im_turn;
 use crate::runtime::{
     acp::AcpBackendAdapter, ApprovalBroker, BackendRegistry, ClawBroNativeBackendAdapter,
     OpenClawBackendAdapter,
 };
+use crate::scheduler_runtime;
 use crate::session::{SessionManager, SessionStorage};
+use crate::skills_internal::SkillLoader;
+use crate::state::{AppState, BrokerApprovalResolver};
+use anyhow::Result;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -71,7 +70,9 @@ pub async fn run() -> Result<()> {
     let roster = if cfg.agent_roster.is_empty() {
         None
     } else {
-        Some(crate::agent_core::AgentRoster::new(cfg.agent_roster.clone()))
+        Some(crate::agent_core::AgentRoster::new(
+            cfg.agent_roster.clone(),
+        ))
     };
 
     // Initialize MemorySystem
@@ -84,7 +85,7 @@ pub async fn run() -> Result<()> {
         let triggers = default_triggers(cfg.memory.distill_every_n);
         Some(MemorySystem::new(triggers, store, distiller))
     };
-    // Keep a reference for cron and nightly scheduler (registry takes ownership of its copy)
+    // Keep a reference for scheduler and nightly scheduler (registry takes ownership of its copy)
     let memory_system_ref = memory_system.clone();
 
     // 初始化 SessionRegistry（替换 AgentRunner）
@@ -129,8 +130,9 @@ pub async fn run() -> Result<()> {
 
     // Channel registry for server-owned outbound sends.
     let mut cron_channel_map = ChannelRegistry::new();
-    let mut dingtalk_webhook_channel: Option<Arc<crate::channels_internal::DingTalkWebhookChannel>> =
-        None;
+    let mut dingtalk_webhook_channel: Option<
+        Arc<crate::channels_internal::DingTalkWebhookChannel>,
+    > = None;
 
     // 启动 Channel 监听（DingTalk）
     if let Some(dt_cfg) = &cfg.channels.dingtalk {
@@ -157,7 +159,11 @@ pub async fn run() -> Result<()> {
                 tokio::spawn(async move {
                     let mut delay = Duration::from_secs(5);
                     loop {
-                        match crate::channels_internal::Channel::listen(channel.as_ref(), tx.clone()).await
+                        match crate::channels_internal::Channel::listen(
+                            channel.as_ref(),
+                            tx.clone(),
+                        )
+                        .await
                         {
                             Err(e) => {
                                 delay = next_delay(delay);
@@ -249,16 +255,17 @@ pub async fn run() -> Result<()> {
                         let is_default = (has_requested_default
                             && instance.id == requested_default)
                             || (!has_requested_default && index == 0);
-                        let channel = Arc::new(crate::channels_internal::LarkChannel::new_with_instance(
-                            instance.id.clone(),
-                            instance.bot_name.clone(),
-                            instance.app_id,
-                            instance.app_secret,
-                            lark_trigger_policy,
-                            is_default,
-                            known_lark_bot_mentions.clone(),
-                            is_default,
-                        ));
+                        let channel =
+                            Arc::new(crate::channels_internal::LarkChannel::new_with_instance(
+                                instance.id.clone(),
+                                instance.bot_name.clone(),
+                                instance.app_id,
+                                instance.app_secret,
+                                lark_trigger_policy,
+                                is_default,
+                                known_lark_bot_mentions.clone(),
+                                is_default,
+                            ));
                         cron_channel_map.register(
                             "lark",
                             Some(instance.id.clone()),
@@ -311,7 +318,8 @@ pub async fn run() -> Result<()> {
                             while let Some(inbound) = rx.recv().await {
                                 spawn_im_turn(
                                     registry_clone.clone(),
-                                    channel_clone.clone() as Arc<dyn crate::channels_internal::Channel>,
+                                    channel_clone.clone()
+                                        as Arc<dyn crate::channels_internal::Channel>,
                                     delivery_channels.clone(),
                                     delivery_cfg.clone(),
                                     inbound,
@@ -353,36 +361,8 @@ pub async fn run() -> Result<()> {
         }
     }
 
-    // 初始化 CronStore（持久化到 ~/.clawbro/cron.db）
-    let cron_db = dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".clawbro")
-        .join("cron.db");
-    if let Some(parent) = cron_db.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    let cron_store = Arc::new(CronStore::open(&cron_db)?);
-
-    // Sync cron jobs declared in config.toml into the SQLite store
-    for job in &cfg.cron_jobs {
-        if let Err(e) = cron_store.upsert_by_name(
-            &job.name,
-            &job.expr,
-            &job.prompt,
-            &job.session_key,
-            job.enabled,
-            job.agent.as_deref(),
-            job.condition.as_deref(),
-        ) {
-            tracing::warn!("Failed to sync cron job {:?} from config: {e}", job.name);
-        }
-    }
-    if !cfg.cron_jobs.is_empty() {
-        tracing::info!(
-            "Synced {} cron job(s) from config.toml",
-            cfg.cron_jobs.len()
-        );
-    }
+    let (scheduler_service, scheduler_db) =
+        scheduler_runtime::build_scheduler_service(cfg_arc.as_ref()).await?;
 
     let cron_channel_map = Arc::new(cron_channel_map);
     let state = AppState {
@@ -394,6 +374,7 @@ pub async fn run() -> Result<()> {
         dingtalk_webhook_channel,
         runtime_token: Arc::new(uuid::Uuid::new_v4().to_string()),
         approvals,
+        scheduler_service: scheduler_service.clone(),
     };
 
     // Approval notify loop: surface runtime approval requests back into the originating IM
@@ -477,8 +458,7 @@ pub async fn run() -> Result<()> {
                     // This ensures an independent Semaphore and independent session history.
                     let agent_bare = target_agent.trim_start_matches('@');
                     let relay_scope = format!("{}:{}", lead_session_key.scope, agent_bare);
-                    let relay_session_key =
-                        crate::protocol::SessionKey::new("relay", &relay_scope);
+                    let relay_session_key = crate::protocol::SessionKey::new("relay", &relay_scope);
 
                     let msg = crate::protocol::InboundMsg {
                         id: uuid::Uuid::new_v4().to_string(),
@@ -496,9 +476,9 @@ pub async fn run() -> Result<()> {
                         .await
                 })
             });
-        registry.set_relay_engine(std::sync::Arc::new(crate::agent_core::relay::RelayEngine::new(
-            relay_dispatch,
-        )));
+        registry.set_relay_engine(std::sync::Arc::new(
+            crate::agent_core::relay::RelayEngine::new(relay_dispatch),
+        ));
         tracing::info!("RelayEngine wired");
     }
 
@@ -508,11 +488,12 @@ pub async fn run() -> Result<()> {
     {
         let bot_names: Vec<String> = cfg.agent_roster.iter().map(|e| e.name.clone()).collect();
         if !bot_names.is_empty() {
-            let trigger =
-                std::sync::Arc::new(crate::channels_internal::mention_trigger::MentionTrigger::new(
+            let trigger = std::sync::Arc::new(
+                crate::channels_internal::mention_trigger::MentionTrigger::new(
                     bot_names,
                     redispatch_tx.clone(),
-                ));
+                ),
+            );
             registry.set_mention_trigger(trigger);
             tracing::info!("MentionTrigger wired ({} bots)", cfg.agent_roster.len());
         }
@@ -579,110 +560,14 @@ pub async fn run() -> Result<()> {
 
     // ── End Swarm Wiring ─────────────────────────────────────────────────────
 
-    // 启动 CronScheduler
-    {
-        let cron_registry = registry.clone();
-        let cron_memory = memory_system_ref.clone();
-        let cron_channels = cron_channel_map.clone();
-        let cfg_for_cron = state.cfg.clone();
-        let cron_trigger: TriggerFn = Arc::new(
-            move |session_key_str: String,
-                  prompt: String,
-                  agent_opt: Option<String>,
-                  condition: Option<String>| {
-                let registry = cron_registry.clone();
-                let memory = cron_memory.clone();
-                let channels = cron_channels.clone();
-                let cfg = cfg_for_cron.clone();
-                tokio::spawn(async move {
-                    // Check condition before firing
-                    if let Some(ref cond_str) = condition {
-                        if let Some(cond) = CronCondition::parse(cond_str) {
-                            match cond {
-                                CronCondition::IdleGtSeconds(threshold) => {
-                                    let idle = registry
-                                        .session_idle_seconds(&session_key_str)
-                                        .unwrap_or(0);
-                                    if idle < threshold {
-                                        tracing::debug!(
-                                            session = %session_key_str,
-                                            idle_secs = idle,
-                                            threshold = threshold,
-                                            "Cron job skipped: session not idle long enough"
-                                        );
-                                        return;
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Parse "channel:scope" into SessionKey.
-                    // Fall back to channel="cron", scope=full string if no colon.
-                    let session_key = if session_key_str.contains(':') {
-                        parse_session_key_text(&session_key_str).unwrap_or_else(|_| {
-                            crate::protocol::SessionKey::new("cron", session_key_str.as_str())
-                        })
-                    } else {
-                        crate::protocol::SessionKey::new("cron", session_key_str.as_str())
-                    };
-                    let msg = crate::protocol::InboundMsg {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        session_key: session_key.clone(),
-                        content: crate::protocol::MsgContent::text(prompt),
-                        sender: "cron".to_string(),
-                        channel: "cron".to_string(),
-                        timestamp: chrono::Utc::now(),
-                        thread_ts: None,
-                        target_agent: agent_opt,
-                        source: crate::protocol::MsgSource::Cron,
-                    };
-                    match registry
-                        .handle_with_context(msg, TurnExecutionContext::default())
-                        .await
-                    {
-                        Ok(Some(result)) => {
-                            // Send result to IM channel if one is registered for this session's channel
-                            if let Some(resolved) = resolve_delivery(
-                                cfg.as_ref(),
-                                channels.as_ref(),
-                                config::DeliveryPurposeConfig::Cron,
-                                &session_key,
-                                None,
-                                None,
-                                None,
-                                None,
-                                None,
-                            ) {
-                                let outbound = resolved.outbound_text(&result);
-                                if let Err(e) = resolved.sender.send(&outbound).await {
-                                    tracing::error!(
-                                        "Cron output send to channel '{}' failed: {e}",
-                                        session_key.channel
-                                    );
-                                }
-                            }
-                            // Emit CronJobCompleted so CronResultTrigger can write to shared memory
-                            if let Some(ms) = &memory {
-                                let summary: String = result.chars().take(300).collect();
-                                ms.emit(crate::agent_core::MemoryEvent::CronJobCompleted {
-                                    scope: session_key,
-                                    agent: "cron".to_string(),
-                                    persona_dir: std::path::PathBuf::new(),
-                                    result_summary: summary,
-                                });
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(e) => tracing::error!("Cron trigger failed: {e}"),
-                    }
-                })
-            },
-        );
-        let scheduler = CronScheduler::new(cron_store, cron_trigger);
-        tokio::spawn(async move { scheduler.run().await });
-        tracing::info!("CronScheduler started (polling every 1s, db={:?})", cron_db);
-    }
+    scheduler_runtime::spawn_scheduler_runtime(
+        scheduler_service,
+        registry.clone(),
+        memory_system_ref.clone(),
+        cron_channel_map.clone(),
+        state.cfg.clone(),
+    );
+    tracing::info!("Scheduler runtime started (db={:?})", scheduler_db);
 
     // 启动 NightlyConsolidation 调度器（每天本地零点合并 agent 私有记忆 → 共享记忆）
     if let Some(ms) = &memory_system_ref {

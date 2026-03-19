@@ -1,11 +1,12 @@
 //! ClawBro server library target.
 //! Exposes modules and test helpers for integration tests.
 
+pub mod agent_core;
+pub mod agent_sdk_internal;
 pub mod channel_registry;
 pub mod channels_internal;
 pub mod cli;
 pub mod config;
-pub mod cron_internal;
 pub mod delivery_resolver;
 pub mod diagnostics;
 pub mod embedded_agent;
@@ -15,8 +16,7 @@ pub mod im_sink;
 pub mod progress_presentation;
 pub mod protocol;
 pub mod runtime;
-pub mod agent_sdk_internal;
-pub mod agent_core;
+pub mod scheduler_runtime;
 pub mod session;
 pub mod skills_internal;
 pub mod state;
@@ -27,14 +27,14 @@ pub use gateway_process::run as run_gateway_process;
 pub use config::GatewayConfig;
 pub use state::{AppState, BrokerApprovalResolver};
 
-use anyhow::Result;
-use crate::skills_internal::SkillLoader;
 use crate::agent_core::{ConductorRuntimeDispatch, SessionRegistry};
 use crate::runtime::{
     acp::AcpBackendAdapter, ApprovalBroker, BackendFamily, BackendRegistry, BackendSpec,
     ClawBroNativeBackendAdapter, LaunchSpec, OpenClawBackendAdapter,
 };
 use crate::session::{SessionManager, SessionStorage};
+use crate::skills_internal::SkillLoader;
+use anyhow::Result;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -127,7 +127,9 @@ pub async fn build_test_state_with_config(cfg: GatewayConfig) -> Result<AppState
         if cfg.agent_roster.is_empty() {
             None
         } else {
-            Some(crate::agent_core::AgentRoster::new(cfg.agent_roster.clone()))
+            Some(crate::agent_core::AgentRoster::new(
+                cfg.agent_roster.clone(),
+            ))
         },
         None,
         None,
@@ -145,7 +147,9 @@ pub async fn build_test_state_with_config(cfg: GatewayConfig) -> Result<AppState
         .as_ref()
         .filter(|section| section.enabled)
         .map(|section| {
-            let channel = Arc::new(channels_internal::DingTalkWebhookChannel::new(section.clone()));
+            let channel = Arc::new(channels_internal::DingTalkWebhookChannel::new(
+                section.clone(),
+            ));
             channel_registry.register(
                 "dingtalk_webhook",
                 Option::<String>::None,
@@ -155,6 +159,7 @@ pub async fn build_test_state_with_config(cfg: GatewayConfig) -> Result<AppState
             channel
         });
     let channel_registry = Arc::new(channel_registry);
+    let scheduler_service = crate::scheduler_runtime::build_test_scheduler_service();
     let state = AppState {
         registry,
         runtime_registry,
@@ -164,6 +169,7 @@ pub async fn build_test_state_with_config(cfg: GatewayConfig) -> Result<AppState
         dingtalk_webhook_channel,
         runtime_token: Arc::new(uuid::Uuid::new_v4().to_string()),
         approvals,
+        scheduler_service,
     };
 
     team_runtime::wire_team_runtime(

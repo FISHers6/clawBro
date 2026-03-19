@@ -46,7 +46,9 @@ impl MemoryTrigger for UserRememberTrigger {
 mod tests {
     use super::*;
     use crate::agent_core::memory::event::{MemoryEvent, MemoryTarget};
-    use crate::agent_core::memory::{distiller::NoopDistiller, store::FileMemoryStore, trigger::MemoryTrigger};
+    use crate::agent_core::memory::{
+        distiller::NoopDistiller, store::FileMemoryStore, trigger::MemoryTrigger,
+    };
     use crate::protocol::SessionKey;
     use std::sync::Arc;
     use tempfile::tempdir;

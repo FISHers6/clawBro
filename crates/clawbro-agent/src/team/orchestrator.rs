@@ -1690,6 +1690,11 @@ For those requests, do not begin with generic repo workflow chatter like \"check
 - `get_task_status()`\n\
 - `post_update(...)`\n\n\
 Generic repo workflow skills remain available, but they are for doing work inside a task or for explicit design/implementation requests from the user.\n\n\
+## Scheduler Rule\n\n\
+- The built-in `scheduler` skill is available by default in this workspace.\n\
+- Use durable scheduling when the user asks for a reminder, future follow-up, or recurring check.\n\
+- In those cases, create or update a schedule through `clawbro schedule ...`; do not merely promise to remember later.\n\
+- Do not use scheduler as a substitute for team task creation or specialist assignment.\n\n\
 ## Specialist Turn Rules\n\n\
 - Treat the assigned task and `tasks/<task-id>/...` artifacts as the working surface.\n\
 - Update `plan.md` before substantive execution if it still contains only the default scaffold.\n\

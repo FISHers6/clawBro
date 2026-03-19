@@ -286,15 +286,17 @@ impl OpenClawGatewayClient {
                         continue;
                     }
                     let prompt = render_exec_approval_prompt(&requested);
-                    let event = RuntimeEvent::ApprovalRequest(crate::runtime::contract::PermissionRequest {
-                        id: requested.id.clone(),
-                        prompt,
-                        command: Some(requested.command.clone()),
-                        cwd: requested.cwd.clone(),
-                        host: requested.host.clone(),
-                        agent_id: requested.agent_id.clone(),
-                        expires_at_ms: requested.expires_at_ms,
-                    });
+                    let event = RuntimeEvent::ApprovalRequest(
+                        crate::runtime::contract::PermissionRequest {
+                            id: requested.id.clone(),
+                            prompt,
+                            command: Some(requested.command.clone()),
+                            cwd: requested.cwd.clone(),
+                            host: requested.host.clone(),
+                            agent_id: requested.agent_id.clone(),
+                            expires_at_ms: requested.expires_at_ms,
+                        },
+                    );
                     return Ok(Some(GatewayInbound::Runtime(event)));
                 }
                 GatewayFrame::Response { id, ok: true, .. }

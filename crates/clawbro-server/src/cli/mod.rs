@@ -6,6 +6,7 @@ pub mod doctor;
 pub mod env;
 pub mod i18n;
 pub mod internal_agent;
+pub mod schedule;
 pub mod serve;
 pub mod setup;
 pub mod status;

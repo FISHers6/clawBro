@@ -1,10 +1,10 @@
 use super::orchestrator::{TeamOrchestrator, TeamState};
 use super::registry::CreateTask;
-use anyhow::Result;
 use crate::protocol::SessionKey;
 use crate::runtime::{
     visible_team_tools_for_role, RuntimeRole, TeamTool, TeamToolCall, TeamToolResponse,
 };
+use anyhow::Result;
 use std::sync::Arc;
 
 pub fn resolve_team_tool_role(
@@ -308,7 +308,9 @@ pub async fn execute_team_tool_call(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_core::team::{heartbeat::DispatchFn, registry::TaskRegistry, session::TeamSession};
+    use crate::agent_core::team::{
+        heartbeat::DispatchFn, registry::TaskRegistry, session::TeamSession,
+    };
     use tempfile::tempdir;
 
     fn make_orchestrator() -> Arc<TeamOrchestrator> {

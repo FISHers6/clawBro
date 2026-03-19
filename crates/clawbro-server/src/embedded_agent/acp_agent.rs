@@ -6,7 +6,9 @@ use crate::agent_sdk_internal::{
     config::{AgentConfig, Provider},
     runtime_bridge::ClawBroRuntimeBridge,
 };
-use crate::embedded_agent::team::ClawBroTeamToolAugmentor;
+use crate::embedded_agent::{
+    schedule::ClawBroScheduleToolAugmentor, team::ClawBroTeamToolAugmentor, ChainedAugmentor,
+};
 use agent_client_protocol as acp;
 use agent_client_protocol::Client as _;
 use std::cell::{Cell, RefCell};
@@ -134,7 +136,9 @@ impl acp::Agent for ClawBroAgent {
         self.sessions
             .borrow_mut()
             .insert(session_id.clone(), vec![]);
-        Ok(acp::NewSessionResponse::new(acp::SessionId::new(session_id)))
+        Ok(acp::NewSessionResponse::new(acp::SessionId::new(
+            session_id,
+        )))
     }
 
     async fn prompt(&self, args: acp::PromptRequest) -> acp::Result<acp::PromptResponse> {
@@ -168,6 +172,8 @@ impl acp::Agent for ClawBroAgent {
 
                 let bridge = ClawBroRuntimeBridge::new(config.clone());
                 let team_tools = ClawBroTeamToolAugmentor::from_env();
+                let schedule_tools = ClawBroScheduleToolAugmentor::from_env();
+                let augmentor = ChainedAugmentor::new(team_tools, schedule_tools);
                 let notif_tx = self.notif_tx.clone();
                 let session_id_for_delta = args.session_id.clone();
 
@@ -206,7 +212,7 @@ impl acp::Agent for ClawBroAgent {
                                 ));
                             }
                         },
-                        &team_tools,
+                        &augmentor,
                     )
                     .await
                     .map_err(|e| {

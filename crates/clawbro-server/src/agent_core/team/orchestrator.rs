@@ -14,9 +14,9 @@
 //! canonical multi-backend semantics 将在 clawbro-runtime::tool_bridge 中升级为
 //! submit/accept/reopen 流程。
 
+use crate::protocol::SessionKey;
 use anyhow::Result;
 use chrono::Utc;
-use crate::protocol::SessionKey;
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -413,11 +413,7 @@ impl TeamOrchestrator {
             .unwrap()
             .as_ref()
             .map(|ctx| ctx.task_id.clone());
-        self.record_leader_fragment(
-            LeaderUpdateKind::PostUpdate,
-            message,
-            task_id.as_deref(),
-        );
+        self.record_leader_fragment(LeaderUpdateKind::PostUpdate, message, task_id.as_deref());
         let event = TeamMilestoneEvent::LeadMessage {
             text: message.to_string(),
         };
@@ -437,7 +433,12 @@ impl TeamOrchestrator {
         true
     }
 
-    pub fn record_leader_fragment(&self, kind: LeaderUpdateKind, text: &str, task_id: Option<&str>) {
+    pub fn record_leader_fragment(
+        &self,
+        kind: LeaderUpdateKind,
+        text: &str,
+        task_id: Option<&str>,
+    ) {
         let source_agent = self
             .lead_agent_name
             .get()
@@ -854,7 +855,9 @@ impl TeamOrchestrator {
             .collect::<Vec<_>>()
             .join(" ");
         let too_close_to_summary = !summary_lower.is_empty()
-            && body_without_markdown.to_lowercase().contains(&summary_lower)
+            && body_without_markdown
+                .to_lowercase()
+                .contains(&summary_lower)
             && body_without_markdown.chars().count() <= summary.chars().count() + 80;
 
         anyhow::ensure!(
@@ -992,8 +995,7 @@ impl TeamOrchestrator {
         summary: &str,
         result_markdown: Option<&str>,
     ) -> Result<()> {
-        let result_body =
-            self.validate_submitted_result_body(task_id, summary, result_markdown)?;
+        let result_body = self.validate_submitted_result_body(task_id, summary, result_markdown)?;
         self.registry.submit_task_result(task_id, agent, summary)?;
         self.record_specialist_action(task_id, agent, SpecialistActionKind::Submitted);
         self.sync_task_artifacts(task_id)?;
@@ -1629,8 +1631,7 @@ impl TeamOrchestrator {
                 );
                 remaining.push(pending_on_error);
             } else if record.review.is_some() {
-                let next_attempt_at =
-                    (now + chrono::Duration::seconds(120)).to_rfc3339();
+                let next_attempt_at = (now + chrono::Duration::seconds(120)).to_rfc3339();
                 remaining.push(record.defer_until(next_attempt_at));
             }
         }
@@ -1826,6 +1827,11 @@ For those requests, do not begin with generic repo workflow chatter like \"check
 - `get_task_status()`\n\
 - `post_update(...)`\n\n\
 Generic repo workflow skills remain available, but they are for doing work inside a task or for explicit design/implementation requests from the user.\n\n\
+## Scheduler Rule\n\n\
+- The built-in `scheduler` skill is available by default in this workspace.\n\
+- Use durable scheduling when the user asks for a reminder, future follow-up, or recurring check.\n\
+- In those cases, create or update a schedule through `clawbro schedule ...`; do not merely promise to remember later.\n\
+- Do not use scheduler as a substitute for team task creation or specialist assignment.\n\n\
 ## Specialist Turn Rules\n\n\
 - Treat the assigned task and `tasks/<task-id>/...` artifacts as the working surface.\n\
 - Update `plan.md` before substantive execution if it still contains only the default scaffold.\n\
@@ -2103,8 +2109,13 @@ mod tests {
         orch.registry.try_claim("T004", "codex").unwrap();
 
         let result_markdown = "# JWT Implementation\n\nImplemented JWT auth flow with middleware, login issuance, and verification tests.";
-        orch.handle_specialist_submitted("T004", "codex", "ready for review", Some(result_markdown))
-            .unwrap();
+        orch.handle_specialist_submitted(
+            "T004",
+            "codex",
+            "ready for review",
+            Some(result_markdown),
+        )
+        .unwrap();
 
         let task = orch.registry.get_task("T004").unwrap().unwrap();
         use crate::agent_core::team::registry::TaskStatus;
@@ -2273,7 +2284,10 @@ mod tests {
             .unwrap();
 
         let feedback = std::fs::read_to_string(
-            tmp.path().join("tasks").join("T004R").join("review-feedback.md"),
+            tmp.path()
+                .join("tasks")
+                .join("T004R")
+                .join("review-feedback.md"),
         )
         .unwrap();
         assert!(feedback.contains("正文太短"));
@@ -2340,7 +2354,7 @@ mod tests {
             "done",
             Some("# Result\n\nCompleted the recorded-actions task with a full deliverable body."),
         )
-            .unwrap();
+        .unwrap();
 
         assert!(matches!(
             orch.classify_specialist_turn("T900", "worker", started_at),
@@ -2390,7 +2404,12 @@ mod tests {
         let pending = orch.session.load_pending_completions().unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(
-            pending[0].envelope.requester_session_key.as_ref().unwrap().scope,
+            pending[0]
+                .envelope
+                .requester_session_key
+                .as_ref()
+                .unwrap()
+                .scope,
             "group:test-team"
         );
 
@@ -2495,9 +2514,7 @@ mod tests {
             delivery_status: RoutingDeliveryStatus::PersistedPending,
             event: TeamRoutingEvent::submitted("T201", "codex", "ready for review"),
         };
-        orch.persist_pending_routing_record(PendingRoutingRecord::from_envelope(
-            envelope.clone(),
-        ));
+        orch.persist_pending_routing_record(PendingRoutingRecord::from_envelope(envelope.clone()));
         orch.persist_pending_routing_record(
             PendingRoutingRecord::from_envelope(envelope.clone()).note_failed_attempt(
                 crate::agent_core::team::completion_routing::ReviewFailureClassification::NoOp,
@@ -2549,11 +2566,19 @@ mod tests {
         let pending = orch.session.load_pending_completions().unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(
-            pending[0].envelope.requester_session_key.as_ref().unwrap().scope,
+            pending[0]
+                .envelope
+                .requester_session_key
+                .as_ref()
+                .unwrap()
+                .scope,
             "group:lead"
         );
         assert_eq!(pending[0].envelope.fallback_session_keys.len(), 1);
-        assert_eq!(pending[0].envelope.fallback_session_keys[0].scope, "group:scope");
+        assert_eq!(
+            pending[0].envelope.fallback_session_keys[0].scope,
+            "group:scope"
+        );
     }
 
     #[test]
@@ -2615,7 +2640,7 @@ mod tests {
             "ready",
             Some("# Result\n\nCompleted the only task and prepared it for lead review."),
         )
-            .unwrap();
+        .unwrap();
         orch.accept_submitted_task("T005", "claude").unwrap();
 
         let task = orch.registry.get_task("T005").unwrap().unwrap();
@@ -2885,7 +2910,7 @@ mod tests {
             "added jwt.rs",
             Some("# Result\n\nImplemented JWT support and added the required tests."),
         )
-            .unwrap();
+        .unwrap();
 
         let evs = events.lock().unwrap();
         assert!(
@@ -3113,9 +3138,11 @@ mod tests {
             "SA01",
             "codex",
             "auth.rs complete",
-            Some("# Result\n\nCompleted auth.rs with the full implementation and supporting notes."),
+            Some(
+                "# Result\n\nCompleted auth.rs with the full implementation and supporting notes.",
+            ),
         )
-            .unwrap();
+        .unwrap();
 
         let evs = events.lock().unwrap();
         let cp_pos = evs.iter().position(|e| {

@@ -3,7 +3,7 @@ use crate::agent_core::relay::RelayEngine;
 use crate::agent_core::routing::RosterMatchData;
 use crate::channels_internal::mention_trigger::MentionTrigger;
 use crate::protocol::{normalize_conversation_identity, InboundMsg, MsgSource, SessionKey};
-use crate::session::{SessionStorage, StoredMessage};
+use crate::session::{SessionStorage, StoredMessage, ToolCallRecord};
 use dashmap::DashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,8 +28,10 @@ pub(crate) struct PostTurnInput<'a> {
     pub persona_dir: Option<PathBuf>,
     pub user_text_for_log: &'a str,
     pub full_text: String,
+    pub tool_calls: Vec<ToolCallRecord>,
     pub is_lead: bool,
-    pub team_orchestrator: Option<std::sync::Arc<crate::agent_core::team::orchestrator::TeamOrchestrator>>,
+    pub team_orchestrator:
+        Option<std::sync::Arc<crate::agent_core::team::orchestrator::TeamOrchestrator>>,
 }
 
 pub(crate) async fn process_post_turn(
@@ -114,7 +116,11 @@ pub(crate) async fn process_post_turn(
         content: stored_content.clone(),
         timestamp: chrono::Utc::now(),
         sender: input.sender_name,
-        tool_calls: None,
+        tool_calls: if input.tool_calls.is_empty() {
+            None
+        } else {
+            Some(input.tool_calls)
+        },
         aggregation_mode: fragment_event_ids
             .as_ref()
             .map(|_| "turn_compacted".to_string()),

@@ -224,8 +224,11 @@ mod tests {
 
     #[test]
     fn lead_helper_failure_becomes_command_failed() {
-        let json =
-            crate::runtime::render_team_helper_failure("assign_task", Some("T001"), "missing assignee");
+        let json = crate::runtime::render_team_helper_failure(
+            "assign_task",
+            Some("T001"),
+            "missing assignee",
+        );
 
         let outcome = OpenClawLeadOutcome::from_helper_json(&json).unwrap();
         assert!(matches!(

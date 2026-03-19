@@ -415,6 +415,8 @@ mod tests {
             tool_surface: ToolSurfaceSpec {
                 team_tools: true,
                 allowed_team_tools: vec![],
+                schedule_tools: true,
+                allowed_schedule_tools: vec![],
                 local_skills: true,
                 external_mcp: false,
                 backend_native_tools: true,

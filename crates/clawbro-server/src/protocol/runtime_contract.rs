@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::SessionKey;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TeamTool {
     CreateTask,
@@ -91,6 +90,27 @@ pub struct TeamToolResponse {
     pub message: String,
     #[serde(default)]
     pub payload: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ScheduleTool {
+    CreateDelayReminder,
+    CreateAtReminder,
+    CreateEveryReminder,
+    CreateCronReminder,
+    CreateDelayAgentSchedule,
+    CreateAtAgentSchedule,
+    CreateEveryAgentSchedule,
+    CreateCronAgentSchedule,
+    ListSchedules,
+    ListCurrentSessionSchedules,
+    PauseSchedule,
+    ResumeSchedule,
+    DeleteSchedule,
+    DeleteScheduleByName,
+    ClearCurrentSessionSchedules,
+    RunScheduleNow,
+    ScheduleHistory,
 }
 
 #[cfg(test)]

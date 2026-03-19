@@ -1,6 +1,6 @@
+use crate::protocol::{InboundMsg, OutboundMsg};
 use anyhow::Result;
 use async_trait::async_trait;
-use crate::protocol::{InboundMsg, OutboundMsg};
 use tokio::sync::mpsc;
 
 /// Channel = 消息平台适配器（参考 zeroclaw/src/channels/traits.rs）

@@ -9,8 +9,8 @@
 //!   - 单层：BotMention 消息不再触发 MentionTrigger（source 检查）
 //!   - 双层保险：hop_count 在 InboundMsg 中（由 registry 控制，此处不涉及）
 
-use chrono::Utc;
 use crate::protocol::{InboundMsg, MsgContent, MsgSource, SessionKey};
+use chrono::Utc;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 

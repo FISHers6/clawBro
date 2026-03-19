@@ -2,7 +2,7 @@
 
 ## Purpose
 
-`ClawBro` now exposes a minimal operations surface for runtime and team visibility.
+`ClawBro` now exposes a minimal operations surface for runtime, scheduler, and team visibility.
 
 This is not a full runbook yet. It is the first stable contract for day-2 inspection.
 
@@ -64,13 +64,36 @@ This is intended to answer:
 - does it have a reachable tool surface
 - how many tasks are pending / claimed / submitted / accepted / done / failed
 
+## Local CLI
+
+### `clawbro status`
+
+Current local status output includes:
+
+- gateway port and mode summary
+- backend/provider summary
+- channel/auth summary
+- gateway running marker
+- scheduler enabled/disabled
+- scheduler DB path and whether the DB file exists
+
+### `clawbro doctor`
+
+Current local doctor output includes:
+
+- binary presence
+- config syntax/schema validation
+- environment and channel checks
+- runtime directory checks
+- gateway process marker
+- scheduler DB path and whether the DB file already exists
+
 ## Current Limitations
 
 This is intentionally conservative.
 
 - backend liveness is not actively probed on every request
 - status relies on cached capability summaries already observed by runtime usage
-- there is no `/doctor` command yet
 - channel-specific diagnostics are not included yet
 - approval details are not exposed, only pending count
 
@@ -78,7 +101,6 @@ This is intentionally conservative.
 
 The next Ops Plane increment should add:
 
-- `/doctor`
 - backend probe refresh on demand
 - channel diagnostics
 - team tool surface diagnostics

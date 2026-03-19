@@ -1,6 +1,6 @@
 [package]
 name = "clawbro"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 rust-version = "1.90"
 autobins = false
@@ -62,6 +62,7 @@ base64 = "0.22"
 hmac = "0.12"
 sha2 = "0.10"
 urlencoding = "2.1"
+clawbro-cron = { version = "0.1.0", path = "../clawbro-cron" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

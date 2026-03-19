@@ -3,8 +3,8 @@ use crate::agent_core::control_reply::ControlReply;
 use crate::agent_core::memory_service::{handle_memory_request, MemoryRequest};
 use crate::agent_core::registry::SlashControlContext;
 use crate::agent_core::slash::SlashCommand;
-use anyhow::Result;
 use crate::protocol::SessionKey;
+use anyhow::Result;
 
 pub(crate) struct SlashRequest<'a> {
     pub session_key: &'a SessionKey,
@@ -106,16 +106,18 @@ pub(crate) async fn execute_slash_request(req: SlashRequest<'_>) -> Result<Contr
 mod tests {
     use super::*;
     use crate::agent_core::approval::{ApprovalDecision, ApprovalResolver};
-    use crate::agent_core::memory::{distiller::NoopDistiller, store::FileMemoryStore, MemorySystem};
+    use crate::agent_core::memory::{
+        distiller::NoopDistiller, store::FileMemoryStore, MemorySystem,
+    };
     use crate::agent_core::registry::SessionRegistry;
     use crate::agent_core::slash::SlashCommand;
     use crate::agent_core::team::heartbeat::DispatchFn;
     use crate::agent_core::team::orchestrator::TeamOrchestrator;
     use crate::agent_core::team::registry::{CreateTask, TaskRegistry};
     use crate::agent_core::team::session::TeamSession;
-    use anyhow::Result;
     use crate::protocol::AgentEvent;
     use crate::session::{SessionManager, SessionStorage};
+    use anyhow::Result;
     use std::sync::{Arc, Mutex};
     use tokio::sync::broadcast;
 
@@ -140,10 +142,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("test-slash-service-{}", uuid::Uuid::new_v4()));
         let storage = SessionStorage::new(dir);
         let session_manager = Arc::new(SessionManager::new(storage));
-        let store: Arc<dyn crate::agent_core::memory::MemoryStore> = Arc::new(FileMemoryStore::new(
-            std::env::temp_dir().join(uuid::Uuid::new_v4().to_string()),
-        ));
-        let distiller: Arc<dyn crate::agent_core::memory::MemoryDistiller> = Arc::new(NoopDistiller);
+        let store: Arc<dyn crate::agent_core::memory::MemoryStore> = Arc::new(
+            FileMemoryStore::new(std::env::temp_dir().join(uuid::Uuid::new_v4().to_string())),
+        );
+        let distiller: Arc<dyn crate::agent_core::memory::MemoryDistiller> =
+            Arc::new(NoopDistiller);
         let memory_system = MemorySystem::new(vec![], store, distiller);
         SessionRegistry::new(
             None,

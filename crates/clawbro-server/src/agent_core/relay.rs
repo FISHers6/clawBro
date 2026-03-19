@@ -11,8 +11,8 @@
 //! 语法：`[RELAY: @agentname <指令文本>]`
 //! 示例：`[RELAY: @codex 帮我验证 JWT 签名逻辑]`
 
-use anyhow::Result;
 use crate::protocol::{MsgContent, SessionKey};
+use anyhow::Result;
 use std::future::Future;
 use std::pin::Pin;
 

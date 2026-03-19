@@ -46,11 +46,7 @@ async fn render_directory_listing(path: &Path) -> Result<ViewFileOutput, ToolErr
             .await
             .map_err(|e| ToolError::ToolCallError(e.into()))?;
         let suffix = if file_type.is_dir() { "/" } else { "" };
-        names.push(format!(
-            "{}{}",
-            entry.file_name().to_string_lossy(),
-            suffix
-        ));
+        names.push(format!("{}{}", entry.file_name().to_string_lossy(), suffix));
     }
 
     names.sort();

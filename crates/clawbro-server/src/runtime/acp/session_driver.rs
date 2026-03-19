@@ -7,8 +7,7 @@ use crate::runtime::{
     codex_local_config::prepare_isolated_codex_home,
     contract::{
         render_runtime_prompt, ApprovalMode, ExternalMcpServerSpec, ExternalMcpTransport,
-        ResumeRecoveryAction,
-        RuntimeEvent, RuntimeSessionSpec, TurnResult,
+        ResumeRecoveryAction, RuntimeEvent, RuntimeSessionSpec, TurnResult,
     },
     event_sink::RuntimeEventSink,
 };
@@ -901,7 +900,9 @@ async fn authenticate_if_configured(
     Ok(())
 }
 
-fn permission_request_from_acp(args: &acp::RequestPermissionRequest) -> crate::runtime::PermissionRequest {
+fn permission_request_from_acp(
+    args: &acp::RequestPermissionRequest,
+) -> crate::runtime::PermissionRequest {
     let title = args
         .tool_call
         .fields
@@ -1122,6 +1123,10 @@ fn spawn_command(
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit());
+
+    if let Ok(path) = std::env::current_exe() {
+        cmd.env("CLAWBRO_SCHEDULE_COMMAND", path);
+    }
 
     if let Some(ws) = workspace_dir {
         if ws.exists() {
@@ -1671,11 +1676,12 @@ mod tests {
             team_tool_url: None,
             provider_profile: Some(crate::runtime::provider_profiles::RuntimeProviderProfile {
                 id: "deepseek-openai".into(),
-                protocol: crate::runtime::provider_profiles::RuntimeProviderProtocol::OpenaiCompatible {
-                    base_url: "https://api.deepseek.com/v1".into(),
-                    api_key: "sk-test".into(),
-                    default_model: "deepseek-chat".into(),
-                },
+                protocol:
+                    crate::runtime::provider_profiles::RuntimeProviderProtocol::OpenaiCompatible {
+                        base_url: "https://api.deepseek.com/v1".into(),
+                        api_key: "sk-test".into(),
+                        default_model: "deepseek-chat".into(),
+                    },
             }),
             backend_session_id: None,
             context: crate::runtime::contract::RuntimeContext::default(),

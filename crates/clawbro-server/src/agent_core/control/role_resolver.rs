@@ -50,12 +50,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let session = Arc::new(TeamSession::from_dir("team-role", tmp.path().to_path_buf()));
         let registry = Arc::new(TaskRegistry::new_in_memory().unwrap());
-        let dispatch = Arc::new(move |_agent: String, _task: crate::agent_core::team::registry::Task| {
-            let fut: std::pin::Pin<
-                Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>,
-            > = Box::pin(async { Ok(()) });
-            fut
-        });
+        let dispatch = Arc::new(
+            move |_agent: String, _task: crate::agent_core::team::registry::Task| {
+                let fut: std::pin::Pin<
+                    Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>,
+                > = Box::pin(async { Ok(()) });
+                fut
+            },
+        );
         let orch = TeamOrchestrator::new(registry, session, dispatch, Duration::from_secs(60));
         orch.set_lead_agent_name("claude".to_string());
         orch

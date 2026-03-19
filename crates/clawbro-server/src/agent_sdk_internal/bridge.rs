@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::protocol::ScheduleTool;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalMode {
@@ -110,6 +112,9 @@ pub struct ToolSurfaceSpec {
     pub team_tools: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_team_tools: Vec<crate::protocol::TeamTool>,
+    pub schedule_tools: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_schedule_tools: Vec<ScheduleTool>,
     pub local_skills: bool,
     pub external_mcp: bool,
     pub backend_native_tools: bool,

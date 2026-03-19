@@ -12,10 +12,16 @@ pub struct DingTalkWebhookMapped {
     pub robot_code: Option<String>,
 }
 
-pub fn map_payload(payload: &DingTalkWebhookPayload, text: String) -> Option<DingTalkWebhookMapped> {
+pub fn map_payload(
+    payload: &DingTalkWebhookPayload,
+    text: String,
+) -> Option<DingTalkWebhookMapped> {
     match payload.conversation_type.as_str() {
         "2" => Some(DingTalkWebhookMapped {
-            session_key: SessionKey::new("dingtalk_webhook", format!("group:{}", payload.conversation_id)),
+            session_key: SessionKey::new(
+                "dingtalk_webhook",
+                format!("group:{}", payload.conversation_id),
+            ),
             sender_id: payload.sender_id.clone(),
             sender_nick: payload.sender_nick.clone(),
             msg_id: payload.msg_id.clone(),

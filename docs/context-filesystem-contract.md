@@ -55,10 +55,16 @@ ClawBro treats files as the durable source of truth and `RuntimeContext` as the 
 
 ## Why `HEARTBEAT.md` Matters
 
-`HEARTBEAT.md` is common in mature systems such as OpenClaw and hiClaw.
-It represents periodic operational intent in a durable, inspectable form rather than burying it inside prompt text or scheduler-specific code.
+`HEARTBEAT.md` remains useful as a durable, inspectable Team or workspace checklist file.
+It is part of the context filesystem contract, not the declaration source for general scheduled jobs.
 
-Adding it to the contract now gives ClawBro:
+In the current scheduler architecture:
+
+- durable scheduled jobs are created through `clawbro schedule ...`
+- scheduler state lives in SQLite via the runtime scheduler
+- `HEARTBEAT.md` can still guide periodic operational review, but it is not the scheduler control plane
+
+Adding it to the contract still gives ClawBro:
 
 - a stable cross-backend context shape
 - a place to evolve heartbeat-native behavior later

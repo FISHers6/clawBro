@@ -19,7 +19,7 @@
     <a href="./docs/setup.md">설정 가이드</a>
   </p>
   <p>
-    <img src="https://img.shields.io/badge/version-0.1.4-blue" alt="Version">
+    <img src="https://img.shields.io/badge/version-0.1.5-blue" alt="Version">
     <img src="https://img.shields.io/badge/rust-1.90%2B-orange" alt="Rust">
     <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
     <img src="https://img.shields.io/badge/agents-Claude%20%7C%20Codex%20%7C%20Qwen%20%7C%20Qoder%20%7C%20Gemini-111827" alt="Agents">
@@ -40,6 +40,7 @@ OpenClaw의 방향을 이어가되, 실전 협업에 더 초점을 맞춥니다.
 - **[03-19]** Lark, DingTalk Stream Mode, DingTalk Custom Robot Webhook, WebSocket에 연결할 수 있어 로컬 사용에서 그룹 채팅까지 단계적으로 확장할 수 있습니다.
 - **[03-19]** 이제 하나의 `clawbro` 런타임을 여러 IM에 상시 연결해 두고 Lark, DingTalk, 팀 대화를 동시에 운영할 수 있습니다.
 - **[03-19]** approvals, allowlist, memory-aware sessions, `/health`, `/status`, `/doctor`, diagnostics 기능을 제공합니다.
+- **[03-20]** 내장 스케줄러가 들어왔습니다. 일회성 알림, 정확한 시각 실행, 고정 간격 폴링, cron 작업, 채팅에서 바로 만드는 리마인더, 현재 대화 기준 일괄 정리까지 같은 런타임에서 처리합니다.
 
 > `clawBro` 는 엔지니어링 협업, 리서치 워크플로, 그룹 채팅 AI 도우미, 멀티 Agent 실험에 적합합니다.
 
@@ -55,12 +56,14 @@ OpenClaw의 방향을 이어가되, 실전 협업에 더 초점을 맞춥니다.
 
 🧠 **기억과 습관**: 공유 메모리와 역할 메모리를 통해 프로젝트 맥락과 선호를 누적할 수 있습니다.
 
+⏰ **스케줄링과 폴링**: `delay`, `at`, `every`, `cron` 네 가지 방식으로 알림도 만들고, 나중에 agent가 다시 일하게 할 수도 있습니다.
+
 🛡️ **운영 가능성**: config validate, doctor/status, 승인 흐름, 헬스 체크를 제공합니다.
 
 ## 🏗️ 아키텍처
 
 ```text
-사용자 / 그룹 / WebSocket / Cron
+사용자 / 그룹 / WebSocket / Scheduled Jobs
               |
               v
            clawbro
@@ -85,6 +88,7 @@ OpenClaw의 방향을 이어가되, 실전 협업에 더 초점을 맞춥니다.
 - [활용 시나리오](#-활용-시나리오)
 - [설치](#-설치)
 - [빠른 시작](#-빠른-시작)
+- [정시 작업](#-정시-작업)
 - [팀 모드](#-팀-모드)
 - [Coding Agent 통합](#-coding-agent-통합)
 - [채팅 채널](#-채팅-채널)
@@ -206,6 +210,35 @@ clawbro config validate
 source ~/.clawbro/.env
 clawbro serve
 ```
+
+## ⏰ 정시 작업
+
+`clawBro` 는 불렀을 때만 답하는 도구가 아니라, 시간이 되면 스스로 다시 움직일 수 있습니다.
+
+- **4가지 스케줄 방식**:
+  - `delay`: “1분 후에 휴대폰 충전하라고 알려줘”
+  - `at`: “내일 오전 9시에 회의 알려줘”
+  - `every`: “30분마다 서비스 상태를 확인해줘”
+  - `cron`: “평일 18시에 issue 진행 상황을 요약해줘”
+- **2가지 실행 스타일**:
+  - 고정 알림은 채팅으로 바로 다시 보냅니다
+  - 동적인 작업은 시간이 되면 agent를 다시 깨워서 실행합니다
+- **채팅에서는 자연어로 바로 말하면 됩니다**:
+  - “1분 후에 휴대폰 충전하라고 알려줘”
+  - “매분 베이징 시간을 알려줘”
+  - “휴대폰 충전 알림 삭제해줘”
+  - “이 대화의 알림을 전부 지워줘”
+- **운영자는 CLI로도 다룰 수 있습니다**:
+
+```bash
+clawbro schedule add-delay --name phone-charge --delay 1m --prompt "Reminder: charge your phone"
+clawbro schedule add-every --name service-check --every 30m --target-kind agent-turn --prompt "Check service status and report anomalies."
+clawbro schedule list
+clawbro schedule delete --name phone-charge
+clawbro schedule delete-all --current-session-key 'lark@alpha:user:ou_xxx'
+```
+
+한마디로, 리마인더는 정확히 튀어나오고, agent 작업은 시간이 되면 다시 출근합니다.
 
 ## 👥 팀 모드
 

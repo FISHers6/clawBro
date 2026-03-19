@@ -178,7 +178,9 @@ mod tests {
     use super::*;
     use crate::runtime::acp::{AcpAuthMethod, CodexProjectionMode};
     use crate::runtime::backend::{ApprovalMode, BackendFamily};
-    use crate::runtime::provider_profiles::{ConfiguredProviderProfile, ConfiguredProviderProtocol};
+    use crate::runtime::provider_profiles::{
+        ConfiguredProviderProfile, ConfiguredProviderProtocol,
+    };
     use crate::runtime::registry::BackendSpec;
 
     fn base_codex_spec() -> BackendSpec {

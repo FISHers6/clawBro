@@ -104,7 +104,7 @@ impl BackendAdapter for OpenClawBackendAdapter {
             scopes: scopes.clone(),
         };
         let mut client = OpenClawGatewayClient::connect(&connect).await?;
-        let helper = if session.tool_surface.team_tools {
+        let helper = if session.tool_surface.team_tools || session.tool_surface.schedule_tools {
             Some(resolve_team_helper_config(
                 team_helper_command.as_deref(),
                 team_helper_args,
@@ -182,6 +182,8 @@ impl BackendAdapter for OpenClawBackendAdapter {
                         sink.emit(bridge.handle_helper_result(&result)?)?;
                     } else if let Some(bridge) = lead_bridge.as_ref() {
                         sink.emit(bridge.handle_helper_result(&result)?)?;
+                    } else if helper.is_some() {
+                        sink.emit(runtime_event_from_generic_helper_result(&result)?)?;
                     } else {
                         anyhow::bail!("received OpenClaw team helper result outside team mode");
                     }
@@ -216,7 +218,9 @@ impl OpenClawBackendAdapter {
         let decision = match approval_mode {
             ApprovalMode::Manual => {
                 let pending = self.approvals.register(&request);
-                sink.emit(crate::runtime::contract::RuntimeEvent::ApprovalRequest(request))?;
+                sink.emit(crate::runtime::contract::RuntimeEvent::ApprovalRequest(
+                    request,
+                ))?;
                 pending.wait().await
             }
             ApprovalMode::AutoAllow => crate::runtime::approval::ApprovalDecision::AllowOnce,
@@ -232,7 +236,7 @@ struct TeamHelperConfig {
     args: Vec<String>,
     session_channel: String,
     session_scope: String,
-    team_tool_url: String,
+    team_tool_url: Option<String>,
 }
 
 fn build_run_binding(
@@ -327,10 +331,18 @@ fn resolve_team_helper_config(
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| anyhow!("OpenClaw team mode requires launch.team_helper_command"))?;
     let path = resolve_helper_path(command)?;
-    let team_tool_url = session
-        .team_tool_url
-        .clone()
-        .ok_or_else(|| anyhow!("OpenClaw team mode requires session.team_tool_url"))?;
+    let team_tool_url = if session.tool_surface.team_tools {
+        Some(
+            session
+                .team_tool_url
+                .clone()
+                .ok_or_else(|| anyhow!("OpenClaw team mode requires session.team_tool_url"))?,
+        )
+    } else if session.tool_surface.schedule_tools {
+        None
+    } else {
+        anyhow::bail!("OpenClaw helper requested without any helper-capable tool surface");
+    };
     Ok(TeamHelperConfig {
         command: path.display().to_string(),
         args: args.to_vec(),
@@ -416,8 +428,10 @@ fn ensure_allowlist_array<'a>(
 fn helper_prefix(helper: &TeamHelperConfig) -> String {
     let mut parts = vec![helper.command.clone()];
     parts.extend(helper.args.clone());
-    parts.push("--url".into());
-    parts.push(shell_quote(&helper.team_tool_url));
+    if let Some(url) = helper.team_tool_url.as_deref() {
+        parts.push("--url".into());
+        parts.push(shell_quote(url));
+    }
     parts.push("--session-channel".into());
     parts.push(shell_quote(&helper.session_channel));
     parts.push("--session-scope".into());
@@ -484,15 +498,85 @@ fn augment_prompt_for_openclaw(
         crate::runtime::contract::RuntimeRole::Solo => String::new(),
     };
 
-    if role_notes.is_empty() {
+    let schedule_notes = if session.tool_surface.schedule_tools {
+        [
+            format!(
+                "`{} create-delay-reminder --delay <30s|5m|2h|1d> --message <message> [--name <name>] [--target-session-key <session>]`",
+                helper_prefix(helper)
+            ),
+            format!(
+                "`{} create-at-reminder --run-at <rfc3339> --message <message> [--name <name>] [--target-session-key <session>]`",
+                helper_prefix(helper)
+            ),
+            format!(
+                "`{} create-every-reminder --every <30s|5m|2h> --message <message> [--name <name>] [--target-session-key <session>]`",
+                helper_prefix(helper)
+            ),
+            format!(
+                "`{} create-cron-reminder --expr '<cron>' --message <message> [--name <name>] [--target-session-key <session>] [--timezone <tz>]`",
+                helper_prefix(helper)
+            ),
+            format!(
+                "`{} create-delay-agent-schedule --delay <30s|5m|2h|1d> --task-prompt <task> [--name <name>] [--target-session-key <session>] [--agent <agent>]`",
+                helper_prefix(helper)
+            ),
+            format!(
+                "`{} create-at-agent-schedule --run-at <rfc3339> --task-prompt <task> [--name <name>] [--target-session-key <session>] [--agent <agent>] [--timezone <tz>]`",
+                helper_prefix(helper)
+            ),
+            format!(
+                "`{} create-every-agent-schedule --every <30s|5m|2h> --task-prompt <task> [--name <name>] [--target-session-key <session>] [--agent <agent>]`",
+                helper_prefix(helper)
+            ),
+            format!(
+                "`{} create-cron-agent-schedule --expr '<cron>' --task-prompt <task> [--name <name>] [--target-session-key <session>] [--agent <agent>] [--timezone <tz>]`",
+                helper_prefix(helper)
+            ),
+            format!("`{} list-schedules`", helper_prefix(helper)),
+            format!("`{} pause-schedule --job-id <job-id>`", helper_prefix(helper)),
+            format!("`{} resume-schedule --job-id <job-id>`", helper_prefix(helper)),
+            format!("`{} delete-schedule --job-id <job-id>`", helper_prefix(helper)),
+            format!("`{} run-schedule-now --job-id <job-id>`", helper_prefix(helper)),
+            format!("`{} schedule-history --job-id <job-id>`", helper_prefix(helper)),
+        ]
+        .join("\n")
+    } else {
+        String::new()
+    };
+
+    if role_notes.is_empty() && schedule_notes.is_empty() {
         return crate::runtime::contract::render_runtime_prompt(session);
     }
 
     format!(
-        "{}\n\n<clawbro_team_contract>\nYou are running inside ClawBro Team mode.\nUse the following helper commands for team coordination instead of inventing your own protocol.\n{}\nIf a task is complete, submit results instead of only saying it in plain text.\n</clawbro_team_contract>",
+        "{}\n\n<clawbro_host_contract>\nUse the following helper commands instead of inventing your own protocol.\n{}\n{}\nIf a task is complete, submit results instead of only saying it in plain text.\n</clawbro_host_contract>",
         crate::runtime::contract::render_runtime_prompt(session),
-        role_notes
+        role_notes,
+        schedule_notes
     )
+}
+
+fn runtime_event_from_generic_helper_result(
+    result: &Value,
+) -> anyhow::Result<crate::runtime::RuntimeEvent> {
+    let parsed = crate::runtime::ParsedTeamHelperResult::from_json(result)?;
+    if parsed.ok {
+        Ok(crate::runtime::RuntimeEvent::ToolCallCompleted {
+            tool_name: parsed.action,
+            call_id: "openclaw-helper".into(),
+            result: serde_json::to_string(result)?,
+        })
+    } else {
+        Ok(crate::runtime::RuntimeEvent::ToolCallFailed {
+            tool_name: parsed.action,
+            call_id: "openclaw-helper".into(),
+            error: result
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("OpenClaw helper command failed")
+                .to_string(),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -701,7 +785,7 @@ mod tests {
             args: vec!["--trace".into()],
             session_channel: "specialist".into(),
             session_scope: "team:codex".into(),
-            team_tool_url: "http://127.0.0.1:3000/runtime/team-tools?token=t".into(),
+            team_tool_url: Some("http://127.0.0.1:3000/runtime/team-tools?token=t".into()),
         };
         let session = RuntimeSessionSpec {
             backend_id: "openclaw-main".into(),
@@ -713,6 +797,8 @@ mod tests {
             tool_surface: ToolSurfaceSpec {
                 team_tools: true,
                 allowed_team_tools: vec![],
+                schedule_tools: false,
+                allowed_schedule_tools: vec![],
                 local_skills: false,
                 external_mcp: false,
                 backend_native_tools: true,
@@ -720,7 +806,7 @@ mod tests {
             approval_mode: Default::default(),
             tool_bridge_url: None,
             external_mcp_servers: vec![],
-            team_tool_url: Some(helper.team_tool_url.clone()),
+            team_tool_url: helper.team_tool_url.clone(),
             provider_profile: None,
             backend_session_id: None,
             context: RuntimeContext::default(),
@@ -739,7 +825,7 @@ mod tests {
             args: vec![],
             session_channel: "specialist".into(),
             session_scope: "team:codex".into(),
-            team_tool_url: "http://127.0.0.1:3000/runtime/team-tools?token=t".into(),
+            team_tool_url: Some("http://127.0.0.1:3000/runtime/team-tools?token=t".into()),
         };
         let session = RuntimeSessionSpec {
             backend_id: "openclaw-main".into(),
@@ -751,6 +837,8 @@ mod tests {
             tool_surface: ToolSurfaceSpec {
                 team_tools: true,
                 allowed_team_tools: vec![],
+                schedule_tools: false,
+                allowed_schedule_tools: vec![],
                 local_skills: false,
                 external_mcp: false,
                 backend_native_tools: true,
@@ -758,7 +846,7 @@ mod tests {
             approval_mode: Default::default(),
             tool_bridge_url: None,
             external_mcp_servers: vec![],
-            team_tool_url: Some(helper.team_tool_url.clone()),
+            team_tool_url: helper.team_tool_url.clone(),
             provider_profile: None,
             backend_session_id: None,
             context: RuntimeContext {
@@ -789,7 +877,7 @@ mod tests {
             args: vec![],
             session_channel: "ws".into(),
             session_scope: "group:team".into(),
-            team_tool_url: "http://127.0.0.1:3000/runtime/team-tools?token=t".into(),
+            team_tool_url: Some("http://127.0.0.1:3000/runtime/team-tools?token=t".into()),
         };
         let session = RuntimeSessionSpec {
             backend_id: "openclaw-main".into(),
@@ -801,6 +889,8 @@ mod tests {
             tool_surface: ToolSurfaceSpec {
                 team_tools: true,
                 allowed_team_tools: vec![],
+                schedule_tools: false,
+                allowed_schedule_tools: vec![],
                 local_skills: false,
                 external_mcp: false,
                 backend_native_tools: true,
@@ -808,7 +898,7 @@ mod tests {
             approval_mode: Default::default(),
             tool_bridge_url: None,
             external_mcp_servers: vec![],
-            team_tool_url: Some(helper.team_tool_url.clone()),
+            team_tool_url: helper.team_tool_url.clone(),
             provider_profile: None,
             backend_session_id: None,
             context: RuntimeContext::default(),

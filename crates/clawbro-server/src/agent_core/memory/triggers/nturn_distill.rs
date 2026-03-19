@@ -59,7 +59,9 @@ impl MemoryTrigger for NTurnDistillTrigger {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_core::memory::{distiller::NoopDistiller, store::FileMemoryStore, trigger::MemoryTrigger};
+    use crate::agent_core::memory::{
+        distiller::NoopDistiller, store::FileMemoryStore, trigger::MemoryTrigger,
+    };
     use crate::protocol::SessionKey;
     use std::path::PathBuf;
     use std::sync::Arc;

@@ -1,8 +1,8 @@
-use anyhow::Result;
 use crate::agent_core::bindings::{BindingPeerKind, BindingRule};
 use crate::agent_core::roster::AgentEntry;
 use crate::agent_core::team::milestone_delivery::TeamPublicUpdatesMode;
 use crate::runtime::{AcpBackend, ApprovalMode, BackendFamily, BackendSpec, LaunchSpec};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -59,21 +59,54 @@ impl Default for MemorySection {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CronJobConfig {
-    pub name: String,
-    pub expr: String,
-    pub prompt: String,
-    pub session_key: String,
-    #[serde(default = "default_true")]
+pub struct SchedulerSection {
+    #[serde(default = "default_scheduler_enabled")]
     pub enabled: bool,
+    #[serde(default = "default_scheduler_poll_secs")]
+    pub poll_secs: u64,
+    #[serde(default = "default_scheduler_max_concurrent")]
+    pub max_concurrent: usize,
+    #[serde(default = "default_scheduler_max_fetch_per_tick")]
+    pub max_fetch_per_tick: usize,
+    #[serde(default = "default_scheduler_default_timezone")]
+    pub default_timezone: String,
     #[serde(default)]
-    pub agent: Option<String>,
-    #[serde(default)]
-    pub condition: Option<String>,
+    pub db_path: Option<PathBuf>,
+    #[serde(default = "default_scheduler_lease_secs")]
+    pub lease_secs: i64,
 }
 
-fn default_true() -> bool {
+fn default_scheduler_enabled() -> bool {
     true
+}
+fn default_scheduler_poll_secs() -> u64 {
+    15
+}
+fn default_scheduler_max_concurrent() -> usize {
+    4
+}
+fn default_scheduler_max_fetch_per_tick() -> usize {
+    64
+}
+fn default_scheduler_default_timezone() -> String {
+    "UTC".to_string()
+}
+fn default_scheduler_lease_secs() -> i64 {
+    120
+}
+
+impl Default for SchedulerSection {
+    fn default() -> Self {
+        Self {
+            enabled: default_scheduler_enabled(),
+            poll_secs: default_scheduler_poll_secs(),
+            max_concurrent: default_scheduler_max_concurrent(),
+            max_fetch_per_tick: default_scheduler_max_fetch_per_tick(),
+            default_timezone: default_scheduler_default_timezone(),
+            db_path: None,
+            lease_secs: default_scheduler_lease_secs(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -101,7 +134,7 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub memory: MemorySection,
     #[serde(default)]
-    pub cron_jobs: Vec<CronJobConfig>,
+    pub scheduler: SchedulerSection,
     /// 群组专项配置列表（`[[group]]` 段，可配置交互模式和 Team Mode 参数）
     #[serde(default, rename = "group")]
     pub groups: Vec<GroupConfig>,
@@ -119,7 +152,9 @@ pub struct GatewayConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GatewaySection {
+    #[serde(default = "default_gateway_host")]
     pub host: String,
+    #[serde(default = "default_gateway_port")]
     pub port: u16,
     /// When true, bot only responds in group chats if @-mentioned.
     /// In private chats this flag has no effect.
@@ -130,11 +165,19 @@ pub struct GatewaySection {
     pub default_workspace: Option<PathBuf>,
 }
 
+fn default_gateway_host() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_gateway_port() -> u16 {
+    0
+}
+
 impl Default for GatewaySection {
     fn default() -> Self {
         Self {
-            host: "127.0.0.1".to_string(),
-            port: 0,
+            host: default_gateway_host(),
+            port: default_gateway_port(),
             require_mention_in_groups: false,
             default_workspace: None,
         }
@@ -142,6 +185,11 @@ impl Default for GatewaySection {
 }
 
 impl GatewayConfig {
+    pub fn from_toml_str(content: &str) -> Result<Self> {
+        reject_legacy_cron_jobs(content)?;
+        Ok(toml::from_str(content)?)
+    }
+
     pub fn resolved_default_backend_id(&self) -> Option<String> {
         let backend_id = self.agent.backend_id.trim();
         (!backend_id.is_empty()).then(|| backend_id.to_string())
@@ -1189,10 +1237,20 @@ impl GatewayConfig {
             return Ok(cfg);
         }
         let content = std::fs::read_to_string(&path)?;
-        let mut cfg: Self = toml::from_str(&content)?;
+        let mut cfg = Self::from_toml_str(&content)?;
         apply_env_overrides(&mut cfg);
         Ok(cfg)
     }
+}
+
+fn reject_legacy_cron_jobs(content: &str) -> Result<()> {
+    let value: toml::Value = toml::from_str(content)?;
+    if value.get("cron_jobs").is_some() {
+        anyhow::bail!(
+            "legacy [[cron_jobs]] is no longer supported; use the runtime scheduler control plane instead"
+        );
+    }
+    Ok(())
 }
 
 fn apply_env_overrides(cfg: &mut GatewayConfig) {
@@ -1425,7 +1483,10 @@ presentation = "progress_compact"
         assert!(webhook.enabled);
         assert_eq!(webhook.secret_key, "SEC-test");
         assert_eq!(webhook.webhook_path, "/channels/dingtalk/webhook");
-        assert_eq!(webhook.presentation, ProgressPresentationMode::ProgressCompact);
+        assert_eq!(
+            webhook.presentation,
+            ProgressPresentationMode::ProgressCompact
+        );
         assert!(webhook.access_token.is_none());
     }
 
@@ -1641,7 +1702,7 @@ backend_id = " native-main "
     #[test]
     fn test_memory_config_deserializes_with_defaults() {
         let toml_str = "[memory]\ndistill_every_n = 5";
-        let cfg: GatewayConfig = toml::from_str(toml_str).unwrap();
+        let cfg = GatewayConfig::from_toml_str(toml_str).unwrap();
         assert_eq!(cfg.memory.distill_every_n, 5);
         assert_eq!(cfg.memory.distiller_binary, "clawbro");
         assert_eq!(cfg.memory.shared_memory_max_words, 300);
@@ -1651,89 +1712,65 @@ backend_id = " native-main "
     #[test]
     fn test_gateway_config_includes_memory_section() {
         let toml_str = "[memory]\ndistill_every_n = 10";
-        let cfg: GatewayConfig = toml::from_str(toml_str).unwrap();
+        let cfg = GatewayConfig::from_toml_str(toml_str).unwrap();
         assert_eq!(cfg.memory.distill_every_n, 10);
     }
 
     #[test]
-    fn test_cron_jobs_config_deserializes() {
+    fn test_scheduler_section_deserializes() {
         let toml_str = r#"
-[[cron_jobs]]
-name = "daily-standup"
-expr = "0 9 * * 1-5"
-prompt = "站会摘要"
-session_key = "dingtalk:group_xxx"
-enabled = true
-
-[[cron_jobs]]
-name = "weekly-report"
-expr = "0 18 * * 5"
-prompt = "工作报告"
-session_key = "lark:ou_xxx"
+        [scheduler]
+        enabled = true
+        poll_secs = 10
+        max_concurrent = 8
+        max_fetch_per_tick = 32
+        default_timezone = "Asia/Shanghai"
+        db_path = "/tmp/scheduler.db"
+        lease_secs = 45
 "#;
-        let cfg: GatewayConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(cfg.cron_jobs.len(), 2);
-        assert_eq!(cfg.cron_jobs[0].name, "daily-standup");
-        assert_eq!(cfg.cron_jobs[0].expr, "0 9 * * 1-5");
-        assert!(cfg.cron_jobs[0].enabled);
-        assert_eq!(cfg.cron_jobs[1].name, "weekly-report");
-        // enabled defaults to true when omitted
-        assert!(cfg.cron_jobs[1].enabled);
-    }
-
-    #[test]
-    fn test_cron_jobs_empty_by_default() {
-        let toml_str = "[gateway]\nhost = \"127.0.0.1\"\nport = 0";
-        let cfg: GatewayConfig = toml::from_str(toml_str).unwrap();
-        assert!(cfg.cron_jobs.is_empty());
-    }
-
-    #[test]
-    fn test_cron_job_config_with_agent() {
-        let toml = r#"
-[[cron_jobs]]
-name = "digest"
-expr = "0 0 8 * * *"
-prompt = "Summarize today"
-session_key = "lark:ou_xxx"
-agent = "reviewer"
-"#;
-        let cfg: GatewayConfig = toml::from_str(toml).unwrap();
-        assert_eq!(cfg.cron_jobs[0].agent, Some("reviewer".to_string()));
-    }
-
-    #[test]
-    fn test_cron_job_config_agent_defaults_to_none() {
-        let toml = r#"
-[[cron_jobs]]
-name = "digest"
-expr = "0 0 8 * * *"
-prompt = "Summarize today"
-session_key = "lark:ou_xxx"
-"#;
-        let cfg: GatewayConfig = toml::from_str(toml).unwrap();
-        assert_eq!(cfg.cron_jobs[0].agent, None);
-    }
-
-    #[test]
-    fn test_cron_job_config_condition_deserializes() {
-        let toml = r#"
-[[cron_jobs]]
-name = "heartbeat"
-expr = "0 */30 * * * *"
-prompt = "Check in with the user"
-session_key = "lark:ou_xxx"
-condition = "idle_gt_seconds = 3600"
-"#;
-        let cfg: GatewayConfig = toml::from_str(toml).unwrap();
+        let cfg = GatewayConfig::from_toml_str(toml_str).unwrap();
+        assert!(cfg.scheduler.enabled);
+        assert_eq!(cfg.scheduler.poll_secs, 10);
+        assert_eq!(cfg.scheduler.max_concurrent, 8);
+        assert_eq!(cfg.scheduler.max_fetch_per_tick, 32);
+        assert_eq!(cfg.scheduler.default_timezone, "Asia/Shanghai");
         assert_eq!(
-            cfg.cron_jobs[0].condition,
-            Some("idle_gt_seconds = 3600".to_string())
+            cfg.scheduler.db_path,
+            Some(PathBuf::from("/tmp/scheduler.db"))
         );
+        assert_eq!(cfg.scheduler.lease_secs, 45);
     }
 
     #[test]
-    fn test_cron_job_config_condition_defaults_to_none() {
+    fn test_scheduler_defaults_apply() {
+        let toml_str = "[gateway]\nhost = \"127.0.0.1\"\nport = 0";
+        let cfg = GatewayConfig::from_toml_str(toml_str).unwrap();
+        assert!(cfg.scheduler.enabled);
+        assert_eq!(cfg.scheduler.poll_secs, 15);
+        assert_eq!(cfg.scheduler.max_concurrent, 4);
+        assert_eq!(cfg.scheduler.max_fetch_per_tick, 64);
+        assert_eq!(cfg.scheduler.default_timezone, "UTC");
+        assert!(cfg.scheduler.db_path.is_none());
+        assert_eq!(cfg.scheduler.lease_secs, 120);
+    }
+
+    #[test]
+    fn test_gateway_section_allows_partial_override_with_defaults() {
+        let toml_str = r#"
+        [gateway]
+        port = 19090
+
+        [scheduler]
+        enabled = true
+        "#;
+        let cfg = GatewayConfig::from_toml_str(toml_str).unwrap();
+        assert_eq!(cfg.gateway.host, "127.0.0.1");
+        assert_eq!(cfg.gateway.port, 19090);
+        assert!(cfg.scheduler.enabled);
+    }
+
+    #[test]
+    fn test_legacy_cron_jobs_are_rejected() {
         let toml = r#"
 [[cron_jobs]]
 name = "ping"
@@ -1741,14 +1778,14 @@ expr = "0 * * * * *"
 prompt = "Hello"
 session_key = "lark:ou_xxx"
 "#;
-        let cfg: GatewayConfig = toml::from_str(toml).unwrap();
-        assert_eq!(cfg.cron_jobs[0].condition, None);
+        let err = GatewayConfig::from_toml_str(toml).unwrap_err();
+        assert!(err.to_string().contains("legacy [[cron_jobs]]"));
     }
 
     #[test]
     fn test_gateway_require_mention_in_groups_defaults_to_false() {
         let toml_str = "[gateway]\nhost = \"127.0.0.1\"\nport = 8080";
-        let cfg: GatewayConfig = toml::from_str(toml_str).unwrap();
+        let cfg = GatewayConfig::from_toml_str(toml_str).unwrap();
         assert!(!cfg.gateway.require_mention_in_groups);
     }
 
@@ -1756,7 +1793,7 @@ session_key = "lark:ou_xxx"
     fn test_gateway_require_mention_in_groups_can_be_set_true() {
         let toml_str =
             "[gateway]\nhost = \"127.0.0.1\"\nport = 8080\nrequire_mention_in_groups = true";
-        let cfg: GatewayConfig = toml::from_str(toml_str).unwrap();
+        let cfg = GatewayConfig::from_toml_str(toml_str).unwrap();
         assert!(cfg.gateway.require_mention_in_groups);
     }
 
@@ -1799,8 +1836,14 @@ enabled = true
             .as_ref()
             .unwrap()
             .resolved_trigger_policy(&cfg.gateway);
-        assert_eq!(policy.group, crate::channels_internal::LarkTriggerMode::MentionOnly);
-        assert_eq!(policy.dm, crate::channels_internal::LarkTriggerMode::AllMessages);
+        assert_eq!(
+            policy.group,
+            crate::channels_internal::LarkTriggerMode::MentionOnly
+        );
+        assert_eq!(
+            policy.dm,
+            crate::channels_internal::LarkTriggerMode::AllMessages
+        );
     }
 
     #[test]
@@ -1826,8 +1869,14 @@ mode = "all_messages"
             .as_ref()
             .unwrap()
             .resolved_trigger_policy(&cfg.gateway);
-        assert_eq!(policy.group, crate::channels_internal::LarkTriggerMode::MentionOnly);
-        assert_eq!(policy.dm, crate::channels_internal::LarkTriggerMode::AllMessages);
+        assert_eq!(
+            policy.group,
+            crate::channels_internal::LarkTriggerMode::MentionOnly
+        );
+        assert_eq!(
+            policy.dm,
+            crate::channels_internal::LarkTriggerMode::AllMessages
+        );
     }
 
     #[test]

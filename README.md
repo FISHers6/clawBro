@@ -19,7 +19,7 @@
     <a href="./docs/setup.md">Setup Guide</a>
   </p>
   <p>
-    <img src="https://img.shields.io/badge/version-0.1.4-blue" alt="Version">
+    <img src="https://img.shields.io/badge/version-0.1.5-blue" alt="Version">
     <img src="https://img.shields.io/badge/rust-1.90%2B-orange" alt="Rust">
     <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
     <img src="https://img.shields.io/badge/agents-Claude%20%7C%20Codex%20%7C%20Qwen%20%7C%20Qoder%20%7C%20Gemini-111827" alt="Agents">
@@ -40,6 +40,7 @@ It stays close to the OpenClaw spirit, but pushes toward practical teamwork: Cla
 - **[03-19]** Group and direct-message usage now fit the same routing model, with Lark, DingTalk Stream Mode, DingTalk custom robot webhook, and WebSocket entrypoints.
 - **[03-19]** Multi-IM connectivity is now practical for always-on chat workflows: one runtime can stay online across Lark, DingTalk, and team conversations at the same time.
 - **[03-19]** Operational controls include approvals, allowlists, memory-aware sessions, `/health`, `/status`, `/doctor`, and diagnostics surfaces.
+- **[03-20]** Durable scheduling is now built in: one-shot reminders, exact-time jobs, interval polling, cron schedules, chat-created reminders, and current-session cleanup all share the same runtime scheduler.
 
 > `clawBro` is built for engineering, research, and workflow experimentation. It is meant for real agent collaboration, not just another chat wrapper.
 
@@ -57,12 +58,14 @@ It stays close to the OpenClaw spirit, but pushes toward practical teamwork: Cla
 
 🧠 **Memory and Habits**: Let agents accumulate working memory, repeated preferences, review standards, and recurring project context over time.
 
+⏰ **Durable Scheduling**: Create reminders, one-time jobs, recurring polling loops, and agent-driven scheduled work through `delay`, `at`, `every`, and `cron`.
+
 🛡️ **Operationally Controllable**: Built-in config validation, approval flow, allowlists, doctor/status commands, and health endpoints.
 
 ## 🏗️ Architecture
 
 ```text
-User / Group / WebSocket / Cron
+User / Group / WebSocket / Scheduled Jobs
               |
               v
            clawbro
@@ -87,6 +90,7 @@ User / Group / WebSocket / Cron
 - [Use Cases](#-use-cases)
 - [Install](#-install)
 - [Quick Start](#-quick-start)
+- [Scheduled Tasks](#-scheduled-tasks)
 - [Team Modes](#-team-modes)
 - [Coding Agent Integration](#-coding-agent-integration)
 - [Chat Channels](#-chat-channels)
@@ -249,6 +253,35 @@ clawbro setup \
   --team-name ops-room \
   --non-interactive
 ```
+
+## ⏰ Scheduled Tasks
+
+`clawBro` can now keep one eye on the clock while your agents keep coding.
+
+- **Four schedule styles**:
+  - `delay`: “in 1 minute remind me to charge my phone”
+  - `at`: “tomorrow at 09:00 remind me about the meeting”
+  - `every`: “check service status every 30 minutes”
+  - `cron`: “every workday at 18:00 summarize today’s issue progress”
+- **Two execution styles**:
+  - fixed reminders go straight back to chat as durable messages
+  - dynamic work goes through scheduled agent turns
+- **Natural-language chat flows**:
+  - “Remind me in 1 minute to charge my phone”
+  - “Tell me Beijing time every minute”
+  - “Delete the charging reminder”
+  - “Clear all reminders in this conversation”
+- **Operator commands**:
+
+```bash
+clawbro schedule add-delay --name phone-charge --delay 1m --prompt "Reminder: charge your phone"
+clawbro schedule add-every --name service-check --every 30m --target-kind agent-turn --prompt "Check service status and report anomalies."
+clawbro schedule list
+clawbro schedule delete --name phone-charge
+clawbro schedule delete-all --current-session-key 'lark@alpha:user:ou_xxx'
+```
+
+The important split is simple: reminders are delivered directly, while scheduled agent jobs wake up later and do fresh work when the time comes.
 
 ## 👥 Team Modes
 

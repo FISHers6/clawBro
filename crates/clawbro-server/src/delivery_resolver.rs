@@ -1,8 +1,8 @@
+use crate::agent_core::TurnDeliverySource;
 use crate::channel_registry::ChannelRegistry;
 use crate::config::{
     DeliveryPurposeConfig, DeliverySenderBindingConfig, DeliveryTargetOverrideConfig, GatewayConfig,
 };
-use crate::agent_core::TurnDeliverySource;
 use crate::protocol::{OutboundMsg, SessionKey};
 use std::sync::Arc;
 
@@ -131,9 +131,9 @@ fn matching_target_override<'a>(
 mod tests {
     use super::*;
     use crate::channel_registry::ChannelRegistry;
+    use crate::protocol::{InboundMsg, SessionKey};
     use anyhow::Result;
     use async_trait::async_trait;
-    use crate::protocol::{InboundMsg, SessionKey};
     use tokio::sync::mpsc;
 
     struct TestChannel {

@@ -1,6 +1,6 @@
 use anyhow::Result;
-use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
@@ -18,7 +18,8 @@ pub fn sign_dingtalk_secret(secret_key: &str, timestamp_ms: i64) -> Result<Signe
         .map_err(|e| anyhow::anyhow!("failed to initialize DingTalk HMAC: {e}"))?;
     let text_to_sign = format!("{timestamp_ms}\n{secret_key}");
     mac.update(text_to_sign.as_bytes());
-    let sign = urlencoding::encode(&BASE64_STANDARD.encode(mac.finalize().into_bytes())).to_string();
+    let sign =
+        urlencoding::encode(&BASE64_STANDARD.encode(mac.finalize().into_bytes())).to_string();
     Ok(SignedQuery { timestamp_ms, sign })
 }
 
@@ -29,7 +30,11 @@ pub async fn send_text_by_session_webhook(
     text: &str,
 ) -> Result<()> {
     let signed = sign_dingtalk_secret(secret_key, chrono::Utc::now().timestamp_millis())?;
-    let separator = if session_webhook.contains('?') { '&' } else { '?' };
+    let separator = if session_webhook.contains('?') {
+        '&'
+    } else {
+        '?'
+    };
     let url = format!(
         "{session_webhook}{separator}timestamp={}&sign={}",
         signed.timestamp_ms, signed.sign
@@ -69,7 +74,9 @@ mod tests {
     fn sign_dingtalk_secret_matches_reference_algorithm_shape() {
         let signed = sign_dingtalk_secret("SEC-test", 1_700_000_000_000).unwrap();
         assert_eq!(signed.timestamp_ms, 1_700_000_000_000);
-        assert!(signed.sign.contains('%') || signed.sign.chars().all(|ch| ch.is_ascii_alphanumeric()));
+        assert!(
+            signed.sign.contains('%') || signed.sign.chars().all(|ch| ch.is_ascii_alphanumeric())
+        );
         assert!(!signed.sign.is_empty());
     }
 }

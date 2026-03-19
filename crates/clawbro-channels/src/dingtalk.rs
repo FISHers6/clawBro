@@ -283,12 +283,11 @@ impl Channel for DingTalkChannel {
                                 .or_else(|| v["headers"]["messageId"].as_str())
                                 .map(str::to_string)
                                 .unwrap_or_else(|| Uuid::new_v4().to_string());
-                            let user_id =
-                                data["senderStaffId"]
-                                    .as_str()
-                                    .or_else(|| data["senderId"].as_str())
-                                    .unwrap_or("unknown")
-                                    .to_string();
+                            let user_id = data["senderStaffId"]
+                                .as_str()
+                                .or_else(|| data["senderId"].as_str())
+                                .unwrap_or("unknown")
+                                .to_string();
                             // Allowlist check uses senderId regardless of chat type.
                             if !checker.is_allowed("dingtalk", &user_id) {
                                 tracing::debug!(
@@ -364,17 +363,17 @@ impl Channel for DingTalkChannel {
                                             target_agent: Some(target_agent),
                                             source: clawbro_protocol::MsgSource::Human,
                                         };
-                                    let _ = tx.send(inbound).await;
+                                        let _ = tx.send(inbound).await;
+                                    }
                                 }
-                            }
-                            if !message_id.is_empty() {
-                                ws.send(Self::build_callback_ack(message_id)).await?;
+                                if !message_id.is_empty() {
+                                    ws.send(Self::build_callback_ack(message_id)).await?;
+                                }
                             }
                         }
                     }
                 }
             }
-        }
         }
         tracing::warn!("DingTalk WebSocket connection closed");
         Ok(())

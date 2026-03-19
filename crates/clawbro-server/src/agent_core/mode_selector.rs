@@ -71,7 +71,9 @@ mod tests {
 
     #[test]
     fn test_team_delegation_request_detected() {
-        assert!(is_team_delegation_request("让其他bot做个任务：讲解一下clawbro"));
+        assert!(is_team_delegation_request(
+            "让其他bot做个任务：讲解一下clawbro"
+        ));
         assert!(is_team_delegation_request("请委派给 specialist"));
         assert!(is_team_delegation_request("delegate this to another bot"));
     }

@@ -86,6 +86,8 @@ impl MemoryDistiller for AcpDistiller {
                         tool_surface: ToolSurfaceSpec {
                             team_tools: false,
                             allowed_team_tools: vec![],
+                            schedule_tools: false,
+                            allowed_schedule_tools: vec![],
                             local_skills: false,
                             external_mcp: false,
                             backend_native_tools: false,

@@ -198,11 +198,22 @@ pub fn build_config_toml(input: &WriteInputs) -> String {
     s.push('\n');
 
     // [skills]
+    s.push_str("# Built-in core skills such as `scheduler` are injected automatically.\n");
+    s.push_str("# Use this directory only for extra user/project skills.\n");
     s.push_str("[skills]\n");
     s.push_str(&format!(
         "dir = {:?}\n",
         qdir.join("skills").to_string_lossy().as_ref()
     ));
+    s.push('\n');
+
+    // [scheduler]
+    s.push_str("[scheduler]\n");
+    s.push_str("enabled = true\n");
+    s.push_str("poll_secs = 15\n");
+    s.push_str("max_concurrent = 4\n");
+    s.push_str("max_fetch_per_tick = 64\n");
+    s.push_str("default_timezone = \"UTC\"\n");
     s.push('\n');
 
     // channels
@@ -483,13 +494,22 @@ mod tests {
             auth: &no_auth(),
             channel: &dt,
         });
-        assert!(t.contains("[channels.dingtalk_webhook]"), "missing webhook: {t}");
-        assert!(t.contains("secret_key = \"SEC-test\""), "missing secret_key: {t}");
+        assert!(
+            t.contains("[channels.dingtalk_webhook]"),
+            "missing webhook: {t}"
+        );
+        assert!(
+            t.contains("secret_key = \"SEC-test\""),
+            "missing secret_key: {t}"
+        );
         assert!(
             t.contains("webhook_path = \"/dingtalk-channel/message\""),
             "missing webhook_path: {t}"
         );
-        assert!(t.contains("access_token = \"dt-token\""), "missing access_token: {t}");
+        assert!(
+            t.contains("access_token = \"dt-token\""),
+            "missing access_token: {t}"
+        );
     }
 
     #[test]
@@ -530,7 +550,10 @@ mod tests {
             webhook_path: None,
         });
         let e = build_env_content(&anthropic(), &dt);
-        assert!(!e.contains("DINGTALK_APP_KEY"), "webhook should not write stream env: {e}");
+        assert!(
+            !e.contains("DINGTALK_APP_KEY"),
+            "webhook should not write stream env: {e}"
+        );
         assert!(
             !e.contains("DINGTALK_APP_SECRET"),
             "webhook should not write stream secret env: {e}"
@@ -703,6 +726,39 @@ mod tests {
         assert!(
             t.contains("channel = \"dingtalk_webhook\""),
             "missing dingtalk_webhook channel name: {t}"
+        );
+    }
+
+    #[test]
+    fn toml_has_scheduler_section_for_new_users() {
+        let t = build_config_toml(&WriteInputs {
+            provider: &anthropic(),
+            mode: &solo(),
+            auth: &no_auth(),
+            channel: &ChannelConfig::None,
+        });
+        assert!(t.contains("[scheduler]"), "missing [scheduler]: {t}");
+        assert!(
+            t.contains("enabled = true"),
+            "missing scheduler enabled: {t}"
+        );
+        assert!(
+            t.contains("default_timezone = \"UTC\""),
+            "missing scheduler timezone default: {t}"
+        );
+    }
+
+    #[test]
+    fn toml_skills_section_explains_builtin_scheduler_skill() {
+        let t = build_config_toml(&WriteInputs {
+            provider: &anthropic(),
+            mode: &solo(),
+            auth: &no_auth(),
+            channel: &ChannelConfig::None,
+        });
+        assert!(
+            t.contains("Built-in core skills such as `scheduler` are injected automatically."),
+            "missing builtin scheduler skill guidance: {t}"
         );
     }
 }

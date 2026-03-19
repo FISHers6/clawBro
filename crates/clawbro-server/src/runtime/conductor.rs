@@ -160,6 +160,8 @@ fn tool_surface_from_intent(intent: &TurnIntent) -> ToolSurfaceSpec {
     ToolSurfaceSpec {
         team_tools: matches!(intent.mode, TurnMode::Team),
         allowed_team_tools: vec![],
+        schedule_tools: matches!(intent.mode, TurnMode::Solo | TurnMode::Team),
+        allowed_schedule_tools: vec![],
         local_skills: true,
         external_mcp: false,
         backend_native_tools: true,

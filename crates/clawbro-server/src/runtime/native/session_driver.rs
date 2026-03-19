@@ -1,8 +1,8 @@
+use crate::agent_sdk_internal::bridge::AgentEvent;
 use crate::runtime::{
     contract::{RuntimeEvent, RuntimeSessionSpec, TurnResult},
     event_sink::RuntimeEventSink,
 };
-use crate::agent_sdk_internal::bridge::AgentEvent;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::Command,
@@ -160,6 +160,9 @@ fn spawn_command(
 
     if let Some(url) = team_tool_url {
         cmd.env("CLAWBRO_TEAM_TOOL_URL", url);
+    }
+    if let Ok(path) = std::env::current_exe() {
+        cmd.env("CLAWBRO_SCHEDULE_COMMAND", path);
     }
 
     if let Some(ws) = workspace_dir {

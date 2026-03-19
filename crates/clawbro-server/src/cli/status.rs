@@ -1,3 +1,5 @@
+use crate::config::GatewayConfig;
+use crate::scheduler_runtime::resolve_scheduler_db_path;
 use anyhow::Result;
 use console::style;
 
@@ -21,6 +23,7 @@ pub async fn run() -> Result<()> {
     let content = std::fs::read_to_string(&cfg_path)?;
     let val: toml::Value =
         toml::from_str(&content).unwrap_or(toml::Value::Table(toml::map::Map::new()));
+    let parsed_cfg = GatewayConfig::from_toml_str(&content).ok();
 
     let port = val
         .get("gateway")
@@ -140,6 +143,32 @@ pub async fn run() -> Result<()> {
             style("not running").dim().to_string()
         }
     );
+
+    if let Some(cfg) = parsed_cfg.as_ref() {
+        let scheduler_db = resolve_scheduler_db_path(cfg);
+        println!(
+            "  Scheduler    {}",
+            if cfg.scheduler.enabled {
+                format!(
+                    "enabled (poll={}s, db={})",
+                    cfg.scheduler.poll_secs,
+                    scheduler_db.display()
+                )
+            } else {
+                format!("disabled (db={})", scheduler_db.display())
+            }
+        );
+        println!(
+            "  Scheduler DB {}",
+            if scheduler_db.exists() {
+                style("present").green().to_string()
+            } else {
+                style("missing").yellow().to_string()
+            }
+        );
+    } else {
+        println!("  Scheduler    config invalid");
+    }
 
     println!("\nConfig: {}", cfg_path.display());
     Ok(())

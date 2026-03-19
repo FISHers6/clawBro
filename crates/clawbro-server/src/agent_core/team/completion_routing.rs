@@ -91,7 +91,9 @@ impl TeamRoutingEvent {
             TeamRoutingEventKind::TaskSubmitted => Some(ReviewRequiredKind::Submitted),
             TeamRoutingEventKind::TaskBlocked => Some(ReviewRequiredKind::Blocked),
             TeamRoutingEventKind::TaskFailed => Some(ReviewRequiredKind::Failed),
-            TeamRoutingEventKind::TaskMissingCompletion => Some(ReviewRequiredKind::MissingCompletion),
+            TeamRoutingEventKind::TaskMissingCompletion => {
+                Some(ReviewRequiredKind::MissingCompletion)
+            }
             TeamRoutingEventKind::TaskCompleted
             | TeamRoutingEventKind::TaskAccepted
             | TeamRoutingEventKind::TaskReopened
@@ -346,18 +348,19 @@ pub struct PendingRoutingRecord {
 
 impl PendingRoutingRecord {
     pub fn from_envelope(envelope: TeamRoutingEnvelope) -> Self {
-        let review = envelope
-            .event
-            .review_required_kind()
-            .map(|review_kind| ReviewAttemptMetadata {
-                review_kind,
-                attempt_count: 0,
-                first_pending_at: chrono::Utc::now().to_rfc3339(),
-                last_attempt_at: None,
-                next_attempt_at: None,
-                last_failure_reason: None,
-                last_failure_classification: None,
-            });
+        let review =
+            envelope
+                .event
+                .review_required_kind()
+                .map(|review_kind| ReviewAttemptMetadata {
+                    review_kind,
+                    attempt_count: 0,
+                    first_pending_at: chrono::Utc::now().to_rfc3339(),
+                    last_attempt_at: None,
+                    next_attempt_at: None,
+                    last_failure_reason: None,
+                    last_failure_classification: None,
+                });
         Self { envelope, review }
     }
 

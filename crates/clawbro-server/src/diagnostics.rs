@@ -1,4 +1,3 @@
-use crate::{config, state::AppState};
 use crate::agent_core::team::orchestrator::{
     TeamArtifactHealthSummary, TeamRoutingStats, TeamRuntimeSummary, TeamState, TeamTaskCounts,
 };
@@ -6,6 +5,7 @@ use crate::agent_core::team::session::{ChannelSendRecord, LeaderUpdateRecord};
 use crate::runtime::{
     provider_profiles::ConfiguredProviderProtocol, AcpBackend, BackendFamily, CapabilityProfile,
 };
+use crate::{config, state::AppState};
 use serde::Serialize;
 use std::collections::BTreeSet;
 
@@ -730,7 +730,6 @@ fn binding_summary(binding: &config::BindingConfig) -> BindingSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{config, state::AppState};
     use crate::agent_core::{
         team::{
             heartbeat::DispatchFn,
@@ -742,6 +741,7 @@ mod tests {
     };
     use crate::runtime::{ApprovalBroker, BackendRegistry, BackendSpec, LaunchSpec};
     use crate::session::{SessionManager, SessionStorage};
+    use crate::{config, state::AppState};
     use std::sync::Arc;
     use tempfile::tempdir;
 
@@ -831,6 +831,7 @@ mod tests {
             dingtalk_webhook_channel: None,
             runtime_token: Arc::new("diagnostics-token".to_string()),
             approvals: ApprovalBroker::default(),
+            scheduler_service: crate::scheduler_runtime::build_test_scheduler_service(),
         }
     }
 

@@ -5,7 +5,7 @@
 //!     TEAM.md        — 团队职责宣言（Lead 在 /team start 时写入）
 //!     CONTEXT.md     — 任务背景（Lead 维护，注入 Specialist 的 shared_memory）
 //!     TASKS.md       — 任务快照（由 TaskRegistry::export_tasks_md 导出，只读）
-//!     HEARTBEAT.md   — 可选的团队心跳检查清单（统一 context contract）
+//!     HEARTBEAT.md   — 可选的团队心跳检查清单（Team context，不是通用 scheduler 定义）
 //!     events.jsonl   — 事件日志（调试用）
 
 use anyhow::{Context, Result};

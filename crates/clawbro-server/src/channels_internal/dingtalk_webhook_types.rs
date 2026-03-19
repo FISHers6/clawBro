@@ -123,6 +123,9 @@ mod tests {
         assert_eq!(parsed.session_webhook_expired_time, 1_770_982_588_732);
         assert_eq!(parsed.robot_code.as_deref(), Some("normal"));
         assert_eq!(parsed.sender_platform.as_deref(), Some("Mac"));
-        assert_eq!(parsed.chatbot_user_id.as_deref(), Some("$:LWCP_v1:$IHInSnicgNoAQhIiY9O0VGFxjAzvyVUf"));
+        assert_eq!(
+            parsed.chatbot_user_id.as_deref(),
+            Some("$:LWCP_v1:$IHInSnicgNoAQhIiY9O0VGFxjAzvyVUf")
+        );
     }
 }

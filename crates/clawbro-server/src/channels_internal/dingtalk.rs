@@ -4,10 +4,10 @@
 
 use crate::channels_internal::mention_parsing::{derive_fanout_message_id, extract_agent_mentions};
 use crate::channels_internal::traits::Channel;
+use crate::protocol::{InboundMsg, MsgContent, OutboundMsg, SessionKey};
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
-use crate::protocol::{InboundMsg, MsgContent, OutboundMsg, SessionKey};
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::sync::Mutex;
@@ -283,12 +283,11 @@ impl Channel for DingTalkChannel {
                                 .or_else(|| v["headers"]["messageId"].as_str())
                                 .map(str::to_string)
                                 .unwrap_or_else(|| Uuid::new_v4().to_string());
-                            let user_id =
-                                data["senderStaffId"]
-                                    .as_str()
-                                    .or_else(|| data["senderId"].as_str())
-                                    .unwrap_or("unknown")
-                                    .to_string();
+                            let user_id = data["senderStaffId"]
+                                .as_str()
+                                .or_else(|| data["senderId"].as_str())
+                                .unwrap_or("unknown")
+                                .to_string();
                             // Allowlist check uses senderId regardless of chat type.
                             if !checker.is_allowed("dingtalk", &user_id) {
                                 tracing::debug!(
@@ -364,16 +363,16 @@ impl Channel for DingTalkChannel {
                                             target_agent: Some(target_agent),
                                             source: crate::protocol::MsgSource::Human,
                                         };
-                                    let _ = tx.send(inbound).await;
+                                        let _ = tx.send(inbound).await;
+                                    }
                                 }
-                            }
-                            if !message_id.is_empty() {
-                                ws.send(Self::build_callback_ack(message_id)).await?;
+                                if !message_id.is_empty() {
+                                    ws.send(Self::build_callback_ack(message_id)).await?;
+                                }
                             }
                         }
                     }
                 }
-            }
             }
         }
         tracing::warn!("DingTalk WebSocket connection closed");
@@ -390,8 +389,8 @@ impl Channel for DingTalkChannel {
 mod tests {
     use super::*;
     use crate::channels_internal::{SEND_INITIAL_DELAY_MS, SEND_MAX_RETRIES};
-    use std::sync::Mutex;
     use serde::Deserialize;
+    use std::sync::Mutex;
 
     #[allow(clippy::assertions_on_constants)]
     #[test]
@@ -672,11 +671,17 @@ mod tests {
         let targets = crate::channels_internal::mention_parsing::extract_agent_mentions(text);
         assert_eq!(targets, vec!["@claude".to_string(), "@codex".to_string()]);
         assert_eq!(
-            crate::channels_internal::mention_parsing::derive_fanout_message_id("evt-1", Some("@claude")),
+            crate::channels_internal::mention_parsing::derive_fanout_message_id(
+                "evt-1",
+                Some("@claude")
+            ),
             "evt-1#target=claude"
         );
         assert_eq!(
-            crate::channels_internal::mention_parsing::derive_fanout_message_id("evt-1", Some("@codex")),
+            crate::channels_internal::mention_parsing::derive_fanout_message_id(
+                "evt-1",
+                Some("@codex")
+            ),
             "evt-1#target=codex"
         );
     }

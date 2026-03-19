@@ -1,5 +1,5 @@
+use crate::protocol::{ScheduleTool, TeamTool};
 use crate::session::ToolCallRecord;
-use crate::protocol::TeamTool;
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -43,6 +43,8 @@ pub struct AgentCtx {
     pub team_tool_url: Option<String>,
     /// Optional allowlist for team coordination tools on this turn.
     pub allowed_team_tools: Vec<TeamTool>,
+    /// Optional allowlist for scheduler tools on this turn.
+    pub allowed_schedule_tools: Vec<ScheduleTool>,
     /// Canonical shared memory / contextual summary for this turn.
     pub shared_memory: Option<String>,
     /// Canonical long-term memory for solo/lead turns.
@@ -74,6 +76,7 @@ impl Default for AgentCtx {
             mcp_server_url: None,
             team_tool_url: None,
             allowed_team_tools: vec![],
+            allowed_schedule_tools: vec![],
             shared_memory: None,
             agent_memory: None,
             team_manifest: None,

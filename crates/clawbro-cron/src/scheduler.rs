@@ -1,162 +1,353 @@
-use crate::store::{CronJob, CronStore};
-use chrono::{DateTime, Utc};
+use crate::models::{RunStatus, ScheduledJob};
+use crate::service::SchedulerService;
+use anyhow::Result;
+use chrono::Utc;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Callback invoked when a cron job fires.
-///
-/// Receives `(session_key, prompt, agent, condition)` and must return a `JoinHandle`
-/// for the spawned work.  Using a callback instead of depending on `clawbro-agent`
-/// directly keeps this crate free of circular dependencies.
-///
-/// The `condition` field is passed through so the caller can perform
-/// any pre-fire checks (e.g. idle_gt_seconds) before dispatching.
-pub type TriggerFn = Arc<
-    dyn (Fn(
-            String,         // session_key
-            String,         // prompt
-            Option<String>, // agent
-            Option<String>, // condition
-        ) -> tokio::task::JoinHandle<()>)
-        + Send
-        + Sync,
->;
+pub type ExecutionResult = Result<ExecutionOutcome>;
+pub type ExecutionFuture = Pin<Box<dyn Future<Output = ExecutionResult> + Send>>;
+pub type ExecutionFn = Arc<dyn Fn(ScheduledJob) -> ExecutionFuture + Send + Sync>;
 
-/// Polls the cron store every second and fires due jobs via the trigger callback.
-pub struct CronScheduler {
-    store: Arc<CronStore>,
-    trigger: TriggerFn,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionOutcome {
+    pub status: RunStatus,
+    pub summary: Option<String>,
+    pub error: Option<String>,
 }
 
-impl CronScheduler {
-    pub fn new(store: Arc<CronStore>, trigger: TriggerFn) -> Self {
-        Self { store, trigger }
-    }
-
-    /// Run the scheduler loop (never returns under normal operation).
-    ///
-    /// Call this inside `tokio::spawn`.
-    pub async fn run(self) {
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
-        loop {
-            interval.tick().await;
-            let now = Utc::now();
-            match self.store.list_enabled() {
-                Ok(jobs) => {
-                    for job in jobs {
-                        if is_due(&job, now) {
-                            tracing::info!("CronScheduler: firing job '{}' ({})", job.name, job.id);
-                            self.store.update_last_run(&job.id, now).ok();
-                            (self.trigger)(
-                                job.session_key.clone(),
-                                job.prompt.clone(),
-                                job.agent.clone(),
-                                job.condition.clone(),
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("CronScheduler: failed to list jobs: {e}");
-                }
-            }
+impl ExecutionOutcome {
+    pub fn succeeded(summary: impl Into<String>) -> Self {
+        Self {
+            status: RunStatus::Succeeded,
+            summary: Some(summary.into()),
+            error: None,
         }
     }
 }
 
-/// Returns `true` if the job should fire right now.
-///
-/// - If the job has never run (`last_run` is `None`) it is always considered due.
-/// - Otherwise the next scheduled time after `last_run` is computed; if that
-///   time is ≤ `now` the job is due.
-fn is_due(job: &CronJob, now: DateTime<Utc>) -> bool {
-    use cron::Schedule;
-    use std::str::FromStr;
+#[derive(Debug, Clone)]
+pub struct SchedulerConfig {
+    pub poll_interval: Duration,
+    pub max_fetch_per_tick: usize,
+    pub max_concurrent: usize,
+    pub lease_secs: i64,
+}
 
-    let Ok(schedule) = Schedule::from_str(&job.expr) else {
-        tracing::warn!(
-            "CronScheduler: invalid cron expression '{}' for job '{}'",
-            job.expr,
-            job.name
-        );
-        return false;
-    };
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval: Duration::from_secs(15),
+            max_fetch_per_tick: 64,
+            max_concurrent: 4,
+            lease_secs: 120,
+        }
+    }
+}
 
-    match job.last_run {
-        None => true,
-        Some(last) => schedule.after(&last).next().is_some_and(|next| next <= now),
+pub struct Scheduler {
+    service: SchedulerService,
+    executor: ExecutionFn,
+    config: SchedulerConfig,
+}
+
+impl Scheduler {
+    pub fn new(service: SchedulerService, executor: ExecutionFn, config: SchedulerConfig) -> Self {
+        Self {
+            service,
+            executor,
+            config,
+        }
+    }
+
+    pub async fn run(self) {
+        let mut interval = tokio::time::interval(self.config.poll_interval);
+        loop {
+            interval.tick().await;
+            if let Err(err) = self.tick_once().await {
+                tracing::error!("scheduler tick failed: {err:#}");
+            }
+        }
+    }
+
+    pub async fn tick_once(&self) -> Result<usize> {
+        let now = Utc::now();
+        let claims = self.service.claim_due_jobs(
+            now,
+            self.config.max_fetch_per_tick,
+            self.config.lease_secs,
+        )?;
+        let to_run = claims
+            .into_iter()
+            .take(self.config.max_concurrent)
+            .collect::<Vec<_>>();
+        let count = to_run.len();
+        for claim in to_run {
+            let run_id = self.service.start_run(&claim, 1)?;
+            let outcome = match (self.executor)(claim.job.clone()).await {
+                Ok(outcome) => outcome,
+                Err(err) => ExecutionOutcome {
+                    status: RunStatus::Failed,
+                    summary: None,
+                    error: Some(err.to_string()),
+                },
+            };
+            self.service.finish_run(
+                &claim,
+                &run_id,
+                outcome.status,
+                Utc::now(),
+                outcome.error,
+                outcome.summary,
+            )?;
+        }
+        Ok(count)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::CronJob;
-    use uuid::Uuid;
+    use crate::models::{
+        CreateJobRequest, CreateTargetRequest, RequestedTargetKind, ScheduleInput,
+        SessionTargetRequest, SourceKind,
+    };
+    use crate::store::{SchedulerStore, StoreConfig};
+    use anyhow::anyhow;
+    use chrono::Duration as ChronoDuration;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    fn make_job(expr: &str, last_run: Option<DateTime<Utc>>) -> CronJob {
-        CronJob {
-            id: Uuid::new_v4().to_string(),
-            name: "test".to_string(),
-            expr: expr.to_string(),
-            prompt: "ping".to_string(),
-            session_key: "lark:ou_test".to_string(),
-            enabled: true,
-            last_run,
-            agent: None,
-            condition: None,
+    fn make_service() -> SchedulerService {
+        SchedulerService::new(Arc::new(
+            SchedulerStore::open(std::path::Path::new(":memory:"), StoreConfig::default()).unwrap(),
+        ))
+    }
+
+    fn req(name: &str, schedule: ScheduleInput) -> CreateJobRequest {
+        CreateJobRequest {
+            name: name.to_string(),
+            schedule,
+            timezone: Some("UTC".to_string()),
+            target: CreateTargetRequest::Session(SessionTargetRequest {
+                requested_kind: RequestedTargetKind::AgentTurn,
+                session_key: "cron:test".to_string(),
+                prompt: "ping".to_string(),
+                agent: Some("default".to_string()),
+                preconditions: vec![],
+            }),
+            max_retries: 0,
+            source_kind: SourceKind::HumanCli,
+            source_actor: "tester".to_string(),
+            source_session_key: None,
+            created_via: "cli".to_string(),
+            requested_by_role: None,
         }
     }
 
-    #[test]
-    fn test_is_due_on_first_run() {
-        // A job that has never run should always be due regardless of expression.
-        let job = make_job("0 * * * * *", None);
+    #[tokio::test(flavor = "current_thread")]
+    async fn due_one_shot_job_fires_once() {
+        let service = make_service();
         let now = Utc::now();
-        assert!(is_due(&job, now), "job with no last_run should be due");
-    }
-
-    #[test]
-    fn test_is_due_respects_interval_too_soon() {
-        // Use a minutely expression ("0 * * * * *" — fires on the 0th second of every minute).
-        // Set last_run to the most recent whole minute so the next tick is up to 60s away,
-        // making it impossible for the 0ms-offset "now" to have passed it already.
-        use chrono::Timelike;
-        let now = Utc::now();
-        // Truncate to the start of the current minute as the simulated last_run.
-        let last = now
-            .with_second(0)
-            .and_then(|t| t.with_nanosecond(0))
-            .unwrap_or(now);
-
-        let job = make_job("0 * * * * *", Some(last));
-        // next fire after `last` is `last + 60s`, which is always > now (since last <= now)
-        assert!(
-            !is_due(&job, now),
-            "job whose next tick is up to 60s away should not be due yet"
+        let job = service
+            .create_job(
+                req(
+                    "once",
+                    ScheduleInput::At {
+                        run_at: now - ChronoDuration::seconds(1),
+                    },
+                ),
+                now,
+            )
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let scheduler = Scheduler::new(
+            service.clone(),
+            Arc::new(move |_| {
+                let calls = calls_clone.clone();
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(ExecutionOutcome::succeeded("ok"))
+                })
+            }),
+            SchedulerConfig::default(),
         );
+        scheduler.tick_once().await.unwrap();
+        scheduler.tick_once().await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let job = service
+            .list_jobs()
+            .unwrap()
+            .into_iter()
+            .find(|j| j.id == job.id)
+            .unwrap();
+        assert!(job.next_run_at.is_none());
     }
 
-    #[test]
-    fn test_is_due_respects_interval_overdue() {
-        // last_run = 2 s ago → the 1-second mark passed → IS due.
-        let last = Utc::now() - chrono::Duration::seconds(2);
-        let job = make_job("* * * * * *", Some(last));
+    #[tokio::test(flavor = "current_thread")]
+    async fn every_job_reschedules_itself() {
+        let service = make_service();
         let now = Utc::now();
-        assert!(is_due(&job, now), "job last run 2s ago should be due");
-    }
-
-    #[test]
-    fn test_is_due_invalid_expr() {
-        let _job = make_job("not-a-cron", None);
-        let now = Utc::now();
-        // Invalid expression: even though last_run is None, invalid expr → false
-        // Actually our implementation returns true when last_run is None before
-        // checking the expression. Let's verify the false path for a job that has run.
-        let job_with_last = make_job("not-a-cron", Some(now));
-        assert!(
-            !is_due(&job_with_last, now),
-            "invalid expr should not be due"
+        let job = service
+            .create_job(
+                req("every", ScheduleInput::Every { interval_ms: 50 }),
+                now - ChronoDuration::seconds(1),
+            )
+            .unwrap();
+        let scheduler = Scheduler::new(
+            service.clone(),
+            Arc::new(move |_| Box::pin(async move { Ok(ExecutionOutcome::succeeded("ok")) })),
+            SchedulerConfig::default(),
         );
+        scheduler.tick_once().await.unwrap();
+        let updated = service
+            .list_jobs()
+            .unwrap()
+            .into_iter()
+            .find(|j| j.id == job.id)
+            .unwrap();
+        assert!(updated.next_run_at > job.next_run_at);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn paused_job_does_not_execute() {
+        let service = make_service();
+        let now = Utc::now();
+        let job = service
+            .create_job(
+                req(
+                    "paused",
+                    ScheduleInput::At {
+                        run_at: now - ChronoDuration::seconds(1),
+                    },
+                ),
+                now,
+            )
+            .unwrap();
+        service.pause_job(&job.id, now).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let scheduler = Scheduler::new(
+            service.clone(),
+            Arc::new({
+                let calls = calls.clone();
+                move |_| {
+                    let calls = calls.clone();
+                    Box::pin(async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(ExecutionOutcome::succeeded("ok"))
+                    })
+                }
+            }),
+            SchedulerConfig::default(),
+        );
+        scheduler.tick_once().await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_now_causes_immediate_execution() {
+        let service = make_service();
+        let now = Utc::now();
+        let job = service
+            .create_job(
+                req(
+                    "run-now",
+                    ScheduleInput::At {
+                        run_at: now + ChronoDuration::hours(1),
+                    },
+                ),
+                now,
+            )
+            .unwrap();
+        service.request_run_now(&job.id, now).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let scheduler = Scheduler::new(
+            service.clone(),
+            Arc::new({
+                let calls = calls.clone();
+                move |_| {
+                    let calls = calls.clone();
+                    Box::pin(async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(ExecutionOutcome::succeeded("ok"))
+                    })
+                }
+            }),
+            SchedulerConfig::default(),
+        );
+        scheduler.tick_once().await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn overlapping_claims_do_not_execute_twice() {
+        let service = make_service();
+        let now = Utc::now();
+        service
+            .create_job(
+                req(
+                    "due",
+                    ScheduleInput::At {
+                        run_at: now - ChronoDuration::seconds(1),
+                    },
+                ),
+                now,
+            )
+            .unwrap();
+        let claims = service.claim_due_jobs(now, 10, 60).unwrap();
+        assert_eq!(claims.len(), 1);
+        let second = service.claim_due_jobs(now, 10, 60).unwrap();
+        assert!(second.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn expired_lease_can_be_reclaimed_after_crash() {
+        let service = make_service();
+        let now = Utc::now();
+        service
+            .create_job(
+                req(
+                    "lease",
+                    ScheduleInput::At {
+                        run_at: now - ChronoDuration::seconds(1),
+                    },
+                ),
+                now,
+            )
+            .unwrap();
+        let first = service.claim_due_jobs(now, 10, 1).unwrap();
+        assert_eq!(first.len(), 1);
+        let reclaimed = service
+            .claim_due_jobs(now + ChronoDuration::seconds(2), 10, 1)
+            .unwrap();
+        assert_eq!(reclaimed.len(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_executor_marks_run_failed() {
+        let service = make_service();
+        let now = Utc::now();
+        let job = service
+            .create_job(
+                req(
+                    "fail",
+                    ScheduleInput::At {
+                        run_at: now - ChronoDuration::seconds(1),
+                    },
+                ),
+                now,
+            )
+            .unwrap();
+        let scheduler = Scheduler::new(
+            service.clone(),
+            Arc::new(move |_| Box::pin(async move { Err(anyhow!("boom")) })),
+            SchedulerConfig::default(),
+        );
+        scheduler.tick_once().await.unwrap();
+        let history = service.list_run_history(Some(&job.id)).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].status, RunStatus::Failed);
     }
 }

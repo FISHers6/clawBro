@@ -5,12 +5,12 @@
 //!     TEAM.md        — 团队职责宣言（Lead 在 /team start 时写入）
 //!     CONTEXT.md     — 任务背景（Lead 维护，注入 Specialist 的 shared_memory）
 //!     TASKS.md       — 任务快照（由 TaskRegistry::export_tasks_md 导出，只读）
-//!     HEARTBEAT.md   — 可选的团队心跳检查清单（统一 context contract）
+//!     HEARTBEAT.md   — 可选的团队心跳检查清单（Team context，不是通用 scheduler 定义）
 //!     events.jsonl   — 事件日志（调试用）
 
+use crate::protocol::{normalize_conversation_identity, SessionKey};
 use anyhow::{Context, Result};
 use chrono::Utc;
-use crate::protocol::{normalize_conversation_identity, SessionKey};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -274,8 +274,8 @@ impl TeamSession {
             if !root.is_dir() {
                 return Ok(());
             }
-            for entry in fs::read_dir(root)
-                .with_context(|| format!("Failed to read {}", root.display()))?
+            for entry in
+                fs::read_dir(root).with_context(|| format!("Failed to read {}", root.display()))?
             {
                 let entry = entry?;
                 if !entry.file_type()?.is_dir() {
@@ -545,7 +545,10 @@ impl TeamSession {
         Ok(removed)
     }
 
-    pub fn append_review_attempt_diagnostic(&self, diagnostic: &ReviewAttemptDiagnostic) -> Result<()> {
+    pub fn append_review_attempt_diagnostic(
+        &self,
+        diagnostic: &ReviewAttemptDiagnostic,
+    ) -> Result<()> {
         self.append_jsonl("review-attempts.jsonl", diagnostic)
     }
 
@@ -709,7 +712,11 @@ impl TeamSession {
         self.load_latest_jsonl("leader-updates.jsonl")
     }
 
-    pub fn has_post_update_for_task_since(&self, task_id: &str, since_rfc3339: &str) -> Result<bool> {
+    pub fn has_post_update_for_task_since(
+        &self,
+        task_id: &str,
+        since_rfc3339: &str,
+    ) -> Result<bool> {
         let path = self.dir.join("leader-updates.jsonl");
         if !path.exists() {
             return Ok(false);
@@ -1163,8 +1170,9 @@ mod tests {
     fn test_latest_delivery_ledgers_return_last_record() {
         let (session, _tmp) = make_session();
         let lead_key = SessionKey::with_instance("lark", "alpha", "group:test");
-        let lead_source = crate::agent_core::turn_context::TurnDeliverySource::from_session_key(&lead_key)
-            .with_reply_context(Some("msg-2".into()), Some("thread-9".into()));
+        let lead_source =
+            crate::agent_core::turn_context::TurnDeliverySource::from_session_key(&lead_key)
+                .with_reply_context(Some("msg-2".into()), Some("thread-9".into()));
 
         session
             .record_leader_update(

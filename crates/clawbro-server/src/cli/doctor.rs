@@ -1,5 +1,6 @@
-use anyhow::Result;
 use crate::config::GatewayConfig;
+use crate::scheduler_runtime::resolve_scheduler_db_path;
+use anyhow::Result;
 use console::style;
 
 pub async fn run() -> Result<()> {
@@ -41,10 +42,7 @@ pub async fn run() -> Result<()> {
                 match toml::from_str::<GatewayConfig>(&content) {
                     Ok(cfg) => parsed_cfg = Some(cfg),
                     Err(e) => {
-                        println!(
-                            "  {} config.toml schema error: {e}",
-                            style("✗").red()
-                        );
+                        println!("  {} config.toml schema error: {e}", style("✗").red());
                         issues += 1;
                     }
                 }
@@ -89,13 +87,15 @@ pub async fn run() -> Result<()> {
     // 4. Channel configuration
     println!("\n[4] Channel configuration");
     if let Some(cfg) = &parsed_cfg {
-        match cfg.channels.dingtalk_webhook.as_ref().filter(|section| section.enabled) {
+        match cfg
+            .channels
+            .dingtalk_webhook
+            .as_ref()
+            .filter(|section| section.enabled)
+        {
             Some(webhook) => {
                 if webhook.secret_key.trim().is_empty() {
-                    println!(
-                        "  {} dingtalk_webhook.secret_key missing",
-                        style("✗").red()
-                    );
+                    println!("  {} dingtalk_webhook.secret_key missing", style("✗").red());
                     issues += 1;
                 } else {
                     println!(
@@ -133,14 +133,14 @@ pub async fn run() -> Result<()> {
                 }
             }
             None => {
-                println!(
-                    "  {} dingtalk_webhook not enabled",
-                    style("–").yellow()
-                );
+                println!("  {} dingtalk_webhook not enabled", style("–").yellow());
             }
         }
     } else {
-        println!("  {} channel checks skipped (config invalid)", style("–").yellow());
+        println!(
+            "  {} channel checks skipped (config invalid)",
+            style("–").yellow()
+        );
     }
 
     // 5. Runtime directories
@@ -175,6 +175,42 @@ pub async fn run() -> Result<()> {
     } else {
         println!(
             "  {} Not running (gateway.port missing)",
+            style("–").yellow()
+        );
+    }
+
+    // 7. Scheduler
+    println!("\n[7] Scheduler");
+    if let Some(cfg) = &parsed_cfg {
+        let db_path = resolve_scheduler_db_path(cfg);
+        println!(
+            "  {} scheduler {}",
+            if cfg.scheduler.enabled {
+                style("✓").green()
+            } else {
+                style("–").yellow()
+            },
+            if cfg.scheduler.enabled {
+                format!(
+                    "enabled (poll={}s, max_concurrent={})",
+                    cfg.scheduler.poll_secs, cfg.scheduler.max_concurrent
+                )
+            } else {
+                "disabled".to_string()
+            }
+        );
+        if db_path.exists() {
+            println!("  {} db path {}", style("✓").green(), db_path.display());
+        } else {
+            println!(
+                "  {} db path {} (not created yet)",
+                style("–").yellow(),
+                db_path.display()
+            );
+        }
+    } else {
+        println!(
+            "  {} scheduler checks skipped (config invalid)",
             style("–").yellow()
         );
     }

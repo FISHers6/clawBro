@@ -1,7 +1,3 @@
-use crate::channel_registry::ChannelRegistry;
-use crate::config::{GatewayConfig, InteractionMode};
-use crate::delivery_resolver::resolve_delivery;
-use anyhow::Result;
 use crate::agent_core::team::completion_routing::{
     PendingRoutingRecord, ReviewAttemptDiagnostic, ReviewFailureClassification,
     RoutingDeliveryStatus, TeamRoutingEnvelope,
@@ -11,7 +7,11 @@ use crate::agent_core::team::milestone_delivery::{milestone_dedupe_key, mileston
 use crate::agent_core::team::registry::TaskStatus;
 use crate::agent_core::team::session::{ChannelSendSourceKind, ChannelSendStatus, TeamSession};
 use crate::agent_core::{SessionRegistry, TurnExecutionContext};
+use crate::channel_registry::ChannelRegistry;
+use crate::config::{GatewayConfig, InteractionMode};
+use crate::delivery_resolver::resolve_delivery;
 use crate::protocol::{InboundMsg, MsgContent, MsgSource, OutboundMsg, SessionKey};
+use anyhow::Result;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -512,8 +512,9 @@ pub async fn wire_team_runtime(
                             );
                         }
                     }
-                    let delivery_result =
-                        registry_for_notify.handle_with_context(inbound, turn_ctx).await;
+                    let delivery_result = registry_for_notify
+                        .handle_with_context(inbound, turn_ctx)
+                        .await;
                     if let Some(team_orch) =
                         registry_for_notify.get_team_orchestrator(&request.envelope.team_id)
                     {
@@ -538,21 +539,21 @@ pub async fn wire_team_runtime(
                                         );
                                     let record = base_record
                                         .clone()
-                                        .with_delivery_status(RoutingDeliveryStatus::PersistedPending)
-                                    .note_failed_attempt(
-                                        classification,
-                                        reason,
-                                        Some(next_review_retry_at(
-                                            base_record
-                                                .review
-                                                .as_ref()
-                                                .map(|review| review.attempt_count + 1)
-                                                .unwrap_or(1),
-                                        )),
-                                    );
-                                    if let Some(diagnostic) =
-                                        review_attempt_diagnostic(&record)
-                                    {
+                                        .with_delivery_status(
+                                            RoutingDeliveryStatus::PersistedPending,
+                                        )
+                                        .note_failed_attempt(
+                                            classification,
+                                            reason,
+                                            Some(next_review_retry_at(
+                                                base_record
+                                                    .review
+                                                    .as_ref()
+                                                    .map(|review| review.attempt_count + 1)
+                                                    .unwrap_or(1),
+                                            )),
+                                        );
+                                    if let Some(diagnostic) = review_attempt_diagnostic(&record) {
                                         let _ = team_orch
                                             .session
                                             .append_review_attempt_diagnostic(&diagnostic);
@@ -593,17 +594,17 @@ pub async fn wire_team_runtime(
                                 let record = base_record
                                     .clone()
                                     .with_delivery_status(RoutingDeliveryStatus::PersistedPending)
-                                .note_failed_attempt(
-                                    ReviewFailureClassification::RuntimeError,
-                                    e.to_string(),
-                                    Some(next_review_retry_at(
-                                        base_record
-                                            .review
-                                            .as_ref()
-                                            .map(|review| review.attempt_count + 1)
-                                            .unwrap_or(1),
-                                    )),
-                                );
+                                    .note_failed_attempt(
+                                        ReviewFailureClassification::RuntimeError,
+                                        e.to_string(),
+                                        Some(next_review_retry_at(
+                                            base_record
+                                                .review
+                                                .as_ref()
+                                                .map(|review| review.attempt_count + 1)
+                                                .unwrap_or(1),
+                                        )),
+                                    );
                                 if let Some(diagnostic) = review_attempt_diagnostic(&record) {
                                     let _ = team_orch
                                         .session
@@ -827,17 +828,21 @@ fn routing_event_is_stale_for_delivery(
     };
 
     match envelope.event.kind {
-        crate::agent_core::team::completion_routing::TeamRoutingEventKind::TaskCheckpoint => matches!(
-            task.status_parsed(),
-            TaskStatus::Submitted { .. }
-                | TaskStatus::Accepted { .. }
-                | TaskStatus::Done
-                | TaskStatus::Failed(_)
-        ),
-        crate::agent_core::team::completion_routing::TeamRoutingEventKind::TaskSubmitted => matches!(
-            task.status_parsed(),
-            TaskStatus::Accepted { .. } | TaskStatus::Done | TaskStatus::Failed(_)
-        ),
+        crate::agent_core::team::completion_routing::TeamRoutingEventKind::TaskCheckpoint => {
+            matches!(
+                task.status_parsed(),
+                TaskStatus::Submitted { .. }
+                    | TaskStatus::Accepted { .. }
+                    | TaskStatus::Done
+                    | TaskStatus::Failed(_)
+            )
+        }
+        crate::agent_core::team::completion_routing::TeamRoutingEventKind::TaskSubmitted => {
+            matches!(
+                task.status_parsed(),
+                TaskStatus::Accepted { .. } | TaskStatus::Done | TaskStatus::Failed(_)
+            )
+        }
         _ => false,
     }
 }
@@ -859,7 +864,8 @@ fn render_routing_event_for_delivery(record: &PendingRoutingRecord) -> String {
         .last_failure_reason
         .as_deref()
         .unwrap_or("上一轮未留下明确失败原因");
-    let corrective_contract = review_retry_corrective_contract(review.review_kind, &record.envelope.event.task_id);
+    let corrective_contract =
+        review_retry_corrective_contract(review.review_kind, &record.envelope.event.task_id);
 
     rendered = format!(
         "[系统纠偏提醒]\n此前同一控制面事件已失败 {attempts} 次。\n最近一次失败分类：{failure_label}\n最近一次失败原因：{failure_reason}\n\n{corrective_contract}\n\n{rendered}",
@@ -1006,15 +1012,15 @@ fn review_attempt_diagnostic(record: &PendingRoutingRecord) -> Option<ReviewAtte
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ChannelsSection, GatewayConfig, LarkSection, ProgressPresentationMode};
-    use anyhow::Result;
-    use async_trait::async_trait;
     use crate::agent_core::team::completion_routing::{RoutingDeliveryStatus, TeamRoutingEvent};
     use crate::agent_core::team::milestone::TeamMilestoneEvent;
     use crate::agent_core::team::milestone_delivery::{milestone_is_public, TeamPublicUpdatesMode};
     use crate::agent_core::team::orchestrator::TeamOrchestrator;
     use crate::agent_core::team::registry::{CreateTask, TaskRegistry};
     use crate::agent_core::team::session::{stable_team_id_for_session_key, TeamSession};
+    use crate::config::{ChannelsSection, GatewayConfig, LarkSection, ProgressPresentationMode};
+    use anyhow::Result;
+    use async_trait::async_trait;
     use std::sync::Arc;
     use std::sync::Mutex;
     use tempfile::tempdir;
@@ -1186,16 +1192,16 @@ mod tests {
 
         assert!(routing_event_still_requires_resolution_after_delivery(
             orch.as_ref(),
-            &envelope
-            , None
+            &envelope,
+            None
         ));
 
         registry.accept_task("T006", "lead").unwrap();
 
         assert!(!routing_event_still_requires_resolution_after_delivery(
             orch.as_ref(),
-            &envelope
-            , None
+            &envelope,
+            None
         ));
     }
 
@@ -1287,8 +1293,7 @@ mod tests {
             delivery_source: None,
         };
 
-        let (classification, reason) =
-            unresolved_review_failure_from_turn_result(None, &envelope);
+        let (classification, reason) = unresolved_review_failure_from_turn_result(None, &envelope);
         assert_eq!(classification, ReviewFailureClassification::NoOp);
         assert!(reason.contains("produced no output"));
 
@@ -1367,9 +1372,10 @@ mod tests {
             event: TeamRoutingEvent::failed("T009", "quota"),
             delivery_source: None,
         };
-        let failed_review = crate::agent_core::team::completion_routing::PendingRoutingRecord::from_envelope(
-            failed.clone(),
-        );
+        let failed_review =
+            crate::agent_core::team::completion_routing::PendingRoutingRecord::from_envelope(
+                failed.clone(),
+            );
         assert!(routing_event_still_requires_resolution_after_delivery(
             orch.as_ref(),
             &failed,
@@ -1410,9 +1416,10 @@ mod tests {
             event: TeamRoutingEvent::blocked("T010", "codex-beta", "waiting_user"),
             delivery_source: None,
         };
-        let blocked_review = crate::agent_core::team::completion_routing::PendingRoutingRecord::from_envelope(
-            blocked.clone(),
-        );
+        let blocked_review =
+            crate::agent_core::team::completion_routing::PendingRoutingRecord::from_envelope(
+                blocked.clone(),
+            );
         assert!(routing_event_still_requires_resolution_after_delivery(
             orch.as_ref(),
             &blocked,

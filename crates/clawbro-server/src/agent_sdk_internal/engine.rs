@@ -166,7 +166,9 @@ impl RigEngine {
                         .map_err(|e| anyhow::anyhow!("OpenAI client build failed: {e}"))?
                 };
                 // Force Chat Completions API (not Responses API)
-                let chat_model = client.completions_api().completion_model(&self.config.model);
+                let chat_model = client
+                    .completions_api()
+                    .completion_model(&self.config.model);
                 let registration = register_runtime_tools(
                     AgentBuilder::new(chat_model).preamble(&self.config.system_prompt),
                     session,

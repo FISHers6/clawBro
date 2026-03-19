@@ -1,8 +1,8 @@
 //! OutputSink trait: unified IM / WS output strategy
 //! throttled_stream: 500ms debounce for streaming delta updates
 
-use async_trait::async_trait;
 use crate::protocol::AgentEvent;
+use async_trait::async_trait;
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::broadcast;

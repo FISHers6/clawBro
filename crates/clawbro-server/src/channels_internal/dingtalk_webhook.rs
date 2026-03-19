@@ -1,12 +1,12 @@
 use crate::channels_internal::allowlist::AllowlistChecker;
 use crate::channels_internal::dingtalk_webhook_dedup::DingTalkWebhookDedup;
 use crate::channels_internal::dingtalk_webhook_mapper::{map_payload, DingTalkWebhookMapped};
+use crate::channels_internal::dingtalk_webhook_reply::{
+    send_text_by_robot_access_token, send_text_by_session_webhook,
+};
 use crate::channels_internal::dingtalk_webhook_richtext::{
     inject_resolved_image_urls, parse_richtext_nodes, resolve_richtext_image_urls,
     RichTextImageTask,
-};
-use crate::channels_internal::dingtalk_webhook_reply::{
-    send_text_by_robot_access_token, send_text_by_session_webhook,
 };
 use crate::channels_internal::dingtalk_webhook_types::DingTalkWebhookPayload;
 use crate::channels_internal::mention_parsing::{derive_fanout_message_id, extract_agent_mentions};
@@ -94,7 +94,8 @@ impl DingTalkWebhookChannel {
         body: &[u8],
     ) -> Result<DingTalkWebhookIngress, DingTalkWebhookRejectReason> {
         verify_token(&self.secret_key, extract_token_header(headers))?;
-        let payload = parse_payload(body).map_err(|_| DingTalkWebhookRejectReason::InvalidPayload)?;
+        let payload =
+            parse_payload(body).map_err(|_| DingTalkWebhookRejectReason::InvalidPayload)?;
         dedup_event(&self.dedup, &payload.msg_id)?;
         let (mapped, rich_text_images) = validate_payload_for_phase1(&self.allowlist, &payload)?;
         self.record_session_webhook_lease(
@@ -173,8 +174,7 @@ impl DingTalkWebhookChannel {
             .expect("dingtalk webhook lease mutex poisoned");
         if let Some(thread_ts) = thread_ts.map(str::trim).filter(|value| !value.is_empty()) {
             match leases.get(scope) {
-                Some(lease)
-                    if lease.webhook_url == thread_ts && lease.expires_at_ms <= now_ms => {}
+                Some(lease) if lease.webhook_url == thread_ts && lease.expires_at_ms <= now_ms => {}
                 _ => return Some(ReplyRoute::SessionWebhook(thread_ts.to_string())),
             }
         }
@@ -287,9 +287,7 @@ pub fn dedup_event(
     dedup: &Mutex<DingTalkWebhookDedup>,
     event_id: &str,
 ) -> Result<(), DingTalkWebhookRejectReason> {
-    let mut guard = dedup
-        .lock()
-        .expect("dingtalk webhook dedup mutex poisoned");
+    let mut guard = dedup.lock().expect("dingtalk webhook dedup mutex poisoned");
     if guard.record_if_new(event_id) {
         Ok(())
     } else {
@@ -347,8 +345,8 @@ fn extract_phase1_text(
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
-    use tempfile::NamedTempFile;
     use std::io::Write;
+    use tempfile::NamedTempFile;
 
     fn sample_group_payload() -> DingTalkWebhookPayload {
         serde_json::from_value(serde_json::json!({
@@ -366,7 +364,8 @@ mod tests {
             "text": { "content": "hello @claude" },
             "robotCode": "normal",
             "msgtype": "text"
-        })).unwrap()
+        }))
+        .unwrap()
     }
 
     fn checker_from_json(json: &str) -> AllowlistChecker {
@@ -434,10 +433,14 @@ mod tests {
     #[test]
     fn dingtalk_webhook_allowlist_uses_existing_allowlist_checker() {
         let payload = sample_group_payload();
-        let checker = checker_from_json(r#"{"dingtalk":{"enabled":true,"mode":"allowlist","users":["user-1"]}}"#);
+        let checker = checker_from_json(
+            r#"{"dingtalk":{"enabled":true,"mode":"allowlist","users":["user-1"]}}"#,
+        );
         assert!(check_allowlist(&checker, &payload));
 
-        let denied = checker_from_json(r#"{"dingtalk":{"enabled":true,"mode":"allowlist","users":["user-2"]}}"#);
+        let denied = checker_from_json(
+            r#"{"dingtalk":{"enabled":true,"mode":"allowlist","users":["user-2"]}}"#,
+        );
         assert!(!check_allowlist(&denied, &payload));
     }
 
@@ -454,7 +457,9 @@ mod tests {
     #[test]
     fn dingtalk_webhook_validate_payload_for_phase1_accepts_group_mentions() {
         let payload = sample_group_payload();
-        let checker = checker_from_json(r#"{"dingtalk":{"enabled":true,"mode":"allowlist","users":["user-1"]}}"#);
+        let checker = checker_from_json(
+            r#"{"dingtalk":{"enabled":true,"mode":"allowlist","users":["user-1"]}}"#,
+        );
         let (mapped, rich_text_images) = validate_payload_for_phase1(&checker, &payload).unwrap();
         assert_eq!(mapped.session_key.channel, "dingtalk_webhook");
         assert_eq!(mapped.session_key.scope, "group:cid-group-1");
@@ -478,7 +483,10 @@ mod tests {
         let messages = channel.to_inbound_messages(ingress).await;
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].target_agent.as_deref(), Some("@claude"));
-        assert_eq!(messages[0].thread_ts.as_deref(), Some("https://oapi.dingtalk.com/robot/sendBySession?session=xxx"));
+        assert_eq!(
+            messages[0].thread_ts.as_deref(),
+            Some("https://oapi.dingtalk.com/robot/sendBySession?session=xxx")
+        );
     }
 
     #[tokio::test]
@@ -574,7 +582,9 @@ mod tests {
         });
         assert_eq!(
             channel.resolve_reply_route("group:cid-group-1", Some("https://session-live"), 2_000),
-            Some(ReplyRoute::SessionWebhook("https://session-live".to_string()))
+            Some(ReplyRoute::SessionWebhook(
+                "https://session-live".to_string()
+            ))
         );
     }
 }

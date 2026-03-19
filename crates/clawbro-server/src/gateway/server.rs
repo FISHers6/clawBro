@@ -41,8 +41,9 @@ pub fn build_router(state: AppState) -> Router {
         .as_ref()
         .filter(|section| section.enabled)
     {
-        let webhook_path =
-            crate::channels_internal::dingtalk_webhook::normalize_webhook_path(&webhook_cfg.webhook_path);
+        let webhook_path = crate::channels_internal::dingtalk_webhook::normalize_webhook_path(
+            &webhook_cfg.webhook_path,
+        );
         router = router.route(&webhook_path, post(dingtalk_webhook));
     }
 
@@ -169,8 +170,6 @@ async fn dingtalk_webhook(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{config, state::AppState};
-    use axum::{body::Body, http::Request};
     use crate::agent_core::{
         roster::AgentEntry,
         team::{
@@ -183,6 +182,8 @@ mod tests {
         BackendFamily, BackendRegistry, BackendSpec, ClawBroNativeBackendAdapter, LaunchSpec,
     };
     use crate::session::{SessionManager, SessionStorage};
+    use crate::{config, state::AppState};
+    use axum::{body::Body, http::Request};
     use std::sync::Arc;
     use tempfile::tempdir;
     use tower::util::ServiceExt;
@@ -282,6 +283,7 @@ mod tests {
             dingtalk_webhook_channel: None,
             runtime_token: Arc::new("status-token".to_string()),
             approvals: crate::runtime::ApprovalBroker::default(),
+            scheduler_service: crate::scheduler_runtime::build_test_scheduler_service(),
         }
     }
 

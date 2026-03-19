@@ -3,6 +3,7 @@ use anyhow::Result;
 use std::path::{Path, PathBuf};
 
 const MAX_SCAN_BYTES: usize = 64 * 1024; // 64 KB
+const BUILTIN_SCHEDULER_NAME: &str = "scheduler";
 
 const INJECTION_KEYWORDS: &[&str] = &[
     "ignore previous instructions",
@@ -42,6 +43,7 @@ pub struct LoadedSkill {
 /// Skills 加载器（参考 openclaw skills 系统）
 pub struct SkillLoader {
     dirs: Vec<PathBuf>,
+    include_builtin_scheduler: bool,
 }
 
 impl SkillLoader {
@@ -51,12 +53,18 @@ impl SkillLoader {
         if let Some(home) = dirs::home_dir() {
             dirs.push(home.join(".clawbro").join("skills"));
         }
-        Self { dirs }
+        Self {
+            dirs,
+            include_builtin_scheduler: true,
+        }
     }
 
     /// 只搜索指定目录（测试用）
     pub fn with_dirs(dirs: Vec<PathBuf>) -> Self {
-        Self { dirs }
+        Self {
+            dirs,
+            include_builtin_scheduler: false,
+        }
     }
 
     /// Returns the directories this loader searches.
@@ -67,6 +75,11 @@ impl SkillLoader {
     /// 扫描所有目录，加载所有合法 skill
     pub fn load_all(&self) -> Vec<LoadedSkill> {
         let mut skills = Vec::new();
+        if self.include_builtin_scheduler {
+            if let Some(skill) = self.load_builtin_scheduler_skill() {
+                skills.push(skill);
+            }
+        }
         for dir in &self.dirs {
             if !dir.exists() {
                 continue;
@@ -87,7 +100,20 @@ impl SkillLoader {
                 }
             }
         }
-        skills
+        dedupe_scheduler_skill(skills)
+    }
+
+    fn load_builtin_scheduler_skill(&self) -> Option<LoadedSkill> {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../skills")
+            .join(BUILTIN_SCHEDULER_NAME);
+        self.try_load_skill_md(&dir).map(|mut skill| {
+            skill.manifest.id = BUILTIN_SCHEDULER_NAME.to_string();
+            skill.manifest.name = BUILTIN_SCHEDULER_NAME.to_string();
+            skill.manifest.version = "builtin".to_string();
+            skill.manifest.trusted = Some(true);
+            skill
+        })
     }
 
     fn load_from_dir(&self, dir: &PathBuf) -> Result<LoadedSkill> {
@@ -316,6 +342,24 @@ impl SkillLoader {
         }
         personas
     }
+}
+
+fn dedupe_scheduler_skill(skills: Vec<LoadedSkill>) -> Vec<LoadedSkill> {
+    let mut seen_builtin = false;
+    let mut result = Vec::new();
+    for skill in skills {
+        if skill.manifest.name == BUILTIN_SCHEDULER_NAME {
+            if seen_builtin {
+                tracing::warn!(
+                    "ignoring duplicate scheduler skill; built-in scheduler skill remains authoritative"
+                );
+                continue;
+            }
+            seen_builtin = true;
+        }
+        result.push(skill);
+    }
+    result
 }
 
 /// Parse a SKILL.md file into its full frontmatter data + body.
@@ -817,5 +861,26 @@ mod tests {
             rex.capability_body.contains("战略分解") || rex.capability_body.contains("架构评审"),
             "capability_body should mention Rex's capability areas"
         );
+    }
+
+    #[test]
+    fn test_builtin_scheduler_skill_loads_for_default_loader_mode() {
+        let loader = SkillLoader {
+            dirs: vec![],
+            include_builtin_scheduler: true,
+        };
+        let skills = loader.load_all();
+        assert!(skills
+            .iter()
+            .any(|skill| skill.manifest.name == "scheduler"));
+    }
+
+    #[test]
+    fn test_with_dirs_does_not_force_builtin_scheduler_skill() {
+        let loader = SkillLoader::with_dirs(vec![]);
+        let skills = loader.load_all();
+        assert!(!skills
+            .iter()
+            .any(|skill| skill.manifest.name == "scheduler"));
     }
 }

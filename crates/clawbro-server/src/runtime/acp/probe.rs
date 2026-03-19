@@ -1,4 +1,6 @@
-use crate::runtime::backend::{CapabilityProfile, NativeTeamCapability, RoleEligibility, ToolBridgeKind};
+use crate::runtime::backend::{
+    CapabilityProfile, NativeTeamCapability, RoleEligibility, ToolBridgeKind,
+};
 use agent_client_protocol as acp;
 
 pub fn capability_profile_from_initialize(

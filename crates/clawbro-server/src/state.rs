@@ -1,12 +1,15 @@
-use crate::config::GatewayConfig;
+use crate::agent_core::{
+    ApprovalDecision as AgentApprovalDecision, ApprovalResolver, SessionRegistry,
+};
 use crate::channel_registry::ChannelRegistry;
 use crate::channels_internal::dingtalk_webhook::DingTalkWebhookChannel;
-use async_trait::async_trait;
-use crate::agent_core::{ApprovalDecision as AgentApprovalDecision, ApprovalResolver, SessionRegistry};
+use crate::config::GatewayConfig;
 use crate::protocol::AgentEvent;
 use crate::runtime::{
     ApprovalBroker, ApprovalDecision as RuntimeApprovalDecision, BackendRegistry,
 };
+use async_trait::async_trait;
+use clawbro_cron::SchedulerService;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
@@ -20,6 +23,7 @@ pub struct AppState {
     pub dingtalk_webhook_channel: Option<Arc<DingTalkWebhookChannel>>,
     pub runtime_token: Arc<String>,
     pub approvals: ApprovalBroker,
+    pub scheduler_service: Arc<SchedulerService>,
 }
 
 #[derive(Clone)]

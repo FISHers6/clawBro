@@ -1,4 +1,6 @@
-use crate::runtime::backend::{CapabilityProfile, NativeTeamCapability, RoleEligibility, ToolBridgeKind};
+use crate::runtime::backend::{
+    CapabilityProfile, NativeTeamCapability, RoleEligibility, ToolBridgeKind,
+};
 
 pub fn default_openclaw_capability_profile() -> CapabilityProfile {
     CapabilityProfile {

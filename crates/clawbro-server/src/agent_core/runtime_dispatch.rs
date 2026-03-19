@@ -1,6 +1,4 @@
 use crate::agent_core::traits::AgentCtx;
-use anyhow::Result;
-use async_trait::async_trait;
 use crate::protocol::{render_scope_storage_key, AgentEvent};
 use crate::runtime::contract::RuntimeToolCall;
 use crate::runtime::{
@@ -10,6 +8,8 @@ use crate::runtime::{
     RuntimeTranscriptSemantics, ToolSurfaceSpec, TranscriptCompactionMode, TranscriptPruningMode,
     TurnIntent, TurnResult,
 };
+use anyhow::Result;
+use async_trait::async_trait;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -260,6 +260,8 @@ async fn run_dispatch_job(
                 tool_surface: ToolSurfaceSpec {
                     team_tools: ctx.mcp_server_url.is_some() || ctx.team_tool_url.is_some(),
                     allowed_team_tools: ctx.allowed_team_tools.clone(),
+                    schedule_tools: !ctx.allowed_schedule_tools.is_empty(),
+                    allowed_schedule_tools: ctx.allowed_schedule_tools.clone(),
                     local_skills: false,
                     external_mcp: !spec.external_mcp_servers.is_empty(),
                     backend_native_tools: true,
@@ -431,7 +433,10 @@ fn collect_workspace_native_files(ctx: &AgentCtx) -> Vec<String> {
             push_visible_file(&mut files, &mut seen, persona_dir, name);
         }
         push_visible_file(&mut files, &mut seen, persona_dir, "USER.md");
-        if !matches!(ctx.agent_role, crate::agent_core::traits::AgentRole::Specialist) {
+        if !matches!(
+            ctx.agent_role,
+            crate::agent_core::traits::AgentRole::Specialist
+        ) {
             push_visible_file(&mut files, &mut seen, persona_dir, "MEMORY.md");
         }
         let scoped_memory_name = format!("memory/{}.md", scoped_memory_file_stem(&ctx.session_key));
@@ -879,6 +884,8 @@ mod tests {
             tool_surface: ToolSurfaceSpec {
                 team_tools: false,
                 allowed_team_tools: vec![],
+                schedule_tools: false,
+                allowed_schedule_tools: vec![],
                 local_skills: false,
                 external_mcp: !spec.external_mcp_servers.is_empty(),
                 backend_native_tools: true,

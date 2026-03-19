@@ -22,7 +22,12 @@ pub fn parse_richtext_nodes(nodes: &[DingTalkWebhookRichTextNode]) -> RichTextRe
     let mut placeholder_index = 0usize;
 
     for node in nodes {
-        if let Some(text) = node.text.as_deref().map(str::trim).filter(|text| !text.is_empty()) {
+        if let Some(text) = node
+            .text
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        {
             parts.push(text.to_string());
             continue;
         }
@@ -36,7 +41,9 @@ pub fn parse_richtext_nodes(nodes: &[DingTalkWebhookRichTextNode]) -> RichTextRe
                     .map(str::trim)
                     .filter(|code| !code.is_empty());
                 parts.push(IMAGE_PLACEHOLDER.to_string());
-                if let Some(download_code) = download_code.filter(|_| images.len() < MAX_RICHTEXT_IMAGES) {
+                if let Some(download_code) =
+                    download_code.filter(|_| images.len() < MAX_RICHTEXT_IMAGES)
+                {
                     images.push(RichTextImageTask {
                         download_code: download_code.to_string(),
                         placeholder_index,

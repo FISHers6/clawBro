@@ -3,7 +3,9 @@ use crate::agent_sdk_internal::{
     config::AgentConfig,
     runtime_bridge::ClawBroRuntimeBridge,
 };
-use crate::embedded_agent::team::ClawBroTeamToolAugmentor;
+use crate::embedded_agent::{
+    schedule::ClawBroScheduleToolAugmentor, team::ClawBroTeamToolAugmentor, ChainedAugmentor,
+};
 use anyhow::Result;
 use std::sync::{Arc, Mutex};
 
@@ -13,6 +15,8 @@ pub async fn run_stdio_bridge() -> Result<()> {
         Ok(config) => {
             let bridge = ClawBroRuntimeBridge::new(config);
             let team_tools = ClawBroTeamToolAugmentor::from_env();
+            let schedule_tools = ClawBroScheduleToolAugmentor::from_env();
+            let augmentor = ChainedAugmentor::new(team_tools, schedule_tools);
             let stdout = Arc::new(Mutex::new(std::io::BufWriter::new(std::io::stdout())));
             let delta_writer = Arc::clone(&stdout);
             tracing::info!(
@@ -32,7 +36,7 @@ pub async fn run_stdio_bridge() -> Result<()> {
                             let _ = std::io::Write::flush(&mut *stdout);
                         }
                     },
-                    &team_tools,
+                    &augmentor,
                 )
                 .await;
 

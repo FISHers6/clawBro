@@ -115,7 +115,10 @@ mod tests {
                 ..
             } => {
                 assert_eq!(approval_id, "approval-1");
-                assert_eq!(session_key, crate::protocol::SessionKey::new("ws", "approval"));
+                assert_eq!(
+                    session_key,
+                    crate::protocol::SessionKey::new("ws", "approval")
+                );
                 assert_eq!(command.as_deref(), Some("git status"));
                 assert_eq!(expires_at_ms, Some(123));
             }

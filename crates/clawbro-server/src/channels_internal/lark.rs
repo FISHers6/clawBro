@@ -4,10 +4,10 @@
 
 use crate::channels_internal::mention_parsing::{derive_fanout_message_id, extract_agent_mentions};
 use crate::channels_internal::traits::Channel;
+use crate::protocol::{InboundMsg, MsgContent, OutboundMsg, SessionKey};
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
-use crate::protocol::{InboundMsg, MsgContent, OutboundMsg, SessionKey};
 use futures::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
 use serde::Deserialize;
@@ -603,8 +603,10 @@ impl Channel for LarkChannel {
                 "content": content_json,
                 "msg_type": "text"
             });
-            crate::channels_internal::send_with_retry(|| client.post(&url).header("Authorization", &auth).json(&body))
-                .await?;
+            crate::channels_internal::send_with_retry(|| {
+                client.post(&url).header("Authorization", &auth).json(&body)
+            })
+            .await?;
         } else if let Some(chat_id) = scope.strip_prefix("group:") {
             // Proactive group message — send to chat_id.
             let client = self.client.clone();
@@ -615,8 +617,10 @@ impl Channel for LarkChannel {
                 "content": content_json,
                 "msg_type": "text"
             });
-            crate::channels_internal::send_with_retry(|| client.post(&url).header("Authorization", &auth).json(&body))
-                .await?;
+            crate::channels_internal::send_with_retry(|| {
+                client.post(&url).header("Authorization", &auth).json(&body)
+            })
+            .await?;
         } else {
             // Proactive DM — scope is "user:{open_id}".
             if !scope.starts_with("user:") {
@@ -634,8 +638,10 @@ impl Channel for LarkChannel {
                 "content": content_json,
                 "msg_type": "text"
             });
-            crate::channels_internal::send_with_retry(|| client.post(&url).header("Authorization", &auth).json(&body))
-                .await?;
+            crate::channels_internal::send_with_retry(|| {
+                client.post(&url).header("Authorization", &auth).json(&body)
+            })
+            .await?;
         }
         Ok(())
     }
@@ -1167,7 +1173,9 @@ mod tests {
 
     #[tokio::test]
     async fn lark_group_message_only_dispatches_to_mentioned_instance() {
-        let checker = crate::channels_internal::allowlist::AllowlistChecker::from_path(None::<std::path::PathBuf>);
+        let checker = crate::channels_internal::allowlist::AllowlistChecker::from_path(
+            None::<std::path::PathBuf>,
+        );
         let (alpha_tx, mut alpha_rx) = mpsc::channel(1);
         let (beta_tx, mut beta_rx) = mpsc::channel(1);
         let alpha = LarkChannel::new_with_instance(
@@ -1228,7 +1236,9 @@ mod tests {
 
     #[tokio::test]
     async fn lark_unmentioned_group_message_only_default_instance_accepts() {
-        let checker = crate::channels_internal::allowlist::AllowlistChecker::from_path(None::<std::path::PathBuf>);
+        let checker = crate::channels_internal::allowlist::AllowlistChecker::from_path(
+            None::<std::path::PathBuf>,
+        );
         let (alpha_tx, mut alpha_rx) = mpsc::channel(1);
         let (beta_tx, mut beta_rx) = mpsc::channel(1);
         let alpha = LarkChannel::new_with_instance(
@@ -1288,7 +1298,9 @@ mod tests {
 
     #[tokio::test]
     async fn lark_group_message_with_multiple_platform_mentions_fans_out() {
-        let checker = crate::channels_internal::allowlist::AllowlistChecker::from_path(None::<std::path::PathBuf>);
+        let checker = crate::channels_internal::allowlist::AllowlistChecker::from_path(
+            None::<std::path::PathBuf>,
+        );
         let (alpha_tx, mut alpha_rx) = mpsc::channel(4);
         let (beta_tx, mut beta_rx) = mpsc::channel(1);
         let alpha = LarkChannel::new_with_instance(
@@ -1426,7 +1438,9 @@ mod tests {
     #[tokio::test]
     async fn test_lark_binary_event_dispatches_inbound_message() {
         let (tx, mut rx) = mpsc::channel(1);
-        let checker = crate::channels_internal::allowlist::AllowlistChecker::from_path(None::<std::path::PathBuf>);
+        let checker = crate::channels_internal::allowlist::AllowlistChecker::from_path(
+            None::<std::path::PathBuf>,
+        );
         let channel = LarkChannel::new(
             "app".into(),
             "secret".into(),
@@ -1470,7 +1484,9 @@ mod tests {
     #[tokio::test]
     async fn lark_platform_mention_is_removed_from_model_visible_text() {
         let (tx, mut rx) = mpsc::channel(1);
-        let checker = crate::channels_internal::allowlist::AllowlistChecker::from_path(None::<std::path::PathBuf>);
+        let checker = crate::channels_internal::allowlist::AllowlistChecker::from_path(
+            None::<std::path::PathBuf>,
+        );
         let channel = LarkChannel::new(
             "app".into(),
             "secret".into(),
@@ -1507,7 +1523,9 @@ mod tests {
     #[tokio::test]
     async fn lark_explicit_agent_mention_survives_normalization() {
         let (tx, mut rx) = mpsc::channel(1);
-        let checker = crate::channels_internal::allowlist::AllowlistChecker::from_path(None::<std::path::PathBuf>);
+        let checker = crate::channels_internal::allowlist::AllowlistChecker::from_path(
+            None::<std::path::PathBuf>,
+        );
         let channel = LarkChannel::new(
             "app".into(),
             "secret".into(),
@@ -1544,7 +1562,9 @@ mod tests {
     #[tokio::test]
     async fn lark_message_with_only_platform_mention_is_dropped() {
         let (tx, mut rx) = mpsc::channel(1);
-        let checker = crate::channels_internal::allowlist::AllowlistChecker::from_path(None::<std::path::PathBuf>);
+        let checker = crate::channels_internal::allowlist::AllowlistChecker::from_path(
+            None::<std::path::PathBuf>,
+        );
         let channel = LarkChannel::new(
             "app".into(),
             "secret".into(),

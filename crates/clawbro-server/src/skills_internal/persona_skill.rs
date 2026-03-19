@@ -34,8 +34,8 @@ impl PersonaSkillData {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::identity::IdentityData;
+    use super::*;
 
     fn make_identity(name: &str, emoji: Option<&str>, mbti: Option<&str>) -> IdentityData {
         IdentityData {

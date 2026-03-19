@@ -3,7 +3,10 @@ use clawbro_agent_sdk::{
     tools::{ConfiguredAgentBuilder, EventedTool, RuntimeToolAugmentor, ToolProgressTracker},
 };
 use clawbro_protocol::{parse_session_key_text, TeamToolCall, TeamToolRequest, TeamToolResponse};
-use rig::{completion::{CompletionModel, ToolDefinition}, tool::{Tool, ToolError}};
+use rig::{
+    completion::{CompletionModel, ToolDefinition},
+    tool::{Tool, ToolError},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 

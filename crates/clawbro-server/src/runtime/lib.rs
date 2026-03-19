@@ -48,6 +48,7 @@ pub use provider_profiles::{
 pub use registry::{BackendRegistry, BackendSpec};
 pub use testing::{CapturedTurn, ScriptedAdapter, ScriptedTurn};
 pub use tool_bridge::{
-    visible_team_tools_for_role, TeamTool, TeamToolCall, TeamToolRequest, TeamToolResponse,
+    visible_schedule_tools_for_role, visible_team_tools_for_role, ScheduleTool,
+    ScheduleToolVisibility, TeamTool, TeamToolCall, TeamToolRequest, TeamToolResponse,
     TeamToolVisibility,
 };

@@ -3,8 +3,8 @@ use crate::agent_core::memory::cap_to_words;
 use crate::agent_core::memory::MemoryEvent;
 use crate::agent_core::registry::MemoryControlContext;
 use crate::agent_core::slash::SlashCommand;
-use anyhow::{bail, Result};
 use crate::protocol::SessionKey;
+use anyhow::{bail, Result};
 
 pub(crate) struct MemoryRequest<'a> {
     pub session_key: &'a SessionKey,
@@ -147,10 +147,11 @@ mod tests {
             std::env::temp_dir().join(format!("test-memory-service-{}", uuid::Uuid::new_v4()));
         let storage = SessionStorage::new(dir);
         let session_manager = Arc::new(SessionManager::new(storage));
-        let store: Arc<dyn crate::agent_core::memory::MemoryStore> = Arc::new(FileMemoryStore::new(
-            std::env::temp_dir().join(uuid::Uuid::new_v4().to_string()),
-        ));
-        let distiller: Arc<dyn crate::agent_core::memory::MemoryDistiller> = Arc::new(NoopDistiller);
+        let store: Arc<dyn crate::agent_core::memory::MemoryStore> = Arc::new(
+            FileMemoryStore::new(std::env::temp_dir().join(uuid::Uuid::new_v4().to_string())),
+        );
+        let distiller: Arc<dyn crate::agent_core::memory::MemoryDistiller> =
+            Arc::new(NoopDistiller);
         let triggers: Vec<Arc<dyn MemoryTrigger>> = vec![Arc::new(UserRememberTrigger)];
         let memory_system = MemorySystem::new(triggers, store, distiller);
         SessionRegistry::new(

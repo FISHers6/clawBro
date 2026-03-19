@@ -14,7 +14,9 @@ use crate::agent_core::post_turn::{process_post_turn, PostTurnInput, PostTurnPro
 use crate::agent_core::relay::RelayEngine;
 use crate::agent_core::roster::AgentRoster;
 use crate::agent_core::routing::resolve_turn_routing;
-use crate::agent_core::runtime_dispatch::{default_runtime_dispatch, RuntimeDispatch, RuntimeDispatchRequest};
+use crate::agent_core::runtime_dispatch::{
+    default_runtime_dispatch, RuntimeDispatch, RuntimeDispatchRequest,
+};
 use crate::agent_core::slash::SlashCommand;
 use crate::agent_core::slash_service::{execute_slash_request, SlashRequest};
 use crate::agent_core::team::orchestrator::TeamOrchestrator;
@@ -22,14 +24,16 @@ use crate::agent_core::team::orchestrator::TeamRuntimeSummary;
 use crate::agent_core::team::tool_executor::{execute_team_tool_call, resolve_team_tool_role};
 use crate::agent_core::turn_context::{TurnDeliverySource, TurnExecutionContext};
 use crate::agent_core::ApprovalResolver;
-use anyhow::Result;
 use crate::channels_internal::mention_trigger::MentionTrigger;
 use crate::protocol::{
     normalize_conversation_identity, parse_session_key_text, AgentEvent, InboundMsg, SessionKey,
 };
 use crate::runtime::contract::{ResumeRecoveryAction, TeamCallback, TurnResult};
 use crate::runtime::{RuntimeEvent, TeamToolCall, TeamToolResponse};
-use crate::session::{ResumableBackendSession, ResumeDropReason, SessionManager, StoredMessage};
+use crate::session::{
+    ResumableBackendSession, ResumeDropReason, SessionManager, StoredMessage, ToolCallRecord,
+};
+use anyhow::Result;
 use dashmap::DashMap;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
@@ -43,6 +47,87 @@ pub struct Session {
 
 fn normalized_session_key(session_key: &SessionKey) -> SessionKey {
     normalize_conversation_identity(session_key)
+}
+
+fn collect_tool_call_records(events: &[RuntimeEvent]) -> Vec<ToolCallRecord> {
+    use serde_json::json;
+    use std::collections::{hash_map::Entry, HashMap};
+
+    let mut order = Vec::new();
+    let mut records: HashMap<String, ToolCallRecord> = HashMap::new();
+
+    for event in events {
+        match event {
+            RuntimeEvent::ToolCallStarted {
+                tool_name,
+                call_id,
+                input_summary,
+            } => match records.entry(call_id.clone()) {
+                Entry::Vacant(slot) => {
+                    order.push(call_id.clone());
+                    slot.insert(ToolCallRecord {
+                        tool_call_id: Some(call_id.clone()),
+                        name: tool_name.clone(),
+                        input: input_summary
+                            .as_ref()
+                            .map(|summary| json!({ "summary": summary }))
+                            .unwrap_or(serde_json::Value::Null),
+                        output: None,
+                    });
+                }
+                Entry::Occupied(mut slot) => {
+                    let record = slot.get_mut();
+                    record.name = tool_name.clone();
+                    if record.input.is_null() {
+                        record.input = input_summary
+                            .as_ref()
+                            .map(|summary| json!({ "summary": summary }))
+                            .unwrap_or(serde_json::Value::Null);
+                    }
+                }
+            },
+            RuntimeEvent::ToolCallCompleted {
+                tool_name,
+                call_id,
+                result,
+            } => {
+                let record = records.entry(call_id.clone()).or_insert_with(|| {
+                    order.push(call_id.clone());
+                    ToolCallRecord {
+                        tool_call_id: Some(call_id.clone()),
+                        name: tool_name.clone(),
+                        input: serde_json::Value::Null,
+                        output: None,
+                    }
+                });
+                record.name = tool_name.clone();
+                record.output = Some(result.clone());
+            }
+            RuntimeEvent::ToolCallFailed {
+                tool_name,
+                call_id,
+                error,
+            } => {
+                let record = records.entry(call_id.clone()).or_insert_with(|| {
+                    order.push(call_id.clone());
+                    ToolCallRecord {
+                        tool_call_id: Some(call_id.clone()),
+                        name: tool_name.clone(),
+                        input: serde_json::Value::Null,
+                        output: None,
+                    }
+                });
+                record.name = tool_name.clone();
+                record.output = Some(format!("ERROR: {error}"));
+            }
+            _ => {}
+        }
+    }
+
+    order
+        .into_iter()
+        .filter_map(|call_id| records.remove(&call_id))
+        .collect()
 }
 
 #[derive(Clone, Copy)]
@@ -496,7 +581,10 @@ impl SessionRegistry {
             return false;
         }
         let state = orch.team_state();
-        let suppress = matches!(state, crate::agent_core::team::orchestrator::TeamState::Running);
+        let suppress = matches!(
+            state,
+            crate::agent_core::team::orchestrator::TeamState::Running
+        );
         tracing::info!(
             channel = %session_key.channel,
             scope = %session_key.scope,
@@ -634,7 +722,8 @@ impl SessionRegistry {
     pub fn register_binding(&self, binding: BindingRule) {
         let agent_name = binding.agent_name().to_string();
         if self.roster.as_ref().is_some_and(|roster| {
-            crate::agent_core::routing::resolve_roster_match_by_name(Some(roster), &agent_name).is_none()
+            crate::agent_core::routing::resolve_roster_match_by_name(Some(roster), &agent_name)
+                .is_none()
         }) {
             tracing::warn!(
                 agent = %agent_name,
@@ -770,7 +859,10 @@ impl SessionRegistry {
         is_lead: bool,
         team_orchestrator_present: bool,
     ) -> bool {
-        if !is_lead || !team_orchestrator_present || inbound.source != crate::protocol::MsgSource::Human {
+        if !is_lead
+            || !team_orchestrator_present
+            || inbound.source != crate::protocol::MsgSource::Human
+        {
             return false;
         }
         inbound
@@ -946,7 +1038,9 @@ impl SessionRegistry {
         // When Lead called request_confirmation(), the next Human message is the user's yes/no.
         if inbound.source == crate::protocol::MsgSource::Human {
             if let Some(team_orch) = session_team_orch.as_ref() {
-                if team_orch.team_state() == crate::agent_core::team::orchestrator::TeamState::AwaitingConfirm {
+                if team_orch.team_state()
+                    == crate::agent_core::team::orchestrator::TeamState::AwaitingConfirm
+                {
                     if let Some(lead_key) = team_orch.lead_session_key() {
                         if session_key == lead_key {
                             let text_lower = user_text.to_lowercase();
@@ -1339,6 +1433,7 @@ impl SessionRegistry {
                 persona_dir: resolved_persona_dir,
                 user_text_for_log: &user_text_for_log,
                 full_text: turn.full_text,
+                tool_calls: collect_tool_call_records(&turn.events),
                 is_lead,
                 team_orchestrator: session_team_orch,
             },
@@ -1399,7 +1494,9 @@ impl SessionRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_core::memory::{distiller::NoopDistiller, store::FileMemoryStore, MemorySystem};
+    use crate::agent_core::memory::{
+        distiller::NoopDistiller, store::FileMemoryStore, MemorySystem,
+    };
     use crate::agent_core::roster::{AgentEntry, AgentRoster};
     use crate::agent_core::runtime_dispatch::{RuntimeDispatch, RuntimeDispatchRequest};
     use crate::agent_core::ApprovalDecision;
@@ -1585,7 +1682,8 @@ mod tests {
         let mem_dir = tempdir().unwrap();
         let store: Arc<dyn crate::agent_core::memory::MemoryStore> =
             Arc::new(FileMemoryStore::new(mem_dir.keep()));
-        let distiller: Arc<dyn crate::agent_core::memory::MemoryDistiller> = Arc::new(NoopDistiller);
+        let distiller: Arc<dyn crate::agent_core::memory::MemoryDistiller> =
+            Arc::new(NoopDistiller);
         let memory_system = MemorySystem::new(vec![], store, distiller);
         SessionRegistry::new(
             None,
@@ -3043,13 +3141,15 @@ mod tests {
             "AwaitingConfirm state must not suppress confirmation replies"
         );
 
-        *orch.team_state_inner.lock().unwrap() = crate::agent_core::team::orchestrator::TeamState::Running;
+        *orch.team_state_inner.lock().unwrap() =
+            crate::agent_core::team::orchestrator::TeamState::Running;
         assert!(
             registry.should_suppress_lead_final_reply(&lead_key),
             "Running state should suppress the normal stream path"
         );
 
-        *orch.team_state_inner.lock().unwrap() = crate::agent_core::team::orchestrator::TeamState::Done;
+        *orch.team_state_inner.lock().unwrap() =
+            crate::agent_core::team::orchestrator::TeamState::Done;
         assert!(
             !registry.should_suppress_lead_final_reply(&lead_key),
             "Done state must not suppress direct lead replies"
@@ -3059,7 +3159,8 @@ mod tests {
     #[tokio::test]
     async fn test_new_human_lead_turn_reopens_done_team_for_new_planning_cycle() {
         let (registry, orch, calls) = make_registry_with_runtime_dispatch_and_team_orchestrator();
-        *orch.team_state_inner.lock().unwrap() = crate::agent_core::team::orchestrator::TeamState::Done;
+        *orch.team_state_inner.lock().unwrap() =
+            crate::agent_core::team::orchestrator::TeamState::Done;
 
         let inbound = InboundMsg {
             id: "team-reopen-1".to_string(),
@@ -3125,8 +3226,10 @@ mod tests {
         };
         use tempfile::tempdir;
 
-        let dir = std::env::temp_dir()
-            .join(format!("test-registry-team-turn-side-effect-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!(
+            "test-registry-team-turn-side-effect-{}",
+            uuid::Uuid::new_v4()
+        ));
         let storage = SessionStorage::new(dir);
         let session_manager = Arc::new(SessionManager::new(storage));
 
@@ -3199,8 +3302,10 @@ mod tests {
         };
         use tempfile::tempdir;
 
-        let dir = std::env::temp_dir()
-            .join(format!("test-registry-team-turn-activation-fail-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!(
+            "test-registry-team-turn-activation-fail-{}",
+            uuid::Uuid::new_v4()
+        ));
         let storage = SessionStorage::new(dir);
         let session_manager = Arc::new(SessionManager::new(storage));
 
@@ -3276,17 +3381,17 @@ mod tests {
             target_agent: None,
             source: crate::protocol::MsgSource::Human,
         };
-        assert!(SessionRegistry::lead_human_team_delegation_requires_side_effect(
-            &inbound, true, true
-        ));
+        assert!(
+            SessionRegistry::lead_human_team_delegation_requires_side_effect(&inbound, true, true)
+        );
 
         let plain = InboundMsg {
             content: MsgContent::text("直接讲解一下clawbro"),
             ..inbound.clone()
         };
-        assert!(!SessionRegistry::lead_human_team_delegation_requires_side_effect(
-            &plain, true, true
-        ));
+        assert!(
+            !SessionRegistry::lead_human_team_delegation_requires_side_effect(&plain, true, true)
+        );
     }
 
     #[test]
@@ -3303,13 +3408,17 @@ mod tests {
             used_backend_id: None,
             resume_recovery: None,
         };
-        assert!(SessionRegistry::turn_has_team_coordination_side_effect(&with_create));
+        assert!(SessionRegistry::turn_has_team_coordination_side_effect(
+            &with_create
+        ));
 
         let without_real_side_effect = TurnResult {
             full_text: "talk only".into(),
-            events: vec![RuntimeEvent::ToolCallback(TeamCallback::PublicUpdatePosted {
-                message: "working".into(),
-            })],
+            events: vec![RuntimeEvent::ToolCallback(
+                TeamCallback::PublicUpdatePosted {
+                    message: "working".into(),
+                },
+            )],
             emitted_backend_session_id: None,
             backend_resume_fingerprint: None,
             used_backend_id: None,

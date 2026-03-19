@@ -19,7 +19,7 @@
     <a href="./docs/setup.md">安装配置</a>
   </p>
   <p>
-    <img src="https://img.shields.io/badge/version-0.1.4-blue" alt="Version">
+    <img src="https://img.shields.io/badge/version-0.1.5-blue" alt="Version">
     <img src="https://img.shields.io/badge/rust-1.90%2B-orange" alt="Rust">
     <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
     <img src="https://img.shields.io/badge/agents-Claude%20%7C%20Codex%20%7C%20Qwen%20%7C%20Qoder%20%7C%20Gemini-111827" alt="Agents">
@@ -40,6 +40,7 @@
 - **[03-19]** 支持把工作流接入 Lark、DingTalk Stream Mode、DingTalk 自定义机器人 Webhook 和 WebSocket，适合从本地到群聊逐步扩展。
 - **[03-19]** 现在可以稳定做多 IM 常驻：一个 `clawbro` 运行时可以同时在线接 Lark、DingTalk 和团队对话，随时聊天、随时继续任务。
 - **[03-19]** 运行时提供 approvals、allowlist、memory-aware sessions、`/health`、`/status`、`/doctor` 和 diagnostics 能力。
+- **[03-20]** 现在内置持久化定时任务：一次性提醒、指定时刻任务、固定轮询、cron 调度、聊天里直接创建提醒、按当前会话清理提醒，全部走同一套 runtime scheduler。
 
 > `clawBro` 适合工程协作、研究工作流、群聊 AI 助手和多 Agent 实验，而不是单纯做一个最轻量的对话 CLI。
 
@@ -57,12 +58,14 @@
 
 🧠 **记忆与习惯**：支持共享记忆、角色记忆、项目偏好沉淀，让 Agent 越用越贴近你的真实工作方式。
 
+⏰ **定时与轮询**：支持 `delay`、`at`、`every`、`cron` 四类调度，既能做提醒，也能做定时触发的 Agent 工作流。
+
 🛡️ **工程可控**：内置 config validate、doctor/status、审批和健康检查，不是黑盒跑完就结束。
 
 ## 🏗️ 架构
 
 ```text
-用户 / 群聊 / WebSocket / Cron
+用户 / 群聊 / WebSocket / 定时任务
               |
               v
            clawbro
@@ -87,6 +90,7 @@
 - [应用场景](#-应用场景)
 - [安装](#-安装)
 - [快速开始](#-快速开始)
+- [定时任务](#-定时任务)
 - [团队模式](#-团队模式)
 - [Coding Agent 接入](#-coding-agent-接入)
 - [聊天渠道](#-聊天渠道)
@@ -249,6 +253,35 @@ clawbro serve
   --team-name ops-room \
   --non-interactive
 ```
+
+## ⏰ 定时任务
+
+`clawBro` 现在不只是随叫随到，也能“到了时间自己开工”。
+
+- **四种调度方式**：
+  - `delay`：比如“1 分钟后提醒我给手机充电”
+  - `at`：比如“明天早上 9 点提醒我开会”
+  - `every`：比如“每 30 分钟检查一次服务状态”
+  - `cron`：比如“工作日每天 18 点总结 issue 进展”
+- **两种执行方式**：
+  - 固定提醒会直接回到聊天会话
+  - 动态任务会在到点后拉起 agent 再执行一轮
+- **聊天里可以直接说**：
+  - “一分钟后提醒我给手机充电”
+  - “每分钟告诉我一下北京时间”
+  - “把给手机充电的提醒删掉”
+  - “清空这个会话里的所有提醒”
+- **管理员也可以走正式命令**：
+
+```bash
+clawbro schedule add-delay --name phone-charge --delay 1m --prompt "提醒：请给手机充电"
+clawbro schedule add-every --name service-check --every 30m --target-kind agent-turn --prompt "检查服务状态，有异常就汇报。"
+clawbro schedule list
+clawbro schedule delete --name phone-charge
+clawbro schedule delete-all --current-session-key 'lark@alpha:user:ou_xxx'
+```
+
+简单说：提醒类任务负责准时冒泡，Agent 定时任务负责到点后重新干活，二者共用同一套 scheduler，但执行语义清楚分开。
 
 ## 👥 团队模式
 

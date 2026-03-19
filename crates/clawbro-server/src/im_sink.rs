@@ -1,16 +1,16 @@
-use crate::channel_registry::ChannelRegistry;
-use crate::config::{DeliveryPurposeConfig, GatewayConfig, ProgressPresentationMode};
-use crate::delivery_resolver::{resolve_delivery, ResolvedDelivery};
-use crate::progress_presentation;
-use async_trait::async_trait;
 use crate::agent_core::team::orchestrator::TeamOrchestrator;
 use crate::agent_core::team::session::{ChannelSendSourceKind, ChannelSendStatus};
 use crate::agent_core::{
     throttled_stream, OutputSink, SessionRegistry, StreamControl, TurnDeliverySource,
     TurnExecutionContext,
 };
+use crate::channel_registry::ChannelRegistry;
 use crate::channels_internal::Channel;
+use crate::config::{DeliveryPurposeConfig, GatewayConfig, ProgressPresentationMode};
+use crate::delivery_resolver::{resolve_delivery, ResolvedDelivery};
+use crate::progress_presentation;
 use crate::protocol::{AgentEvent, InboundMsg, OutboundMsg, SessionKey};
+use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -449,12 +449,12 @@ pub fn spawn_im_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::Result;
     use crate::agent_core::team::heartbeat::DispatchFn;
     use crate::agent_core::team::orchestrator::TeamOrchestrator;
     use crate::agent_core::team::registry::TaskRegistry;
     use crate::agent_core::team::session::TeamSession;
     use crate::protocol::MsgContent;
+    use anyhow::Result;
     use std::sync::{Arc, Mutex as StdMutex};
     use tempfile::tempdir;
     use tokio::sync::mpsc;
