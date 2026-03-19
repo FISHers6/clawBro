@@ -176,18 +176,17 @@ This is one of the most distinctive parts of the project: the architecture is se
 
 ## 📦 Install
 
-**Build from source** (current recommended path)
+**Recommended**
+
+```bash
+cargo install clawbro
+```
+
+**Build from source** (developer path)
 
 ```bash
 cd clawBro
 cargo build -p clawbro --bin clawbro
-```
-
-**Run without installing globally**
-
-```bash
-cd clawBro
-cargo run -p clawbro --bin clawbro -- --help
 ```
 
 ## 🚀 Quick Start
@@ -196,17 +195,16 @@ cargo run -p clawbro --bin clawbro -- --help
 > The recommended first path is `WebSocket + ClawBro Native`.
 > Add agent rosters, bindings, channels, and Team scopes after the base path is working.
 
-**1. Build**
+**1. Install**
 
 ```bash
-cd clawBro
-cargo build -p clawbro --bin clawbro
+cargo install clawbro
 ```
 
 **2. Initialize**
 
 ```bash
-./target/debug/clawbro setup
+clawbro setup
 ```
 
 This creates the default runtime layout under `~/.clawbro/`, including:
@@ -221,20 +219,20 @@ This creates the default runtime layout under `~/.clawbro/`, including:
 **3. Validate your config**
 
 ```bash
-./target/debug/clawbro config validate
+clawbro config validate
 ```
 
 **4. Start the gateway**
 
 ```bash
 source ~/.clawbro/.env
-./target/debug/clawbro serve
+clawbro serve
 ```
 
 **5. Example: non-interactive Team setup**
 
 ```bash
-./target/debug/clawbro setup \
+clawbro setup \
   --lang en \
   --provider anthropic \
   --api-key sk-ant-xxx \
