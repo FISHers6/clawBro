@@ -1,4 +1,5 @@
 <div align="center">
+  <img src="./assets/logo.png" alt="clawBro Logo" width="200">
   <h1>🦀 clawBro：Coding CLI Agent を OpenClaw のように、チャットとチーム協業の中で本当に働かせる</h1>
   <p>
     <strong>OpenClaw の発想を土台に、Claude Code、Codex、Qwen、Qoder、Gemini などの coding agent CLI を協調動作させ、Lark、DingTalk、チームワークフローへ接続します。</strong>
