@@ -1,4 +1,5 @@
 <div align="center">
+  <img src="./assets/logo.png" alt="clawBro Logo" width="200">
   <h1>🦀 clawBro：让 Coding CLI Agents 像 OpenClaw 一样随时在IM App中工作，团队协作模式，真正的干活！</h1>
   <p>
     <strong>围绕 OpenClaw 的思路继续往前走，让 Claude Code、Codex、Qwen、Qoder、Gemini 等 coding agent CLI 能协作干活，并接入 Lark、DingTalk 和团队工作流。</strong>
