@@ -239,6 +239,7 @@ mod tests {
 
     fn extract_text(message: &Message) -> String {
         match message {
+            Message::System { content } => content.clone(),
             Message::User { content } => content
                 .iter()
                 .find_map(|item| match item {

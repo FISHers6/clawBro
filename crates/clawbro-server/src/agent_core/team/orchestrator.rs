@@ -2294,7 +2294,7 @@ mod tests {
             .unwrap();
         orch.registry.try_claim("T004B", "codex").unwrap();
 
-        let result_markdown = "# Result\n\nReady for review\n\n- added jwt.rs\n- added tests";
+        let result_markdown = "# JWT Implementation\n\nImplemented JWT support with middleware, token verification, and focused regression tests.";
         orch.handle_specialist_submitted(
             "T004B",
             "codex",
@@ -2334,7 +2334,12 @@ mod tests {
         let started_at = chrono::Utc::now();
         orch.handle_specialist_checkpoint("T900", "worker", "halfway")
             .unwrap();
-        orch.handle_specialist_submitted("T900", "worker", "done", None)
+        orch.handle_specialist_submitted(
+            "T900",
+            "worker",
+            "done",
+            Some("# Result\n\nCompleted the recorded-actions task with a full deliverable body."),
+        )
             .unwrap();
 
         assert!(matches!(
@@ -2604,7 +2609,12 @@ mod tests {
             })
             .unwrap();
         orch.registry.try_claim("T005", "codex").unwrap();
-        orch.handle_specialist_submitted("T005", "codex", "ready", None)
+        orch.handle_specialist_submitted(
+            "T005",
+            "codex",
+            "ready",
+            Some("# Result\n\nCompleted the only task and prepared it for lead review."),
+        )
             .unwrap();
         orch.accept_submitted_task("T005", "claude").unwrap();
 
@@ -2869,7 +2879,12 @@ mod tests {
             })
             .unwrap();
         orch.registry.try_claim("T121", "codex").unwrap();
-        orch.handle_specialist_submitted("T121", "codex", "added jwt.rs", None)
+        orch.handle_specialist_submitted(
+            "T121",
+            "codex",
+            "added jwt.rs",
+            Some("# Result\n\nImplemented JWT support and added the required tests."),
+        )
             .unwrap();
 
         let evs = events.lock().unwrap();
@@ -3094,7 +3109,12 @@ mod tests {
 
         orch.handle_specialist_checkpoint("SA01", "codex", "50% done")
             .unwrap();
-        orch.handle_specialist_submitted("SA01", "codex", "auth.rs complete", None)
+        orch.handle_specialist_submitted(
+            "SA01",
+            "codex",
+            "auth.rs complete",
+            Some("# Result\n\nCompleted auth.rs with the full implementation and supporting notes."),
+        )
             .unwrap();
 
         let evs = events.lock().unwrap();

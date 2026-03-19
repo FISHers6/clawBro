@@ -746,7 +746,12 @@ mod tests {
             .try_claim("T011", "codex")
             .unwrap();
         srv.orchestrator
-            .handle_specialist_submitted("T011", "codex", "ready", None)
+            .handle_specialist_submitted(
+                "T011",
+                "codex",
+                "ready",
+                Some("# Result\n\nPrepared a full deliverable body that still needs one edge-case fix."),
+            )
             .unwrap();
 
         let result = srv

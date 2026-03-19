@@ -21,7 +21,7 @@ path = "src/main.rs"
 [dependencies]
 clawbro-agent-sdk = { version = "0.1", path = "../clawbro-agent-sdk" }
 clawbro-protocol = { version = "0.1", path = "../clawbro-protocol" }
-rig-core = { version = "0.20", path = "../../../vendor/rig-core-0.20.0", features = ["rmcp"] }
+rig-core = { version = "0.33.0", features = ["rmcp"] }
 agent-client-protocol = "0.9"
 # rustls with ring feature: needed to call install_default() in main() before HTTPS requests.
 rustls = { version = "0.23", features = ["ring"] }

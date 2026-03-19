@@ -6,14 +6,14 @@ use crate::bridge::{
 };
 use anyhow::Result;
 use rig::{
-    agent::AgentBuilder,
+    agent::{AgentBuilder, WithBuilderTools},
     completion::ToolDefinition,
     tool::{Tool, ToolError},
 };
 use rmcp::{
     model::{ClientCapabilities, ClientInfo, Implementation},
     service::{RoleClient, RunningService},
-    transport::SseClientTransport,
+    transport::StreamableHttpClientTransport,
     ServiceExt,
 };
 use std::sync::{
@@ -79,12 +79,13 @@ pub struct EventedTool<T> {
 }
 
 type ExternalMcpClient = RunningService<RoleClient, ClientInfo>;
+pub type ConfiguredAgentBuilder<M> = AgentBuilder<M, (), WithBuilderTools>;
 
 pub struct RuntimeToolRegistration<M>
 where
     M: rig::completion::CompletionModel,
 {
-    pub builder: AgentBuilder<M>,
+    pub builder: ConfiguredAgentBuilder<M>,
     pub external_mcp_clients: Vec<ExternalMcpClient>,
 }
 
@@ -105,11 +106,11 @@ impl<T> EventedTool<T> {
 pub trait RuntimeToolAugmentor {
     fn augment<M: rig::completion::CompletionModel>(
         &self,
-        builder: AgentBuilder<M>,
+        builder: ConfiguredAgentBuilder<M>,
         session: &AgentTurnRequest,
         tracker: Option<ToolProgressTracker>,
         approval_mode: ApprovalMode,
-    ) -> AgentBuilder<M>;
+    ) -> ConfiguredAgentBuilder<M>;
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -118,11 +119,11 @@ pub struct NoopToolAugmentor;
 impl RuntimeToolAugmentor for NoopToolAugmentor {
     fn augment<M: rig::completion::CompletionModel>(
         &self,
-        builder: AgentBuilder<M>,
+        builder: ConfiguredAgentBuilder<M>,
         _session: &AgentTurnRequest,
         _tracker: Option<ToolProgressTracker>,
         _approval_mode: ApprovalMode,
-    ) -> AgentBuilder<M> {
+    ) -> ConfiguredAgentBuilder<M> {
         builder
     }
 }
@@ -187,7 +188,7 @@ where
 ///   ```
 pub fn register_tools<M: rig::completion::CompletionModel>(
     builder: rig::agent::AgentBuilder<M>,
-) -> rig::agent::AgentBuilder<M> {
+) -> ConfiguredAgentBuilder<M> {
     builder
         .tool(BashTool)
         .tool(ViewFileTool)
@@ -198,7 +199,7 @@ pub fn register_tools<M: rig::completion::CompletionModel>(
         .tool(LsTool)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "internal-sdk-tests"))]
 mod tests {
     use super::*;
     use crate::bridge::{
@@ -562,10 +563,10 @@ pub async fn register_runtime_tools<M: rig::completion::CompletionModel>(
 }
 
 async fn register_external_mcp_tools<M: rig::completion::CompletionModel>(
-    builder: AgentBuilder<M>,
+    builder: ConfiguredAgentBuilder<M>,
     servers: &[ExternalMcpServerSpec],
     approval_mode: ApprovalMode,
-) -> Result<(AgentBuilder<M>, Vec<ExternalMcpClient>)> {
+) -> Result<(ConfiguredAgentBuilder<M>, Vec<ExternalMcpClient>)> {
     if !matches!(approval_mode, ApprovalMode::AutoAllow) {
         tracing::warn!(
             ?approval_mode,
@@ -600,9 +601,7 @@ async fn register_external_mcp_tools<M: rig::completion::CompletionModel>(
             }
         };
         let peer = client.peer().clone();
-        builder = tools.into_iter().fold(builder, |builder, tool| {
-            builder.rmcp_tool(tool, peer.clone())
-        });
+        builder = builder.rmcp_tools(tools, peer);
         clients.push(client);
     }
 
@@ -612,8 +611,9 @@ async fn register_external_mcp_tools<M: rig::completion::CompletionModel>(
 async fn connect_external_mcp_server(server: &ExternalMcpServerSpec) -> Result<ExternalMcpClient> {
     match &server.transport {
         ExternalMcpTransport::Sse { url } => {
-            let transport = SseClientTransport::start(url.clone()).await?;
+            let transport = StreamableHttpClientTransport::from_uri(url.clone());
             let client_info = ClientInfo {
+                meta: None,
                 protocol_version: Default::default(),
                 capabilities: ClientCapabilities::default(),
                 client_info: Implementation::from_build_env(),

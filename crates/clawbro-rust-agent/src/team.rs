@@ -1,13 +1,9 @@
 use clawbro_agent_sdk::{
     bridge::{AgentTurnRequest, ApprovalMode, ExecutionRole},
-    tools::{EventedTool, RuntimeToolAugmentor, ToolProgressTracker},
+    tools::{ConfiguredAgentBuilder, EventedTool, RuntimeToolAugmentor, ToolProgressTracker},
 };
 use clawbro_protocol::{parse_session_key_text, TeamToolCall, TeamToolRequest, TeamToolResponse};
-use rig::{
-    agent::AgentBuilder,
-    completion::{CompletionModel, ToolDefinition},
-    tool::{Tool, ToolError},
-};
+use rig::{completion::{CompletionModel, ToolDefinition}, tool::{Tool, ToolError}};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -79,11 +75,11 @@ impl ClawBroTeamToolAugmentor {
 impl RuntimeToolAugmentor for ClawBroTeamToolAugmentor {
     fn augment<M: CompletionModel>(
         &self,
-        builder: AgentBuilder<M>,
+        builder: ConfiguredAgentBuilder<M>,
         session: &AgentTurnRequest,
         tracker: Option<ToolProgressTracker>,
         approval_mode: ApprovalMode,
-    ) -> AgentBuilder<M> {
+    ) -> ConfiguredAgentBuilder<M> {
         if !session.tool_surface.team_tools {
             return builder;
         }
@@ -417,11 +413,11 @@ define_team_tool!(
 );
 
 fn register_team_tools<M: CompletionModel>(
-    mut builder: AgentBuilder<M>,
+    mut builder: ConfiguredAgentBuilder<M>,
     role: ExecutionRole,
     client: TeamToolClient,
     approval_mode: ApprovalMode,
-) -> AgentBuilder<M> {
+) -> ConfiguredAgentBuilder<M> {
     match role {
         ExecutionRole::Solo => builder,
         ExecutionRole::Leader => {
@@ -493,12 +489,12 @@ fn register_team_tools<M: CompletionModel>(
 }
 
 fn register_team_tools_with_progress<M: CompletionModel>(
-    mut builder: AgentBuilder<M>,
+    mut builder: ConfiguredAgentBuilder<M>,
     role: ExecutionRole,
     client: TeamToolClient,
     tracker: ToolProgressTracker,
     approval_mode: ApprovalMode,
-) -> AgentBuilder<M> {
+) -> ConfiguredAgentBuilder<M> {
     match role {
         ExecutionRole::Solo => builder,
         ExecutionRole::Leader => {

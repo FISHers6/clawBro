@@ -50,7 +50,8 @@ impl RigEngine {
         tracker: Option<ToolProgressTracker>,
         augmentor: &A,
     ) -> Result<RuntimeToolRegistration<deepseek::CompletionModel>> {
-        let client = deepseek::Client::new(&self.config.api_key);
+        let client = deepseek::Client::new(&self.config.api_key)
+            .map_err(|e| anyhow::anyhow!("DeepSeek client build failed: {e}"))?;
         register_runtime_tools(
             client
                 .agent(&self.config.model)
@@ -70,12 +71,14 @@ impl RigEngine {
         augmentor: &A,
     ) -> Result<RuntimeToolRegistration<anthropic::completion::CompletionModel>> {
         let client = if let Some(url) = base_url {
-            anthropic::Client::builder(&self.config.api_key)
+            anthropic::Client::builder()
+                .api_key(&self.config.api_key)
                 .base_url(url)
                 .build()
                 .map_err(|e| anyhow::anyhow!("Anthropic client build failed: {e}"))?
         } else {
             anthropic::Client::new(&self.config.api_key)
+                .map_err(|e| anyhow::anyhow!("Anthropic client init failed: {e}"))?
         };
 
         let builder = if base_url.is_some() {
@@ -135,9 +138,9 @@ impl RigEngine {
                     .map_err(|e| anyhow::anyhow!("Anthropic chat failed: {e}"))
             }
             Provider::OpenAI { base_url } => {
-                // rig-core 0.20 defaults to the new Responses API (POST /responses).
+                // rig-core 0.33 defaults to the new Responses API (POST /responses).
                 // DeepSeek and other OpenAI-compatible providers only support Chat Completions.
-                // Use completion_model(...).completions_api() to force the /chat/completions path.
+                // Use the OpenAI Completions API client to force /chat/completions.
                 let client = if let Some(url) = base_url {
                     // Append /v1 if the base URL does not already end with it
                     let api_url = if url.ends_with("/v1") || url.ends_with("/v1/") {
@@ -149,7 +152,8 @@ impl RigEngine {
                         "OpenAI-compatible client base_url={api_url} model={}",
                         self.config.model
                     );
-                    openai::Client::builder(&self.config.api_key)
+                    openai::Client::builder()
+                        .api_key(&self.config.api_key)
                         .base_url(&api_url)
                         .build()
                         .map_err(|e| anyhow::anyhow!("OpenAI client build failed: {e}"))?
@@ -159,11 +163,10 @@ impl RigEngine {
                         self.config.model
                     );
                     openai::Client::new(&self.config.api_key)
+                        .map_err(|e| anyhow::anyhow!("OpenAI client build failed: {e}"))?
                 };
                 // Force Chat Completions API (not Responses API)
-                let chat_model = client
-                    .completion_model(&self.config.model)
-                    .completions_api();
+                let chat_model = client.completions_api().completion_model(&self.config.model);
                 let registration = register_runtime_tools(
                     AgentBuilder::new(chat_model).preamble(&self.config.system_prompt),
                     session,
@@ -255,7 +258,7 @@ async fn stream_agent_chat<M, F>(
     user_message: &str,
     on_event: Arc<F>,
     _external_mcp_clients: Vec<
-        rmcp06::service::RunningService<rmcp06::service::RoleClient, rmcp06::model::ClientInfo>,
+        rmcp16::service::RunningService<rmcp16::service::RoleClient, rmcp16::model::ClientInfo>,
     >,
 ) -> Result<String>
 where
@@ -271,7 +274,7 @@ where
     let mut full = String::new();
     while let Some(chunk) = stream.next().await {
         match chunk.map_err(|e| anyhow::anyhow!("stream chunk error: {e}"))? {
-            MultiTurnStreamItem::StreamItem(content) => match content {
+            MultiTurnStreamItem::StreamAssistantItem(content) => match content {
                 StreamedAssistantContent::Text(delta) => {
                     on_event(AgentEvent::TextDelta {
                         text: delta.text.clone(),
@@ -279,8 +282,10 @@ where
                     full.push_str(&delta.text);
                 }
                 StreamedAssistantContent::Final(_) => {}
-                StreamedAssistantContent::ToolCall(_) => {}
+                StreamedAssistantContent::ToolCall { .. } => {}
+                StreamedAssistantContent::ToolCallDelta { .. } => {}
                 StreamedAssistantContent::Reasoning(_) => {}
+                StreamedAssistantContent::ReasoningDelta { .. } => {}
             },
             MultiTurnStreamItem::FinalResponse(final_response) => {
                 if full.trim().is_empty() {

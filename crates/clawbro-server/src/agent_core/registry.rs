@@ -3344,7 +3344,10 @@ mod tests {
                 TeamToolCall::SubmitTaskResult {
                     task_id: "T100".into(),
                     summary: "auth implemented".into(),
-                    result_markdown: None,
+                    result_markdown: Some(
+                        "# Auth Implementation\n\nImplemented auth flow, middleware, and validation tests."
+                            .into(),
+                    ),
                     agent: Some("codex".into()),
                 },
             )
@@ -3522,7 +3525,10 @@ mod tests {
                     events: vec![RuntimeEvent::ToolCallback(TeamCallback::TaskSubmitted {
                         task_id: "T300".into(),
                         summary: "bridge implemented".into(),
-                        result_markdown: None,
+                        result_markdown: Some(
+                            "# Bridge Implementation\n\nImplemented the bridge end-to-end and verified the runtime path."
+                                .into(),
+                        ),
                         agent: "openclaw-main".into(),
                     })],
                     emitted_backend_session_id: None,
