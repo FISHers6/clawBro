@@ -18,7 +18,7 @@
     <a href="https://github.com/fishers6/clawbro/blob/main/docs/setup.md">Setup Guide</a>
   </p>
   <p>
-    <img src="https://img.shields.io/badge/version-0.1.3-blue" alt="Version">
+    <img src="https://img.shields.io/badge/version-0.1.4-blue" alt="Version">
     <img src="https://img.shields.io/badge/rust-1.90%2B-orange" alt="Rust">
     <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
     <img src="https://img.shields.io/badge/agents-Claude%20%7C%20Codex%20%7C%20Qwen%20%7C%20Qoder%20%7C%20Gemini-111827" alt="Agents">
@@ -36,7 +36,8 @@ It stays close to the OpenClaw spirit, but pushes toward practical teamwork: Cla
 
 - **[03-19]** One `clawbro` surface now brings together multiple AI coding CLIs instead of forcing one tool per workflow.
 - **[03-19]** Team orchestration supports lead-driven workflows, specialist agents, milestone delivery, and named roles like `planner`, `coder`, `reviewer`, and `researcher`.
-- **[03-19]** Group and direct-message usage now fit the same routing model, with Lark, DingTalk, and WebSocket entrypoints.
+- **[03-19]** Group and direct-message usage now fit the same routing model, with Lark, DingTalk Stream Mode, DingTalk custom robot webhook, and WebSocket entrypoints.
+- **[03-19]** Multi-IM connectivity is now practical for always-on chat workflows: one runtime can stay online across Lark, DingTalk, and team conversations at the same time.
 - **[03-19]** Operational controls include approvals, allowlists, memory-aware sessions, `/health`, `/status`, `/doctor`, and diagnostics surfaces.
 
 > `clawBro` is built for engineering, research, and workflow experimentation. It is meant for real agent collaboration, not just another chat wrapper.
@@ -50,6 +51,8 @@ It stays close to the OpenClaw spirit, but pushes toward practical teamwork: Cla
 👥 **Team Orchestration**: Support `solo`, `multi`, and `team` interaction models with lead + specialists, scope-aware routing, and milestone-style collaboration.
 
 💬 **Group Chat Collaboration**: Connect workflows to Lark and DingTalk, route group mentions to named agents, and turn chat rooms into AI workbenches.
+
+📡 **Always-On Multi-IM**: Keep one `clawbro` runtime online across Lark, DingTalk Stream Mode, DingTalk custom robot webhook, and WebSocket, then keep chatting without switching tools.
 
 🧠 **Memory and Habits**: Let agents accumulate working memory, repeated preferences, review standards, and recurring project context over time.
 

@@ -19,7 +19,7 @@
     <a href="./docs/setup.md">安装配置</a>
   </p>
   <p>
-    <img src="https://img.shields.io/badge/version-0.1.0-blue" alt="Version">
+    <img src="https://img.shields.io/badge/version-0.1.4-blue" alt="Version">
     <img src="https://img.shields.io/badge/rust-1.90%2B-orange" alt="Rust">
     <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
     <img src="https://img.shields.io/badge/agents-Claude%20%7C%20Codex%20%7C%20Qwen%20%7C%20Qoder%20%7C%20Gemini-111827" alt="Agents">
@@ -37,7 +37,8 @@
 
 - **[03-19]** 把多个 AI coding CLI 放进同一套协作流程，而不是每个工具单独跑一套。
 - **[03-19]** 支持Team协作模式： Lead 负责对外，specialist 在后台执行，再由 Lead 汇总 milestone。
-- **[03-19]** 支持把工作流接入 Lark、DingTalk 和 WebSocket，适合从本地到群聊逐步扩展。
+- **[03-19]** 支持把工作流接入 Lark、DingTalk Stream Mode、DingTalk 自定义机器人 Webhook 和 WebSocket，适合从本地到群聊逐步扩展。
+- **[03-19]** 现在可以稳定做多 IM 常驻：一个 `clawbro` 运行时可以同时在线接 Lark、DingTalk 和团队对话，随时聊天、随时继续任务。
 - **[03-19]** 运行时提供 approvals、allowlist、memory-aware sessions、`/health`、`/status`、`/doctor` 和 diagnostics 能力。
 
 > `clawBro` 适合工程协作、研究工作流、群聊 AI 助手和多 Agent 实验，而不是单纯做一个最轻量的对话 CLI。
@@ -51,6 +52,8 @@
 👥 **团队协作模式**：支持 `solo`、`multi`、`team` 三种交互模式，适合从个人使用一路升级到 Lead + Specialists。
 
 💬 **接入聊天场景**：工作流可以接进 Lark / DingTalk，也可以先从 WebSocket 起步。
+
+📡 **多 IM 常驻在线**：同一个 `clawbro` 运行时可以同时连 Lark、DingTalk Stream、DingTalk Webhook 和 WebSocket，不需要为不同聊天入口分别起一套系统。
 
 🧠 **记忆与习惯**：支持共享记忆、角色记忆、项目偏好沉淀，让 Agent 越用越贴近你的真实工作方式。
 
@@ -177,18 +180,17 @@
 
 ## 📦 安装
 
-**从源码编译**（当前推荐方式）
+**推荐方式**
+
+```bash
+cargo install clawbro
+```
+
+**从源码编译**（开发者路径）
 
 ```bash
 cd clawBro
 cargo build -p clawbro --bin clawbro
-```
-
-**不全局安装，直接运行**
-
-```bash
-cd clawBro
-cargo run -p clawbro --bin clawbro -- --help
 ```
 
 ## 🚀 快速开始
@@ -197,17 +199,16 @@ cargo run -p clawbro --bin clawbro -- --help
 > 推荐先走 `WebSocket + ClawBro Native` 这条最小路径。
 > 跑通以后，再继续加 `agent_roster`、bindings、channels 和 Team scope。
 
-**1. 编译**
+**1. 安装**
 
 ```bash
-cd clawBro
-cargo build -p clawbro --bin clawbro
+cargo install clawbro
 ```
 
 **2. 初始化**
 
 ```bash
-./target/debug/clawbro setup
+clawbro setup
 ```
 
 它会在 `~/.clawbro/` 下创建默认运行目录，包括：
@@ -222,14 +223,14 @@ cargo build -p clawbro --bin clawbro
 **3. 校验配置**
 
 ```bash
-./target/debug/clawbro config validate
+clawbro config validate
 ```
 
 **4. 启动服务**
 
 ```bash
 source ~/.clawbro/.env
-./target/debug/clawbro serve
+clawbro serve
 ```
 
 **5. 示例：非交互初始化一个 Team**
