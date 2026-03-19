@@ -5,19 +5,22 @@ use crate::{
         collect_topology_diagnostic, BackendDiagnostic, ChannelDiagnostic, DoctorReport,
         HealthReport, StatusReport, TeamDiagnostic, TopologyDiagnostic,
     },
+    im_sink::spawn_im_turn,
     state::AppState,
 };
 use axum::{
+    body::Bytes,
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     routing::{get, post},
     Json, Router,
 };
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::net::TcpListener;
 
 pub fn build_router(state: AppState) -> Router {
-    Router::new()
+    let mut router = Router::new()
         .route("/health", get(health))
         .route("/status", get(status))
         .route("/doctor", get(doctor))
@@ -29,8 +32,21 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/runtime/team-tools",
             post(super::team_tools_handler::invoke_team_tool),
-        )
-        .with_state(state)
+        );
+
+    if let Some(webhook_cfg) = state
+        .cfg
+        .channels
+        .dingtalk_webhook
+        .as_ref()
+        .filter(|section| section.enabled)
+    {
+        let webhook_path =
+            crate::channels_internal::dingtalk_webhook::normalize_webhook_path(&webhook_cfg.webhook_path);
+        router = router.route(&webhook_path, post(dingtalk_webhook));
+    }
+
+    router.with_state(state)
 }
 
 pub async fn start(state: AppState, host: &str, port: u16) -> anyhow::Result<SocketAddr> {
@@ -85,6 +101,71 @@ async fn diagnostics_topology(State(state): State<AppState>) -> Json<TopologyDia
     Json(collect_topology_diagnostic(&state))
 }
 
+async fn dingtalk_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(channel) = state.dingtalk_webhook_channel.clone() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "error": "dingtalk_webhook_not_enabled" })),
+        );
+    };
+    let presentation = state
+        .cfg
+        .channels
+        .dingtalk_webhook
+        .as_ref()
+        .map(|section| section.presentation)
+        .unwrap_or_default();
+    match channel.ingest(&headers, &body) {
+        Ok(ingress) => {
+            let state_for_dispatch = state.clone();
+            let channel_for_dispatch = channel.clone();
+            tokio::spawn(async move {
+                let messages = channel_for_dispatch.to_inbound_messages(ingress).await;
+                for inbound in messages {
+                    spawn_im_turn(
+                        state_for_dispatch.registry.clone(),
+                        channel_for_dispatch.clone() as Arc<dyn crate::channels_internal::Channel>,
+                        state_for_dispatch.channel_registry.clone(),
+                        state_for_dispatch.cfg.clone(),
+                        inbound,
+                        presentation,
+                    );
+                }
+            });
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "ok": true, "accepted": true })),
+            )
+        }
+        Err(reason) => {
+            let (status, body) = match reason {
+                crate::channels_internal::dingtalk_webhook::DingTalkWebhookRejectReason::MissingToken
+                | crate::channels_internal::dingtalk_webhook::DingTalkWebhookRejectReason::InvalidToken => (
+                    StatusCode::UNAUTHORIZED,
+                    serde_json::json!({ "ok": false, "error": "invalid_token" }),
+                ),
+                crate::channels_internal::dingtalk_webhook::DingTalkWebhookRejectReason::InvalidPayload => (
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({ "ok": false, "error": "invalid_payload" }),
+                ),
+                other => (
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "ok": true,
+                        "accepted": false,
+                        "ignored": format!("{other:?}")
+                    }),
+                ),
+            };
+            (status, Json(body))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,6 +213,7 @@ mod tests {
                     enabled: false,
                     presentation: config::ProgressPresentationMode::FinalOnly,
                 }),
+                dingtalk_webhook: None,
             },
             agent_roster: vec![AgentEntry {
                 name: "claude".to_string(),
@@ -196,9 +278,36 @@ mod tests {
             runtime_registry,
             event_tx: tokio::sync::broadcast::channel(8).0,
             cfg: Arc::new(cfg),
+            channel_registry: Arc::new(crate::channel_registry::ChannelRegistry::new()),
+            dingtalk_webhook_channel: None,
             runtime_token: Arc::new("status-token".to_string()),
             approvals: crate::runtime::ApprovalBroker::default(),
         }
+    }
+
+    async fn test_state_with_dingtalk_webhook() -> AppState {
+        let mut state = test_state().await;
+        let webhook_cfg = config::DingTalkWebhookSection {
+            enabled: true,
+            secret_key: "SEC-test".to_string(),
+            webhook_path: "/dingtalk-channel/message".to_string(),
+            access_token: None,
+            presentation: config::ProgressPresentationMode::FinalOnly,
+        };
+        let channel = Arc::new(crate::channels_internal::DingTalkWebhookChannel::new(
+            webhook_cfg.clone(),
+        ));
+        let mut channels = crate::channel_registry::ChannelRegistry::new();
+        channels.register(
+            "dingtalk_webhook",
+            Option::<String>::None,
+            channel.clone() as Arc<dyn crate::channels_internal::Channel>,
+            true,
+        );
+        Arc::make_mut(&mut state.cfg).channels.dingtalk_webhook = Some(webhook_cfg);
+        state.channel_registry = Arc::new(channels);
+        state.dingtalk_webhook_channel = Some(channel);
+        state
     }
 
     #[tokio::test]
@@ -399,5 +508,78 @@ mod tests {
             .unwrap()
             .iter()
             .any(|entry| entry == "lark"));
+    }
+
+    #[tokio::test]
+    async fn dingtalk_webhook_route_accepts_valid_group_message() {
+        let app = build_router(test_state_with_dingtalk_webhook().await);
+        let payload = serde_json::json!({
+            "senderPlatform": "Mac",
+            "conversationId": "cid-group-1",
+            "atUsers": [{ "dingtalkId": "bot-1" }],
+            "chatbotUserId": "bot-1",
+            "msgId": "msg-1",
+            "senderNick": "User",
+            "senderId": "user-1",
+            "sessionWebhookExpiredTime": 1770982588732i64,
+            "conversationType": "2",
+            "isInAtList": true,
+            "sessionWebhook": "https://oapi.dingtalk.com/robot/sendBySession?session=xxx",
+            "text": { "content": "hello @claude" },
+            "robotCode": "normal",
+            "msgtype": "text"
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/dingtalk-channel/message")
+                    .header("token", "SEC-test")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["accepted"], true);
+    }
+
+    #[tokio::test]
+    async fn dingtalk_webhook_route_rejects_invalid_token() {
+        let app = build_router(test_state_with_dingtalk_webhook().await);
+        let payload = serde_json::json!({
+            "senderPlatform": "Mac",
+            "conversationId": "cid-group-1",
+            "atUsers": [{ "dingtalkId": "bot-1" }],
+            "chatbotUserId": "bot-1",
+            "msgId": "msg-2",
+            "senderNick": "User",
+            "senderId": "user-1",
+            "sessionWebhookExpiredTime": 1770982588732i64,
+            "conversationType": "2",
+            "isInAtList": true,
+            "sessionWebhook": "https://oapi.dingtalk.com/robot/sendBySession?session=xxx",
+            "text": { "content": "hello @claude" },
+            "robotCode": "normal",
+            "msgtype": "text"
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/dingtalk-channel/message")
+                    .header("token", "SEC-other")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }

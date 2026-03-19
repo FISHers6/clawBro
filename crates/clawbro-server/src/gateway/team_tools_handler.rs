@@ -107,6 +107,8 @@ mod tests {
             runtime_registry: Arc::new(crate::runtime::BackendRegistry::new()),
             event_tx: registry.global_sender(),
             cfg: Arc::new(cfg),
+            channel_registry: Arc::new(crate::channel_registry::ChannelRegistry::new()),
+            dingtalk_webhook_channel: None,
             runtime_token: Arc::new("test-token".to_string()),
             approvals: crate::runtime::ApprovalBroker::default(),
         };

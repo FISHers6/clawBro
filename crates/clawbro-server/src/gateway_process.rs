@@ -125,17 +125,12 @@ pub async fn run() -> Result<()> {
     let event_tx = registry.global_sender();
     registry.set_approval_resolver(Arc::new(BrokerApprovalResolver::new(approvals.clone())));
 
-    let state = AppState {
-        registry: registry.clone(),
-        runtime_registry: Arc::clone(&runtime_registry),
-        event_tx: event_tx.clone(),
-        cfg: Arc::new(cfg.clone()),
-        runtime_token: Arc::new(uuid::Uuid::new_v4().to_string()),
-        approvals,
-    };
+    let cfg_arc = Arc::new(cfg.clone());
 
     // Channel registry for server-owned outbound sends.
     let mut cron_channel_map = ChannelRegistry::new();
+    let mut dingtalk_webhook_channel: Option<Arc<crate::channels_internal::DingTalkWebhookChannel>> =
+        None;
 
     // 启动 Channel 监听（DingTalk）
     if let Some(dt_cfg) = &cfg.channels.dingtalk {
@@ -155,7 +150,7 @@ pub async fn run() -> Result<()> {
                 let registry_clone = registry.clone();
                 let channel_clone = channel.clone();
                 let delivery_channels = Arc::new(cron_channel_map.clone());
-                let delivery_cfg = state.cfg.clone();
+                let delivery_cfg = cfg_arc.clone();
                 let (tx, mut rx) = tokio::sync::mpsc::channel(64);
 
                 // 监听线程：接收 DingTalk 消息 → tx（带断线重连）
@@ -278,7 +273,7 @@ pub async fn run() -> Result<()> {
                         let registry_clone = registry.clone();
                         let channel_clone = channel.clone();
                         let delivery_channels = delivery_channels.clone();
-                        let delivery_cfg = state.cfg.clone();
+                        let delivery_cfg = cfg_arc.clone();
                         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
                         let listen_instance_id = instance_id.clone();
 
@@ -339,6 +334,25 @@ pub async fn run() -> Result<()> {
         }
     }
 
+    if let Some(webhook_cfg) = &cfg.channels.dingtalk_webhook {
+        if webhook_cfg.enabled {
+            let channel = Arc::new(crate::channels_internal::DingTalkWebhookChannel::new(
+                webhook_cfg.clone(),
+            ));
+            cron_channel_map.register(
+                "dingtalk_webhook",
+                Option::<String>::None,
+                channel.clone() as Arc<dyn crate::channels_internal::Channel>,
+                true,
+            );
+            tracing::info!(
+                path = %channel.webhook_path(),
+                "DingTalk custom robot webhook channel enabled"
+            );
+            dingtalk_webhook_channel = Some(channel);
+        }
+    }
+
     // 初始化 CronStore（持久化到 ~/.clawbro/cron.db）
     let cron_db = dirs::home_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
@@ -371,6 +385,16 @@ pub async fn run() -> Result<()> {
     }
 
     let cron_channel_map = Arc::new(cron_channel_map);
+    let state = AppState {
+        registry: registry.clone(),
+        runtime_registry: Arc::clone(&runtime_registry),
+        event_tx: event_tx.clone(),
+        cfg: cfg_arc.clone(),
+        channel_registry: cron_channel_map.clone(),
+        dingtalk_webhook_channel,
+        runtime_token: Arc::new(uuid::Uuid::new_v4().to_string()),
+        approvals,
+    };
 
     // Approval notify loop: surface runtime approval requests back into the originating IM
     // session so operators can resolve them with `/approve <id> <decision>`.

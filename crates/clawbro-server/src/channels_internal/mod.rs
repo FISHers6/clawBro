@@ -1,5 +1,11 @@
 pub mod allowlist;
 pub mod dingtalk;
+pub mod dingtalk_webhook;
+pub mod dingtalk_webhook_dedup;
+pub mod dingtalk_webhook_mapper;
+pub mod dingtalk_webhook_reply;
+pub mod dingtalk_webhook_richtext;
+pub mod dingtalk_webhook_types;
 pub mod lark;
 mod mention_parsing;
 pub mod mention_trigger;
@@ -7,6 +13,7 @@ pub mod traits;
 
 pub use allowlist::AllowlistChecker;
 pub use dingtalk::{DingTalkChannel, DingTalkConfig};
+pub use dingtalk_webhook::DingTalkWebhookChannel;
 pub use lark::{LarkChannel, LarkTriggerMode, LarkTriggerPolicy};
 pub use traits::{BoxChannel, Channel};
 

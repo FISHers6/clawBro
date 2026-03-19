@@ -1,4 +1,6 @@
 use crate::config::GatewayConfig;
+use crate::channel_registry::ChannelRegistry;
+use crate::channels_internal::dingtalk_webhook::DingTalkWebhookChannel;
 use async_trait::async_trait;
 use crate::agent_core::{ApprovalDecision as AgentApprovalDecision, ApprovalResolver, SessionRegistry};
 use crate::protocol::AgentEvent;
@@ -14,6 +16,8 @@ pub struct AppState {
     pub runtime_registry: Arc<BackendRegistry>,
     pub event_tx: broadcast::Sender<AgentEvent>,
     pub cfg: Arc<GatewayConfig>,
+    pub channel_registry: Arc<ChannelRegistry>,
+    pub dingtalk_webhook_channel: Option<Arc<DingTalkWebhookChannel>>,
     pub runtime_token: Arc<String>,
     pub approvals: ApprovalBroker,
 }

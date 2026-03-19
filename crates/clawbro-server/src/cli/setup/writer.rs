@@ -1,6 +1,6 @@
 use super::{
     auth_cfg::AuthConfig,
-    channel::ChannelConfig,
+    channel::{ChannelConfig, DingTalkReceiveMode},
     mode::{Mode, ModeConfig, TeamTarget},
     provider::ProviderConfig,
 };
@@ -12,6 +12,17 @@ pub struct WriteInputs<'a> {
     pub mode: &'a ModeConfig,
     pub auth: &'a AuthConfig,
     pub channel: &'a ChannelConfig,
+}
+
+fn configured_team_channel(channel: &ChannelConfig) -> Option<&'static str> {
+    match channel {
+        ChannelConfig::Lark(_) => Some("lark"),
+        ChannelConfig::DingTalk(d) => match d.receive_mode {
+            DingTalkReceiveMode::Stream => Some("dingtalk"),
+            DingTalkReceiveMode::Webhook => Some("dingtalk_webhook"),
+        },
+        ChannelConfig::None => None,
+    }
 }
 
 pub fn build_config_toml(input: &WriteInputs) -> String {
@@ -98,11 +109,7 @@ pub fn build_config_toml(input: &WriteInputs) -> String {
             s.push('\n');
         }
         Mode::Team => {
-            let team_channel = match input.channel {
-                ChannelConfig::Lark(_) => Some("lark"),
-                ChannelConfig::DingTalk(_) => Some("dingtalk"),
-                ChannelConfig::None => None,
-            };
+            let team_channel = configured_team_channel(input.channel);
             s.push_str("[[agent_roster]]\n");
             s.push_str(&format!("name = {:?}\n", front_bot));
             s.push_str(&format!("mentions = [{:?}]\n", format!("@{front_bot}")));
@@ -213,17 +220,41 @@ pub fn build_config_toml(input: &WriteInputs) -> String {
             }
             s.push('\n');
         }
-        ChannelConfig::DingTalk(d) => {
-            s.push_str("[channels.dingtalk]\n");
-            s.push_str("enabled = true\n");
-            if let Some(aid) = d.agent_id {
-                s.push_str(&format!("agent_id = {}\n", aid));
+        ChannelConfig::DingTalk(d) => match d.receive_mode {
+            DingTalkReceiveMode::Stream => {
+                s.push_str("[channels.dingtalk]\n");
+                s.push_str("enabled = true\n");
+                if let Some(aid) = d.agent_id {
+                    s.push_str(&format!("agent_id = {}\n", aid));
+                }
+                if let Some(bn) = &d.bot_name {
+                    s.push_str(&format!("bot_name = {:?}\n", bn));
+                }
+                s.push('\n');
             }
-            if let Some(bn) = &d.bot_name {
-                s.push_str(&format!("bot_name = {:?}\n", bn));
+            DingTalkReceiveMode::Webhook => {
+                s.push_str("[channels.dingtalk_webhook]\n");
+                s.push_str("enabled = true\n");
+                s.push_str(&format!(
+                    "secret_key = {:?}\n",
+                    d.webhook_secret_key.as_deref().unwrap_or_default()
+                ));
+                s.push_str(&format!(
+                    "webhook_path = {:?}\n",
+                    d.webhook_path
+                        .as_deref()
+                        .unwrap_or("/channels/dingtalk/webhook")
+                ));
+                if let Some(access_token) = d
+                    .webhook_access_token
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                {
+                    s.push_str(&format!("access_token = {:?}\n", access_token));
+                }
+                s.push('\n');
             }
-            s.push('\n');
-        }
+        },
         ChannelConfig::None => {}
     }
 
@@ -240,14 +271,18 @@ pub fn build_env_content(provider: &ProviderConfig, channel: &ChannelConfig) -> 
         ChannelConfig::Lark(l) => {
             lines.push(format!("export LARK_APP_ID={}", l.app_id));
             lines.push(format!("export LARK_APP_SECRET={}", l.app_secret));
-            lines.push(format!(
-                "export LARK_VERIFICATION_TOKEN={}",
-                l.verification_token
-            ));
         }
         ChannelConfig::DingTalk(d) => {
-            lines.push(format!("export DINGTALK_APP_KEY={}", d.client_id));
-            lines.push(format!("export DINGTALK_APP_SECRET={}", d.client_secret));
+            if d.receive_mode == DingTalkReceiveMode::Stream {
+                if let Some(client_id) = d.client_id.as_deref().filter(|value| !value.is_empty()) {
+                    lines.push(format!("export DINGTALK_APP_KEY={client_id}"));
+                }
+                if let Some(client_secret) =
+                    d.client_secret.as_deref().filter(|value| !value.is_empty())
+                {
+                    lines.push(format!("export DINGTALK_APP_SECRET={client_secret}"));
+                }
+            }
         }
         ChannelConfig::None => {}
     }
@@ -307,7 +342,7 @@ mod tests {
     use super::*;
     use crate::cli::setup::{
         auth_cfg::AuthConfig,
-        channel::{ChannelConfig, DingTalkCfg, LarkCfg},
+        channel::{ChannelConfig, DingTalkCfg, DingTalkReceiveMode, LarkCfg},
         mode::{Mode, ModeConfig},
         provider::{ProviderConfig, ProviderKind},
     };
@@ -396,7 +431,6 @@ mod tests {
         let lark = ChannelConfig::Lark(LarkCfg {
             app_id: "cli_abc".into(),
             app_secret: "sec".into(),
-            verification_token: "tok".into(),
             bot_name: Some("AI".into()),
         });
         let t = build_config_toml(&WriteInputs {
@@ -412,10 +446,14 @@ mod tests {
     #[test]
     fn toml_dingtalk_agent_id() {
         let dt = ChannelConfig::DingTalk(DingTalkCfg {
-            client_id: "dingxxxx".into(),
-            client_secret: "sec".into(),
+            receive_mode: DingTalkReceiveMode::Stream,
+            client_id: Some("dingxxxx".into()),
+            client_secret: Some("sec".into()),
             agent_id: Some(12345),
             bot_name: None,
+            webhook_secret_key: None,
+            webhook_access_token: None,
+            webhook_path: None,
         });
         let t = build_config_toml(&WriteInputs {
             provider: &anthropic(),
@@ -425,6 +463,33 @@ mod tests {
         });
         assert!(t.contains("[channels.dingtalk]"), "missing dingtalk: {t}");
         assert!(t.contains("agent_id = 12345"), "missing agent_id: {t}");
+    }
+
+    #[test]
+    fn toml_dingtalk_webhook_channel() {
+        let dt = ChannelConfig::DingTalk(DingTalkCfg {
+            receive_mode: DingTalkReceiveMode::Webhook,
+            client_id: None,
+            client_secret: None,
+            agent_id: None,
+            bot_name: None,
+            webhook_secret_key: Some("SEC-test".into()),
+            webhook_access_token: Some("dt-token".into()),
+            webhook_path: Some("/dingtalk-channel/message".into()),
+        });
+        let t = build_config_toml(&WriteInputs {
+            provider: &anthropic(),
+            mode: &solo(),
+            auth: &no_auth(),
+            channel: &dt,
+        });
+        assert!(t.contains("[channels.dingtalk_webhook]"), "missing webhook: {t}");
+        assert!(t.contains("secret_key = \"SEC-test\""), "missing secret_key: {t}");
+        assert!(
+            t.contains("webhook_path = \"/dingtalk-channel/message\""),
+            "missing webhook_path: {t}"
+        );
+        assert!(t.contains("access_token = \"dt-token\""), "missing access_token: {t}");
     }
 
     #[test]
@@ -441,14 +506,34 @@ mod tests {
         let lark = ChannelConfig::Lark(LarkCfg {
             app_id: "cli_abc".into(),
             app_secret: "sec".into(),
-            verification_token: "vtok".into(),
             bot_name: None,
         });
         let e = build_env_content(&anthropic(), &lark);
         assert!(e.contains("LARK_APP_ID=cli_abc"), "missing lark id: {e}");
+        assert!(e.contains("LARK_APP_SECRET=sec"), "missing secret: {e}");
         assert!(
-            e.contains("LARK_VERIFICATION_TOKEN=vtok"),
-            "missing token: {e}"
+            !e.contains("LARK_VERIFICATION_TOKEN"),
+            "should not write verification token: {e}"
+        );
+    }
+
+    #[test]
+    fn env_dingtalk_webhook_writes_no_stream_credentials() {
+        let dt = ChannelConfig::DingTalk(DingTalkCfg {
+            receive_mode: DingTalkReceiveMode::Webhook,
+            client_id: None,
+            client_secret: None,
+            agent_id: None,
+            bot_name: None,
+            webhook_secret_key: Some("SEC-test".into()),
+            webhook_access_token: Some("dt-token".into()),
+            webhook_path: None,
+        });
+        let e = build_env_content(&anthropic(), &dt);
+        assert!(!e.contains("DINGTALK_APP_KEY"), "webhook should not write stream env: {e}");
+        assert!(
+            !e.contains("DINGTALK_APP_SECRET"),
+            "webhook should not write stream secret env: {e}"
         );
     }
 
@@ -554,7 +639,6 @@ mod tests {
             channel: &ChannelConfig::Lark(LarkCfg {
                 app_id: "cli_abc".into(),
                 app_secret: "sec".into(),
-                verification_token: "tok".into(),
                 bot_name: Some("AI".into()),
             }),
         });
@@ -581,6 +665,44 @@ mod tests {
         assert!(
             t.contains("roster = [\"analyst\"]"),
             "missing analyst roster: {t}"
+        );
+    }
+
+    #[test]
+    fn team_group_mode_writes_dingtalk_webhook_channel_name() {
+        let team_mode = ModeConfig {
+            mode: Mode::Team,
+            team_target: Some(TeamTarget::Group),
+            front_bot: Some("captain".into()),
+            specialists: vec!["analyst".into()],
+            team_scope: Some("group:dingtalk:conversation-123".into()),
+            team_name: Some("ops-room".into()),
+            port: 8080,
+            workspace: None,
+        };
+        let t = build_config_toml(&WriteInputs {
+            provider: &anthropic(),
+            mode: &team_mode,
+            auth: &no_auth(),
+            channel: &ChannelConfig::DingTalk(DingTalkCfg {
+                receive_mode: DingTalkReceiveMode::Webhook,
+                client_id: None,
+                client_secret: None,
+                agent_id: None,
+                bot_name: None,
+                webhook_secret_key: Some("SEC-test".into()),
+                webhook_access_token: Some("dt-token".into()),
+                webhook_path: Some("/channels/dingtalk/webhook".into()),
+            }),
+        });
+        assert!(t.contains("[[group]]"), "missing group: {t}");
+        assert!(
+            t.contains("scope = \"group:dingtalk:conversation-123\""),
+            "missing group scope: {t}"
+        );
+        assert!(
+            t.contains("channel = \"dingtalk_webhook\""),
+            "missing dingtalk_webhook channel name: {t}"
         );
     }
 }

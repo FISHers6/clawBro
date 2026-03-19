@@ -275,7 +275,6 @@ setup 支持在向导里直接录入 channel 配置。
 
 - App ID
 - App Secret
-- Verification Token
 - 可选 bot name
 
 ### DingTalk
@@ -288,6 +287,91 @@ setup 支持在向导里直接录入 channel 配置。
 - 可选 bot name
 
 这些配置会直接写入 `config.toml`，对应 key 也会写进 `.env`。
+
+### DingTalk Custom Robot Webhook
+
+这是和 stream mode 并行的另一条接入方式，不会替代现有 `dingtalk`。
+
+当前 phase 1 支持面：
+
+- 自定义机器人群聊 webhook 入站
+- 仅处理群聊 `@` 机器人消息
+- 复用现有 `InboundMsg -> spawn_im_turn -> Channel::send()` 主链
+- 回复优先走钉钉提供的 `sessionWebhook`
+- richText 文本与图片消息的异步解析
+
+当前 phase 1 非目标：
+
+- 不支持 1:1 私聊 webhook
+- 不在 webhook handler 内同步跑重逻辑
+- 不把 webhook mode 扩展成完整的通用主动出站系统
+
+`setup` 现在支持在交互向导里选择 DingTalk `stream` 或 `webhook` 模式。
+
+如果你在向导里选择 `Webhook Mode`，会生成和下面等价的配置：
+
+```toml
+[channels.dingtalk_webhook]
+enabled = true
+secret_key = "SECxxxxxxxx"
+webhook_path = "/dingtalk-channel/message"
+access_token = "dt_access_token_xxx"
+presentation = "final_only"
+```
+
+说明：
+
+- `stream` mode
+  - 使用 `client_id / client_secret / agent_id`
+  - 适合开放平台 app / stream 路径
+- `webhook` mode
+  - 使用 `secret_key`
+  - 可选 `access_token`
+  - 适合自定义机器人群聊 webhook 路径
+- `secret_key`
+  - 钉钉自定义机器人安全密钥
+- `webhook_path`
+  - 你的公网回调路径，默认建议独立出来，不和 stream mode 复用
+- `presentation`
+  - 和其他 channel 一样，控制 IM 进度展示风格
+- `access_token`
+  - 可选
+  - 用于 `sessionWebhook` 过期后的 robot-level fallback 出站
+  - 当前 phase 2 只把它作为 fallback，不把它扩展成完整主动出站能力
+
+回调地址示例：
+
+```text
+https://your-domain.example/dingtalk-channel/message
+```
+
+allowlist 仍然复用全局：
+
+- `~/.clawbro/allowlist.json`
+
+当前 webhook mode 继续按 `dingtalk` channel key 做 allowlist 判断，不会引入第二套来源。
+
+`clawbro doctor` 也会检查：
+
+- `dingtalk_webhook.secret_key`
+- `dingtalk_webhook.webhook_path`
+- `access_token` 是否配置了 fallback
+
+当前 reply 语义：
+
+- 优先使用 webhook 入站携带的 `sessionWebhook`
+- `clawbro` 会按 `session_key.scope` 缓存最近的 `sessionWebhook + expired_time`
+- 如果即时回复缺少 `thread_ts`，但 scope 下还有未过期 lease，仍可继续回发
+- 如果 lease 已过期且配置了 `access_token`，会退化到 DingTalk custom robot 的 `robot/send` fallback
+
+这意味着 phase 2 现在已经支持：
+
+- 即时回复
+- 短时间延迟回复
+- 过期后的 bot-level fallback
+- richText 中文本和图片占位的异步补全
+
+但仍然不等价于完整的主动出站系统。
 
 ---
 

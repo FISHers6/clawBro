@@ -247,6 +247,7 @@ pub fn collect_channel_diagnostics(state: &AppState) -> Vec<ChannelDiagnostic> {
             let configured = match channel.as_str() {
                 "lark" => state.cfg.channels.lark.is_some(),
                 "dingtalk" => state.cfg.channels.dingtalk.is_some(),
+                "dingtalk_webhook" => state.cfg.channels.dingtalk_webhook.is_some(),
                 "ws" => true,
                 _ => false,
             };
@@ -261,6 +262,12 @@ pub fn collect_channel_diagnostics(state: &AppState) -> Vec<ChannelDiagnostic> {
                     .cfg
                     .channels
                     .dingtalk
+                    .as_ref()
+                    .is_some_and(|cfg| cfg.enabled),
+                "dingtalk_webhook" => state
+                    .cfg
+                    .channels
+                    .dingtalk_webhook
                     .as_ref()
                     .is_some_and(|cfg| cfg.enabled),
                 "ws" => true,
@@ -577,6 +584,9 @@ fn inferred_channels(cfg: &config::GatewayConfig) -> Vec<String> {
     if cfg.channels.dingtalk.is_some() {
         channels.insert("dingtalk".to_string());
     }
+    if cfg.channels.dingtalk_webhook.is_some() {
+        channels.insert("dingtalk_webhook".to_string());
+    }
     channels.insert("ws".to_string());
 
     for group in &cfg.groups {
@@ -761,6 +771,7 @@ mod tests {
                     enabled: false,
                     presentation: config::ProgressPresentationMode::FinalOnly,
                 }),
+                dingtalk_webhook: None,
             },
             groups: vec![config::GroupConfig {
                 scope: "group:lark:abc".to_string(),
@@ -816,6 +827,8 @@ mod tests {
             runtime_registry,
             event_tx: tokio::sync::broadcast::channel(8).0,
             cfg: Arc::new(cfg),
+            channel_registry: Arc::new(crate::channel_registry::ChannelRegistry::new()),
+            dingtalk_webhook_channel: None,
             runtime_token: Arc::new("diagnostics-token".to_string()),
             approvals: ApprovalBroker::default(),
         }

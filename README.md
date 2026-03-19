@@ -331,7 +331,7 @@ ClawBro connects agent workflows to chat delivery surfaces while keeping transcr
 | Channel | Current status | Notes |
 | --- | --- | --- |
 | **Lark / Feishu** | Complete | Supports `final_only` and `progress_compact` presentation modes. |
-| **DingTalk** | Structured | Supports the same presentation direction, with current rollout still marked as structured. |
+| **DingTalk** | Structured | Supports both app/stream mode and custom robot group webhook mode. |
 | **WebSocket** | Structured | Recommended first setup path before adding IM integrations. |
 
 Typical deployment path:
@@ -340,6 +340,15 @@ Typical deployment path:
 2. Add `agent_roster`, bindings, and named roles.
 3. Add Team scope and routing.
 4. Connect Lark or DingTalk.
+
+For DingTalk, there are now two distinct integration styles:
+
+- `dingtalk`
+  - app / stream mode
+  - uses `client_id`, `client_secret`, and optional `agent_id`
+- `dingtalk_webhook`
+  - custom robot group webhook mode
+  - uses `secret_key`, your inbound `webhook_path`, and optional `access_token` fallback
 
 ## ⚙️ Configuration & Operations
 

@@ -1,4 +1,5 @@
 use anyhow::Result;
+use crate::config::GatewayConfig;
 use console::style;
 
 pub async fn run() -> Result<()> {
@@ -28,13 +29,26 @@ pub async fn run() -> Result<()> {
         .unwrap_or_default()
         .join(".clawbro")
         .join("config.toml");
+    let mut parsed_cfg: Option<GatewayConfig> = None;
     if cfg_path.exists() {
         let content = std::fs::read_to_string(&cfg_path).unwrap_or_default();
         match toml::from_str::<toml::Value>(&content) {
-            Ok(_) => println!(
-                "  {} ~/.clawbro/config.toml (valid TOML)",
-                style("✓").green()
-            ),
+            Ok(_) => {
+                println!(
+                    "  {} ~/.clawbro/config.toml (valid TOML)",
+                    style("✓").green()
+                );
+                match toml::from_str::<GatewayConfig>(&content) {
+                    Ok(cfg) => parsed_cfg = Some(cfg),
+                    Err(e) => {
+                        println!(
+                            "  {} config.toml schema error: {e}",
+                            style("✗").red()
+                        );
+                        issues += 1;
+                    }
+                }
+            }
             Err(e) => {
                 println!("  {} config.toml syntax error: {e}", style("✗").red());
                 issues += 1;
@@ -72,8 +86,65 @@ pub async fn run() -> Result<()> {
         }
     }
 
-    // 4. Runtime directories
-    println!("\n[4] Runtime directories");
+    // 4. Channel configuration
+    println!("\n[4] Channel configuration");
+    if let Some(cfg) = &parsed_cfg {
+        match cfg.channels.dingtalk_webhook.as_ref().filter(|section| section.enabled) {
+            Some(webhook) => {
+                if webhook.secret_key.trim().is_empty() {
+                    println!(
+                        "  {} dingtalk_webhook.secret_key missing",
+                        style("✗").red()
+                    );
+                    issues += 1;
+                } else {
+                    println!(
+                        "  {} dingtalk_webhook.secret_key configured",
+                        style("✓").green()
+                    );
+                }
+                if webhook.webhook_path.trim().is_empty() {
+                    println!(
+                        "  {} dingtalk_webhook.webhook_path missing",
+                        style("✗").red()
+                    );
+                    issues += 1;
+                } else {
+                    println!(
+                        "  {} dingtalk_webhook.webhook_path = {}",
+                        style("✓").green(),
+                        webhook.webhook_path
+                    );
+                }
+                if webhook
+                    .access_token
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+                {
+                    println!(
+                        "  {} dingtalk_webhook.access_token configured (fallback enabled)",
+                        style("✓").green()
+                    );
+                } else {
+                    println!(
+                        "  {} dingtalk_webhook.access_token missing (no robot/send fallback)",
+                        style("–").yellow()
+                    );
+                }
+            }
+            None => {
+                println!(
+                    "  {} dingtalk_webhook not enabled",
+                    style("–").yellow()
+                );
+            }
+        }
+    } else {
+        println!("  {} channel checks skipped (config invalid)", style("–").yellow());
+    }
+
+    // 5. Runtime directories
+    println!("\n[5] Runtime directories");
     for sub in ["sessions", "shared", "skills"] {
         let p = dirs::home_dir()
             .unwrap_or_default()
@@ -92,8 +163,8 @@ pub async fn run() -> Result<()> {
         }
     }
 
-    // 5. Gateway process
-    println!("\n[5] Gateway process");
+    // 6. Gateway process
+    println!("\n[6] Gateway process");
     let port_file = dirs::home_dir()
         .unwrap_or_default()
         .join(".clawbro")

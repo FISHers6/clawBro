@@ -745,12 +745,25 @@ pub struct ChannelsSection {
     #[serde(default)]
     pub dingtalk: Option<DingTalkSection>,
     #[serde(default)]
+    pub dingtalk_webhook: Option<DingTalkWebhookSection>,
+    #[serde(default)]
     pub lark: Option<LarkSection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DingTalkSection {
     pub enabled: bool,
+    #[serde(default)]
+    pub presentation: ProgressPresentationMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DingTalkWebhookSection {
+    pub enabled: bool,
+    pub secret_key: String,
+    pub webhook_path: String,
+    #[serde(default)]
+    pub access_token: Option<String>,
     #[serde(default)]
     pub presentation: ProgressPresentationMode,
 }
@@ -1396,6 +1409,24 @@ presentation = "progress_compact"
             cfg.channels.dingtalk.unwrap().presentation,
             ProgressPresentationMode::ProgressCompact
         );
+    }
+
+    #[test]
+    fn test_dingtalk_webhook_config_deserializes() {
+        let toml = r#"
+[channels.dingtalk_webhook]
+enabled = true
+secret_key = "SEC-test"
+webhook_path = "/channels/dingtalk/webhook"
+presentation = "progress_compact"
+        "#;
+        let cfg: GatewayConfig = toml::from_str(toml).unwrap();
+        let webhook = cfg.channels.dingtalk_webhook.unwrap();
+        assert!(webhook.enabled);
+        assert_eq!(webhook.secret_key, "SEC-test");
+        assert_eq!(webhook.webhook_path, "/channels/dingtalk/webhook");
+        assert_eq!(webhook.presentation, ProgressPresentationMode::ProgressCompact);
+        assert!(webhook.access_token.is_none());
     }
 
     #[test]

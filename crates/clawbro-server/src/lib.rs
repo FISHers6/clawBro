@@ -138,11 +138,30 @@ pub async fn build_test_state_with_config(cfg: GatewayConfig) -> Result<AppState
     let event_tx = registry.global_sender();
     registry.set_approval_resolver(Arc::new(BrokerApprovalResolver::new(approvals.clone())));
 
+    let mut channel_registry = channel_registry::ChannelRegistry::new();
+    let dingtalk_webhook_channel = cfg
+        .channels
+        .dingtalk_webhook
+        .as_ref()
+        .filter(|section| section.enabled)
+        .map(|section| {
+            let channel = Arc::new(channels_internal::DingTalkWebhookChannel::new(section.clone()));
+            channel_registry.register(
+                "dingtalk_webhook",
+                Option::<String>::None,
+                channel.clone() as Arc<dyn channels_internal::Channel>,
+                true,
+            );
+            channel
+        });
+    let channel_registry = Arc::new(channel_registry);
     let state = AppState {
         registry,
         runtime_registry,
         event_tx,
         cfg: Arc::new(cfg),
+        channel_registry: channel_registry.clone(),
+        dingtalk_webhook_channel,
         runtime_token: Arc::new(uuid::Uuid::new_v4().to_string()),
         approvals,
     };
@@ -150,7 +169,7 @@ pub async fn build_test_state_with_config(cfg: GatewayConfig) -> Result<AppState
     team_runtime::wire_team_runtime(
         Arc::clone(&state.registry),
         state.cfg.as_ref(),
-        Arc::new(channel_registry::ChannelRegistry::new()),
+        channel_registry,
         Duration::from_millis(50),
     )
     .await?;

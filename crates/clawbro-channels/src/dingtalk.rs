@@ -94,7 +94,11 @@ impl DingTalkChannel {
         // Fetch a fresh token
         #[derive(Deserialize)]
         struct TokenResp {
+            #[serde(rename = "accessToken", alias = "access_token")]
             access_token: String,
+            #[serde(rename = "expireIn", alias = "expire_in")]
+            #[allow(dead_code)]
+            expire_in: Option<u64>,
         }
         let resp: TokenResp = self
             .client
@@ -111,6 +115,38 @@ impl DingTalkChannel {
         let token = resp.access_token;
         *self.token_cache.lock().unwrap() = Some((token.clone(), Instant::now()));
         Ok(token)
+    }
+
+    fn build_stream_connect_url(endpoint: &str, ticket: &str) -> String {
+        format!("{}?ticket={}", endpoint, ticket)
+    }
+
+    fn build_stream_ack(message_id: &str, data: serde_json::Value) -> WsMsg {
+        WsMsg::Text(
+            serde_json::json!({
+                "code": 200,
+                "headers": {
+                    "messageId": message_id,
+                    "contentType": "application/json"
+                },
+                "message": "OK",
+                "data": data.to_string()
+            })
+            .to_string()
+            .into(),
+        )
+    }
+
+    fn build_system_ack(message_id: &str, opaque: Option<&str>) -> WsMsg {
+        let data = match opaque {
+            Some(value) => serde_json::json!({ "opaque": value }),
+            None => serde_json::json!({}),
+        };
+        Self::build_stream_ack(message_id, data)
+    }
+
+    fn build_callback_ack(message_id: &str) -> WsMsg {
+        Self::build_stream_ack(message_id, serde_json::json!({ "response": null }))
     }
 }
 
@@ -181,16 +217,14 @@ impl Channel for DingTalkChannel {
     }
 
     async fn listen(&self, tx: mpsc::Sender<InboundMsg>) -> Result<()> {
-        let token = self.get_access_token().await?;
         let endpoint_resp: serde_json::Value = self
             .client
             .post("https://api.dingtalk.com/v1.0/gateway/connections/open")
-            .header("x-acs-dingtalk-access-token", &token)
             .json(&serde_json::json!({
                 "clientId": self.config.app_key,
                 "clientSecret": self.config.app_secret,
                 "subscriptions": [
-                    { "type": "EVENT", "topic": "chat_update_pull_v1" }
+                    { "type": "CALLBACK", "topic": "/v1.0/im/bot/messages/get" }
                 ]
             }))
             .send()
@@ -208,48 +242,62 @@ impl Channel for DingTalkChannel {
             .ok_or_else(|| anyhow::anyhow!("No ticket in DingTalk connection response"))?
             .to_string();
 
-        tracing::info!("DingTalk Stream Mode connecting: {}", ws_url);
+        let ws_connect_url = Self::build_stream_connect_url(&ws_url, &ticket);
 
-        let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
+        tracing::info!("DingTalk Stream Mode connecting: {}", ws_connect_url);
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(&ws_connect_url)
             .await
             .map_err(|e| anyhow::anyhow!("WS connect failed: {e}"))?;
-
-        // 发送注册帧
-        let register = serde_json::json!({
-            "specVersion": "1.0",
-            "stage": "REGISTER",
-            "headers": {
-                "chId": "ch1",
-                "chType": "STREAM",
-                "topic": "/v1.0/im/bot/messages/get",
-                "contentType": "application/json"
-            },
-            "data": ticket
-        });
-        ws.send(WsMsg::Text(register.to_string().into())).await?;
 
         let checker = crate::allowlist::AllowlistChecker::load();
 
         while let Some(Ok(msg)) = ws.next().await {
             if let WsMsg::Text(text) = msg {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(text.as_str()) {
-                    // Extract eventId from outer frame headers — stable per-message ID for dedup.
-                    // Falls back to UUID only if the field is absent (non-standard event).
-                    let event_id = v["headers"]["eventId"]
-                        .as_str()
-                        .map(str::to_string)
-                        .unwrap_or_else(|| Uuid::new_v4().to_string());
+                    let frame_type = v["type"].as_str().unwrap_or("");
+                    let message_id = v["headers"]["messageId"].as_str().unwrap_or("");
+
+                    if frame_type == "SYSTEM" {
+                        let topic = v["headers"]["topic"].as_str().unwrap_or("");
+                        let opaque = v["data"]
+                            .as_str()
+                            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                            .and_then(|value| value["opaque"].as_str().map(str::to_string));
+                        if !message_id.is_empty() {
+                            ws.send(Self::build_system_ack(message_id, opaque.as_deref()))
+                                .await?;
+                        }
+                        if topic == "disconnect" {
+                            tracing::warn!("DingTalk Stream server requested disconnect");
+                            break;
+                        }
+                        continue;
+                    }
 
                     if let Some(data_str) = v["data"].as_str() {
                         if let Ok(data) = serde_json::from_str::<serde_json::Value>(data_str) {
+                            let event_id = data["msgId"]
+                                .as_str()
+                                .or_else(|| v["headers"]["eventId"].as_str())
+                                .or_else(|| v["headers"]["messageId"].as_str())
+                                .map(str::to_string)
+                                .unwrap_or_else(|| Uuid::new_v4().to_string());
                             let user_id =
-                                data["senderId"].as_str().unwrap_or("unknown").to_string();
+                                data["senderStaffId"]
+                                    .as_str()
+                                    .or_else(|| data["senderId"].as_str())
+                                    .unwrap_or("unknown")
+                                    .to_string();
                             // Allowlist check uses senderId regardless of chat type.
                             if !checker.is_allowed("dingtalk", &user_id) {
                                 tracing::debug!(
                                     "AllowlistChecker: dingtalk user {} denied",
                                     user_id
                                 );
+                                if !message_id.is_empty() {
+                                    ws.send(Self::build_callback_ack(message_id)).await?;
+                                }
                                 continue;
                             }
                             // Derive scope: group chat uses conversationId, private chat uses senderId.
@@ -316,14 +364,17 @@ impl Channel for DingTalkChannel {
                                             target_agent: Some(target_agent),
                                             source: clawbro_protocol::MsgSource::Human,
                                         };
-                                        let _ = tx.send(inbound).await;
-                                    }
+                                    let _ = tx.send(inbound).await;
                                 }
+                            }
+                            if !message_id.is_empty() {
+                                ws.send(Self::build_callback_ack(message_id)).await?;
                             }
                         }
                     }
                 }
             }
+        }
         }
         tracing::warn!("DingTalk WebSocket connection closed");
         Ok(())
@@ -339,6 +390,7 @@ impl Channel for DingTalkChannel {
 mod tests {
     use super::*;
     use crate::{SEND_INITIAL_DELAY_MS, SEND_MAX_RETRIES};
+    use serde::Deserialize;
     use std::sync::Mutex;
 
     #[allow(clippy::assertions_on_constants)]
@@ -385,6 +437,45 @@ mod tests {
         };
         let ch = DingTalkChannel::new(cfg, false);
         assert_eq!(ch.name(), "dingtalk");
+    }
+
+    #[test]
+    fn test_dingtalk_token_response_parses_camel_case_fields() {
+        #[derive(Deserialize)]
+        struct TokenResp {
+            #[serde(rename = "accessToken", alias = "access_token")]
+            access_token: String,
+            #[serde(rename = "expireIn", alias = "expire_in")]
+            expire_in: Option<u64>,
+        }
+
+        let payload = r#"{"expireIn":7200,"accessToken":"tok-123"}"#;
+        let parsed: TokenResp = serde_json::from_str(payload).unwrap();
+        assert_eq!(parsed.access_token, "tok-123");
+        assert_eq!(parsed.expire_in, Some(7200));
+    }
+
+    #[test]
+    fn test_dingtalk_stream_connect_url_includes_ticket_query() {
+        let url = DingTalkChannel::build_stream_connect_url(
+            "wss://wss-open-connection.dingtalk.com:443/connect",
+            "ticket-123",
+        );
+        assert_eq!(
+            url,
+            "wss://wss-open-connection.dingtalk.com:443/connect?ticket=ticket-123"
+        );
+    }
+
+    #[test]
+    fn test_dingtalk_callback_ack_shape() {
+        let WsMsg::Text(payload) = DingTalkChannel::build_callback_ack("mid-1") else {
+            panic!("expected text ack");
+        };
+        let value: serde_json::Value = serde_json::from_str(payload.as_ref()).unwrap();
+        assert_eq!(value["code"], 200);
+        assert_eq!(value["headers"]["messageId"], "mid-1");
+        assert_eq!(value["data"], "{\"response\":null}");
     }
 
     /// Verify that a group chat event (conversationType="2") produces scope "group:{conversationId}".
