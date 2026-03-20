@@ -19,7 +19,7 @@
     <a href="./docs/setup.md">セットアップ</a>
   </p>
   <p>
-    <img src="https://img.shields.io/badge/version-0.1.8-blue" alt="Version">
+    <img src="https://img.shields.io/badge/version-0.1.9-blue" alt="Version">
     <img src="https://img.shields.io/badge/rust-1.90%2B-orange" alt="Rust">
     <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
     <img src="https://img.shields.io/badge/agents-Claude%20%7C%20Codex%20%7C%20Qwen%20%7C%20Qoder%20%7C%20Gemini-111827" alt="Agents">

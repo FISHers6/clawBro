@@ -1,6 +1,6 @@
 {
   "name": "clawbro",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "npm installer for prebuilt clawbro binaries",
   "license": "MIT",
   "repository": {
