@@ -33,19 +33,17 @@ jobs:
 
       - name: Build release binary
         run: cargo build -p clawbro --release --bin clawbro --target "${{ matrix.target }}"
-        working-directory: clawBro
 
       - name: Package artifact
         run: |
           chmod +x scripts/release/package-artifact.sh
           scripts/release/package-artifact.sh "${{ matrix.target }}" "${GITHUB_REF_NAME#v}" release-assets
-        working-directory: clawBro
 
       - name: Upload packaged artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
-          path: clawBro/release-assets/*
+          path: release-assets/*
 
   publish-release:
     needs: build
@@ -62,8 +60,8 @@ jobs:
 
       - name: Generate checksums
         run: |
-          chmod +x clawBro/scripts/release/checksums.sh
-          clawBro/scripts/release/checksums.sh artifacts
+          chmod +x scripts/release/checksums.sh
+          scripts/release/checksums.sh artifacts
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2

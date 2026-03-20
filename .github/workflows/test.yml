@@ -21,12 +21,9 @@ jobs:
 
       - name: Cargo check
         run: cargo check -p clawbro --lib
-        working-directory: clawBro
 
       - name: Scheduler tests
         run: cargo test -p clawbro schedule -- --nocapture
-        working-directory: clawBro
 
       - name: Scheduler runtime tests
         run: cargo test -p clawbro scheduler_runtime -- --nocapture
-        working-directory: clawBro
