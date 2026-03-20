@@ -190,6 +190,26 @@ This is one of the most distinctive parts of the project: the architecture is se
 cargo install clawbro
 ```
 
+**GitHub Release** (no Rust required)
+
+1. Download the archive for your platform from GitHub Releases
+2. Unpack it
+3. Run `./clawbro --version`
+
+If you want a global command, move it into your `PATH`:
+
+```bash
+chmod +x clawbro
+mv clawbro ~/.local/bin/clawbro
+```
+
+**npm** (binary installer)
+
+```bash
+npm install -g clawbro
+clawbro --version
+```
+
 **Build from source** (developer path)
 
 ```bash
@@ -207,6 +227,17 @@ cargo build -p clawbro --bin clawbro
 
 ```bash
 cargo install clawbro
+```
+
+Or choose one of these:
+
+```bash
+# GitHub Release: unpack and run directly
+./clawbro --version
+
+# npm: download the matching binary during install
+npm install -g clawbro
+clawbro --version
 ```
 
 **2. Initialize**
@@ -282,6 +313,28 @@ clawbro schedule delete-all --current-session-key 'lark@alpha:user:ou_xxx'
 ```
 
 The important split is simple: reminders are delivered directly, while scheduled agent jobs wake up later and do fresh work when the time comes.
+
+## 📦 Distribution
+
+`clawBro` now ships through three install paths:
+
+- **Cargo** for Rust-first users:
+  - `cargo install clawbro`
+- **GitHub Release binaries** for quick download-and-run installs:
+  - download the archive for macOS or Linux
+  - unpack it and run `./clawbro`
+  - move it into `PATH` later if you want a global command
+- **npm binary installer** for JavaScript-heavy setups:
+  - `npm install -g clawbro`
+  - the installer downloads the matching GitHub Release binary for your machine
+
+Phase 1 release targets:
+
+- macOS Apple Silicon
+- macOS Intel
+- Linux x86_64
+
+On macOS, the binary may show the usual first-run Gatekeeper prompt because it is not notarized yet.
 
 ## 👥 Team Modes
 

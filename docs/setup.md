@@ -18,9 +18,22 @@
 
 至少准备这些：
 
+- 一个 provider API Key
+- 根据你的安装方式准备对应环境
+
+安装方式分三种：
+
+1. Cargo
+   - 需要 Rust toolchain 和 Cargo
+2. GitHub Release 二进制
+   - 不需要 Rust，下载解压即可运行
+3. npm 二进制安装器
+   - 需要 Node.js 18+
+
+如果你走源码开发路径，再准备：
+
 - Rust toolchain
 - Cargo
-- 一个 provider API Key
 - 本仓库源码
 
 当前 workspace 使用的 Rust 版本锁在：
@@ -36,7 +49,50 @@ cargo --version
 
 ---
 
-## 2. Build
+## 2. Install
+
+### Cargo
+
+```bash
+cargo install clawbro
+```
+
+### GitHub Release Binary
+
+1. 从 GitHub Releases 下载对应平台压缩包
+2. 解压
+3. 直接运行
+
+示例：
+
+```bash
+tar -xzf clawbro-darwin-aarch64.tar.gz
+./clawbro --version
+```
+
+如果你想把它变成全局命令，可以手动放到 `PATH`：
+
+```bash
+chmod +x clawbro
+mv clawbro ~/.local/bin/clawbro
+```
+
+### npm Binary Installer
+
+```bash
+npm install -g clawbro
+clawbro --version
+```
+
+npm 安装器会自动下载当前平台对应的 GitHub Release 二进制。
+
+当前第一阶段支持：
+
+- macOS Apple Silicon
+- macOS Intel
+- Linux x86_64
+
+## 3. Build
 
 在仓库根内进入 gateway 子项目：
 
@@ -58,7 +114,7 @@ cargo build -p clawbro --bin clawbro --release
 
 ---
 
-## 3. Runtime Layout
+## 4. Runtime Layout
 
 默认运行目录在：
 
@@ -73,7 +129,7 @@ cargo build -p clawbro --bin clawbro --release
 
 ---
 
-## 4. First-Time Setup
+## 5. First-Time Setup
 
 ### Interactive
 
@@ -107,7 +163,7 @@ clawbro setup \
 
 ---
 
-## 5. Setup Modes
+## 6. Setup Modes
 
 ### Solo
 
@@ -237,7 +293,7 @@ Group:
 
 ---
 
-## 6. Provider Setup
+## 7. Provider Setup
 
 当前原生 runtime 最常见的 key 读取优先级：
 

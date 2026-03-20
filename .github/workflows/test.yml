@@ -1,0 +1,32 @@
+name: test
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Cargo check
+        run: cargo check -p clawbro --lib
+        working-directory: clawBro
+
+      - name: Scheduler tests
+        run: cargo test -p clawbro schedule -- --nocapture
+        working-directory: clawBro
+
+      - name: Scheduler runtime tests
+        run: cargo test -p clawbro scheduler_runtime -- --nocapture
+        working-directory: clawBro

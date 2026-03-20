@@ -1,0 +1,46 @@
+{
+  "name": "clawbro",
+  "version": "0.1.6",
+  "description": "npm installer for prebuilt clawbro binaries",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fishers6/clawBro.git"
+  },
+  "homepage": "https://github.com/fishers6/clawBro",
+  "bugs": {
+    "url": "https://github.com/fishers6/clawBro/issues"
+  },
+  "bin": {
+    "clawbro": "bin/clawbro.js"
+  },
+  "files": [
+    "bin",
+    "scripts",
+    "vendor",
+    "README.md"
+  ],
+  "scripts": {
+    "postinstall": "node scripts/postinstall.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "ai",
+    "agent",
+    "cli",
+    "rust"
+  ]
+}

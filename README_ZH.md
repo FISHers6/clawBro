@@ -190,6 +190,26 @@
 cargo install clawbro
 ```
 
+**GitHub Release**（不需要 Rust）
+
+1. 从 GitHub Releases 下载对应平台压缩包
+2. 解压
+3. 直接运行 `./clawbro --version`
+
+如果你想像全局命令一样使用，也可以放进 `PATH`：
+
+```bash
+chmod +x clawbro
+mv clawbro ~/.local/bin/clawbro
+```
+
+**npm**（二进制安装器）
+
+```bash
+npm install -g clawbro
+clawbro --version
+```
+
 **从源码编译**（开发者路径）
 
 ```bash
@@ -207,6 +227,17 @@ cargo build -p clawbro --bin clawbro
 
 ```bash
 cargo install clawbro
+```
+
+也可以选下面两种：
+
+```bash
+# GitHub Release：解压后直接运行
+./clawbro --version
+
+# npm：安装时自动下载匹配平台的二进制
+npm install -g clawbro
+clawbro --version
 ```
 
 **2. 初始化**
@@ -282,6 +313,28 @@ clawbro schedule delete-all --current-session-key 'lark@alpha:user:ou_xxx'
 ```
 
 简单说：提醒类任务负责准时冒泡，Agent 定时任务负责到点后重新干活，二者共用同一套 scheduler，但执行语义清楚分开。
+
+## 📦 分发方式
+
+现在 `clawBro` 有三条安装路径：
+
+- **Cargo**：适合 Rust 用户
+  - `cargo install clawbro`
+- **GitHub Release 二进制**：适合想直接下载就跑的人
+  - 下载对应平台压缩包
+  - 解压后直接执行 `./clawbro`
+  - 需要全局命令时再手动放进 `PATH`
+- **npm 二进制安装器**：适合 JavaScript / Node 用户
+  - `npm install -g clawbro`
+  - 安装时会自动下载当前机器对应的 GitHub Release 二进制
+
+第一阶段支持的平台：
+
+- macOS Apple Silicon
+- macOS Intel
+- Linux x86_64
+
+macOS 上首次运行时，系统可能会给出未公证二进制的常规提示，这是预期行为。
 
 ## 👥 团队模式
 
