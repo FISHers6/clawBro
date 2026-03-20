@@ -2,6 +2,7 @@ use crate::runtime::{
     acp::{
         probe::capability_profile_from_initialize,
         session_driver::{probe_command_backend, run_command_turn, AcpCommandConfig},
+        supports_native_local_skills,
     },
     adapter::{BackendAdapter, LaunchSpec},
     approval::ApprovalBroker,
@@ -41,7 +42,11 @@ impl BackendAdapter for AcpBackendAdapter {
     async fn probe(&self, spec: &BackendSpec) -> anyhow::Result<CapabilityProfile> {
         let config = Self::command_config(spec)?;
         let init = probe_command_backend(&config).await?;
-        Ok(capability_profile_from_initialize(&init, true))
+        Ok(capability_profile_from_initialize(
+            &init,
+            true,
+            supports_native_local_skills(spec.acp_backend),
+        ))
     }
 
     async fn run_turn(

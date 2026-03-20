@@ -9,5 +9,6 @@ pub mod internal_agent;
 pub mod schedule;
 pub mod serve;
 pub mod setup;
+pub mod skills;
 pub mod status;
 pub mod team_helper;

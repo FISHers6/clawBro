@@ -23,6 +23,18 @@ pub struct BackendSpec {
     pub codex_projection: Option<crate::runtime::acp::CodexProjectionMode>,
 }
 
+impl BackendSpec {
+    pub fn supports_native_local_skills(&self) -> bool {
+        match self.family {
+            crate::runtime::backend::BackendFamily::OpenClawGateway => true,
+            crate::runtime::backend::BackendFamily::ClawBroNative => false,
+            crate::runtime::backend::BackendFamily::Acp => {
+                crate::runtime::acp::supports_native_local_skills(self.acp_backend)
+            }
+        }
+    }
+}
+
 pub struct BackendRegistry {
     backends: RwLock<HashMap<String, BackendSpec>>,
     adapters: RwLock<HashMap<String, Arc<dyn BackendAdapter>>>,

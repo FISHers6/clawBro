@@ -365,7 +365,7 @@ pub struct SessionRegistry {
     default_workspace: Option<std::path::PathBuf>,
     /// Per-session workspace overrides set via /workspace command.
     session_workspaces: DashMap<SessionKey, std::path::PathBuf>,
-    /// Gateway-level skill search directories (fallback after workspace/.agents/skills/ and agent extra dirs).
+    /// Gateway-level skill search directories (fallback after workspace-derived project skill dirs and agent extra dirs).
     skill_loader_dirs: Vec<std::path::PathBuf>,
     /// Tracks which persona directories have already been initialized (SOUL.md created).
     /// Avoids repeated blocking filesystem calls per message.
@@ -1144,6 +1144,33 @@ impl SessionRegistry {
                 team_orch.set_scope(session_key.clone());
             }
         }
+        let expected_backend_id: Option<String> = routing
+            .intent
+            .target_backend
+            .clone()
+            .or_else(|| routing.intent.leader_candidate.clone())
+            .or_else(|| routing.fallback_backend_id.clone());
+        let inject_prompt_skills = if let Some(ref backend_id) = expected_backend_id {
+            match self
+                .runtime_dispatch
+                .backend_native_local_skills(backend_id)
+                .await
+            {
+                Ok(Some(native_local_skills)) => !native_local_skills,
+                Ok(None) => true,
+                Err(error) => {
+                    tracing::warn!(
+                        backend_id = %backend_id,
+                        error = %error,
+                        "failed to probe backend capability profile before context assembly; falling back to prompt skill injection"
+                    );
+                    true
+                }
+            }
+        } else {
+            true
+        };
+
         let assembled = assemble_context(ContextAssemblyRequest {
             session_id,
             session_key: &session_key,
@@ -1159,6 +1186,7 @@ impl SessionRegistry {
             default_workspace: self.default_workspace.clone(),
             session_workspace: self.session_workspace(&session_key),
             skill_loader_dirs: &self.skill_loader_dirs,
+            inject_prompt_skills,
             initialized_persona_dirs: &self.initialized_persona_dirs,
             team_tool_url: self.team_tool_url.get().cloned(),
             allowed_team_tools: routing.allowed_team_tools.clone(),
@@ -1177,11 +1205,6 @@ impl SessionRegistry {
         } = routing;
 
         // Resolve the expected backend_id for session lifecycle tracking.
-        let expected_backend_id: Option<String> = intent
-            .target_backend
-            .clone()
-            .or_else(|| intent.leader_candidate.clone())
-            .or_else(|| fallback_backend_id.clone());
         // Load stored ACP session ID for this backend (if any) and stamp into ctx.
         if let Some(ref bid) = expected_backend_id {
             match self.runtime_dispatch.backend_resume_fingerprint(bid).await {
@@ -1583,6 +1606,10 @@ mod tests {
         async fn backend_resume_fingerprint(&self, _backend_id: &str) -> Result<Option<String>> {
             Ok(self.backend_resume_fingerprint.clone())
         }
+
+        async fn backend_native_local_skills(&self, _backend_id: &str) -> Result<Option<bool>> {
+            Ok(None)
+        }
     }
 
     struct TeamSideEffectRuntimeDispatch {
@@ -1613,6 +1640,10 @@ mod tests {
         }
 
         async fn backend_resume_fingerprint(&self, _backend_id: &str) -> Result<Option<String>> {
+            Ok(None)
+        }
+
+        async fn backend_native_local_skills(&self, _backend_id: &str) -> Result<Option<bool>> {
             Ok(None)
         }
     }
@@ -1654,6 +1685,10 @@ mod tests {
         }
 
         async fn backend_resume_fingerprint(&self, _backend_id: &str) -> Result<Option<String>> {
+            Ok(None)
+        }
+
+        async fn backend_native_local_skills(&self, _backend_id: &str) -> Result<Option<bool>> {
             Ok(None)
         }
     }

@@ -8,6 +8,7 @@ use crate::cli::{
     args::SetupArgs,
     i18n::{Language, Messages},
 };
+use crate::{config::GatewayConfig, skills_internal::reconcile_default_skills};
 use anyhow::Result;
 use console::style;
 use dialoguer::{theme::ColorfulTheme, Confirm, Select};
@@ -94,6 +95,12 @@ pub async fn run(args: SetupArgs) -> Result<()> {
     writer::write_env(&provider_cfg, &channel_cfg)?;
     if !provider_cfg.api_key.is_empty() {
         println!("{}", style(m.written_env).green());
+    }
+
+    let cfg = GatewayConfig::load()?;
+    let report = reconcile_default_skills(&cfg)?;
+    for warning in report.warnings() {
+        eprintln!("warning: {warning}");
     }
 
     // Step 10: Done

@@ -6,6 +6,7 @@ pub fn default_native_capability_profile() -> CapabilityProfile {
     CapabilityProfile {
         streaming: true,
         workspace_native_contract: true,
+        native_local_skills: false,
         tool_bridge: ToolBridgeKind::BackendNative,
         native_team: NativeTeamCapability::Unsupported,
         role_eligibility: RoleEligibility {

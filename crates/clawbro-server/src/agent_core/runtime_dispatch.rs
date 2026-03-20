@@ -30,6 +30,7 @@ pub struct RuntimeDispatchRequest {
 pub trait RuntimeDispatch: Send + Sync {
     async fn dispatch(&self, request: RuntimeDispatchRequest) -> Result<TurnResult>;
     async fn backend_resume_fingerprint(&self, backend_id: &str) -> Result<Option<String>>;
+    async fn backend_native_local_skills(&self, backend_id: &str) -> Result<Option<bool>>;
 }
 
 /// Convenience constructor that pre-registers all three adapters and returns a dispatch handle.
@@ -111,6 +112,13 @@ impl RuntimeDispatch for ConductorRuntimeDispatch {
             return Ok(None);
         };
         Ok(Some(fingerprint_backend_spec(&spec)?))
+    }
+
+    async fn backend_native_local_skills(&self, backend_id: &str) -> Result<Option<bool>> {
+        let Some(spec) = self.registry.backend_spec(backend_id).await else {
+            return Ok(None);
+        };
+        Ok(Some(spec.supports_native_local_skills()))
     }
 }
 
@@ -607,6 +615,7 @@ mod tests {
             Ok(CapabilityProfile {
                 streaming: true,
                 workspace_native_contract: false,
+                native_local_skills: false,
                 tool_bridge: ToolBridgeKind::None,
                 native_team: NativeTeamCapability::Unsupported,
                 role_eligibility: RoleEligibility {
@@ -658,6 +667,7 @@ mod tests {
             Ok(CapabilityProfile {
                 streaming: true,
                 workspace_native_contract: false,
+                native_local_skills: false,
                 tool_bridge: ToolBridgeKind::None,
                 native_team: NativeTeamCapability::Unsupported,
                 role_eligibility: RoleEligibility {

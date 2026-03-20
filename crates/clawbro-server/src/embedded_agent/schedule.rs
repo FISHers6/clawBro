@@ -86,10 +86,7 @@ impl ScheduleToolClient {
     }
 }
 
-fn normalize_current_session_args(
-    args: Vec<String>,
-    default_session_ref: &str,
-) -> Vec<String> {
+fn normalize_current_session_args(args: Vec<String>, default_session_ref: &str) -> Vec<String> {
     let mut normalized = Vec::with_capacity(args.len() + 2);
     let mut index = 0usize;
     while index < args.len() {
@@ -763,21 +760,21 @@ fn build_create_schedule_call(
 ) -> Result<Vec<String>, ToolError> {
     let mut command = vec!["schedule".to_string(), "--json".to_string()];
     if let Some(expr) = args.expr {
-            command.push("add-cron".into());
-            command.push("--expr".into());
-            command.push(expr);
+        command.push("add-cron".into());
+        command.push("--expr".into());
+        command.push(expr);
     } else if let Some(run_at) = args.run_at {
-            command.push("add-at".into());
-            command.push("--at".into());
-            command.push(run_at);
+        command.push("add-at".into());
+        command.push("--at".into());
+        command.push(run_at);
     } else if let Some(every) = args.every {
-            command.push("add-every".into());
-            command.push("--every".into());
-            command.push(every);
+        command.push("add-every".into());
+        command.push("--every".into());
+        command.push(every);
     } else if let Some(delay) = args.delay {
-            command.push("add-delay".into());
-            command.push("--delay".into());
-            command.push(delay);
+        command.push("add-delay".into());
+        command.push("--delay".into());
+        command.push(delay);
     } else {
         return Err(ToolError::ToolCallError(
             "missing schedule time field for create schedule call".into(),

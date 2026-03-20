@@ -21,7 +21,7 @@ pub struct AgentEntry {
     /// Directory to use as working directory when spawning the agent subprocess.
     #[serde(default)]
     pub workspace_dir: Option<PathBuf>,
-    /// Explicit extra skill directories for this agent (in addition to workspace-derived .agents/skills/).
+    /// Explicit extra skill directories for this agent (in addition to workspace-derived shared/private/agent-scoped skill dirs).
     #[serde(default)]
     pub extra_skills_dirs: Vec<PathBuf>,
 }

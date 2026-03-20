@@ -12,7 +12,7 @@ use crate::runtime::{
 };
 use crate::scheduler_runtime;
 use crate::session::{SessionManager, SessionStorage};
-use crate::skills_internal::SkillLoader;
+use crate::skills_internal::{reconcile_default_skills, SkillLoader};
 use crate::state::{AppState, BrokerApprovalResolver};
 use anyhow::Result;
 use std::sync::Arc;
@@ -34,6 +34,10 @@ pub async fn run() -> Result<()> {
 
     let cfg = config::GatewayConfig::load()?;
     cfg.validate_runtime_topology()?;
+    let default_skills_report = reconcile_default_skills(&cfg)?;
+    for warning in default_skills_report.warnings() {
+        tracing::warn!(warning = %warning, "default skills mirror skipped");
+    }
     tracing::info!("Loaded config with {} backends", cfg.backends.len());
 
     // 初始化 Session 存储
@@ -57,8 +61,13 @@ pub async fn run() -> Result<()> {
     all_skill_dirs.extend(cfg.skills.global_dirs.iter().cloned());
     let skill_loader = SkillLoader::new(all_skill_dirs.clone());
     let skills = skill_loader.load_all();
-    let system_injection = skill_loader.build_system_injection(&skills);
-    tracing::info!("Loaded {} skills", skills.len());
+    let system_injection = skill_loader.build_builtin_system_injection();
+    let skill_loader_dirs = skill_loader.search_dirs().to_vec();
+    tracing::info!(
+        discovered_skills = skills.len(),
+        static_builtin_skills = usize::from(!system_injection.trim().is_empty()),
+        "Discovered skills and prepared static builtin injection"
+    );
 
     let default_backend_id = cfg.resolved_default_backend_id();
     tracing::info!(
@@ -119,7 +128,7 @@ pub async fn run() -> Result<()> {
         memory_system,
         Some(cfg.memory.shared_dir.clone()),
         cfg.gateway.default_workspace.clone(),
-        all_skill_dirs,
+        skill_loader_dirs,
         runtime_dispatch,
     );
     // 使用 registry 内部的 global_tx，确保事件正确广播

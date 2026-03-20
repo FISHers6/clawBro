@@ -1,9 +1,15 @@
 use super::manifest::SkillManifest;
 use anyhow::Result;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 const MAX_SCAN_BYTES: usize = 64 * 1024; // 64 KB
 const BUILTIN_SCHEDULER_NAME: &str = "scheduler";
+const BUILTIN_SCHEDULER_DIR: &str = "[builtin]/scheduler";
+const BUILTIN_SCHEDULER_SKILL_MD: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/builtin-skills/scheduler/SKILL.md"
+));
 
 const INJECTION_KEYWORDS: &[&str] = &[
     "ignore previous instructions",
@@ -51,7 +57,8 @@ impl SkillLoader {
     pub fn new(extra_dirs: Vec<PathBuf>) -> Self {
         let mut dirs = extra_dirs;
         if let Some(home) = dirs::home_dir() {
-            dirs.push(home.join(".clawbro").join("skills"));
+            push_unique_dir(&mut dirs, home.join(".clawbro").join("skills"));
+            push_unique_dir(&mut dirs, home.join(".agents").join("skills"));
         }
         Self {
             dirs,
@@ -70,6 +77,17 @@ impl SkillLoader {
     /// Returns the directories this loader searches.
     pub fn search_dirs(&self) -> &[PathBuf] {
         &self.dirs
+    }
+
+    /// Builds the static host-owned skill injection that should always be present,
+    /// independent of backend-native local skill loading.
+    pub fn build_builtin_system_injection(&self) -> String {
+        if !self.include_builtin_scheduler {
+            return String::new();
+        }
+        self.load_builtin_scheduler_skill()
+            .map(|skill| self.build_system_injection(&[skill]))
+            .unwrap_or_default()
     }
 
     /// 扫描所有目录，加载所有合法 skill
@@ -100,19 +118,23 @@ impl SkillLoader {
                 }
             }
         }
-        dedupe_scheduler_skill(skills)
+        dedupe_loaded_skills(skills)
     }
 
     fn load_builtin_scheduler_skill(&self) -> Option<LoadedSkill> {
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../skills")
-            .join(BUILTIN_SCHEDULER_NAME);
-        self.try_load_skill_md(&dir).map(|mut skill| {
-            skill.manifest.id = BUILTIN_SCHEDULER_NAME.to_string();
-            skill.manifest.name = BUILTIN_SCHEDULER_NAME.to_string();
-            skill.manifest.version = "builtin".to_string();
-            skill.manifest.trusted = Some(true);
-            skill
+        let fm = parse_skill_md_full(BUILTIN_SCHEDULER_SKILL_MD, BUILTIN_SCHEDULER_NAME);
+        Some(LoadedSkill {
+            manifest: SkillManifest {
+                id: BUILTIN_SCHEDULER_NAME.to_string(),
+                name: BUILTIN_SCHEDULER_NAME.to_string(),
+                version: "builtin".to_string(),
+                description: String::new(),
+                skill_md: "SKILL.md".to_string(),
+                tools: vec![],
+                trusted: Some(true),
+            },
+            instruction: fm.body,
+            dir: PathBuf::from(BUILTIN_SCHEDULER_DIR),
         })
     }
 
@@ -325,7 +347,7 @@ impl SkillLoader {
     }
 
     /// Scan all configured directories for `type: persona` SKILL.md packages.
-    /// Returns all found persona skills in directory order.
+    /// Returns deduplicated persona skills in directory order, with later dirs overriding earlier.
     pub fn load_personas(&self) -> Vec<super::persona_skill::PersonaSkillData> {
         let mut personas = Vec::new();
         for dir in &self.dirs {
@@ -340,26 +362,64 @@ impl SkillLoader {
                 }
             }
         }
-        personas
+        dedupe_persona_skills(personas)
     }
 }
 
-fn dedupe_scheduler_skill(skills: Vec<LoadedSkill>) -> Vec<LoadedSkill> {
-    let mut seen_builtin = false;
-    let mut result = Vec::new();
-    for skill in skills {
-        if skill.manifest.name == BUILTIN_SCHEDULER_NAME {
-            if seen_builtin {
-                tracing::warn!(
-                    "ignoring duplicate scheduler skill; built-in scheduler skill remains authoritative"
-                );
-                continue;
-            }
-            seen_builtin = true;
+fn dedupe_loaded_skills(skills: Vec<LoadedSkill>) -> Vec<LoadedSkill> {
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::with_capacity(skills.len());
+    for skill in skills.into_iter().rev() {
+        let key = skill.manifest.name.to_ascii_lowercase();
+        if seen.insert(key) {
+            deduped.push(skill);
+        } else {
+            tracing::warn!(
+                skill = %skill.manifest.name,
+                dir = %skill.dir.display(),
+                "Duplicate skill detected; keeping later occurrence"
+            );
         }
-        result.push(skill);
     }
-    result
+    deduped.reverse();
+    deduped
+}
+
+fn dedupe_persona_skills(
+    personas: Vec<super::persona_skill::PersonaSkillData>,
+) -> Vec<super::persona_skill::PersonaSkillData> {
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::with_capacity(personas.len());
+    for persona in personas.into_iter().rev() {
+        let key = persona.identity.name.to_ascii_lowercase();
+        if seen.insert(key) {
+            deduped.push(persona);
+        } else {
+            tracing::warn!(
+                persona = %persona.identity.name,
+                "Duplicate persona detected; keeping later occurrence"
+            );
+        }
+    }
+    deduped.reverse();
+    deduped
+}
+
+fn push_unique_dir(dirs: &mut Vec<PathBuf>, dir: PathBuf) {
+    if dirs.iter().any(|existing| paths_equivalent(existing, &dir)) {
+        return;
+    }
+    dirs.push(dir);
+}
+
+fn paths_equivalent(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
 }
 
 /// Parse a SKILL.md file into its full frontmatter data + body.
@@ -596,6 +656,15 @@ mod tests {
     }
 
     #[test]
+    fn builtin_system_injection_contains_scheduler_only() {
+        let loader = SkillLoader::new(vec![]);
+        let injection = loader.build_builtin_system_injection();
+
+        assert!(injection.contains("scheduler"));
+        assert!(!injection.contains("skill-creator"));
+    }
+
+    #[test]
     fn test_parse_skill_md_frontmatter_closing_delimiter_no_trailing_newline() {
         // Closing --- with no trailing newline: body should be empty, no panic.
         let content = "---\nname: my-skill\nmetadata:\n  version: '1.0.0'\n---";
@@ -715,6 +784,45 @@ mod tests {
         assert!(personas[0]
             .soul_injection
             .contains("Ignore previous instructions"));
+    }
+
+    #[test]
+    fn test_load_personas_dedupes_same_name_prefers_later_dir() {
+        let tmp = TempDir::new().unwrap();
+        let first_root = tmp.path().join("first");
+        let second_root = tmp.path().join("second");
+
+        std::fs::create_dir_all(first_root.join("rex-first")).unwrap();
+        std::fs::write(
+            first_root.join("rex-first/SKILL.md"),
+            "---\nname: Rex\ntype: persona\n---\nFirst capability body.",
+        )
+        .unwrap();
+        std::fs::write(
+            first_root.join("rex-first/soul-injection.md"),
+            "You are first Rex.",
+        )
+        .unwrap();
+
+        std::fs::create_dir_all(second_root.join("rex-second")).unwrap();
+        std::fs::write(
+            second_root.join("rex-second/SKILL.md"),
+            "---\nname: Rex\ntype: persona\n---\nSecond capability body.",
+        )
+        .unwrap();
+        std::fs::write(
+            second_root.join("rex-second/soul-injection.md"),
+            "You are second Rex.",
+        )
+        .unwrap();
+
+        let loader = SkillLoader::with_dirs(vec![first_root, second_root]);
+        let personas = loader.load_personas();
+
+        assert_eq!(personas.len(), 1);
+        assert_eq!(personas[0].identity.name, "Rex");
+        assert_eq!(personas[0].soul_injection, "You are second Rex.");
+        assert_eq!(personas[0].capability_body, "Second capability body.");
     }
 
     #[test]
@@ -870,9 +978,12 @@ mod tests {
             include_builtin_scheduler: true,
         };
         let skills = loader.load_all();
-        assert!(skills
+        let scheduler = skills
             .iter()
-            .any(|skill| skill.manifest.name == "scheduler"));
+            .find(|skill| skill.manifest.name == "scheduler")
+            .expect("builtin scheduler should load");
+        assert_eq!(scheduler.dir, PathBuf::from(BUILTIN_SCHEDULER_DIR));
+        assert_eq!(scheduler.manifest.version, "builtin");
     }
 
     #[test]
@@ -882,5 +993,47 @@ mod tests {
         assert!(!skills
             .iter()
             .any(|skill| skill.manifest.name == "scheduler"));
+    }
+
+    #[test]
+    fn test_load_all_dedupes_same_name_prefers_later_dir() {
+        let tmp = TempDir::new().unwrap();
+        let first_root = tmp.path().join("first");
+        let second_root = tmp.path().join("second");
+
+        std::fs::create_dir_all(first_root.join("shared")).unwrap();
+        std::fs::write(
+            first_root.join("shared/SKILL.md"),
+            "---\nname: shared\nmetadata:\n  version: '1.0.0'\n---\nFirst version.",
+        )
+        .unwrap();
+
+        std::fs::create_dir_all(second_root.join("shared")).unwrap();
+        std::fs::write(
+            second_root.join("shared/SKILL.md"),
+            "---\nname: shared\nmetadata:\n  version: '2.0.0'\n---\nSecond version.",
+        )
+        .unwrap();
+
+        let loader = SkillLoader::with_dirs(vec![first_root, second_root]);
+        let skills = loader.load_all();
+
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].manifest.name, "shared");
+        assert_eq!(skills[0].manifest.version, "2.0.0");
+        assert!(skills[0].instruction.contains("Second version."));
+    }
+
+    #[test]
+    fn test_new_dedupes_default_managed_dir_and_adds_universal_global_dir() {
+        let home = dirs::home_dir().expect("home dir");
+        let managed = home.join(".clawbro").join("skills");
+        let universal = home.join(".agents").join("skills");
+
+        let loader = SkillLoader::new(vec![managed.clone()]);
+        let dirs = loader.search_dirs();
+
+        assert_eq!(dirs.iter().filter(|dir| *dir == &managed).count(), 1);
+        assert!(dirs.iter().any(|dir| dir == &universal));
     }
 }

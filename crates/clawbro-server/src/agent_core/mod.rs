@@ -16,6 +16,7 @@ pub mod relay;
 pub mod roster;
 pub mod routing;
 pub mod runtime_dispatch;
+pub mod skill_paths;
 pub mod slash;
 pub mod slash_service;
 pub mod team;

@@ -1,14 +1,13 @@
 use crate::cli::args::{
     ScheduleAddAtArgs, ScheduleAddCronArgs, ScheduleAddDelayArgs, ScheduleAddEveryArgs,
-    ScheduleArgs, ScheduleCommands, ScheduleDeleteAllArgs, ScheduleDeleteArgs,
-    ScheduleHistoryArgs, ScheduleListArgs, ScheduleSessionFilterArgs, ScheduleTargetArgs,
-    ScheduleTargetKindArg,
+    ScheduleArgs, ScheduleCommands, ScheduleDeleteAllArgs, ScheduleDeleteArgs, ScheduleHistoryArgs,
+    ScheduleListArgs, ScheduleSessionFilterArgs, ScheduleTargetArgs, ScheduleTargetKindArg,
 };
 use crate::config::GatewayConfig;
 use crate::protocol::parse_session_key_text;
 use crate::scheduler::{
-    CreateJobRequest, CreateTargetRequest, ExecutionPrecondition, JobQuery,
-    RequestedTargetKind, ScheduleInput, SchedulerService, SessionTargetRequest, SourceKind,
+    CreateJobRequest, CreateTargetRequest, ExecutionPrecondition, JobQuery, RequestedTargetKind,
+    ScheduleInput, SchedulerService, SessionTargetRequest, SourceKind,
 };
 use crate::scheduler_runtime;
 use anyhow::{bail, Context, Result};

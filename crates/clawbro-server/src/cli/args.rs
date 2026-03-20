@@ -38,8 +38,178 @@ pub enum Commands {
     Status,
     /// 管理本地 runtime scheduler
     Schedule(ScheduleArgs),
+    /// 管理本地 skills 目录
+    Skill(SkillArgs),
     /// 生成 Shell 补全脚本
     Completions(CompletionsArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct SkillArgs {
+    #[command(subcommand)]
+    pub command: SkillCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SkillCommands {
+    /// 安装一个 skill 到指定 scope（优先委托 skills 生态）
+    Add(SkillAddArgs),
+    /// 检查默认 baseline skills 和 backend mirrors 状态
+    Check(SkillCheckArgs),
+    /// 委托 ClawHub 管理 workspace ./skills
+    Hub(SkillHubArgs),
+    /// 列出当前 skills 目录
+    List(SkillListArgs),
+    /// 从指定 scope 删除一个 skill
+    Remove(SkillRemoveArgs),
+    /// 同步默认 baseline skills 和 backend mirrors
+    Sync(SkillSyncArgs),
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum SkillScopeArg {
+    Managed,
+    Project,
+    Private,
+    Agent,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct SkillAddArgs {
+    /// 本地目录、git/url/repo 标识等 skills 生态 source
+    #[arg(long)]
+    pub source: PathBuf,
+    #[arg(long, value_enum)]
+    pub scope: SkillScopeArg,
+    #[arg(long)]
+    pub workspace: Option<PathBuf>,
+    #[arg(long)]
+    pub agent: Option<String>,
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct SkillHubArgs {
+    #[command(subcommand)]
+    pub command: SkillHubCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SkillHubCommands {
+    /// 在 ClawHub 中搜索 skills
+    Search(SkillHubSearchArgs),
+    /// 通过 ClawHub 安装到 workspace ./skills
+    #[command(disable_version_flag = true)]
+    Install(SkillHubInstallArgs),
+    /// 列出当前 workspace 的 ClawHub lock 记录
+    List(SkillHubListArgs),
+    /// 更新一个或全部已安装的 ClawHub skills
+    #[command(disable_version_flag = true)]
+    Update(SkillHubUpdateArgs),
+    /// 扫描并同步本地 workspace skills 到 ClawHub
+    Sync(SkillHubSyncArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct SkillHubSearchArgs {
+    pub query: String,
+    #[arg(long)]
+    pub limit: Option<u32>,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct SkillHubInstallArgs {
+    pub slug: String,
+    #[arg(long)]
+    pub workspace: Option<PathBuf>,
+    #[arg(long)]
+    pub dir: Option<PathBuf>,
+    #[arg(long)]
+    pub version: Option<String>,
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(clap::Args, Debug, Default)]
+pub struct SkillHubListArgs {
+    #[arg(long)]
+    pub workspace: Option<PathBuf>,
+    #[arg(long)]
+    pub dir: Option<PathBuf>,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct SkillHubUpdateArgs {
+    pub slug: Option<String>,
+    #[arg(long)]
+    pub all: bool,
+    #[arg(long)]
+    pub workspace: Option<PathBuf>,
+    #[arg(long)]
+    pub dir: Option<PathBuf>,
+    #[arg(long)]
+    pub version: Option<String>,
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(clap::Args, Debug, Default)]
+pub struct SkillHubSyncArgs {
+    #[arg(long)]
+    pub workspace: Option<PathBuf>,
+    #[arg(long)]
+    pub dir: Option<PathBuf>,
+    #[arg(long = "root")]
+    pub roots: Vec<PathBuf>,
+    #[arg(long)]
+    pub all: bool,
+    #[arg(long = "dry-run")]
+    pub dry_run: bool,
+    #[arg(long)]
+    pub bump: Option<String>,
+    #[arg(long)]
+    pub changelog: Option<String>,
+    #[arg(long)]
+    pub tags: Option<String>,
+    #[arg(long)]
+    pub concurrency: Option<u32>,
+}
+
+#[derive(clap::Args, Debug, Default)]
+pub struct SkillCheckArgs {
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(clap::Args, Debug, Default)]
+pub struct SkillListArgs {
+    #[arg(long, value_enum)]
+    pub scope: Option<SkillScopeArg>,
+    #[arg(long)]
+    pub workspace: Option<PathBuf>,
+    #[arg(long)]
+    pub agent: Option<String>,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct SkillRemoveArgs {
+    #[arg(long)]
+    pub name: String,
+    #[arg(long, value_enum)]
+    pub scope: SkillScopeArg,
+    #[arg(long)]
+    pub workspace: Option<PathBuf>,
+    #[arg(long)]
+    pub agent: Option<String>,
+}
+
+#[derive(clap::Args, Debug, Default)]
+pub struct SkillSyncArgs {
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -326,4 +496,70 @@ pub enum ShellArg {
     Zsh,
     Fish,
     PowerShell,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parses_skill_hub_install_with_version_flag() {
+        let cli = Cli::try_parse_from([
+            "clawbro",
+            "skill",
+            "hub",
+            "install",
+            "weather",
+            "--workspace",
+            "/tmp/ws",
+            "--version",
+            "1.2.3",
+            "--force",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Skill(SkillArgs {
+                command:
+                    SkillCommands::Hub(SkillHubArgs {
+                        command: SkillHubCommands::Install(args),
+                    }),
+            }) => {
+                assert_eq!(args.slug, "weather");
+                assert_eq!(args.version.as_deref(), Some("1.2.3"));
+                assert!(args.force);
+            }
+            _ => panic!("expected skill hub install command"),
+        }
+    }
+
+    #[test]
+    fn parses_skill_hub_update_with_version_flag() {
+        let cli = Cli::try_parse_from([
+            "clawbro",
+            "skill",
+            "hub",
+            "update",
+            "weather",
+            "--workspace",
+            "/tmp/ws",
+            "--version",
+            "2.0.0",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Skill(SkillArgs {
+                command:
+                    SkillCommands::Hub(SkillHubArgs {
+                        command: SkillHubCommands::Update(args),
+                    }),
+            }) => {
+                assert_eq!(args.slug.as_deref(), Some("weather"));
+                assert_eq!(args.version.as_deref(), Some("2.0.0"));
+            }
+            _ => panic!("expected skill hub update command"),
+        }
+    }
 }

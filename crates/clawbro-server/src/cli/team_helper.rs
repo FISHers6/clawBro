@@ -42,12 +42,8 @@ pub async fn run(args: TeamHelperArgs) -> Result<()> {
             }
             render_team_helper_output(&call, body)
         }
-        HelperCall::Schedule {
-            action,
-            command,
-        } => {
-            let command =
-                normalize_schedule_helper_command(command, &action, &session_key);
+        HelperCall::Schedule { action, command } => {
+            let command = normalize_schedule_helper_command(command, &action, &session_key);
             match invoke_schedule_command(&command).await {
                 Ok(body) => render_schedule_helper_output(&action, body),
                 Err(err) => render_team_helper_failure(&action, None, &err.to_string()),
@@ -315,7 +311,11 @@ fn parse_call(mut args: Vec<String>) -> Result<HelperCall> {
 fn parse_schedule_create(args: &mut Vec<String>) -> Result<(String, Vec<String>)> {
     let kind = take_optional_flag(args, "--kind")
         .or_else(|| infer_schedule_kind_from_flags(args))
-        .ok_or_else(|| anyhow!("missing schedule kind: provide --kind or one of --expr/--run-at/--every/--delay"))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "missing schedule kind: provide --kind or one of --expr/--run-at/--every/--delay"
+            )
+        })?;
     let mut command = vec!["schedule".into(), "--json".into()];
     let action = "create_schedule".to_string();
     match kind.as_str() {
@@ -382,7 +382,11 @@ fn parse_split_schedule_create(
     target_kind: &str,
     prompt_flag: &str,
 ) -> Result<(String, Vec<String>)> {
-    let mut command = vec!["schedule".into(), "--json".into(), schedule_subcommand.into()];
+    let mut command = vec![
+        "schedule".into(),
+        "--json".into(),
+        schedule_subcommand.into(),
+    ];
     command.push(schedule_cli_flag(schedule_flag));
     command.push(take_flag(args, schedule_flag)?);
     command.push("--name".into());

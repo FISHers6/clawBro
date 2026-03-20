@@ -1,4 +1,5 @@
 use crate::runtime::contract::{RuntimeProviderProfile, RuntimeProviderProtocol};
+use crate::skills_internal::sync_default_skills_into_codex_home;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Map, Value};
 use std::fs;
@@ -60,6 +61,13 @@ pub fn prepare_isolated_codex_home(
     .with_context(|| format!("writing {}", auth_path.display()))?;
     fs::write(&config_path, config_text)
         .with_context(|| format!("writing {}", config_path.display()))?;
+    if let Err(err) = sync_default_skills_into_codex_home(&codex_home) {
+        tracing::warn!(
+            codex_home = %codex_home.display(),
+            error = %err,
+            "failed to sync baseline default skills into isolated CODEX_HOME"
+        );
+    }
 
     Ok(codex_home)
 }
@@ -225,6 +233,9 @@ mod tests {
         assert!(config.contains("preferred_auth_method = \"apikey\""));
         assert!(config.contains("enableRouteSelection = true"));
         assert!(config.contains("requires_openai_auth = false"));
+        assert!(codex_home.join("skills/find-skills/SKILL.md").exists());
+        assert!(codex_home.join("skills/skill-creator/SKILL.md").exists());
+        assert!(codex_home.join("skills/weather/SKILL.md").exists());
     }
 
     #[test]

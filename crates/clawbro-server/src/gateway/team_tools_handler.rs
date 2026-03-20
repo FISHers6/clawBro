@@ -67,9 +67,12 @@ mod tests {
         let cfg = GatewayConfig::default();
         let storage = SessionStorage::new(cfg.session.dir.clone());
         let session_manager = Arc::new(SessionManager::new(storage));
-        let skill_loader = SkillLoader::new(vec![cfg.skills.dir.clone()]);
+        let mut all_skill_dirs = vec![cfg.skills.dir.clone()];
+        all_skill_dirs.extend(cfg.skills.global_dirs.iter().cloned());
+        let skill_loader = SkillLoader::new(all_skill_dirs);
         let skills = skill_loader.load_all();
         let system_injection = skill_loader.build_system_injection(&skills);
+        let skill_loader_dirs = skill_loader.search_dirs().to_vec();
         let (registry, _rx) = SessionRegistry::new(
             None,
             session_manager,
@@ -78,7 +81,7 @@ mod tests {
             None,
             None,
             None,
-            vec![cfg.skills.dir.clone()],
+            skill_loader_dirs,
         );
 
         let tmp = tempdir().unwrap();

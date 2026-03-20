@@ -23,6 +23,7 @@ async fn run() -> Result<()> {
         Commands::Doctor => clawbro::cli::doctor::run().await,
         Commands::Status => clawbro::cli::status::run().await,
         Commands::Schedule(args) => clawbro::cli::schedule::run(args).await,
+        Commands::Skill(args) => clawbro::cli::skills::run(args).await,
         Commands::Completions(args) => clawbro::cli::completions::run(args),
     }
 }

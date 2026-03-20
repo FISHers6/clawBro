@@ -233,6 +233,7 @@ mod tests {
                     profile: CapabilityProfile {
                         streaming: true,
                         workspace_native_contract: false,
+                        native_local_skills: false,
                         tool_bridge: ToolBridgeKind::None,
                         native_team: NativeTeamCapability::Unsupported,
                         role_eligibility: RoleEligibility {
@@ -298,6 +299,7 @@ mod tests {
                     profile: CapabilityProfile {
                         streaming: true,
                         workspace_native_contract: false,
+                        native_local_skills: false,
                         tool_bridge: ToolBridgeKind::None,
                         native_team: NativeTeamCapability::Unsupported,
                         role_eligibility: RoleEligibility {
@@ -365,6 +367,7 @@ mod tests {
                     profile: CapabilityProfile {
                         streaming: true,
                         workspace_native_contract: false,
+                        native_local_skills: false,
                         tool_bridge: ToolBridgeKind::None,
                         native_team: NativeTeamCapability::Unsupported,
                         role_eligibility: RoleEligibility {
@@ -432,6 +435,7 @@ mod tests {
                     profile: CapabilityProfile {
                         streaming: true,
                         workspace_native_contract: false,
+                        native_local_skills: false,
                         tool_bridge: ToolBridgeKind::None,
                         native_team: NativeTeamCapability::Unsupported,
                         role_eligibility: RoleEligibility {

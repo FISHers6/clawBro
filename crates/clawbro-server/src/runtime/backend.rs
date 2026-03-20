@@ -36,6 +36,8 @@ pub struct RoleEligibility {
 pub struct CapabilityProfile {
     pub streaming: bool,
     pub workspace_native_contract: bool,
+    #[serde(default)]
+    pub native_local_skills: bool,
     pub tool_bridge: ToolBridgeKind,
     pub native_team: NativeTeamCapability,
     pub role_eligibility: RoleEligibility,
@@ -46,6 +48,7 @@ impl CapabilityProfile {
         Self {
             streaming: true,
             workspace_native_contract: false,
+            native_local_skills: false,
             tool_bridge: ToolBridgeKind::None,
             native_team: NativeTeamCapability::Unsupported,
             role_eligibility: RoleEligibility {

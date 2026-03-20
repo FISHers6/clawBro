@@ -52,3 +52,21 @@ pub enum CodexProjectionMode {
     /// Materialize local Codex config/auth files and point the process at an isolated CODEX_HOME.
     LocalConfig,
 }
+
+pub fn supports_native_local_skills(backend: Option<AcpBackend>) -> bool {
+    matches!(
+        backend,
+        Some(
+            AcpBackend::Claude
+                | AcpBackend::Codex
+                | AcpBackend::Codebuddy
+                | AcpBackend::Qwen
+                | AcpBackend::Iflow
+                | AcpBackend::Goose
+                | AcpBackend::Kimi
+                | AcpBackend::Opencode
+                | AcpBackend::Qoder
+                | AcpBackend::Vibe
+        )
+    )
+}

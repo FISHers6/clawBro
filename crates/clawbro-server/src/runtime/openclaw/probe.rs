@@ -6,6 +6,7 @@ pub fn default_openclaw_capability_profile() -> CapabilityProfile {
     CapabilityProfile {
         streaming: true,
         workspace_native_contract: true,
+        native_local_skills: true,
         tool_bridge: ToolBridgeKind::BackendNative,
         native_team: NativeTeamCapability::SupportedButDisabled,
         role_eligibility: RoleEligibility {

@@ -2,6 +2,9 @@ use crate::agent_core::memory::MemorySystem;
 use crate::agent_core::persona::AgentPersona;
 use crate::agent_core::prompt_builder::SystemPromptBuilder;
 use crate::agent_core::routing::RosterMatchData;
+use crate::agent_core::skill_paths::{
+    agent_scoped_skills_dir, project_universal_skills_dir, workspace_private_skills_dir,
+};
 use crate::agent_core::team::orchestrator::TeamOrchestrator;
 use crate::agent_core::traits::{AgentCtx, AgentRole, HistoryMsg};
 use crate::protocol::{InboundMsg, MsgSource, ScheduleTool, SessionKey, TeamTool};
@@ -28,6 +31,7 @@ pub(crate) struct ContextAssemblyRequest<'a> {
     pub default_workspace: Option<PathBuf>,
     pub session_workspace: Option<PathBuf>,
     pub skill_loader_dirs: &'a [PathBuf],
+    pub inject_prompt_skills: bool,
     pub initialized_persona_dirs: &'a DashSet<PathBuf>,
     pub team_tool_url: Option<String>,
     pub allowed_team_tools: Vec<TeamTool>,
@@ -38,6 +42,12 @@ pub(crate) struct ContextAssemblyResult {
     pub persona_prefix: Option<String>,
     pub resolved_persona_dir: Option<PathBuf>,
 }
+
+const SCHEDULER_HOST_GUIDANCE: &str = "## Host Scheduler Contract\n\n\
+ClawBro exposes scheduler support at the host/runtime layer in addition to the builtin scheduler skill.\n\
+When a task requires delayed execution, reminders, recurring follow-up, heartbeat checks, or any other time-based orchestration, prefer the scheduler tools instead of promising a manual follow-up in plain text.\n\
+Treat the scheduler skill and the host scheduler contract as complementary: the skill explains the workflow, while the host scheduler tools perform the actual scheduled action.\n\
+Do not claim that something has been scheduled unless the scheduler tool call succeeded.";
 
 pub(crate) async fn assemble_context(request: ContextAssemblyRequest<'_>) -> ContextAssemblyResult {
     let history = build_history(request.recent_messages);
@@ -55,7 +65,7 @@ pub(crate) async fn assemble_context(request: ContextAssemblyRequest<'_>) -> Con
         workspace_dir_resolved.as_ref(),
         request.roster_match,
         request.skill_loader_dirs,
-        frontstage_human_turn,
+        request.inject_prompt_skills,
     );
 
     let resolved_persona_dir = resolve_persona_dir(
@@ -130,6 +140,7 @@ pub(crate) async fn assemble_context(request: ContextAssemblyRequest<'_>) -> Con
             &roster_match.backend_id,
         );
     }
+    append_scheduler_host_guidance(&mut system_injection);
     if matches!(request.agent_role, AgentRole::Lead | AgentRole::Specialist) {
         if let Some(team_workspace_guide) = request
             .session_team_orch
@@ -258,6 +269,18 @@ fn append_team_workspace_guide_injection(system_injection: &mut String, guide: &
     }
 }
 
+fn append_scheduler_host_guidance(system_injection: &mut String) {
+    if system_injection.contains("## Host Scheduler Contract") {
+        return;
+    }
+    if system_injection.trim().is_empty() {
+        *system_injection = SCHEDULER_HOST_GUIDANCE.to_string();
+    } else {
+        system_injection.push_str("\n\n");
+        system_injection.push_str(SCHEDULER_HOST_GUIDANCE);
+    }
+}
+
 pub(crate) fn resolve_effective_workspace(
     agent_role: AgentRole,
     frontstage_human_turn: bool,
@@ -322,14 +345,24 @@ fn load_skill_injection(
     workspace_dir_resolved: Option<&PathBuf>,
     roster_match: Option<&RosterMatchData>,
     skill_loader_dirs: &[PathBuf],
-    frontstage_human_turn: bool,
+    inject_prompt_skills: bool,
 ) -> (String, Option<PersonaSkillData>) {
     let mut agent_skill_dirs = Vec::new();
-    if !frontstage_human_turn {
-        if let Some(workspace) = workspace_dir_resolved {
-            let canonical = workspace.join(".agents").join("skills");
-            if canonical.exists() {
-                agent_skill_dirs.push(canonical);
+    if let Some(workspace) = workspace_dir_resolved {
+        let project_universal = project_universal_skills_dir(workspace);
+        if project_universal.exists() {
+            agent_skill_dirs.push(project_universal);
+        }
+
+        let workspace_private = workspace_private_skills_dir(workspace);
+        if workspace_private.exists() {
+            agent_skill_dirs.push(workspace_private);
+        }
+
+        if let Some(rm) = roster_match {
+            let agent_scoped = agent_scoped_skills_dir(workspace, &rm.agent_name);
+            if agent_scoped.exists() {
+                agent_skill_dirs.push(agent_scoped);
             }
         }
     }
@@ -340,15 +373,24 @@ fn load_skill_injection(
         return (String::new(), None);
     }
 
-    let mut all_dirs = agent_skill_dirs;
-    all_dirs.extend(skill_loader_dirs.iter().cloned());
-    let loader = SkillLoader::with_dirs(all_dirs);
-    let skills = loader.load_all();
-    let personas = loader.load_personas();
-    (
-        loader.build_system_injection(&skills),
-        personas.into_iter().next(),
-    )
+    let mut persona_dirs = agent_skill_dirs.clone();
+    persona_dirs.extend(skill_loader_dirs.iter().cloned());
+    let persona_loader = SkillLoader::with_dirs(persona_dirs);
+    let personas = persona_loader.load_personas();
+
+    let mut capability_dirs = Vec::new();
+    if inject_prompt_skills {
+        capability_dirs = agent_skill_dirs;
+        capability_dirs.extend(skill_loader_dirs.iter().cloned());
+    }
+    let skill_injection = if capability_dirs.is_empty() {
+        String::new()
+    } else {
+        let capability_loader = SkillLoader::with_dirs(capability_dirs);
+        let skills = capability_loader.load_all();
+        capability_loader.build_system_injection(&skills)
+    };
+    (skill_injection, personas.into_iter().next())
 }
 
 fn resolve_persona_dir(
@@ -383,6 +425,7 @@ fn resolve_persona_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_core::skill_paths::sanitize_agent_name_for_path;
     use crate::protocol::SessionKey;
     use crate::protocol::{InboundMsg, MsgContent, MsgSource};
     use dashmap::DashSet;
@@ -497,7 +540,7 @@ mod tests {
         .unwrap();
 
         let (skill_injection, first_persona) =
-            load_skill_injection(None, None, &[tmp.path().to_path_buf()], false);
+            load_skill_injection(None, None, &[tmp.path().to_path_buf()], true);
         let combined = combine_gateway_and_workspace_injection("", &skill_injection);
         assert!(first_persona.is_some());
         assert!(combined.is_empty());
@@ -562,6 +605,7 @@ mod tests {
             default_workspace: None,
             session_workspace: None,
             skill_loader_dirs: &[],
+            inject_prompt_skills: true,
             initialized_persona_dirs,
             team_tool_url: None,
             allowed_team_tools: vec![],
@@ -694,7 +738,7 @@ mod tests {
     }
 
     #[test]
-    fn frontstage_human_turn_skips_workspace_skill_injection() {
+    fn frontstage_human_turn_still_loads_workspace_skill_injection() {
         let workspace = tempfile::TempDir::new().unwrap();
         let skill_dir = workspace.path().join(".agents").join("skills").join("demo");
         std::fs::create_dir_all(&skill_dir).unwrap();
@@ -706,11 +750,151 @@ mod tests {
 
         let (skill_injection, _) =
             load_skill_injection(Some(&workspace.path().to_path_buf()), None, &[], true);
-        assert!(skill_injection.trim().is_empty());
+        assert!(skill_injection.contains("demo"));
+    }
 
-        let (normal_injection, _) =
-            load_skill_injection(Some(&workspace.path().to_path_buf()), None, &[], false);
-        assert!(normal_injection.contains("demo"));
+    #[test]
+    fn workspace_private_skills_override_project_universal_skills() {
+        let workspace = tempfile::TempDir::new().unwrap();
+
+        let project_skill = workspace
+            .path()
+            .join(".agents")
+            .join("skills")
+            .join("shared");
+        std::fs::create_dir_all(&project_skill).unwrap();
+        std::fs::write(
+            project_skill.join("SKILL.md"),
+            "---\nname: shared\ndescription: project\n---\nProject universal body.",
+        )
+        .unwrap();
+
+        let private_skill = workspace.path().join("skills").join("shared");
+        std::fs::create_dir_all(&private_skill).unwrap();
+        std::fs::write(
+            private_skill.join("SKILL.md"),
+            "---\nname: shared\ndescription: private\n---\nWorkspace private body.",
+        )
+        .unwrap();
+
+        let (skill_injection, _) =
+            load_skill_injection(Some(&workspace.path().to_path_buf()), None, &[], true);
+
+        assert!(skill_injection.contains("Workspace private body."));
+        assert!(!skill_injection.contains("Project universal body."));
+    }
+
+    #[test]
+    fn agent_scoped_workspace_skills_override_workspace_private_skills() {
+        let workspace = tempfile::TempDir::new().unwrap();
+
+        let private_skill = workspace.path().join("skills").join("shared");
+        std::fs::create_dir_all(&private_skill).unwrap();
+        std::fs::write(
+            private_skill.join("SKILL.md"),
+            "---\nname: shared\ndescription: private\n---\nWorkspace private body.",
+        )
+        .unwrap();
+
+        let agent_skill = workspace
+            .path()
+            .join(".agents")
+            .join("agents")
+            .join("alpha")
+            .join("skills")
+            .join("shared");
+        std::fs::create_dir_all(&agent_skill).unwrap();
+        std::fs::write(
+            agent_skill.join("SKILL.md"),
+            "---\nname: shared\ndescription: agent\n---\nAgent scoped body.",
+        )
+        .unwrap();
+
+        let roster_match = RosterMatchData {
+            agent_name: "alpha".into(),
+            backend_id: "native-main".into(),
+            persona_dir: None,
+            workspace_dir: Some(workspace.path().to_path_buf()),
+            extra_skills_dirs: vec![],
+        };
+        let (skill_injection, _) = load_skill_injection(
+            Some(&workspace.path().to_path_buf()),
+            Some(&roster_match),
+            &[],
+            true,
+        );
+
+        assert!(skill_injection.contains("Agent scoped body."));
+        assert!(!skill_injection.contains("Workspace private body."));
+    }
+
+    #[test]
+    fn sanitize_agent_name_for_path_replaces_path_traversal_chars() {
+        assert_eq!(
+            sanitize_agent_name_for_path("my agent/../../etc"),
+            "my-agent-------etc"
+        );
+        assert_eq!(sanitize_agent_name_for_path(""), "unknown-agent");
+    }
+
+    #[test]
+    fn gateway_skill_loader_dirs_do_not_reinject_capability_skills_when_system_exists() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let skill_dir = tmp.path().join("gw-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: gw-skill\ndescription: demo\n---\nGateway skill body.",
+        )
+        .unwrap();
+
+        let loader = SkillLoader::with_dirs(vec![tmp.path().to_path_buf()]);
+        let static_injection = loader.build_system_injection(&loader.load_all());
+        let (dynamic_injection, _) =
+            load_skill_injection(None, None, &[tmp.path().to_path_buf()], false);
+        let combined =
+            combine_gateway_and_workspace_injection(&static_injection, &dynamic_injection);
+
+        assert_eq!(combined.matches("Gateway skill body.").count(), 1);
+    }
+
+    #[test]
+    fn non_native_backends_still_receive_loader_prompt_skills_with_builtin_static_injection() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let skill_dir = tmp.path().join("gw-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: gw-skill\ndescription: demo\n---\nGateway skill body.",
+        )
+        .unwrap();
+
+        let (dynamic_injection, _) =
+            load_skill_injection(None, None, &[tmp.path().to_path_buf()], true);
+        let combined = combine_gateway_and_workspace_injection(
+            "builtin scheduler skill marker",
+            &dynamic_injection,
+        );
+
+        assert!(combined.contains("builtin scheduler skill marker"));
+        assert!(combined.contains("Gateway skill body."));
+    }
+
+    #[test]
+    fn gateway_skill_loader_dirs_still_load_personas_when_system_exists() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let persona_dir = tmp.path().join("rex-intj");
+        std::fs::create_dir_all(&persona_dir).unwrap();
+        std::fs::write(
+            persona_dir.join("SKILL.md"),
+            "---\nname: Rex\ntype: persona\n---\nRex capabilities.",
+        )
+        .unwrap();
+
+        let (dynamic_injection, first_persona) =
+            load_skill_injection(None, None, &[tmp.path().to_path_buf()], false);
+        assert!(dynamic_injection.trim().is_empty());
+        assert!(first_persona.is_some());
     }
 
     #[tokio::test]
@@ -753,6 +937,7 @@ mod tests {
             default_workspace: None,
             session_workspace: None,
             skill_loader_dirs: &[],
+            inject_prompt_skills: true,
             initialized_persona_dirs: &initialized,
             team_tool_url: None,
             allowed_team_tools: vec![],
@@ -786,6 +971,7 @@ mod tests {
             default_workspace: None,
             session_workspace: None,
             skill_loader_dirs: &[],
+            inject_prompt_skills: true,
             initialized_persona_dirs: &initialized,
             team_tool_url: None,
             allowed_team_tools: vec![],
@@ -796,6 +982,10 @@ mod tests {
             .ctx
             .system_injection
             .contains("builtin scheduler skill marker"));
+        assert!(result
+            .ctx
+            .system_injection
+            .contains("## Host Scheduler Contract"));
     }
 
     #[tokio::test]
@@ -834,6 +1024,7 @@ mod tests {
             default_workspace: None,
             session_workspace: None,
             skill_loader_dirs: &[],
+            inject_prompt_skills: true,
             initialized_persona_dirs: &initialized,
             team_tool_url: None,
             allowed_team_tools: vec![],
@@ -844,6 +1035,41 @@ mod tests {
             .ctx
             .system_injection
             .contains("builtin scheduler skill marker"));
+        assert!(result
+            .ctx
+            .system_injection
+            .contains("## Host Scheduler Contract"));
         assert!(result.ctx.system_injection.contains("demo"));
+    }
+
+    #[test]
+    fn native_skill_backends_skip_prompt_skill_injection_but_keep_personas() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let skill_dir = workspace.path().join(".agents").join("skills").join("demo");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: demo\ndescription: demo\n---\nUse demo skill.",
+        )
+        .unwrap();
+
+        let persona_dir = workspace.path().join(".agents").join("skills").join("rex");
+        std::fs::create_dir_all(&persona_dir).unwrap();
+        std::fs::write(
+            persona_dir.join("SKILL.md"),
+            "---\nname: Rex\ntype: persona\n---\nRex capability body.",
+        )
+        .unwrap();
+
+        let (skill_injection, first_persona) =
+            load_skill_injection(Some(&workspace.path().to_path_buf()), None, &[], false);
+
+        assert!(skill_injection.trim().is_empty());
+        assert_eq!(
+            first_persona
+                .as_ref()
+                .map(|persona| persona.identity.name.as_str()),
+            Some("Rex")
+        );
     }
 }
