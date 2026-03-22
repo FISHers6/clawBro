@@ -42,7 +42,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/config/raw", put(api::config_write::put_raw_config))
         .route("/api/config/validate", post(api::config_write::validate_config))
         .route("/api/skills", get(api::skills::list_skills))
-        .route("/api/agents/{agent_id}/skills", get(api::skills::get_agent_skills))
+        .route("/api/agents/{name}/skills", get(api::skills::get_agent_skills))
         .route("/api/scheduler/jobs", get(api::scheduler::list_jobs))
         .route("/api/scheduler/jobs/{job_id}", get(api::scheduler::get_job))
         .route(
