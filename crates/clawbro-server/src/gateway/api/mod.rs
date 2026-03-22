@@ -4,6 +4,7 @@ pub mod agents;
 pub mod backends;
 pub mod channels;
 pub mod config;
+pub mod config_write;
 pub mod scheduler;
 pub mod sessions;
 pub mod skills;

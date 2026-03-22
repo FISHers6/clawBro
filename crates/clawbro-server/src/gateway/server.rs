@@ -13,7 +13,7 @@ use axum::{
     body::Bytes,
     extract::State,
     http::{HeaderMap, StatusCode},
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 use std::net::SocketAddr;
@@ -37,6 +37,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/channels/{channel_id}", get(api::channels::get_channel))
         .route("/api/config/effective", get(api::config::get_effective_config))
         .route("/api/config/spec", get(api::config::get_config_spec))
+        .route("/api/config/raw", get(api::config_write::get_raw_config))
+        .route("/api/config/raw", put(api::config_write::put_raw_config))
+        .route("/api/config/validate", post(api::config_write::validate_config))
         .route("/api/skills", get(api::skills::list_skills))
         .route("/api/agents/{agent_id}/skills", get(api::skills::get_agent_skills))
         .route("/api/scheduler/jobs", get(api::scheduler::list_jobs))
