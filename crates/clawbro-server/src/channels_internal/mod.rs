@@ -11,6 +11,7 @@ mod mention_parsing;
 pub mod mention_trigger;
 pub mod traits;
 pub mod wechat;
+pub mod wechat_login;
 pub mod ws_virtual;
 
 pub use allowlist::AllowlistChecker;
@@ -19,6 +20,7 @@ pub use dingtalk_webhook::DingTalkWebhookChannel;
 pub use lark::{LarkChannel, LarkTriggerMode, LarkTriggerPolicy};
 pub use traits::{BoxChannel, Channel};
 pub use wechat::{WeChatChannel, WeChatConfig};
+pub use wechat_login::wechat_login;
 pub use ws_virtual::WsVirtualChannel;
 
 /// Maximum number of retries for transient send errors (not counting the first attempt).

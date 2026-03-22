@@ -45,7 +45,7 @@ fn cmd_set_enabled(channel: ConfigChannelArg, enabled: bool) -> Result<()> {
 async fn cmd_login(channel: ConfigChannelArg) -> Result<()> {
     match channel {
         ConfigChannelArg::Wechat => {
-            let path = clawbro_channels::wechat_login().await?;
+            let path = crate::channels_internal::wechat_login().await?;
             println!(
                 "{} WeChat credentials saved to {}",
                 style("✓").green(),

@@ -73,7 +73,7 @@ pub async fn run(args: SetupArgs) -> Result<()> {
 
     if let channel::ChannelConfig::WeChat(wechat) = &channel_cfg {
         if wechat.login_now {
-            let path = clawbro_channels::wechat_login().await?;
+            let path = crate::channels_internal::wechat_login().await?;
             println!("✓ WeChat credentials saved to {}", path.display());
         }
     }
