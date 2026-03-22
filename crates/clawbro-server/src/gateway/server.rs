@@ -94,6 +94,7 @@ pub fn build_router(state: AppState) -> Router {
             get(api::teams::list_team_pending_completions),
         )
         .route("/api/teams/{team_id}/tasks", get(api::tasks::list_team_tasks))
+        .route("/api/chat", post(api::chat::chat_send))
         .route("/diagnostics/backends", get(diagnostics_backends))
         .route("/diagnostics/teams", get(diagnostics_teams))
         .route("/diagnostics/channels", get(diagnostics_channels))
