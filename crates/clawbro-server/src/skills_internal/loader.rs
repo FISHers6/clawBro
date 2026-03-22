@@ -8,7 +8,7 @@ const BUILTIN_SCHEDULER_NAME: &str = "scheduler";
 const BUILTIN_SCHEDULER_DIR: &str = "[builtin]/scheduler";
 const BUILTIN_SCHEDULER_SKILL_MD: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/builtin-skills/scheduler/SKILL.md"
+    "/host-skills/scheduler/SKILL.md"
 ));
 
 const INJECTION_KEYWORDS: &[&str] = &[

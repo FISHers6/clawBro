@@ -115,7 +115,6 @@ pub struct ToolSurfaceSpec {
     pub schedule_tools: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_schedule_tools: Vec<ScheduleTool>,
-    pub local_skills: bool,
     pub external_mcp: bool,
     pub backend_native_tools: bool,
 }
@@ -172,7 +171,6 @@ pub struct AgentTurnRequest {
     pub tool_surface: ToolSurfaceSpec,
     #[serde(default)]
     pub approval_mode: ApprovalMode,
-    pub tool_bridge_url: Option<String>,
     #[serde(default)]
     pub external_mcp_servers: Vec<ExternalMcpServerSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -229,7 +227,6 @@ mod tests {
             prompt_text: "hello".into(),
             tool_surface: ToolSurfaceSpec::default(),
             approval_mode: ApprovalMode::AutoAllow,
-            tool_bridge_url: None,
             external_mcp_servers: vec![],
             provider_profile: None,
             context: RuntimeContext::default(),

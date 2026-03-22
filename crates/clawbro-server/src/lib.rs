@@ -21,8 +21,8 @@ pub mod scheduler_runtime;
 pub mod session;
 pub mod skills_internal;
 pub mod state;
-pub mod team_runtime;
 pub mod team_contract;
+pub mod team_runtime;
 
 pub use gateway_process::run as run_gateway_process;
 

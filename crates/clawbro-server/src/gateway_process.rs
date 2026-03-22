@@ -357,6 +357,86 @@ pub async fn run() -> Result<()> {
         }
     }
 
+    // 启动 Channel 监听（WeChat）
+    let mut wechat_cancel_token: Option<tokio_util::sync::CancellationToken> = None;
+    if let Some(wx_cfg) = &cfg.channels.wechat {
+        if wx_cfg.enabled {
+            let wx_presentation = wx_cfg.presentation;
+            match crate::channels_internal::WeChatConfig::load() {
+                Ok(wx_config) => {
+                    let wx_cancel = tokio_util::sync::CancellationToken::new();
+                    wechat_cancel_token = Some(wx_cancel.clone());
+                    let wx_cancel_clone = wx_cancel.clone();
+                    let channel = Arc::new(crate::channels_internal::WeChatChannel::new(
+                        wx_config,
+                        cfg.gateway.require_mention_in_groups,
+                        wx_cancel,
+                    ));
+                    cron_channel_map.register(
+                        "wechat",
+                        Option::<String>::None,
+                        channel.clone() as Arc<dyn crate::channels_internal::Channel>,
+                        true,
+                    );
+                    let registry_clone = registry.clone();
+                    let channel_clone = channel.clone();
+                    let delivery_channels = Arc::new(cron_channel_map.clone());
+                    let delivery_cfg = cfg_arc.clone();
+                    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+
+                    tokio::spawn(async move {
+                        let mut delay = Duration::from_secs(5);
+                        loop {
+                            match crate::channels_internal::Channel::listen(
+                                channel.as_ref(),
+                                tx.clone(),
+                            )
+                            .await
+                            {
+                                Err(e) => {
+                                    delay = next_delay(delay);
+                                    tracing::error!(
+                                        "WeChat listen error (retry in {:?}): {e}",
+                                        delay
+                                    );
+                                }
+                                Ok(()) => {
+                                    delay = Duration::from_secs(5);
+                                    tracing::info!(
+                                        "WeChat long-poll ended normally, reconnecting in {:?}",
+                                        delay
+                                    );
+                                }
+                            }
+                            tokio::select! {
+                                _ = tokio::time::sleep(delay) => {},
+                                _ = wx_cancel_clone.cancelled() => break,
+                            }
+                        }
+                    });
+
+                    tokio::spawn(async move {
+                        while let Some(inbound) = rx.recv().await {
+                            spawn_im_turn(
+                                registry_clone.clone(),
+                                channel_clone.clone() as Arc<dyn crate::channels_internal::Channel>,
+                                delivery_channels.clone(),
+                                delivery_cfg.clone(),
+                                inbound,
+                                wx_presentation,
+                            );
+                        }
+                    });
+
+                    tracing::info!("WeChat channel started");
+                }
+                Err(e) => {
+                    tracing::warn!("WeChat enabled but credentials not available: {e}");
+                }
+            }
+        }
+    }
+
     if let Some(webhook_cfg) = &cfg.channels.dingtalk_webhook {
         if webhook_cfg.enabled {
             let channel = Arc::new(crate::channels_internal::DingTalkWebhookChannel::new(
@@ -654,6 +734,13 @@ pub async fn run() -> Result<()> {
     // 阻塞等待
     tokio::signal::ctrl_c().await?;
     tracing::info!("Gateway shutting down");
+
+    // Cancel WeChat listen loop for graceful shutdown
+    if let Some(token) = &wechat_cancel_token {
+        token.cancel();
+        tracing::info!("WeChat cancellation token cancelled");
+    }
+
     Ok(())
 }
 

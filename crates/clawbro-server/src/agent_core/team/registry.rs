@@ -46,7 +46,7 @@ pub enum TaskStatus {
     Retrying(u32),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Task {
     pub id: String,
     pub title: String,

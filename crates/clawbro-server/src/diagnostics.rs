@@ -808,6 +808,7 @@ mod tests {
                     presentation: config::ProgressPresentationMode::FinalOnly,
                 }),
                 dingtalk_webhook: None,
+                wechat: None,
             },
             groups: vec![config::GroupConfig {
                 scope: "group:lark:abc".to_string(),

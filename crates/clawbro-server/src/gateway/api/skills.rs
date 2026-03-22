@@ -1,10 +1,14 @@
 use crate::agent_core::{
     roster::AgentEntry,
-    skill_paths::{agent_scoped_skills_dir, project_universal_skills_dir, workspace_private_skills_dir},
+    skill_paths::{
+        agent_scoped_skills_dir, project_universal_skills_dir, workspace_private_skills_dir,
+    },
 };
 use crate::config::GatewayConfig;
 use crate::runtime::BackendSpec;
-use crate::skills_internal::{check_default_skills, DefaultSkillsCheckReport, LoadedSkill, SkillLoader};
+use crate::skills_internal::{
+    check_default_skills, DefaultSkillsCheckReport, LoadedSkill, SkillLoader,
+};
 use crate::state::AppState;
 use axum::{
     extract::{Path as AxumPath, State},
@@ -254,7 +258,11 @@ fn resolve_agent_roots(cfg: &GatewayConfig, entry: &AgentEntry) -> Vec<LabeledRo
     let mut roots = resolve_global_roots(cfg);
     let mut seen = roots
         .iter()
-        .map(|root| root.path.canonicalize().unwrap_or_else(|_| root.path.clone()))
+        .map(|root| {
+            root.path
+                .canonicalize()
+                .unwrap_or_else(|_| root.path.clone())
+        })
         .collect::<HashSet<_>>();
     if let Some(workspace) = entry.workspace_dir.as_deref() {
         push_labeled_root(
@@ -277,7 +285,12 @@ fn resolve_agent_roots(cfg: &GatewayConfig, entry: &AgentEntry) -> Vec<LabeledRo
         );
     }
     for path in &entry.extra_skills_dirs {
-        push_labeled_root(&mut roots, &mut seen, "agent-extra".to_string(), path.clone());
+        push_labeled_root(
+            &mut roots,
+            &mut seen,
+            "agent-extra".to_string(),
+            path.clone(),
+        );
     }
     roots
 }
@@ -376,7 +389,10 @@ fn derive_agent_role(cfg: &GatewayConfig, agent_name: &str) -> AgentRole {
     let identities = derive_agent_identities(cfg, agent_name);
     if identities.iter().any(|identity| identity == "front_bot") {
         AgentRole::Lead
-    } else if identities.iter().any(|identity| identity == "roster_member") {
+    } else if identities
+        .iter()
+        .any(|identity| identity == "roster_member")
+    {
         AgentRole::Specialist
     } else {
         AgentRole::Solo

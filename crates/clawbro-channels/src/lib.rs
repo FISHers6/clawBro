@@ -4,11 +4,15 @@ pub mod lark;
 mod mention_parsing;
 pub mod mention_trigger;
 pub mod traits;
+pub mod wechat;
+pub mod wechat_login;
 
 pub use allowlist::AllowlistChecker;
 pub use dingtalk::{DingTalkChannel, DingTalkConfig};
 pub use lark::{LarkChannel, LarkTriggerMode, LarkTriggerPolicy};
 pub use traits::{BoxChannel, Channel};
+pub use wechat::{WeChatChannel, WeChatConfig};
+pub use wechat_login::wechat_login;
 
 /// Maximum number of retries for transient send errors (not counting the first attempt).
 pub(crate) const SEND_MAX_RETRIES: u32 = 3;

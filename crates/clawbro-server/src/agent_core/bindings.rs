@@ -112,6 +112,24 @@ pub fn resolve_binding<'a>(
         })
 }
 
+pub fn resolve_channel_instance_binding_for_target<'a>(
+    session_key: &SessionKey,
+    target_agent: &str,
+    bindings: &'a [BindingRule],
+) -> Option<&'a BindingRule> {
+    let Some(channel_instance) = session_key.channel_instance.as_deref() else {
+        return None;
+    };
+    let target_instance = target_agent.trim().trim_start_matches('@');
+    if target_instance != channel_instance {
+        return None;
+    }
+    bindings
+        .iter()
+        .rev()
+        .find(|binding| matches_channel_instance(binding, session_key))
+}
+
 fn channel_matches(binding_channel: &Option<String>, session_key: &SessionKey) -> bool {
     binding_channel
         .as_deref()
@@ -268,6 +286,28 @@ mod tests {
 
         let matched = resolve_binding(&inbound, &inbound.session_key, &bindings).unwrap();
         assert_eq!(matched.agent_name(), "scope-agent");
+    }
+
+    #[test]
+    fn channel_instance_binding_can_be_recovered_from_platform_target() {
+        let session_key = SessionKey::with_instance("lark", "alpha", "group:oc_123");
+        let bindings = vec![
+            BindingRule::ChannelInstance {
+                channel: "lark".into(),
+                channel_instance: "alpha".into(),
+                agent_name: "claw".into(),
+            },
+            BindingRule::ChannelInstance {
+                channel: "lark".into(),
+                channel_instance: "beta".into(),
+                agent_name: "claude".into(),
+            },
+        ];
+
+        let matched =
+            resolve_channel_instance_binding_for_target(&session_key, "@alpha", &bindings)
+                .expect("platform target should resolve through channel-instance binding");
+        assert_eq!(matched.agent_name(), "claw");
     }
 
     #[test]

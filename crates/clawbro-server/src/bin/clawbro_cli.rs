@@ -24,6 +24,10 @@ async fn run() -> Result<()> {
         Commands::Status => clawbro::cli::status::run().await,
         Commands::Schedule(args) => clawbro::cli::schedule::run(args).await,
         Commands::Skill(args) => clawbro::cli::skills::run(args).await,
+        Commands::WechatLogin => {
+            clawbro_channels::wechat_login().await?;
+            Ok(())
+        }
         Commands::Completions(args) => clawbro::cli::completions::run(args),
     }
 }

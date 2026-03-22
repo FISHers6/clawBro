@@ -94,7 +94,10 @@ fn build_agent_view(
     let identities = derive_agent_identities(cfg, &entry.name);
     let role = if identities.iter().any(|identity| identity == "front_bot") {
         "lead"
-    } else if identities.iter().any(|identity| identity == "roster_member") {
+    } else if identities
+        .iter()
+        .any(|identity| identity == "roster_member")
+    {
         "specialist"
     } else {
         "solo"

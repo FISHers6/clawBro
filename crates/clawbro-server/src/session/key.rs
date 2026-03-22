@@ -1,4 +1,4 @@
-use crate::protocol::{normalize_conversation_identity, SessionKey};
+use crate::protocol::{normalize_runtime_session_identity, SessionKey};
 use uuid::Uuid;
 
 pub type SessionId = Uuid;
@@ -6,7 +6,7 @@ pub type SessionId = Uuid;
 /// 从 SessionKey 生成确定性 SessionId（UUID v5）
 pub fn key_to_session_id(key: &SessionKey) -> Uuid {
     let namespace = Uuid::NAMESPACE_URL;
-    let normalized = normalize_conversation_identity(key);
+    let normalized = normalize_runtime_session_identity(key);
     let name = match normalized.channel_instance.as_deref() {
         Some(instance) => format!("{}@{}:{}", normalized.channel, instance, normalized.scope),
         None => format!("{}:{}", normalized.channel, normalized.scope),
@@ -34,10 +34,10 @@ mod tests {
     }
 
     #[test]
-    fn test_group_instances_share_session_id() {
+    fn test_group_instances_have_distinct_session_id() {
         let k1 = SessionKey::with_instance("lark", "alpha", "group:oc_1");
         let k2 = SessionKey::with_instance("lark", "beta", "group:oc_1");
-        assert_eq!(key_to_session_id(&k1), key_to_session_id(&k2));
+        assert_ne!(key_to_session_id(&k1), key_to_session_id(&k2));
     }
 
     #[test]

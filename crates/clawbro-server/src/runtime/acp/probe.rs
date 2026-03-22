@@ -24,7 +24,7 @@ pub fn capability_profile_from_initialize(
         role_eligibility: RoleEligibility {
             solo: true,
             relay: true,
-            specialist: mcp.sse || mcp.http,
+            specialist: true,
             lead: true,
         },
     }
@@ -51,7 +51,7 @@ mod tests {
     }
 
     #[test]
-    fn capability_profile_without_mcp_is_solo_and_relay_only() {
+    fn capability_profile_without_mcp_still_supports_team_roles() {
         let init = acp::InitializeResponse::new(acp::ProtocolVersion::V1);
         let profile = capability_profile_from_initialize(&init, false, false);
 
@@ -59,6 +59,7 @@ mod tests {
         assert!(!profile.native_local_skills);
         assert!(profile.role_eligibility.solo);
         assert!(profile.role_eligibility.relay);
-        assert!(!profile.role_eligibility.specialist);
+        assert!(profile.role_eligibility.specialist);
+        assert!(profile.role_eligibility.lead);
     }
 }

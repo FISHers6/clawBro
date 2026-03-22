@@ -5,6 +5,5 @@ pub mod milestone_delivery;
 pub mod orchestrator;
 pub mod registry;
 pub mod session;
-pub mod shared_mcp_server;
 pub mod specialist_turn;
 pub mod tool_executor;

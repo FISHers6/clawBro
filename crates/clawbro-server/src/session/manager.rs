@@ -1,10 +1,15 @@
-use crate::protocol::{normalize_conversation_identity, SessionKey};
+use crate::protocol::{
+    normalize_runtime_session_identity, DashboardEvent, SessionKey, SessionSummaryEvent,
+};
 use crate::session::key::{key_to_session_id, SessionId};
-use crate::session::storage::{SessionMeta, SessionStatus, SessionStorage, StoredMessage};
+use crate::session::storage::{
+    SessionMeta, SessionStatus, SessionStorage, StoredMessage, StoredSessionEvent,
+};
 use anyhow::Result;
 use chrono::Utc;
 use dashmap::DashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use tokio::sync::broadcast;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResumeDropReason {
@@ -37,6 +42,7 @@ pub struct SessionManager {
     active: DashMap<SessionKey, SessionId>,
     /// Singleflight guard for first-time creation per normalized session key.
     creation_locks: DashMap<SessionKey, Arc<tokio::sync::Mutex<()>>>,
+    dashboard_tx: OnceLock<broadcast::Sender<DashboardEvent>>,
 }
 
 impl SessionManager {
@@ -45,12 +51,43 @@ impl SessionManager {
             storage: Arc::new(storage),
             active: DashMap::new(),
             creation_locks: DashMap::new(),
+            dashboard_tx: OnceLock::new(),
+        }
+    }
+
+    pub fn set_dashboard_sender(&self, tx: broadcast::Sender<DashboardEvent>) {
+        let _ = self.dashboard_tx.set(tx);
+    }
+
+    fn emit_session_meta(&self, meta: &SessionMeta) {
+        if let Some(tx) = self.dashboard_tx.get() {
+            let (status, backend_id) = match &meta.session_status {
+                SessionStatus::Idle => ("idle".to_string(), None),
+                SessionStatus::Running { backend_id, .. } => {
+                    ("running".to_string(), Some(backend_id.clone()))
+                }
+            };
+            let _ = tx.send(DashboardEvent::SessionUpdated {
+                summary: SessionSummaryEvent {
+                    session_id: meta.session_id.to_string(),
+                    session_key: SessionKey {
+                        channel: meta.channel.clone(),
+                        scope: meta.scope.clone(),
+                        channel_instance: meta.channel_instance.clone(),
+                    },
+                    created_at: meta.created_at.to_rfc3339(),
+                    updated_at: meta.updated_at.to_rfc3339(),
+                    message_count: meta.message_count,
+                    status,
+                    backend_id,
+                },
+            });
         }
     }
 
     /// 获取或创建 Session（幂等，基于 UUID v5 确定性 ID）
     pub async fn get_or_create(&self, key: &SessionKey) -> Result<SessionId> {
-        let normalized = normalize_conversation_identity(key);
+        let normalized = normalize_runtime_session_identity(key);
         if let Some(id) = self.active.get(&normalized) {
             return Ok(*id);
         }
@@ -78,17 +115,51 @@ impl SessionManager {
                 session_status: SessionStatus::Idle,
             };
             self.storage.save_meta(&meta).await?;
+            self.emit_session_meta(&meta);
         }
         self.active.insert(normalized, session_id);
         Ok(session_id)
     }
 
     pub async fn append_message(&self, session_id: SessionId, msg: &StoredMessage) -> Result<()> {
-        self.storage.append_message(session_id, msg).await
+        self.storage.append_message(session_id, msg).await?;
+        let mut meta = self
+            .storage
+            .load_meta(session_id)
+            .await?
+            .unwrap_or_else(|| SessionMeta {
+                session_id,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                channel: String::new(),
+                scope: String::new(),
+                channel_instance: None,
+                message_count: 0,
+                backend_session_ids: Default::default(),
+                backend_resume_fingerprints: Default::default(),
+                session_status: SessionStatus::Idle,
+            });
+        meta.message_count = meta.message_count.saturating_add(1);
+        meta.updated_at = Utc::now();
+        self.storage.save_meta(&meta).await?;
+        self.emit_session_meta(&meta);
+        Ok(())
     }
 
     pub fn storage(&self) -> Arc<SessionStorage> {
         self.storage.clone()
+    }
+
+    pub async fn list_metas(&self) -> Result<Vec<SessionMeta>> {
+        self.storage.list_metas().await
+    }
+
+    pub async fn append_event(
+        &self,
+        session_id: SessionId,
+        event: &StoredSessionEvent,
+    ) -> Result<()> {
+        self.storage.append_event(session_id, event).await
     }
 
     /// 读取指定 session 的 meta（用于获取 backend_session_ids）
@@ -135,6 +206,7 @@ impl SessionManager {
                 meta.backend_resume_fingerprints.remove(backend_id);
                 meta.updated_at = Utc::now();
                 self.storage.save_meta(&meta).await?;
+                self.emit_session_meta(&meta);
                 Ok(ResumableBackendSession::DroppedStale {
                     stale_session_id,
                     reason,
@@ -145,7 +217,9 @@ impl SessionManager {
 
     /// 覆盖写 meta（原子 tmp→rename）
     pub async fn save_meta(&self, meta: &SessionMeta) -> Result<()> {
-        self.storage.save_meta(meta).await
+        self.storage.save_meta(meta).await?;
+        self.emit_session_meta(meta);
+        Ok(())
     }
 
     /// Explicitly drop one backend's stored resume state after runtime confirms
@@ -162,6 +236,7 @@ impl SessionManager {
         meta.backend_resume_fingerprints.remove(backend_id);
         meta.updated_at = Utc::now();
         self.storage.save_meta(&meta).await?;
+        self.emit_session_meta(&meta);
         Ok(removed_id)
     }
 
@@ -189,7 +264,9 @@ impl SessionManager {
             started_at: Utc::now(),
         };
         meta.updated_at = Utc::now();
-        self.storage.save_meta(&meta).await
+        self.storage.save_meta(&meta).await?;
+        self.emit_session_meta(&meta);
+        Ok(())
     }
 
     /// turn 完成时调用：更新 backend_session_id，重置 session_status 为 Idle。
@@ -227,7 +304,9 @@ impl SessionManager {
         }
         meta.session_status = SessionStatus::Idle;
         meta.updated_at = Utc::now();
-        self.storage.save_meta(&meta).await
+        self.storage.save_meta(&meta).await?;
+        self.emit_session_meta(&meta);
+        Ok(())
     }
 
     /// 重置会话的 conversation state：清除消息记录、清空所有 backend_session_ids、
@@ -260,7 +339,9 @@ impl SessionManager {
         meta.message_count = 0;
         meta.session_status = SessionStatus::Idle;
         meta.updated_at = Utc::now();
-        self.storage.save_meta(&meta).await
+        self.storage.save_meta(&meta).await?;
+        self.emit_session_meta(&meta);
+        Ok(())
     }
 
     /// 启动时扫描：找出所有 session_status=Running 的 session，重置为 Idle。
@@ -309,6 +390,7 @@ impl SessionManager {
                     );
                     continue;
                 }
+                self.emit_session_meta(&meta);
                 recovered.push(meta.session_id);
             }
         }
@@ -319,12 +401,19 @@ impl SessionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::SessionKey;
+    use crate::protocol::{DashboardEvent, SessionKey};
+    use tokio::sync::broadcast;
 
     fn make_manager() -> (SessionManager, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
         let storage = SessionStorage::new(dir.path().to_path_buf());
         (SessionManager::new(storage), dir)
+    }
+
+    fn attach_dashboard(mgr: &SessionManager) -> broadcast::Receiver<DashboardEvent> {
+        let (tx, rx) = broadcast::channel(16);
+        mgr.set_dashboard_sender(tx);
+        rx
     }
 
     #[tokio::test]
@@ -596,7 +685,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn group_instances_share_session_record() {
+    async fn group_instances_do_not_share_session_record() {
         let (mgr, _dir) = make_manager();
         let key_a = SessionKey::with_instance("lark", "alpha", "group:oc_1");
         let key_b = SessionKey::with_instance("lark", "beta", "group:oc_1");
@@ -604,7 +693,7 @@ mod tests {
         let id_a = mgr.get_or_create(&key_a).await.unwrap();
         let id_b = mgr.get_or_create(&key_b).await.unwrap();
 
-        assert_eq!(id_a, id_b);
+        assert_ne!(id_a, id_b);
     }
 
     #[tokio::test]
@@ -765,5 +854,54 @@ mod tests {
 
         let meta = mgr.load_meta(a).await.unwrap().unwrap();
         assert_eq!(meta.scope, "group:oc_race");
+    }
+
+    #[tokio::test]
+    async fn session_manager_emits_dashboard_session_updates() {
+        let (mgr, _dir) = make_manager();
+        let mut rx = attach_dashboard(&mgr);
+        let key = SessionKey::new("lark", "group:oc_dash");
+        let session_id = mgr.get_or_create(&key).await.unwrap();
+
+        match rx.recv().await.unwrap() {
+            DashboardEvent::SessionUpdated { summary } => {
+                assert_eq!(summary.session_id, session_id.to_string());
+                assert_eq!(summary.session_key, key);
+                assert_eq!(summary.status, "idle");
+                assert_eq!(summary.message_count, 0);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        mgr.begin_turn(session_id, "claude-main").await.unwrap();
+        match rx.recv().await.unwrap() {
+            DashboardEvent::SessionUpdated { summary } => {
+                assert_eq!(summary.status, "running");
+                assert_eq!(summary.backend_id.as_deref(), Some("claude-main"));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        mgr.append_message(
+            session_id,
+            &StoredMessage {
+                id: uuid::Uuid::new_v4(),
+                role: "user".to_string(),
+                content: "hello".to_string(),
+                timestamp: Utc::now(),
+                sender: Some("tester".to_string()),
+                tool_calls: None,
+                fragment_event_ids: None,
+                aggregation_mode: None,
+            },
+        )
+        .await
+        .unwrap();
+        match rx.recv().await.unwrap() {
+            DashboardEvent::SessionUpdated { summary } => {
+                assert_eq!(summary.message_count, 1);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 }

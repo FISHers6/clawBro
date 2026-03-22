@@ -804,6 +804,8 @@ pub struct ChannelsSection {
     pub dingtalk_webhook: Option<DingTalkWebhookSection>,
     #[serde(default)]
     pub lark: Option<LarkSection>,
+    #[serde(default)]
+    pub wechat: Option<WeChatSection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -820,6 +822,13 @@ pub struct DingTalkWebhookSection {
     pub webhook_path: String,
     #[serde(default)]
     pub access_token: Option<String>,
+    #[serde(default)]
+    pub presentation: ProgressPresentationMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WeChatSection {
+    pub enabled: bool,
     #[serde(default)]
     pub presentation: ProgressPresentationMode,
 }

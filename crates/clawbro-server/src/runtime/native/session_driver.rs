@@ -1,4 +1,5 @@
 use crate::agent_sdk_internal::bridge::AgentEvent;
+use crate::protocol::render_session_key_text;
 use crate::runtime::{
     contract::{RuntimeEvent, RuntimeSessionSpec, TurnResult},
     event_sink::RuntimeEventSink,
@@ -32,6 +33,7 @@ pub async fn run_command_turn(
         config,
         session.workspace_dir.as_deref(),
         session.team_tool_url.as_deref(),
+        Some(&render_session_key_text(&session.session_key)),
     )?;
     let mut stdin = child.stdin.take().expect("stdin available");
     let stdout = child.stdout.take().expect("stdout available");
@@ -150,6 +152,7 @@ fn spawn_command(
     config: &NativeCommandConfig,
     workspace_dir: Option<&std::path::Path>,
     team_tool_url: Option<&str>,
+    session_ref: Option<&str>,
 ) -> anyhow::Result<tokio::process::Child> {
     let mut cmd = Command::new(&config.command);
     cmd.args(&config.args)
@@ -160,6 +163,9 @@ fn spawn_command(
 
     if let Some(url) = team_tool_url {
         cmd.env("CLAWBRO_TEAM_TOOL_URL", url);
+    }
+    if let Some(session_ref) = session_ref {
+        cmd.env("CLAWBRO_SESSION_REF", session_ref);
     }
     if let Ok(path) = std::env::current_exe() {
         cmd.env("CLAWBRO_SCHEDULE_COMMAND", path);
@@ -205,7 +211,6 @@ mod tests {
             prompt_text: "hello".into(),
             tool_surface: ToolSurfaceSpec::default(),
             approval_mode: Default::default(),
-            tool_bridge_url: None,
             external_mcp_servers: vec![],
             team_tool_url: None,
             provider_profile: None,
@@ -227,7 +232,6 @@ mod tests {
             prompt_text: "hello".into(),
             tool_surface: ToolSurfaceSpec::default(),
             approval_mode: Default::default(),
-            tool_bridge_url: None,
             external_mcp_servers: vec![],
             team_tool_url: None,
             provider_profile: None,
@@ -257,5 +261,31 @@ mod tests {
             .events
             .iter()
             .any(|event| matches!(event, RuntimeEvent::TurnFailed { error } if error == "boom")));
+    }
+
+    #[tokio::test]
+    async fn native_team_turn_injects_team_session_ref_env() {
+        let cfg = NativeCommandConfig {
+            command: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                "printf '%s\\n' \"{\\\"TurnComplete\\\":{\\\"full_text\\\":\\\"$CLAWBRO_SESSION_REF|$CLAWBRO_TEAM_TOOL_URL\\\"}}\"".into(),
+            ],
+            env: vec![],
+        };
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink = RuntimeEventSink::new(tx);
+        let mut session = sample_runtime_session();
+        session.session_key = crate::protocol::SessionKey::new("lark", "group:team-native");
+        session.team_tool_url = Some("http://127.0.0.1:18080/runtime/team-tools?token=test".into());
+
+        let result = run_command_turn(&cfg, session, sink)
+            .await
+            .expect("native command turn should complete");
+
+        assert_eq!(
+            result.full_text,
+            "lark:group:team-native|http://127.0.0.1:18080/runtime/team-tools?token=test"
+        );
     }
 }

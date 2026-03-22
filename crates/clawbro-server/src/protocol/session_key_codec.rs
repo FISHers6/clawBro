@@ -24,6 +24,13 @@ pub fn normalize_channel_instance(value: Option<&str>) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+pub fn normalize_runtime_session_identity(session_key: &SessionKey) -> SessionKey {
+    let mut normalized = session_key.clone();
+    normalized.channel_instance =
+        normalize_channel_instance(session_key.channel_instance.as_deref());
+    normalized
+}
+
 pub fn normalize_conversation_identity(session_key: &SessionKey) -> SessionKey {
     let mut normalized = session_key.clone();
     normalized.channel_instance = match classify_session_scope(session_key) {
@@ -142,6 +149,23 @@ mod tests {
                 channel: "lark".into(),
                 scope: "group:oc_x".into(),
                 channel_instance: None,
+            }
+        );
+    }
+
+    #[test]
+    fn normalize_runtime_session_identity_keeps_group_instances() {
+        let session_key = SessionKey {
+            channel: "lark".into(),
+            scope: "group:oc_x".into(),
+            channel_instance: Some("beta".into()),
+        };
+        assert_eq!(
+            normalize_runtime_session_identity(&session_key),
+            SessionKey {
+                channel: "lark".into(),
+                scope: "group:oc_x".into(),
+                channel_instance: Some("beta".into()),
             }
         );
     }

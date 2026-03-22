@@ -1,3 +1,4 @@
+use crate::protocol::AgentEvent;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -30,6 +31,12 @@ pub struct ToolCallRecord {
     pub input: serde_json::Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredSessionEvent {
+    pub timestamp: DateTime<Utc>,
+    pub event: AgentEvent,
 }
 
 /// ACP backend session 的运行状态，用于检测 Gateway 崩溃后遗留的卡死 session。
@@ -189,8 +196,73 @@ impl SessionStorage {
         Ok(Some(serde_json::from_str(&json)?))
     }
 
+    pub async fn list_metas(&self) -> Result<Vec<SessionMeta>> {
+        let mut metas = Vec::new();
+        let mut entries = match tokio::fs::read_dir(&self.base_dir).await {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(metas),
+            Err(err) => return Err(err.into()),
+        };
+
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let meta_path = path.join("metadata.json");
+            if !meta_path.exists() {
+                continue;
+            }
+            let json = match tokio::fs::read_to_string(&meta_path).await {
+                Ok(json) => json,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err.into()),
+            };
+            metas.push(serde_json::from_str(&json)?);
+        }
+
+        metas.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        Ok(metas)
+    }
+
     fn message_path(&self, session_id: Uuid) -> PathBuf {
         self.session_dir(session_id).join("messages.jsonl")
+    }
+
+    fn event_path(&self, session_id: Uuid) -> PathBuf {
+        self.session_dir(session_id).join("events.jsonl")
+    }
+
+    pub async fn append_event(&self, session_id: Uuid, event: &StoredSessionEvent) -> Result<()> {
+        let dir = self.session_dir(session_id);
+        tokio::fs::create_dir_all(&dir).await?;
+        let path = self.event_path(session_id);
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await?;
+        let line = serde_json::to_string(event)?;
+        file.write_all(format!("{}\n", line).as_bytes()).await?;
+        Ok(())
+    }
+
+    pub async fn load_events(&self, session_id: Uuid) -> Result<Vec<StoredSessionEvent>> {
+        let path = self.event_path(session_id);
+        if !path.exists() {
+            return Ok(vec![]);
+        }
+        let content = match tokio::fs::read_to_string(&path).await {
+            Ok(content) => content,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+            Err(err) => return Err(err.into()),
+        };
+        let events = content
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(serde_json::from_str)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(events)
     }
 
     /// 清除该 session 的所有消息（删除 JSONL 文件）
@@ -322,6 +394,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_list_metas_scans_all_session_directories() {
+        let dir = tempdir().unwrap();
+        let storage = SessionStorage::new(dir.path().to_path_buf());
+
+        for scope in ["user:one", "group:two"] {
+            let meta = SessionMeta {
+                session_id: Uuid::new_v4(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                channel: "lark".to_string(),
+                scope: scope.to_string(),
+                channel_instance: Some("alpha".to_string()),
+                message_count: 0,
+                backend_session_ids: Default::default(),
+                backend_resume_fingerprints: Default::default(),
+                session_status: SessionStatus::Idle,
+            };
+            storage.save_meta(&meta).await.unwrap();
+        }
+
+        let metas = storage.list_metas().await.unwrap();
+        assert_eq!(metas.len(), 2);
+    }
+
+    #[tokio::test]
     async fn test_load_recent_messages_respects_limit() {
         let dir = tempdir().unwrap();
         let storage = SessionStorage::new(dir.path().to_path_buf());
@@ -416,6 +513,21 @@ mod tests {
             loaded[0].aggregation_mode.as_deref(),
             Some("turn_compacted")
         );
+    }
+
+    #[tokio::test]
+    async fn stored_session_events_roundtrip() {
+        let dir = tempdir().unwrap();
+        let storage = SessionStorage::new(dir.path().to_path_buf());
+        let session_id = Uuid::new_v4();
+        let record = StoredSessionEvent {
+            timestamp: Utc::now(),
+            event: AgentEvent::Thinking { session_id },
+        };
+        storage.append_event(session_id, &record).await.unwrap();
+        let loaded = storage.load_events(session_id).await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert!(matches!(loaded[0].event, AgentEvent::Thinking { .. }));
     }
 
     #[test]

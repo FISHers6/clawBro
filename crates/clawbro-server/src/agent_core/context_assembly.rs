@@ -11,6 +11,7 @@ use crate::protocol::{InboundMsg, MsgSource, ScheduleTool, SessionKey, TeamTool}
 use crate::runtime::{visible_schedule_tools_for_role, RuntimeRole};
 use crate::session::StoredMessage;
 use crate::skills_internal::{PersonaSkillData, SkillLoader};
+use crate::team_contract::{render_canonical_team_skill_injection, render_team_host_contract};
 use dashmap::DashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -141,6 +142,7 @@ pub(crate) async fn assemble_context(request: ContextAssemblyRequest<'_>) -> Con
         );
     }
     append_scheduler_host_guidance(&mut system_injection);
+    append_team_contract_guidance(&mut system_injection, request.agent_role);
     if matches!(request.agent_role, AgentRole::Lead | AgentRole::Specialist) {
         if let Some(team_workspace_guide) = request
             .session_team_orch
@@ -162,12 +164,6 @@ pub(crate) async fn assemble_context(request: ContextAssemblyRequest<'_>) -> Con
         team_dir.clone(),
         workspace_dir_resolved.clone(),
     );
-    // Base URL without path suffix; build_mcp_servers appends /sse or /mcp
-    // depending on what the ACP agent reports it supports.
-    let mcp_server_url = request
-        .session_team_orch
-        .and_then(|o| o.mcp_server_port.get().copied())
-        .map(|port| format!("http://127.0.0.1:{port}"));
     let team_tool_url = request
         .session_team_orch
         .and_then(|_| request.team_tool_url.clone());
@@ -192,7 +188,6 @@ pub(crate) async fn assemble_context(request: ContextAssemblyRequest<'_>) -> Con
             agent_role: request.agent_role,
             team_dir,
             task_reminder: request.task_reminder,
-            mcp_server_url,
             team_tool_url,
             allowed_team_tools: request.allowed_team_tools,
             allowed_schedule_tools,
@@ -278,6 +273,32 @@ fn append_scheduler_host_guidance(system_injection: &mut String) {
     } else {
         system_injection.push_str("\n\n");
         system_injection.push_str(SCHEDULER_HOST_GUIDANCE);
+    }
+}
+
+fn append_team_contract_guidance(system_injection: &mut String, agent_role: AgentRole) {
+    if !matches!(agent_role, AgentRole::Lead | AgentRole::Specialist) {
+        return;
+    }
+
+    let host_contract = render_team_host_contract(agent_role);
+    if !system_injection.contains("## Host Team Contract") {
+        if system_injection.trim().is_empty() {
+            *system_injection = host_contract.to_string();
+        } else {
+            system_injection.push_str("\n\n");
+            system_injection.push_str(host_contract);
+        }
+    }
+
+    let team_skill = render_canonical_team_skill_injection(agent_role);
+    if !system_injection.contains("# Canonical Team Skill") {
+        if system_injection.trim().is_empty() {
+            *system_injection = team_skill.to_string();
+        } else {
+            system_injection.push_str("\n\n");
+            system_injection.push_str(team_skill);
+        }
     }
 }
 
@@ -378,9 +399,8 @@ fn load_skill_injection(
     let persona_loader = SkillLoader::with_dirs(persona_dirs);
     let personas = persona_loader.load_personas();
 
-    let mut capability_dirs = Vec::new();
+    let mut capability_dirs = agent_skill_dirs;
     if inject_prompt_skills {
-        capability_dirs = agent_skill_dirs;
         capability_dirs.extend(skill_loader_dirs.iter().cloned());
     }
     let skill_injection = if capability_dirs.is_empty() {
@@ -949,6 +969,14 @@ mod tests {
             .ctx
             .system_injection
             .contains("Use create_task first."));
+        assert!(result
+            .ctx
+            .system_injection
+            .contains("## Host Team Contract"));
+        assert!(result
+            .ctx
+            .system_injection
+            .contains("# Canonical Team Skill"));
     }
 
     #[tokio::test]
@@ -1043,7 +1071,7 @@ mod tests {
     }
 
     #[test]
-    fn native_skill_backends_skip_prompt_skill_injection_but_keep_personas() {
+    fn native_skill_backends_skip_loader_prompt_skills_but_keep_workspace_overlays_and_personas() {
         let workspace = tempfile::TempDir::new().unwrap();
         let skill_dir = workspace.path().join(".agents").join("skills").join("demo");
         std::fs::create_dir_all(&skill_dir).unwrap();
@@ -1061,10 +1089,24 @@ mod tests {
         )
         .unwrap();
 
-        let (skill_injection, first_persona) =
-            load_skill_injection(Some(&workspace.path().to_path_buf()), None, &[], false);
+        let gateway = tempfile::TempDir::new().unwrap();
+        let gateway_skill_dir = gateway.path().join("gw-skill");
+        std::fs::create_dir_all(&gateway_skill_dir).unwrap();
+        std::fs::write(
+            gateway_skill_dir.join("SKILL.md"),
+            "---\nname: gw-skill\ndescription: demo\n---\nGateway skill body.",
+        )
+        .unwrap();
 
-        assert!(skill_injection.trim().is_empty());
+        let (skill_injection, first_persona) = load_skill_injection(
+            Some(&workspace.path().to_path_buf()),
+            None,
+            &[gateway.path().to_path_buf()],
+            false,
+        );
+
+        assert!(skill_injection.contains("Use demo skill."));
+        assert!(!skill_injection.contains("Gateway skill body."));
         assert_eq!(
             first_persona
                 .as_ref()

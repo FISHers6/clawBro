@@ -311,4 +311,110 @@ mod tests {
             Some("beta")
         );
     }
+
+    #[test]
+    fn lead_final_sender_binding_overrides_inbound_instance() {
+        let mut cfg = test_cfg();
+        cfg.delivery_sender_bindings
+            .push(DeliverySenderBindingConfig {
+                purpose: DeliveryPurposeConfig::LeadFinal,
+                agent: Some("claude".into()),
+                channel: Some("lark".into()),
+                channel_instance: "beta".into(),
+            });
+        let channels = test_channels();
+        let natural = SessionKey::with_instance("lark", "alpha", "group:oc_1");
+        let active = TurnDeliverySource::from_session_key(&natural)
+            .with_reply_context(Some("om_1".into()), None);
+
+        let resolved = resolve_delivery(
+            &cfg,
+            &channels,
+            DeliveryPurposeConfig::LeadFinal,
+            &natural,
+            Some(&active),
+            None,
+            Some("claude"),
+            Some("om_1"),
+            None,
+        )
+        .expect("resolved");
+
+        assert_eq!(resolved.sender.name(), "beta");
+        assert_eq!(resolved.sender_channel_instance.as_deref(), Some("beta"));
+        assert_eq!(
+            resolved.session_key.channel_instance.as_deref(),
+            Some("alpha")
+        );
+    }
+
+    #[test]
+    fn lead_message_sender_binding_overrides_inbound_instance() {
+        let mut cfg = test_cfg();
+        cfg.delivery_sender_bindings
+            .push(DeliverySenderBindingConfig {
+                purpose: DeliveryPurposeConfig::LeadMessage,
+                agent: Some("claude".into()),
+                channel: Some("lark".into()),
+                channel_instance: "beta".into(),
+            });
+        let channels = test_channels();
+        let natural = SessionKey::with_instance("lark", "alpha", "group:oc_1");
+        let stored = TurnDeliverySource::from_session_key(&natural);
+
+        let resolved = resolve_delivery(
+            &cfg,
+            &channels,
+            DeliveryPurposeConfig::LeadMessage,
+            &natural,
+            None,
+            Some(&stored),
+            Some("claude"),
+            None,
+            None,
+        )
+        .expect("resolved");
+
+        assert_eq!(resolved.sender.name(), "beta");
+        assert_eq!(resolved.sender_channel_instance.as_deref(), Some("beta"));
+        assert_eq!(
+            resolved.session_key.channel_instance.as_deref(),
+            Some("alpha")
+        );
+    }
+
+    #[test]
+    fn milestone_sender_binding_without_agent_overrides_inbound_instance() {
+        let mut cfg = test_cfg();
+        cfg.delivery_sender_bindings
+            .push(DeliverySenderBindingConfig {
+                purpose: DeliveryPurposeConfig::Milestone,
+                agent: None,
+                channel: Some("lark".into()),
+                channel_instance: "beta".into(),
+            });
+        let channels = test_channels();
+        let natural = SessionKey::with_instance("lark", "alpha", "group:oc_1");
+        let stored = TurnDeliverySource::from_session_key(&natural);
+
+        let resolved = resolve_delivery(
+            &cfg,
+            &channels,
+            DeliveryPurposeConfig::Milestone,
+            &natural,
+            None,
+            Some(&stored),
+            Some("team-runtime"),
+            None,
+            None,
+        )
+        .expect("resolved");
+
+        assert_eq!(resolved.sender.name(), "beta");
+        assert_eq!(resolved.sender_channel_instance.as_deref(), Some("beta"));
+        assert_eq!(
+            resolved.session_key.channel_instance.as_deref(),
+            Some("alpha")
+        );
+    }
 }

@@ -46,7 +46,7 @@ pub(crate) async fn process_post_turn(
     )
     .await;
 
-    // Lead agents coordinate via MCP tools (assign_task), not via @mention in reply text.
+    // Lead agents coordinate via canonical team actions, not via @mention in reply text.
     // Scanning Lead output would cause double-dispatch: MentionTrigger fires immediately
     // on the suppressed reply text, while Heartbeat also dispatches the same specialist.
     if !input.is_lead && should_scan_mentions(&input.inbound.source) {
@@ -188,7 +188,7 @@ pub(crate) async fn apply_relay_hook(
             tracing::warn!(
                 session = ?session_key,
                 "Lead turn output contains [RELAY:] syntax — relay hook skipped. \
-                 Use assign_task MCP tool to communicate with Specialists."
+                 Use canonical team actions through `clawbro team-helper` to communicate with Specialists."
             );
         }
         return full_text;
@@ -247,7 +247,7 @@ mod tests {
         // preventing double-dispatch (MentionTrigger + Heartbeat both run beta).
         assert!(should_scan_mentions(&MsgSource::Human)); // Human would normally trigger
                                                           // The !is_lead guard in process_post_turn blocks the scan before we reach scan_and_dispatch.
-                                                          // This test documents the invariant: Lead uses MCP tools, not @mentions.
+                                                          // This test documents the invariant: Lead uses canonical team actions, not @mentions.
     }
 
     #[test]

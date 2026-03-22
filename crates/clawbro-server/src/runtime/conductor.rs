@@ -29,7 +29,6 @@ impl RuntimeConductor {
             prompt_text: intent.user_text.clone(),
             tool_surface: tool_surface_from_intent(&intent),
             approval_mode: Default::default(),
-            tool_bridge_url: None,
             external_mcp_servers: vec![],
             team_tool_url: None,
             provider_profile: None,
@@ -162,7 +161,6 @@ fn tool_surface_from_intent(intent: &TurnIntent) -> ToolSurfaceSpec {
         allowed_team_tools: vec![],
         schedule_tools: matches!(intent.mode, TurnMode::Solo | TurnMode::Team),
         allowed_schedule_tools: vec![],
-        local_skills: true,
         external_mcp: false,
         backend_native_tools: true,
     }

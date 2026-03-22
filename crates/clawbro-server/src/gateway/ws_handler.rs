@@ -378,20 +378,17 @@ mod tests {
                 senders
             },
         );
-        let delivered_a = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            private_rx_a.recv(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let delivered_a =
+            tokio::time::timeout(std::time::Duration::from_secs(1), private_rx_a.recv())
+                .await
+                .unwrap()
+                .unwrap();
         assert!(matches!(delivered_a, AgentEvent::Thinking { .. }));
-        assert!(tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            private_rx_b.recv()
-        )
-        .await
-        .is_err());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), private_rx_b.recv())
+                .await
+                .is_err()
+        );
 
         let event_b = AgentEvent::TurnComplete {
             session_id: uuid::Uuid::new_v4(),
@@ -405,19 +402,16 @@ mod tests {
                 senders
             },
         );
-        let delivered_b = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            private_rx_b.recv(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let delivered_b =
+            tokio::time::timeout(std::time::Duration::from_secs(1), private_rx_b.recv())
+                .await
+                .unwrap()
+                .unwrap();
         assert!(matches!(delivered_b, AgentEvent::TurnComplete { .. }));
-        assert!(tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            private_rx_a.recv()
-        )
-        .await
-        .is_err());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), private_rx_a.recv())
+                .await
+                .is_err()
+        );
     }
 }

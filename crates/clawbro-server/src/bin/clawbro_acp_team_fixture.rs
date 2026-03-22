@@ -1,12 +1,6 @@
 use agent_client_protocol::{self as acp, Client as _};
-use anyhow::{anyhow, Context, Result};
-use rmcp::{model::CallToolRequestParam, service::ServiceExt, transport::SseClientTransport};
-use serde_json::json;
-use std::{
-    cell::{Cell, RefCell},
-    collections::HashMap,
-    rc::Rc,
-};
+use anyhow::{Context, Result};
+use std::cell::Cell;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
 
@@ -21,18 +15,13 @@ enum AgentAction {
 struct TeamFixtureAgent {
     action_tx: mpsc::UnboundedSender<AgentAction>,
     next_session_id: Cell<u64>,
-    session_mcp_urls: Rc<RefCell<HashMap<String, String>>>,
 }
 
 impl TeamFixtureAgent {
-    fn new(
-        action_tx: mpsc::UnboundedSender<AgentAction>,
-        session_mcp_urls: Rc<RefCell<HashMap<String, String>>>,
-    ) -> Self {
+    fn new(action_tx: mpsc::UnboundedSender<AgentAction>) -> Self {
         Self {
             action_tx,
             next_session_id: Cell::new(0),
-            session_mcp_urls,
         }
     }
 }
@@ -43,15 +32,12 @@ impl acp::Agent for TeamFixtureAgent {
         &self,
         arguments: acp::InitializeRequest,
     ) -> Result<acp::InitializeResponse, acp::Error> {
-        Ok(acp::InitializeResponse::new(arguments.protocol_version)
-            .agent_info(
+        Ok(
+            acp::InitializeResponse::new(arguments.protocol_version).agent_info(
                 acp::Implementation::new("clawbro-acp-team-fixture", "0.1.0")
                     .title("ClawBro ACP Team Fixture"),
-            )
-            .agent_capabilities(
-                acp::AgentCapabilities::default()
-                    .mcp_capabilities(acp::McpCapabilities::new().sse(true)),
-            ))
+            ),
+        )
     }
 
     async fn authenticate(
@@ -63,16 +49,11 @@ impl acp::Agent for TeamFixtureAgent {
 
     async fn new_session(
         &self,
-        arguments: acp::NewSessionRequest,
+        _arguments: acp::NewSessionRequest,
     ) -> Result<acp::NewSessionResponse, acp::Error> {
         let session_id = self.next_session_id.get();
         self.next_session_id.set(session_id + 1);
         let session_id = session_id.to_string();
-        if let Some(url) = arguments.mcp_servers.iter().find_map(extract_sse_url) {
-            self.session_mcp_urls
-                .borrow_mut()
-                .insert(session_id.clone(), url.to_string());
-        }
         Ok(acp::NewSessionResponse::new(session_id))
     }
 
@@ -144,56 +125,51 @@ async fn run_prompt_action(
     conn: &acp::AgentSideConnection,
     session_id: acp::SessionId,
     prompt_text: String,
-    session_mcp_urls: Rc<RefCell<HashMap<String, String>>>,
 ) -> Result<acp::PromptResponse, acp::Error> {
-    let session_key = session_id.0.to_string();
-    let mcp_url = session_mcp_urls
-        .borrow()
-        .get(&session_key)
-        .cloned()
-        .ok_or_else(acp::Error::internal_error)?;
-
     let task_id = extract_task_id(&prompt_text).unwrap_or_else(|| "T001".to_string());
-    call_submit_task_result(&mcp_url, &task_id)
-        .await
-        .map_err(|_| acp::Error::internal_error())?;
+    if let Err(err) = call_submit_task_result(&task_id).await {
+        eprintln!("clawbro-acp-team-fixture submit_task_result failed: {err:#}");
+        return Err(acp::Error::internal_error());
+    }
 
     send_text(conn, session_id, format!("acp-worker:submitted:{task_id}")).await?;
     Ok(acp::PromptResponse::new(acp::StopReason::EndTurn))
 }
 
-async fn call_submit_task_result(mcp_url: &str, task_id: &str) -> Result<()> {
-    let transport = SseClientTransport::start(mcp_url.to_string())
-        .await
-        .context("failed to connect to injected MCP SSE server")?;
-    let client = ().serve(transport).await.context("failed to initialize MCP client")?;
+async fn call_submit_task_result(task_id: &str) -> Result<()> {
+    let url = std::env::var("CLAWBRO_TEAM_TOOL_URL")
+        .context("missing CLAWBRO_TEAM_TOOL_URL for ACP specialist turn")?;
+    let session_ref = std::env::var("CLAWBRO_SESSION_REF")
+        .context("missing CLAWBRO_SESSION_REF for ACP specialist turn")?;
+    let session_key = clawbro::protocol::parse_session_key_text(&session_ref)
+        .map_err(|err| anyhow::anyhow!("invalid CLAWBRO_SESSION_REF: {err}"))?;
 
-    let arguments = json!({
-        "task_id": task_id,
-        "summary": "acp worker fixture result",
-        "agent": "worker",
-    });
-
-    let result = client
-        .call_tool(CallToolRequestParam {
-            name: "submit_task_result".into(),
-            arguments: arguments.as_object().cloned(),
+    let response = reqwest::Client::new()
+        .post(url)
+        .json(&clawbro::runtime::TeamToolRequest {
+            session_key,
+            call: clawbro::runtime::TeamToolCall::SubmitTaskResult {
+                task_id: task_id.to_string(),
+                summary: "acp worker fixture result".to_string(),
+                result_markdown: Some(
+                    "# ACP Worker Result\n\nImplemented the fixture task and prepared the final deliverable body for lead review."
+                        .to_string(),
+                ),
+                agent: Some("worker".to_string()),
+            },
         })
+        .send()
         .await
-        .context("submit_task_result tool call failed")?;
-    client.cancel().await.ok();
-
-    if result.is_error.unwrap_or(false) {
-        return Err(anyhow!("submit_task_result returned MCP error"));
+        .context("failed to invoke team tool endpoint")?;
+    let status = response.status();
+    let body: clawbro::runtime::TeamToolResponse = response
+        .json()
+        .await
+        .context("failed to decode team tool response")?;
+    if !status.is_success() || !body.ok {
+        anyhow::bail!("submit_task_result failed: {}", body.message);
     }
     Ok(())
-}
-
-fn extract_sse_url(server: &acp::McpServer) -> Option<&str> {
-    match server {
-        acp::McpServer::Sse(sse) => Some(sse.url.as_str()),
-        _ => None,
-    }
 }
 
 fn extract_prompt_text(blocks: &[acp::ContentBlock]) -> String {
@@ -211,7 +187,10 @@ fn extract_prompt_text(blocks: &[acp::ContentBlock]) -> String {
 
 fn extract_task_id(text: &str) -> Option<String> {
     for token in text.split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-') {
-        if token.starts_with('T') && token.len() > 1 {
+        if token.starts_with('T')
+            && token.len() > 1
+            && token[1..].chars().all(|c| c.is_ascii_digit())
+        {
             return Some(token.to_string());
         }
     }
@@ -227,9 +206,8 @@ async fn main() -> acp::Result<()> {
     local_set
         .run_until(async move {
             let (action_tx, mut action_rx) = mpsc::unbounded_channel();
-            let session_mcp_urls = Rc::new(RefCell::new(HashMap::new()));
             let (conn, handle_io) = acp::AgentSideConnection::new(
-                TeamFixtureAgent::new(action_tx, session_mcp_urls.clone()),
+                TeamFixtureAgent::new(action_tx),
                 outgoing,
                 incoming,
                 |fut| {
@@ -245,14 +223,9 @@ async fn main() -> acp::Result<()> {
                             prompt_text,
                             reply,
                         } => {
-                            let result = run_prompt_action(
-                                &conn,
-                                session_id,
-                                prompt_text,
-                                session_mcp_urls.clone(),
-                            )
-                            .await;
-                            let response = result.unwrap_or_else(|_| {
+                            let result = run_prompt_action(&conn, session_id, prompt_text).await;
+                            let response = result.unwrap_or_else(|err| {
+                                eprintln!("clawbro-acp-team-fixture prompt failed: {err:#}");
                                 acp::PromptResponse::new(acp::StopReason::EndTurn)
                             });
                             let _ = reply.send(response);

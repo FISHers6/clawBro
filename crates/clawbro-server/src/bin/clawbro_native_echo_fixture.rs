@@ -1,4 +1,5 @@
-use clawbro::runtime::{RuntimeEvent, RuntimeSessionSpec};
+use clawbro::agent_sdk_internal::bridge::AgentTurnRequest;
+use clawbro::runtime::RuntimeEvent;
 use std::io::{self, Read};
 
 fn main() {
@@ -11,7 +12,7 @@ fn main() {
 fn run() -> anyhow::Result<()> {
     let mut input = String::new();
     io::stdin().read_to_string(&mut input)?;
-    let session: RuntimeSessionSpec = serde_json::from_str(&input)?;
+    let session: AgentTurnRequest = serde_json::from_str(&input)?;
     let text = session
         .context
         .user_input

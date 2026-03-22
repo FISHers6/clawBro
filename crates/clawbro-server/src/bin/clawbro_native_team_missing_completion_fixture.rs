@@ -1,5 +1,6 @@
 use anyhow::Result;
-use clawbro::runtime::{RuntimeEvent, RuntimeRole, RuntimeSessionSpec};
+use clawbro::agent_sdk_internal::bridge::{AgentTurnRequest, ExecutionRole};
+use clawbro::runtime::RuntimeEvent;
 use std::io::{self, Read};
 
 #[tokio::main(flavor = "current_thread")]
@@ -16,16 +17,16 @@ async fn run() -> Result<()> {
     if input.trim().is_empty() {
         return Ok(());
     }
-    let session: RuntimeSessionSpec = serde_json::from_str(&input)?;
+    let session: AgentTurnRequest = serde_json::from_str(&input)?;
 
     match session.role {
-        RuntimeRole::Leader => emit_complete("leader:noop")?,
-        RuntimeRole::Specialist => {
+        ExecutionRole::Leader => emit_complete("leader:noop")?,
+        ExecutionRole::Specialist => {
             let reminder = session.context.task_reminder.as_deref().unwrap_or_default();
             let task_id = extract_task_id(reminder).unwrap_or_else(|| "T001".to_string());
             emit_complete(&format!("worker:text-only:{task_id}"))?;
         }
-        RuntimeRole::Solo => emit_complete("solo:noop")?,
+        ExecutionRole::Solo => emit_complete("solo:noop")?,
     }
 
     Ok(())
@@ -49,7 +50,10 @@ fn emit_complete(text: &str) -> Result<()> {
 
 fn extract_task_id(text: &str) -> Option<String> {
     for token in text.split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-') {
-        if token.starts_with('T') && token.len() > 1 {
+        if token.starts_with('T')
+            && token.len() > 1
+            && token[1..].chars().all(|c| c.is_ascii_digit())
+        {
             return Some(token.to_string());
         }
     }

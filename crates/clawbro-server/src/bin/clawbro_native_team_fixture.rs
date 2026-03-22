@@ -1,7 +1,6 @@
 use anyhow::Result;
-use clawbro::runtime::{
-    RuntimeEvent, RuntimeRole, RuntimeSessionSpec, TeamToolCall, TeamToolRequest, TeamToolResponse,
-};
+use clawbro::agent_sdk_internal::bridge::{AgentTurnRequest, ExecutionRole};
+use clawbro::runtime::{RuntimeEvent, TeamToolCall, TeamToolRequest, TeamToolResponse};
 use std::io::{self, Read};
 
 #[tokio::main(flavor = "current_thread")]
@@ -18,23 +17,23 @@ async fn run() -> Result<()> {
     if input.trim().is_empty() {
         return Ok(());
     }
-    let session: RuntimeSessionSpec = serde_json::from_str(&input)?;
+    let session: AgentTurnRequest = serde_json::from_str(&input)?;
 
     match session.role {
-        RuntimeRole::Leader => run_leader(&session).await?,
-        RuntimeRole::Specialist => run_specialist(&session).await?,
-        RuntimeRole::Solo => emit_complete("solo:noop")?,
+        ExecutionRole::Leader => run_leader(&session).await?,
+        ExecutionRole::Specialist => run_specialist(&session).await?,
+        ExecutionRole::Solo => emit_complete("solo:noop")?,
     }
 
     Ok(())
 }
 
-async fn run_leader(session: &RuntimeSessionSpec) -> Result<()> {
+async fn run_leader(session: &AgentTurnRequest) -> Result<()> {
     let user_input = session.context.user_input.as_deref().unwrap_or_default();
-    let team_url = session
-        .team_tool_url
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("missing team_tool_url for leader turn"))?;
+    let team_url = std::env::var("CLAWBRO_TEAM_TOOL_URL")
+        .map_err(|_| anyhow::anyhow!("missing CLAWBRO_TEAM_TOOL_URL for leader turn"))?;
+    let session_key = clawbro::protocol::parse_session_key_text(&session.session_ref)
+        .map_err(|err| anyhow::anyhow!("invalid session_ref: {err}"))?;
 
     if user_input.contains("请求协助") {
         let task_id = extract_task_id(user_input).unwrap_or_else(|| "T001".to_string());
@@ -51,8 +50,8 @@ async fn run_leader(session: &RuntimeSessionSpec) -> Result<()> {
     if user_input.contains("已提交待验收") {
         let task_id = extract_task_id(user_input).unwrap_or_else(|| "T001".to_string());
         invoke_team_tool(
-            team_url,
-            &session.session_key,
+            &team_url,
+            &session_key,
             TeamToolCall::AcceptTask {
                 task_id: task_id.clone(),
                 by: Some("leader".to_string()),
@@ -75,8 +74,8 @@ async fn run_leader(session: &RuntimeSessionSpec) -> Result<()> {
     }
 
     invoke_team_tool(
-        team_url,
-        &session.session_key,
+        &team_url,
+        &session_key,
         TeamToolCall::CreateTask {
             id: Some("T001".to_string()),
             title: "fixture task".to_string(),
@@ -87,25 +86,28 @@ async fn run_leader(session: &RuntimeSessionSpec) -> Result<()> {
         },
     )
     .await?;
-    invoke_team_tool(team_url, &session.session_key, TeamToolCall::StartExecution).await?;
+    invoke_team_tool(&team_url, &session_key, TeamToolCall::StartExecution).await?;
     emit_complete("leader:planned:T001")?;
     Ok(())
 }
 
-async fn run_specialist(session: &RuntimeSessionSpec) -> Result<()> {
-    let team_url = session
-        .team_tool_url
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("missing team_tool_url for specialist turn"))?;
+async fn run_specialist(session: &AgentTurnRequest) -> Result<()> {
+    let team_url = std::env::var("CLAWBRO_TEAM_TOOL_URL")
+        .map_err(|_| anyhow::anyhow!("missing CLAWBRO_TEAM_TOOL_URL for specialist turn"))?;
+    let session_key = clawbro::protocol::parse_session_key_text(&session.session_ref)
+        .map_err(|err| anyhow::anyhow!("invalid session_ref: {err}"))?;
     let reminder = session.context.task_reminder.as_deref().unwrap_or_default();
     let task_id = extract_task_id(reminder).unwrap_or_else(|| "T001".to_string());
     invoke_team_tool(
-        team_url,
-        &session.session_key,
+        &team_url,
+        &session_key,
         TeamToolCall::SubmitTaskResult {
             task_id: task_id.clone(),
             summary: "worker fixture result".to_string(),
-            result_markdown: None,
+            result_markdown: Some(
+                "# Worker Result\n\nImplemented the fixture task and prepared the final deliverable body for lead review."
+                    .to_string(),
+            ),
             agent: Some("worker".to_string()),
         },
     )
@@ -153,7 +155,10 @@ fn emit_complete(text: &str) -> Result<()> {
 
 fn extract_task_id(text: &str) -> Option<String> {
     for token in text.split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-') {
-        if token.starts_with('T') && token.len() > 1 {
+        if token.starts_with('T')
+            && token.len() > 1
+            && token[1..].chars().all(|c| c.is_ascii_digit())
+        {
             return Some(token.to_string());
         }
     }

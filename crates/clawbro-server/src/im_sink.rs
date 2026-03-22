@@ -9,7 +9,7 @@ use crate::channels_internal::Channel;
 use crate::config::{DeliveryPurposeConfig, GatewayConfig, ProgressPresentationMode};
 use crate::delivery_resolver::{resolve_delivery, ResolvedDelivery};
 use crate::progress_presentation;
-use crate::protocol::{AgentEvent, InboundMsg, OutboundMsg, SessionKey};
+use crate::protocol::{AgentEvent, DashboardEvent, InboundMsg, OutboundMsg, SessionKey};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -180,8 +180,16 @@ enum FinalDeliveryDecision {
 
 fn decide_final_delivery(
     snapshot_suppressed: bool,
+    team_was_running_or_done_before_handle: bool,
     team_running_after_handle: bool,
+    force_direct_send: bool,
 ) -> FinalDeliveryDecision {
+    if force_direct_send {
+        return FinalDeliveryDecision::DirectSend;
+    }
+    if snapshot_suppressed && !team_was_running_or_done_before_handle && team_running_after_handle {
+        return FinalDeliveryDecision::DirectSend;
+    }
     match (snapshot_suppressed, team_running_after_handle) {
         (_, true) => FinalDeliveryDecision::Suppress,
         (true, false) => FinalDeliveryDecision::DirectSend,
@@ -219,7 +227,7 @@ fn record_team_channel_send(
         Ok(()) => (ChannelSendStatus::Sent, None),
         Err(error) => (ChannelSendStatus::SendFailed, Some(error)),
     };
-    if let Err(err) = team_orchestrator.session.record_channel_send(
+    match team_orchestrator.session.record_channel_send(
         &session_key.channel,
         sender_channel_instance,
         session_key.channel_instance.as_deref(),
@@ -236,11 +244,17 @@ fn record_team_channel_send(
         status,
         error.as_deref(),
     ) {
-        tracing::warn!(
-            team_id = %team_orchestrator.session.team_id,
-            error = %err,
-            "Failed to append channel send ledger entry"
-        );
+        Ok(record) => team_orchestrator.emit_dashboard_event(DashboardEvent::TeamChannelSend {
+            team_id: team_orchestrator.session.team_id.clone(),
+            record,
+        }),
+        Err(err) => {
+            tracing::warn!(
+                team_id = %team_orchestrator.session.team_id,
+                error = %err,
+                "Failed to append channel send ledger entry"
+            );
+        }
     }
 }
 
@@ -291,9 +305,11 @@ pub fn spawn_im_turn(
     let (turn_event_tx, turn_event_rx) = broadcast::channel::<AgentEvent>(1024);
     let (control_tx, control_rx) = oneshot::channel::<StreamControl>();
 
-    // Capture before spawning tasks to snapshot state consistently (fixes TOCTOU).
-    // When true: Lead communicates only via post_update — stream path must be silent.
+    // Capture before spawning tasks to snapshot state consistently.
+    // Team Lead turns always use a silent stream path; final delivery is decided only
+    // after handle() finishes and post-turn validation has had a chance to rewrite reply text.
     let suppress_lead_final = registry.should_suppress_lead_final_reply(&session_key);
+    let team_was_running_or_done_before_handle = registry.is_team_running_or_done(&session_key);
     let team_orchestrator_for_session = registry.team_orchestrator_for_session(&session_key);
     let lead_agent_name = team_orchestrator_for_session
         .as_ref()
@@ -385,7 +401,9 @@ pub fn spawn_im_turn(
             Ok(Some(reply)) => {
                 match decide_final_delivery(
                     suppress_lead_final,
+                    team_was_running_or_done_before_handle,
                     registry.is_team_running_or_done(&session_key_for_handle),
+                    SessionRegistry::is_canonical_team_guard_reply(&reply),
                 ) {
                     FinalDeliveryDecision::Suppress => {
                         let _ = control_tx.send(StreamControl::Stop);
@@ -612,15 +630,23 @@ mod tests {
     #[test]
     fn final_delivery_rechecks_team_state_after_handle() {
         assert_eq!(
-            decide_final_delivery(false, true),
+            decide_final_delivery(false, false, true, false),
             FinalDeliveryDecision::Suppress
         );
         assert_eq!(
-            decide_final_delivery(false, false),
+            decide_final_delivery(false, false, false, false),
             FinalDeliveryDecision::StreamFinal
         );
         assert_eq!(
-            decide_final_delivery(true, false),
+            decide_final_delivery(true, false, false, false),
+            FinalDeliveryDecision::DirectSend
+        );
+        assert_eq!(
+            decide_final_delivery(true, true, true, true),
+            FinalDeliveryDecision::DirectSend
+        );
+        assert_eq!(
+            decide_final_delivery(true, false, true, false),
             FinalDeliveryDecision::DirectSend
         );
     }

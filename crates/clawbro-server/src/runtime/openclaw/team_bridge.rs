@@ -1,5 +1,6 @@
 use crate::runtime::contract::{RuntimeEvent, TeamCallback};
 use crate::runtime::helper_contract::ParsedTeamHelperResult;
+use crate::team_contract::projection::openclaw::normalize_openclaw_helper_action;
 use anyhow::anyhow;
 use serde_json::Value;
 
@@ -71,7 +72,7 @@ impl OpenClawTeamBridge {
 impl OpenClawTeamOutcome {
     pub fn from_helper_json(value: &Value) -> anyhow::Result<Self> {
         let parsed = ParsedTeamHelperResult::from_json(value)?;
-        let normalized_action = normalize_action(parsed.action.as_str())?;
+        let normalized_action = normalize_openclaw_helper_action(parsed.action.as_str())?;
         if !parsed.ok {
             return Ok(Self::CommandFailed {
                 task_id: parsed.task_id,
@@ -164,16 +165,6 @@ pub fn map_outcome_to_team_callback(
             action.as_deref().unwrap_or("-"),
             error
         )),
-    }
-}
-
-fn normalize_action(action: &str) -> anyhow::Result<&'static str> {
-    match action {
-        "checkpoint_task" => Ok("checkpoint_task"),
-        "submit_task_result" => Ok("submit_task_result"),
-        "block_task" => Ok("block_task"),
-        "request_help" => Ok("request_help"),
-        other => Err(anyhow!("unsupported helper action: {other}")),
     }
 }
 

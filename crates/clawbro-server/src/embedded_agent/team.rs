@@ -5,6 +5,8 @@ use crate::agent_sdk_internal::{
 use crate::protocol::{
     parse_session_key_text, TeamTool, TeamToolCall, TeamToolRequest, TeamToolResponse,
 };
+use crate::runtime::RuntimeRole;
+use crate::team_contract::projection::local_tools::project_local_team_tools;
 use rig::{
     completion::{CompletionModel, ToolDefinition},
     tool::{Tool, ToolError},
@@ -474,34 +476,12 @@ fn visible_team_tools_for_request(
     role: ExecutionRole,
     allowed_team_tools: &[TeamTool],
 ) -> Vec<TeamTool> {
-    let default_tools = match role {
-        ExecutionRole::Leader => vec![
-            TeamTool::CreateTask,
-            TeamTool::StartExecution,
-            TeamTool::RequestConfirmation,
-            TeamTool::PostUpdate,
-            TeamTool::GetTaskStatus,
-            TeamTool::AssignTask,
-            TeamTool::AcceptTask,
-            TeamTool::ReopenTask,
-        ],
-        ExecutionRole::Specialist => vec![
-            TeamTool::PostUpdate,
-            TeamTool::GetTaskStatus,
-            TeamTool::CheckpointTask,
-            TeamTool::SubmitTaskResult,
-            TeamTool::BlockTask,
-            TeamTool::RequestHelp,
-        ],
-        ExecutionRole::Solo => vec![],
+    let runtime_role = match role {
+        ExecutionRole::Leader => RuntimeRole::Leader,
+        ExecutionRole::Specialist => RuntimeRole::Specialist,
+        ExecutionRole::Solo => RuntimeRole::Solo,
     };
-    if allowed_team_tools.is_empty() {
-        return default_tools;
-    }
-    default_tools
-        .into_iter()
-        .filter(|tool| allowed_team_tools.contains(tool))
-        .collect()
+    project_local_team_tools(runtime_role, allowed_team_tools)
 }
 
 fn add_leader_team_tool<M: CompletionModel>(

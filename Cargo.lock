@@ -480,6 +480,7 @@ dependencies = [
  "chrono-tz",
  "clap",
  "clap_complete",
+ "clawbro-channels",
  "console",
  "cron",
  "dashmap",
@@ -490,6 +491,7 @@ dependencies = [
  "glob",
  "hmac",
  "prost",
+ "rand 0.8.5",
  "regex",
  "reqwest 0.11.27",
  "rig-core",
@@ -505,6 +507,7 @@ dependencies = [
  "tokio-tungstenite 0.26.2",
  "tokio-util",
  "toml 0.9.12+spec-1.1.0",
+ "toml_edit",
  "tower",
  "tracing",
  "tracing-subscriber",
@@ -572,18 +575,24 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "clawbro-protocol",
  "dirs",
+ "fast_qr",
  "futures",
  "prost",
+ "rand 0.8.5",
+ "regex-lite",
  "reqwest 0.11.27",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "tokio-tungstenite 0.26.2",
+ "tokio-util",
  "tracing",
+ "urlencoding",
  "uuid",
 ]
 
@@ -1054,6 +1063,12 @@ name = "fallible-streaming-iterator"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
+
+[[package]]
+name = "fast_qr"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f5ea9788036fedaf55f43a2db0ba01eedf47d26fd6852f01e5cf51952571d57"
 
 [[package]]
 name = "fastrand"
@@ -2348,6 +2363,12 @@ dependencies = [
  "memchr",
  "regex-syntax",
 ]
+
+[[package]]
+name = "regex-lite"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cab834c73d247e67f4fae452806d17d3c7501756d98c8808d7c9c7aa7d18f973"
 
 [[package]]
 name = "regex-syntax"

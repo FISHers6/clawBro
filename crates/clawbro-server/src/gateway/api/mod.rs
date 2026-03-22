@@ -1,9 +1,9 @@
-pub mod approvals;
-pub mod chat;
 pub mod agents;
 pub mod agents_write;
+pub mod approvals;
 pub mod backends;
 pub mod channels;
+pub mod chat;
 pub mod config;
 pub mod config_write;
 pub mod scheduler;

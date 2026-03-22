@@ -187,7 +187,6 @@ impl acp::Agent for ClawBroAgent {
                             prompt_text: user_text.clone(),
                             tool_surface: ToolSurfaceSpec::default(),
                             approval_mode: Default::default(),
-                            tool_bridge_url: None,
                             external_mcp_servers: vec![],
                             provider_profile: None,
                             context: RuntimeContext {

@@ -18,7 +18,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const CLAWBRO_SKILLS_AGENT: &str = "clawbro";
-const UNIVERSAL_SKILLS_AGENT: &str = "universal";
 
 pub async fn run(args: SkillArgs) -> Result<()> {
     let cfg = GatewayConfig::load()?;
@@ -341,11 +340,7 @@ fn local_skills_cli_path() -> Option<PathBuf> {
 }
 
 fn delegated_skills_agent() -> &'static str {
-    if local_skills_cli_path().is_some() && command_available("node") {
-        CLAWBRO_SKILLS_AGENT
-    } else {
-        UNIVERSAL_SKILLS_AGENT
-    }
+    CLAWBRO_SKILLS_AGENT
 }
 
 fn run_external_cli(invocation: ExternalCliInvocation) -> Result<()> {
@@ -430,9 +425,7 @@ fn append_clawhub_install_args(args: &mut Vec<String>, install: SkillHubInstallA
     append_optional_string_flag(
         args,
         "--dir",
-        install
-            .dir
-            .map(|value| value.to_string_lossy().into_owned()),
+        clawhub_dir_arg(install.workspace.as_deref(), install.dir),
     );
     append_optional_string_flag(args, "--version", install.version);
     if install.force {
@@ -445,7 +438,7 @@ fn append_clawhub_list_args(args: &mut Vec<String>, list: SkillHubListArgs) {
     append_optional_string_flag(
         args,
         "--dir",
-        list.dir.map(|value| value.to_string_lossy().into_owned()),
+        clawhub_dir_arg(list.workspace.as_deref(), list.dir),
     );
 }
 
@@ -466,7 +459,7 @@ fn append_clawhub_update_args(args: &mut Vec<String>, update: SkillHubUpdateArgs
     append_optional_string_flag(
         args,
         "--dir",
-        update.dir.map(|value| value.to_string_lossy().into_owned()),
+        clawhub_dir_arg(update.workspace.as_deref(), update.dir),
     );
     append_optional_string_flag(args, "--version", update.version);
     if update.force {
@@ -480,7 +473,7 @@ fn append_clawhub_sync_args(args: &mut Vec<String>, sync: SkillHubSyncArgs) {
     append_optional_string_flag(
         args,
         "--dir",
-        sync.dir.map(|value| value.to_string_lossy().into_owned()),
+        clawhub_dir_arg(sync.workspace.as_deref(), sync.dir),
     );
     for root in sync.roots {
         args.push("--root".to_string());
@@ -499,6 +492,18 @@ fn append_clawhub_sync_args(args: &mut Vec<String>, sync: SkillHubSyncArgs) {
         args.push("--concurrency".to_string());
         args.push(concurrency.to_string());
     }
+}
+
+fn clawhub_dir_arg(workspace: Option<&Path>, explicit_dir: Option<PathBuf>) -> Option<String> {
+    explicit_dir
+        .map(|value| value.to_string_lossy().into_owned())
+        .or_else(|| {
+            workspace.map(|workspace| {
+                project_universal_skills_dir(workspace)
+                    .to_string_lossy()
+                    .into_owned()
+            })
+        })
 }
 
 fn append_optional_string_flag(args: &mut Vec<String>, flag: &str, value: Option<String>) {
@@ -937,6 +942,11 @@ mod tests {
     }
 
     #[test]
+    fn delegated_skills_agent_is_clawbro() {
+        assert_eq!(delegated_skills_agent(), "clawbro");
+    }
+
+    #[test]
     fn build_skills_stage_invocation_forces_copy_into_temp_workspace() {
         let invocation = build_skills_stage_invocation(
             "vercel-labs/skills@find-skills".into(),
@@ -957,7 +967,7 @@ mod tests {
     }
 
     #[test]
-    fn build_clawhub_install_invocation_uses_workspace_skills_dir() {
+    fn build_clawhub_install_invocation_defaults_to_project_universal_dir() {
         let invocation = build_clawhub_invocation(SkillHubCommands::Install(SkillHubInstallArgs {
             slug: "weather-pack".into(),
             workspace: Some(PathBuf::from("/tmp/ws")),
@@ -976,6 +986,8 @@ mod tests {
                 "clawhub",
                 "install",
                 "weather-pack",
+                "--dir",
+                "/tmp/ws/.agents/skills",
                 "--version",
                 "1.2.3",
                 "--force",
@@ -1068,6 +1080,27 @@ mod tests {
         assert_eq!(
             invocation.args,
             vec!["--yes", "clawhub", "list", "--dir", "vendor-skills"]
+        );
+    }
+
+    #[test]
+    fn build_clawhub_list_invocation_defaults_to_project_universal_dir() {
+        let invocation = build_clawhub_invocation(SkillHubCommands::List(SkillHubListArgs {
+            workspace: Some(PathBuf::from("/tmp/ws")),
+            dir: None,
+        }))
+        .unwrap();
+
+        assert_eq!(invocation.cwd, Some(PathBuf::from("/tmp/ws")));
+        assert_eq!(
+            invocation.args,
+            vec![
+                "--yes",
+                "clawhub",
+                "list",
+                "--dir",
+                "/tmp/ws/.agents/skills"
+            ]
         );
     }
 

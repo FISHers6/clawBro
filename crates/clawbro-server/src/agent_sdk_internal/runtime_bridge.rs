@@ -211,7 +211,6 @@ mod tests {
             prompt_text: prompt_text.into(),
             tool_surface: ToolSurfaceSpec::default(),
             approval_mode: Default::default(),
-            tool_bridge_url: None,
             external_mcp_servers: vec![],
             provider_profile: None,
             context: RuntimeContext {
@@ -267,7 +266,6 @@ mod tests {
             prompt_text: "hello".into(),
             tool_surface: ToolSurfaceSpec::default(),
             approval_mode: Default::default(),
-            tool_bridge_url: None,
             external_mcp_servers: vec![],
             provider_profile: None,
             context: RuntimeContext {
@@ -306,7 +304,6 @@ mod tests {
             prompt_text: "hello".into(),
             tool_surface: ToolSurfaceSpec::default(),
             approval_mode: Default::default(),
-            tool_bridge_url: None,
             external_mcp_servers: vec![ExternalMcpServerSpec {
                 name: "filesystem".into(),
                 transport: ExternalMcpTransport::Sse {

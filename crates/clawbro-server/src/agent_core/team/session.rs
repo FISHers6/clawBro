@@ -24,7 +24,7 @@ use super::registry::{Task, TaskRegistry, TaskStatus};
 
 const DELIVERY_DEDUPE_LEDGER_MAX_LINES: usize = 2_000;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskArtifactMeta {
     pub id: String,
     pub title: String,
@@ -404,6 +404,26 @@ impl TeamSession {
         self.read_task_file(task_id, "review-feedback.md")
     }
 
+    pub fn read_task_meta(&self, task_id: &str) -> Result<Option<TaskArtifactMeta>> {
+        let path = self.task_dir(task_id).join("meta.json");
+        if !path.exists() {
+            return Ok(None);
+        }
+        let body = std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        Ok(Some(serde_json::from_str(&body)?))
+    }
+
+    pub fn read_task_artifact(&self, task_id: &str, file_name: &str) -> Result<Option<String>> {
+        let path = self.task_dir(task_id).join(file_name);
+        if !path.exists() {
+            return Ok(None);
+        }
+        std::fs::read_to_string(&path)
+            .map(Some)
+            .with_context(|| format!("Failed to read {}", path.display()))
+    }
+
     /// 从 TaskRegistry 导出任务快照到 TASKS.md
     pub fn sync_tasks_md(&self, registry: &TaskRegistry) -> Result<()> {
         let md = registry.export_tasks_md()?;
@@ -425,6 +445,16 @@ impl TeamSession {
 
     pub fn read_heartbeat_md(&self) -> String {
         self.read_file("HEARTBEAT.md")
+    }
+
+    pub fn read_root_artifact(&self, file_name: &str) -> Result<Option<String>> {
+        let path = self.dir.join(file_name);
+        if !path.exists() {
+            return Ok(None);
+        }
+        std::fs::read_to_string(&path)
+            .map(Some)
+            .with_context(|| format!("Failed to read {}", path.display()))
     }
 
     /// 追加事件日志（JSONL 格式，调试用）
@@ -635,7 +665,7 @@ impl TeamSession {
         kind: LeaderUpdateKind,
         text: &str,
         task_id: Option<&str>,
-    ) -> Result<String> {
+    ) -> Result<LeaderUpdateRecord> {
         let event_id = uuid::Uuid::new_v4().to_string();
         let record = LeaderUpdateRecord {
             event_id: event_id.clone(),
@@ -656,7 +686,7 @@ impl TeamSession {
             session_message_id: None,
         };
         self.append_jsonl("leader-updates.jsonl", &record)?;
-        Ok(event_id)
+        Ok(record)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -677,7 +707,7 @@ impl TeamSession {
         text: &str,
         status: ChannelSendStatus,
         error: Option<&str>,
-    ) -> Result<String> {
+    ) -> Result<ChannelSendRecord> {
         let event_id = uuid::Uuid::new_v4().to_string();
         let record = ChannelSendRecord {
             event_id: event_id.clone(),
@@ -705,11 +735,15 @@ impl TeamSession {
             error: error.map(ToOwned::to_owned),
         };
         self.append_jsonl("channel-sends.jsonl", &record)?;
-        Ok(event_id)
+        Ok(record)
     }
 
     pub fn load_latest_leader_update(&self) -> Result<Option<LeaderUpdateRecord>> {
         self.load_latest_jsonl("leader-updates.jsonl")
+    }
+
+    pub fn load_leader_updates(&self) -> Result<Vec<LeaderUpdateRecord>> {
+        self.load_jsonl("leader-updates.jsonl")
     }
 
     pub fn has_post_update_for_task_since(
@@ -750,6 +784,10 @@ impl TeamSession {
 
     pub fn load_latest_channel_send(&self) -> Result<Option<ChannelSendRecord>> {
         self.load_latest_jsonl("channel-sends.jsonl")
+    }
+
+    pub fn load_channel_sends(&self) -> Result<Vec<ChannelSendRecord>> {
+        self.load_jsonl("channel-sends.jsonl")
     }
 
     // ── task_reminder 构建 ───────────────────────────────────────────────────
@@ -842,9 +880,8 @@ impl TeamSession {
              1. 阶段性进展可调用 `checkpoint_task(task_id, note)` 向 Lead 发送检查点\n\
              2. 完成任务后优先调用 `submit_task_result(task_id, summary)`，并在 `result_markdown` 中提交完整最终交付正文；不要提交“产物说明/元数据摘要/文件路径列表”来代替正文\n\
              3. 遇到阻塞时调用 `block_task(task_id, reason)` 释放任务并上报；仅需协助时调用 `request_help(task_id, message)`，保留 claim\n\
-             4. 兼容旧路径时仍可调用 `complete_task(task_id, note)`，但新语义优先使用 submit_task_result\n\
-             5. 重要产出（文件路径、关键发现）写在 summary / note 参数中\n\
-             6. 在结束本轮前，必须至少调用一个 canonical team tool：`submit_task_result`、`complete_task`、`checkpoint_task`、`request_help` 或 `block_task`\n\
+             4. 重要产出（文件路径、关键发现）写在 summary / note 参数中\n\
+             5. 在结束本轮前，必须至少调用一个 canonical team tool：`submit_task_result`、`checkpoint_task`、`request_help` 或 `block_task`\n\
              ══════════════════════════════════════════{resume_note}{review_feedback_section}{upstream_section}",
             id = task.id,
             title = task.title,
@@ -953,6 +990,20 @@ impl TeamSession {
             return Ok(None);
         };
         Ok(Some(serde_json::from_str(line)?))
+    }
+
+    fn load_jsonl<T: DeserializeOwned>(&self, name: &str) -> Result<Vec<T>> {
+        let path = self.dir.join(name);
+        if !path.exists() {
+            return Ok(vec![]);
+        }
+        let content = std::fs::read_to_string(&path)?;
+        content
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(serde_json::from_str)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 }
 
@@ -1108,7 +1159,7 @@ mod tests {
     fn test_record_leader_update_writes_jsonl() {
         let (session, _tmp) = make_session();
         let lead_key = SessionKey::new("lark", "user:test");
-        let event_id = session
+        let record = session
             .record_leader_update(
                 Some(&lead_key),
                 None,
@@ -1121,7 +1172,7 @@ mod tests {
 
         let content = std::fs::read_to_string(session.dir.join("leader-updates.jsonl")).unwrap();
         let row: LeaderUpdateRecord = serde_json::from_str(content.trim()).unwrap();
-        assert_eq!(row.event_id, event_id);
+        assert_eq!(row.event_id, record.event_id);
         assert_eq!(row.team_id, "team-001");
         assert_eq!(row.lead_session_channel.as_deref(), Some("lark"));
         assert_eq!(row.lead_session_scope.as_deref(), Some("user:test"));
@@ -1134,7 +1185,7 @@ mod tests {
     fn test_record_channel_send_writes_jsonl() {
         let (session, _tmp) = make_session();
         let lead_key = SessionKey::new("lark", "user:test");
-        let event_id = session
+        let record = session
             .record_channel_send(
                 "lark",
                 None,
@@ -1156,7 +1207,7 @@ mod tests {
 
         let content = std::fs::read_to_string(session.dir.join("channel-sends.jsonl")).unwrap();
         let row: ChannelSendRecord = serde_json::from_str(content.trim()).unwrap();
-        assert_eq!(row.event_id, event_id);
+        assert_eq!(row.event_id, record.event_id);
         assert_eq!(row.channel, "lark");
         assert_eq!(row.target_scope, "user:test");
         assert_eq!(row.source_agent, "codex-alpha");
@@ -1298,12 +1349,12 @@ mod tests {
         assert!(reminder.contains("Implement JWT"));
         assert!(reminder.contains("JWT token is generated"));
         assert!(
-            reminder.contains("complete_task"),
-            "must mention complete_task MCP tool"
+            reminder.contains("block_task"),
+            "must mention block_task canonical team action"
         );
         assert!(
-            reminder.contains("block_task"),
-            "must mention block_task MCP tool"
+            !reminder.contains("complete_task"),
+            "must not mention removed complete_task tool"
         );
     }
 

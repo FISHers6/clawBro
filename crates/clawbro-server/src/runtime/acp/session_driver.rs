@@ -190,7 +190,7 @@ pub async fn probe_command_backend(
 ) -> anyhow::Result<acp::InitializeResponse> {
     use acp::Agent as _;
 
-    let mut child = ChildKillGuard(spawn_command(config, None)?);
+    let mut child = ChildKillGuard(spawn_command(config, None, None, None)?);
     let stdin = child
         .0
         .stdin
@@ -278,7 +278,6 @@ pub async fn run_command_turn(
         backend_id = %session.backend_id,
         workspace_dir = ?session.workspace_dir,
         external_mcp_servers = session.external_mcp_servers.len(),
-        has_tool_bridge = session.tool_bridge_url.is_some(),
         codex_projection = ?codex_projection,
         "Starting ACP command turn"
     );
@@ -306,9 +305,12 @@ pub async fn run_command_turn(
         env_count = spawn_config.env.len(),
         "Launching ACP child process"
     );
+    let session_ref = crate::protocol::render_session_key_text(&session.session_key);
     let mut child = ChildKillGuard(spawn_command(
         &spawn_config,
         session.workspace_dir.as_deref(),
+        session.team_tool_url.as_deref(),
+        Some(session_ref.as_str()),
     )?);
     let stdin = child
         .0
@@ -622,7 +624,6 @@ pub async fn run_command_turn(
     let mcp_servers = build_mcp_servers(
         init_resp.agent_capabilities.mcp_capabilities.sse,
         init_resp.agent_capabilities.mcp_capabilities.http,
-        session.tool_bridge_url.as_deref(),
         &session.external_mcp_servers,
     );
     tracing::debug!(
@@ -977,14 +978,12 @@ fn outcome_from_decision(
 pub fn build_mcp_servers(
     supports_sse: bool,
     supports_http: bool,
-    team_tools_base_url: Option<&str>,
     external_mcp_servers: &[ExternalMcpServerSpec],
 ) -> Vec<acp::McpServer> {
     if !supports_sse && !supports_http {
-        if team_tools_base_url.is_some() || !external_mcp_servers.is_empty() {
+        if !external_mcp_servers.is_empty() {
             tracing::warn!(
                 configured_external = external_mcp_servers.len(),
-                has_team_tools = team_tools_base_url.is_some(),
                 "ACP agent does not report SSE or HTTP MCP capability; skipping MCP server registration"
             );
         }
@@ -992,25 +991,6 @@ pub fn build_mcp_servers(
     }
 
     let mut servers = Vec::new();
-    if let Some(base) = team_tools_base_url {
-        if !base.is_empty() {
-            if supports_http {
-                // Streamable HTTP MCP (MCP 2025-03-26 spec) — preferred when available
-                let url = format!("{base}/mcp");
-                servers.push(acp::McpServer::Http(acp::McpServerHttp::new(
-                    "team-tools",
-                    &url,
-                )));
-            } else {
-                // Legacy SSE MCP
-                let url = format!("{base}/sse");
-                servers.push(acp::McpServer::Sse(acp::McpServerSse::new(
-                    "team-tools",
-                    &url,
-                )));
-            }
-        }
-    }
     for server in external_mcp_servers {
         match &server.transport {
             ExternalMcpTransport::Sse { url } if !url.is_empty() => {
@@ -1115,6 +1095,8 @@ async fn apply_codex_session_mode_projection(
 fn spawn_command(
     config: &AcpCommandConfig,
     workspace_dir: Option<&std::path::Path>,
+    team_tool_url: Option<&str>,
+    session_ref: Option<&str>,
 ) -> anyhow::Result<tokio::process::Child> {
     let mut cmd = Command::new(&config.command);
     cmd.args(&config.args)
@@ -1124,6 +1106,12 @@ fn spawn_command(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit());
 
+    if let Some(url) = team_tool_url {
+        cmd.env("CLAWBRO_TEAM_TOOL_URL", url);
+    }
+    if let Some(session_ref) = session_ref {
+        cmd.env("CLAWBRO_SESSION_REF", session_ref);
+    }
     if let Ok(path) = std::env::current_exe() {
         cmd.env("CLAWBRO_SCHEDULE_COMMAND", path);
     }
@@ -1277,23 +1265,35 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn build_mcp_servers_empty_when_no_url() {
-        assert!(build_mcp_servers(true, false, None, &[]).is_empty());
+    fn build_mcp_servers_empty_when_no_external_servers() {
+        assert!(build_mcp_servers(true, false, &[]).is_empty());
     }
 
     #[test]
     fn build_mcp_servers_empty_when_no_capability() {
-        assert!(build_mcp_servers(false, false, Some("http://127.0.0.1:9999"), &[]).is_empty());
+        let external = vec![ExternalMcpServerSpec {
+            name: "filesystem".into(),
+            transport: ExternalMcpTransport::Sse {
+                url: "http://127.0.0.1:3001/sse".into(),
+            },
+        }];
+        assert!(build_mcp_servers(false, false, &external).is_empty());
     }
 
     #[test]
     fn build_mcp_servers_sse_when_sse_capability() {
-        let servers = build_mcp_servers(true, false, Some("http://127.0.0.1:9999"), &[]);
+        let external = vec![ExternalMcpServerSpec {
+            name: "filesystem".into(),
+            transport: ExternalMcpTransport::Sse {
+                url: "http://127.0.0.1:3001/sse".into(),
+            },
+        }];
+        let servers = build_mcp_servers(true, false, &external);
         assert_eq!(servers.len(), 1);
         match &servers[0] {
             acp::McpServer::Sse(sse) => {
-                assert_eq!(sse.name, "team-tools");
-                assert_eq!(sse.url, "http://127.0.0.1:9999/sse");
+                assert_eq!(sse.name, "filesystem");
+                assert_eq!(sse.url, "http://127.0.0.1:3001/sse");
             }
             other => panic!("unexpected mcp server: {other:?}"),
         }
@@ -1301,12 +1301,18 @@ mod tests {
 
     #[test]
     fn build_mcp_servers_http_when_http_capability() {
-        let servers = build_mcp_servers(false, true, Some("http://127.0.0.1:9999"), &[]);
+        let external = vec![ExternalMcpServerSpec {
+            name: "filesystem".into(),
+            transport: ExternalMcpTransport::Sse {
+                url: "http://127.0.0.1:3001/sse".into(),
+            },
+        }];
+        let servers = build_mcp_servers(false, true, &external);
         assert_eq!(servers.len(), 1);
         match &servers[0] {
             acp::McpServer::Http(http) => {
-                assert_eq!(http.name, "team-tools");
-                assert_eq!(http.url, "http://127.0.0.1:9999/mcp");
+                assert_eq!(http.name, "filesystem");
+                assert_eq!(http.url, "http://127.0.0.1:3001/sse");
             }
             other => panic!("unexpected mcp server: {other:?}"),
         }
@@ -1315,7 +1321,13 @@ mod tests {
     #[test]
     fn build_mcp_servers_http_preferred_when_both_capabilities() {
         // When agent supports both, HTTP (streamable) is preferred
-        let servers = build_mcp_servers(true, true, Some("http://127.0.0.1:9999"), &[]);
+        let external = vec![ExternalMcpServerSpec {
+            name: "filesystem".into(),
+            transport: ExternalMcpTransport::Sse {
+                url: "http://127.0.0.1:3001/sse".into(),
+            },
+        }];
+        let servers = build_mcp_servers(true, true, &external);
         assert_eq!(servers.len(), 1);
         assert!(matches!(servers[0], acp::McpServer::Http(_)));
     }
@@ -1361,7 +1373,6 @@ mod tests {
             prompt_text: String::new(),
             tool_surface: crate::runtime::contract::ToolSurfaceSpec::default(),
             approval_mode: Default::default(),
-            tool_bridge_url: None,
             external_mcp_servers: vec![],
             team_tool_url: None,
             provider_profile: None,
@@ -1403,7 +1414,6 @@ mod tests {
             prompt_text: String::new(),
             tool_surface: crate::runtime::contract::ToolSurfaceSpec::default(),
             approval_mode: Default::default(),
-            tool_bridge_url: None,
             external_mcp_servers: vec![],
             team_tool_url: None,
             provider_profile: None,
@@ -1466,7 +1476,6 @@ mod tests {
             prompt_text: String::new(),
             tool_surface: crate::runtime::contract::ToolSurfaceSpec::default(),
             approval_mode: Default::default(),
-            tool_bridge_url: None,
             external_mcp_servers: vec![],
             team_tool_url: None,
             provider_profile: None,
@@ -1507,7 +1516,6 @@ mod tests {
             prompt_text: String::new(),
             tool_surface: crate::runtime::contract::ToolSurfaceSpec::default(),
             approval_mode: Default::default(),
-            tool_bridge_url: None,
             external_mcp_servers: vec![],
             team_tool_url: None,
             provider_profile: None,
@@ -1546,7 +1554,7 @@ mod tests {
     }
 
     #[test]
-    fn build_mcp_servers_merges_team_and_external_servers() {
+    fn build_mcp_servers_registers_external_servers_only() {
         let external = vec![
             ExternalMcpServerSpec {
                 name: "filesystem".into(),
@@ -1562,8 +1570,8 @@ mod tests {
             },
         ];
 
-        let servers = build_mcp_servers(true, false, Some("http://127.0.0.1:9999"), &external);
-        assert_eq!(servers.len(), 3);
+        let servers = build_mcp_servers(true, false, &external);
+        assert_eq!(servers.len(), 2);
         let names: Vec<_> = servers
             .iter()
             .map(|server| match server {
@@ -1571,7 +1579,7 @@ mod tests {
                 other => panic!("unexpected mcp server: {other:?}"),
             })
             .collect();
-        assert_eq!(names, vec!["team-tools", "filesystem", "github"]);
+        assert_eq!(names, vec!["filesystem", "github"]);
     }
 
     #[test]
@@ -1671,7 +1679,6 @@ mod tests {
             prompt_text: "hello".into(),
             tool_surface: crate::runtime::contract::ToolSurfaceSpec::default(),
             approval_mode: ApprovalMode::Manual,
-            tool_bridge_url: None,
             external_mcp_servers: vec![],
             team_tool_url: None,
             provider_profile: Some(crate::runtime::provider_profiles::RuntimeProviderProfile {
@@ -1825,6 +1832,8 @@ mod tests {
                 args: vec!["30".into()],
                 env: vec![],
             },
+            None,
+            None,
             None,
         )
         .unwrap();

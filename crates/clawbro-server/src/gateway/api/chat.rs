@@ -6,11 +6,7 @@ use crate::{
     protocol::{InboundMsg, MsgContent, MsgSource, SessionKey},
     state::AppState,
 };
-use axum::{
-    extract::State,
-    http::StatusCode,
-    Json,
-};
+use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 

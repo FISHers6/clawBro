@@ -40,6 +40,8 @@ pub enum Commands {
     Schedule(ScheduleArgs),
     /// 管理本地 skills 目录
     Skill(SkillArgs),
+    /// WeChat QR 码扫码登录
+    WechatLogin,
     /// 生成 Shell 补全脚本
     Completions(CompletionsArgs),
 }
@@ -99,10 +101,10 @@ pub struct SkillHubArgs {
 pub enum SkillHubCommands {
     /// 在 ClawHub 中搜索 skills
     Search(SkillHubSearchArgs),
-    /// 通过 ClawHub 安装到 workspace ./skills
+    /// 通过 ClawHub 安装到 project canonical skills dir（默认 <workspace>/.agents/skills）
     #[command(disable_version_flag = true)]
     Install(SkillHubInstallArgs),
-    /// 列出当前 workspace 的 ClawHub lock 记录
+    /// 列出当前 project canonical skills dir 的 ClawHub 记录
     List(SkillHubListArgs),
     /// 更新一个或全部已安装的 ClawHub skills
     #[command(disable_version_flag = true)]
@@ -337,9 +339,9 @@ pub struct TeamHelperArgs {
     #[arg(long)]
     pub url: Option<String>,
     #[arg(long = "session-channel")]
-    pub session_channel: String,
+    pub session_channel: Option<String>,
     #[arg(long = "session-scope")]
-    pub session_scope: String,
+    pub session_scope: Option<String>,
     #[arg(value_name = "ARGS", allow_hyphen_values = true, num_args = 1..)]
     pub command: Vec<String>,
 }

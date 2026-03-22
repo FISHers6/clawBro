@@ -1,96 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::protocol::SessionKey;
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum TeamTool {
-    CreateTask,
-    StartExecution,
-    RequestConfirmation,
-    PostUpdate,
-    GetTaskStatus,
-    AssignTask,
-    CheckpointTask,
-    SubmitTaskResult,
-    CompleteTask,
-    AcceptTask,
-    ReopenTask,
-    BlockTask,
-    RequestHelp,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TeamToolCall {
-    CreateTask {
-        id: Option<String>,
-        title: String,
-        assignee: Option<String>,
-        spec: Option<String>,
-        deps: Vec<String>,
-        success_criteria: Option<String>,
-    },
-    StartExecution,
-    RequestConfirmation {
-        plan_summary: String,
-    },
-    PostUpdate {
-        message: String,
-    },
-    GetTaskStatus,
-    AssignTask {
-        task_id: String,
-        new_assignee: String,
-    },
-    CheckpointTask {
-        task_id: String,
-        note: String,
-        agent: Option<String>,
-    },
-    SubmitTaskResult {
-        task_id: String,
-        summary: String,
-        result_markdown: Option<String>,
-        agent: Option<String>,
-    },
-    AcceptTask {
-        task_id: String,
-        by: Option<String>,
-    },
-    ReopenTask {
-        task_id: String,
-        reason: String,
-        by: Option<String>,
-    },
-    CompleteTask {
-        task_id: String,
-        note: String,
-        result_markdown: Option<String>,
-        agent: Option<String>,
-    },
-    BlockTask {
-        task_id: String,
-        reason: String,
-        agent: Option<String>,
-    },
-    RequestHelp {
-        task_id: String,
-        message: String,
-        agent: Option<String>,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TeamToolRequest {
-    pub session_key: SessionKey,
-    pub call: TeamToolCall,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TeamToolResponse {
-    pub ok: bool,
-    pub message: String,
-    #[serde(default)]
-    pub payload: Option<serde_json::Value>,
-}
+pub use crate::team_contract::{TeamTool, TeamToolCall, TeamToolRequest, TeamToolResponse};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ScheduleTool {
@@ -116,6 +26,7 @@ pub enum ScheduleTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::SessionKey;
 
     #[test]
     fn team_tool_request_round_trips_through_json() {

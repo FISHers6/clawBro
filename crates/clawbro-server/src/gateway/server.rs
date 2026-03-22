@@ -1,11 +1,11 @@
 use crate::{
-    gateway::api,
     diagnostics::{
         collect_backend_diagnostics, collect_channel_diagnostics, collect_doctor_report,
         collect_health_report, collect_status_report, collect_team_diagnostics,
         collect_topology_diagnostic, BackendDiagnostic, ChannelDiagnostic, DoctorReport,
         HealthReport, StatusReport, TeamDiagnostic, TopologyDiagnostic,
     },
+    gateway::api,
     im_sink::spawn_im_turn,
     state::AppState,
 };
@@ -27,22 +27,51 @@ pub fn build_router(state: AppState) -> Router {
         .route("/doctor", get(doctor))
         .route("/api/agents", get(api::agents::list_agents))
         .route("/api/agents", post(api::agents_write::create_agent))
-        .route("/api/agents/{name}", get(api::agents::get_agent).patch(api::agents_write::patch_agent).delete(api::agents_write::delete_agent))
+        .route(
+            "/api/agents/{name}",
+            get(api::agents::get_agent)
+                .patch(api::agents_write::patch_agent)
+                .delete(api::agents_write::delete_agent),
+        )
         .route("/api/approvals", get(api::approvals::list_approvals))
-        .route("/api/approvals/{approval_id}", get(api::approvals::get_approval))
-        .route("/api/approvals/{approval_id}/approve", post(api::approvals::approve_approval))
-        .route("/api/approvals/{approval_id}/deny", post(api::approvals::deny_approval))
+        .route(
+            "/api/approvals/{approval_id}",
+            get(api::approvals::get_approval),
+        )
+        .route(
+            "/api/approvals/{approval_id}/approve",
+            post(api::approvals::approve_approval),
+        )
+        .route(
+            "/api/approvals/{approval_id}/deny",
+            post(api::approvals::deny_approval),
+        )
         .route("/api/backends", get(api::backends::list_backends))
-        .route("/api/backends/{backend_id}", get(api::backends::get_backend))
+        .route(
+            "/api/backends/{backend_id}",
+            get(api::backends::get_backend),
+        )
         .route("/api/channels", get(api::channels::list_channels))
-        .route("/api/channels/{channel_id}", get(api::channels::get_channel))
-        .route("/api/config/effective", get(api::config::get_effective_config))
+        .route(
+            "/api/channels/{channel_id}",
+            get(api::channels::get_channel),
+        )
+        .route(
+            "/api/config/effective",
+            get(api::config::get_effective_config),
+        )
         .route("/api/config/spec", get(api::config::get_config_spec))
         .route("/api/config/raw", get(api::config_write::get_raw_config))
         .route("/api/config/raw", put(api::config_write::put_raw_config))
-        .route("/api/config/validate", post(api::config_write::validate_config))
+        .route(
+            "/api/config/validate",
+            post(api::config_write::validate_config),
+        )
         .route("/api/skills", get(api::skills::list_skills))
-        .route("/api/agents/{name}/skills", get(api::skills::get_agent_skills))
+        .route(
+            "/api/agents/{name}/skills",
+            get(api::skills::get_agent_skills),
+        )
         .route("/api/scheduler/jobs", get(api::scheduler::list_jobs))
         .route("/api/scheduler/jobs/{job_id}", get(api::scheduler::get_job))
         .route(
@@ -54,10 +83,19 @@ pub fn build_router(state: AppState) -> Router {
             post(api::scheduler::run_job_now),
         )
         .route("/api/sessions", get(api::sessions::list_sessions))
-        .route("/api/sessions", delete(api::sessions_write::delete_session_history))
+        .route(
+            "/api/sessions",
+            delete(api::sessions_write::delete_session_history),
+        )
         .route("/api/sessions/detail", get(api::sessions::get_session))
-        .route("/api/sessions/messages", get(api::sessions::get_session_messages))
-        .route("/api/sessions/events", get(api::sessions::get_session_events))
+        .route(
+            "/api/sessions/messages",
+            get(api::sessions::get_session_messages),
+        )
+        .route(
+            "/api/sessions/events",
+            get(api::sessions::get_session_events),
+        )
         .route("/api/tasks", get(api::tasks::list_tasks))
         .route("/api/tasks/{task_id}", get(api::tasks::get_task))
         .route("/api/teams", get(api::teams::list_teams))
@@ -98,7 +136,10 @@ pub fn build_router(state: AppState) -> Router {
             "/api/teams/{team_id}/pending-completions",
             get(api::teams::list_team_pending_completions),
         )
-        .route("/api/teams/{team_id}/tasks", get(api::tasks::list_team_tasks))
+        .route(
+            "/api/teams/{team_id}/tasks",
+            get(api::tasks::list_team_tasks),
+        )
         .route("/api/chat", post(api::chat::chat_send))
         .route("/diagnostics/backends", get(diagnostics_backends))
         .route("/diagnostics/teams", get(diagnostics_teams))
@@ -302,6 +343,7 @@ mod tests {
                     presentation: config::ProgressPresentationMode::FinalOnly,
                 }),
                 dingtalk_webhook: None,
+                wechat: None,
             },
             agent_roster: vec![AgentEntry {
                 name: "claude".to_string(),
@@ -334,7 +376,9 @@ mod tests {
             Some("native-main".to_string()),
             session_manager,
             String::new(),
-            Some(crate::agent_core::AgentRoster::new(cfg.agent_roster.clone())),
+            Some(crate::agent_core::AgentRoster::new(
+                cfg.agent_roster.clone(),
+            )),
             None,
             None,
             None,
@@ -747,7 +791,10 @@ mod tests {
             backends_json["items"][0]["supports_native_local_skills"],
             false
         );
-        assert_eq!(backends_json["items"][0]["launch"]["type"], "bundled_command");
+        assert_eq!(
+            backends_json["items"][0]["launch"]["type"],
+            "bundled_command"
+        );
 
         let channels = app
             .oneshot(
@@ -793,7 +840,11 @@ mod tests {
         assert_eq!(json["default_backend_id"], "native-main");
         assert!(json["roster_agents"].as_array().unwrap().len() >= 1);
         assert!(json["team_scopes"].is_array());
-        assert!(json["channels"].as_array().unwrap().iter().any(|v| v == "lark"));
+        assert!(json["channels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "lark"));
     }
 
     #[tokio::test]
@@ -858,7 +909,10 @@ mod tests {
         assert!(json["memory"].get("shared_dir").is_none());
         assert_eq!(json["scheduler"]["db_path_configured"], false);
         assert!(json["scheduler"].get("db_path").is_none());
-        assert_eq!(json["backends"][0]["external_mcp_servers"][0]["name"], "docs");
+        assert_eq!(
+            json["backends"][0]["external_mcp_servers"][0]["name"],
+            "docs"
+        );
         assert_eq!(json["backends"][0]["launch"]["type"], "bundled_command");
     }
 
@@ -866,8 +920,14 @@ mod tests {
     async fn api_sessions_support_query_param_identity_and_message_reads() {
         let state = test_state().await;
         let key = crate::protocol::SessionKey::with_instance("lark", "alpha", "group:oc_test");
-        let session_id = state.registry.session_manager_ref().get_or_create(&key).await.unwrap();
-        state.registry
+        let session_id = state
+            .registry
+            .session_manager_ref()
+            .get_or_create(&key)
+            .await
+            .unwrap();
+        state
+            .registry
             .session_manager_ref()
             .append_message(
                 session_id,
@@ -945,7 +1005,13 @@ mod tests {
                 .unwrap();
         let list_without_instance_json: Value =
             serde_json::from_slice(&list_without_instance_body).unwrap();
-        assert_eq!(list_without_instance_json["items"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            list_without_instance_json["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
 
         let bad_filter = app
             .clone()
@@ -991,7 +1057,10 @@ mod tests {
             .unwrap();
         let event_json: Value = serde_json::from_slice(&event_body).unwrap();
         assert_eq!(event_json["items"][0]["event_type"], "thinking");
-        assert_eq!(event_json["items"][0]["payload"]["session_id"], session_id.to_string());
+        assert_eq!(
+            event_json["items"][0]["payload"]["session_id"],
+            session_id.to_string()
+        );
         assert!(event_json["items"][0]["payload"].get("type").is_none());
     }
 
@@ -1078,8 +1147,7 @@ mod tests {
         .unwrap();
 
         Arc::make_mut(&mut state.cfg).skills.dir = managed_root;
-        Arc::make_mut(&mut state.cfg).groups[0].mode.interaction =
-            config::InteractionMode::Team;
+        Arc::make_mut(&mut state.cfg).groups[0].mode.interaction = config::InteractionMode::Team;
         Arc::make_mut(&mut state.cfg).groups[0].mode.front_bot = Some("claude".to_string());
         Arc::make_mut(&mut state.cfg).groups[0].team.roster = vec!["claude".to_string()];
         let app = build_router(state);
@@ -1352,7 +1420,9 @@ mod tests {
             delivery_status:
                 crate::agent_core::team::completion_routing::RoutingDeliveryStatus::PersistedPending,
             event: crate::agent_core::team::completion_routing::TeamRoutingEvent::submitted(
-                "T001", "claw", "ready for review",
+                "T001",
+                "claw",
+                "ready for review",
             ),
         };
         session.append_routing_outcome(&envelope).unwrap();
@@ -1643,7 +1713,11 @@ mod tests {
                 dispatch_fn.clone(),
                 std::time::Duration::from_secs(60),
             );
-            orch.set_scope(crate::protocol::SessionKey::with_instance("lark", "beta", group_scope));
+            orch.set_scope(crate::protocol::SessionKey::with_instance(
+                "lark",
+                "beta",
+                group_scope,
+            ));
             orch.set_lead_session_key(crate::protocol::SessionKey::with_instance(
                 "lark",
                 "beta",
@@ -1674,14 +1748,21 @@ mod tests {
         let state = test_state().await;
         let tmp = tempdir().unwrap();
         let task_registry = Arc::new(TaskRegistry::new_in_memory().unwrap());
-        let session = Arc::new(TeamSession::from_dir("team-root-files", tmp.path().to_path_buf()));
+        let session = Arc::new(TeamSession::from_dir(
+            "team-root-files",
+            tmp.path().to_path_buf(),
+        ));
         session.write_team_md("# Team\nLead is claude").unwrap();
-        session.write_agents_md("# Agents\n- claude\n- claw").unwrap();
-        session.write_context_md("# Context\nTrack the current user goal").unwrap();
-        session.write_heartbeat_md("# Heartbeat\nCheck stale tasks").unwrap();
         session
-            .sync_tasks_md(&task_registry)
+            .write_agents_md("# Agents\n- claude\n- claw")
             .unwrap();
+        session
+            .write_context_md("# Context\nTrack the current user goal")
+            .unwrap();
+        session
+            .write_heartbeat_md("# Heartbeat\nCheck stale tasks")
+            .unwrap();
+        session.sync_tasks_md(&task_registry).unwrap();
 
         let dispatch_fn: DispatchFn = Arc::new(|_, _| Box::pin(async { Ok(()) }));
         let orch = TeamOrchestrator::new(

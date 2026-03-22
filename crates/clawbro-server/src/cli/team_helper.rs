@@ -1,5 +1,5 @@
 use crate::cli::args::TeamHelperArgs;
-use crate::protocol::{render_session_key_text, SessionKey};
+use crate::protocol::{parse_session_key_text, render_session_key_text, SessionKey};
 use crate::runtime::{
     render_team_helper_failure, render_team_helper_success, TeamToolCall, TeamToolRequest,
     TeamToolResponse,
@@ -10,13 +10,15 @@ use tokio::process::Command;
 
 pub async fn run(args: TeamHelperArgs) -> Result<()> {
     let call = parse_call(args.command)?;
-    let session_key = SessionKey::new(args.session_channel, args.session_scope);
+    let resolved_url = args
+        .url
+        .or_else(|| std::env::var("CLAWBRO_TEAM_TOOL_URL").ok());
+    let session_key = resolve_helper_session_key(args.session_channel, args.session_scope)?;
     let rendered = match call {
         HelperCall::Team(call) => {
-            let url = args
-                .url
+            let url = resolved_url
                 .as_ref()
-                .context("--url is required for team helper subcommands")?;
+                .context("--url is required, or set CLAWBRO_TEAM_TOOL_URL")?;
             let response = reqwest::Client::new()
                 .post(url)
                 .json(&TeamToolRequest {
@@ -52,6 +54,24 @@ pub async fn run(args: TeamHelperArgs) -> Result<()> {
     };
     println!("{}", serde_json::to_string(&rendered)?);
     Ok(())
+}
+
+fn resolve_helper_session_key(
+    session_channel: Option<String>,
+    session_scope: Option<String>,
+) -> Result<SessionKey> {
+    match (session_channel, session_scope) {
+        (Some(channel), Some(scope)) => Ok(SessionKey::new(channel, scope)),
+        (None, None) => {
+            let session_ref = std::env::var("CLAWBRO_SESSION_REF")
+                .context("--session-channel/--session-scope missing, and CLAWBRO_SESSION_REF is not set")?;
+            parse_session_key_text(&session_ref)
+                .map_err(|e| anyhow!("failed to parse CLAWBRO_SESSION_REF `{session_ref}`: {e}"))
+        }
+        _ => bail!(
+            "--session-channel and --session-scope must be provided together, or omit both and use CLAWBRO_SESSION_REF"
+        ),
+    }
 }
 
 #[derive(Clone)]
@@ -106,12 +126,6 @@ fn parse_call(mut args: Vec<String>) -> Result<HelperCall> {
         "submit-task-result" => Ok(HelperCall::Team(TeamToolCall::SubmitTaskResult {
             task_id: take_flag(&mut args, "--task-id")?,
             summary: take_flag(&mut args, "--summary")?,
-            result_markdown: take_optional_flag(&mut args, "--result-markdown"),
-            agent: take_optional_flag(&mut args, "--agent"),
-        })),
-        "complete-task" => Ok(HelperCall::Team(TeamToolCall::CompleteTask {
-            task_id: take_flag(&mut args, "--task-id")?,
-            note: take_flag(&mut args, "--note")?,
             result_markdown: take_optional_flag(&mut args, "--result-markdown"),
             agent: take_optional_flag(&mut args, "--agent"),
         })),
@@ -458,6 +472,39 @@ fn normalize_schedule_helper_command(
     normalized
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_helper_session_key_accepts_explicit_channel_and_scope() {
+        let key = resolve_helper_session_key(Some("lark".into()), Some("group:oc_test".into()))
+            .expect("explicit session key");
+        assert_eq!(key.channel, "lark");
+        assert_eq!(key.scope, "group:oc_test");
+    }
+
+    #[test]
+    fn resolve_helper_session_key_reads_env_session_ref() {
+        unsafe {
+            std::env::set_var("CLAWBRO_SESSION_REF", "lark@alpha:group:oc_test");
+        }
+        let key = resolve_helper_session_key(None, None).expect("env session key");
+        assert_eq!(key.channel, "lark");
+        assert_eq!(key.scope, "group:oc_test");
+        assert_eq!(key.channel_instance.as_deref(), Some("alpha"));
+        unsafe {
+            std::env::remove_var("CLAWBRO_SESSION_REF");
+        }
+    }
+
+    #[test]
+    fn resolve_helper_session_key_rejects_partial_explicit_args() {
+        let err = resolve_helper_session_key(Some("lark".into()), None).unwrap_err();
+        assert!(err.to_string().contains("must be provided together"));
+    }
+}
+
 fn infer_schedule_kind_from_flags(args: &[String]) -> Option<String> {
     let mut inferred = Vec::new();
     if args.iter().any(|arg| arg == "--expr") {
@@ -607,21 +654,22 @@ fn render_team_helper_output(call: &TeamToolCall, response: TeamToolResponse) ->
             ]),
         ),
         TeamToolCall::SubmitTaskResult {
-            task_id, summary, ..
+            task_id,
+            summary,
+            result_markdown,
+            ..
         } => render_team_helper_success(
             "submit_task_result",
             Map::from_iter([
                 ("task_id".into(), Value::String(task_id.clone())),
                 ("summary".into(), Value::String(summary.clone())),
-                ("message".into(), Value::String(response.message)),
-                ("payload".into(), response.payload.unwrap_or(Value::Null)),
-            ]),
-        ),
-        TeamToolCall::CompleteTask { task_id, note, .. } => render_team_helper_success(
-            "complete_task",
-            Map::from_iter([
-                ("task_id".into(), Value::String(task_id.clone())),
-                ("note".into(), Value::String(note.clone())),
+                (
+                    "result_markdown".into(),
+                    result_markdown
+                        .as_ref()
+                        .map(|v| Value::String(v.clone()))
+                        .unwrap_or(Value::Null),
+                ),
                 ("message".into(), Value::String(response.message)),
                 ("payload".into(), response.payload.unwrap_or(Value::Null)),
             ]),

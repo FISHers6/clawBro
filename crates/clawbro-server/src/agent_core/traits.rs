@@ -36,9 +36,6 @@ pub struct AgentCtx {
     pub team_dir: Option<PathBuf>,
     /// 注入 Layer 0 的任务提醒文本（Specialist / Lead 有任务时有效）
     pub task_reminder: Option<String>,
-    /// URL of the running TeamMcpServer (e.g. "http://127.0.0.1:54321/sse").
-    /// Set only for Specialist turns when TeamOrchestrator is wired and running.
-    pub mcp_server_url: Option<String>,
     /// URL of the family-agnostic Team Tool RPC endpoint.
     pub team_tool_url: Option<String>,
     /// Optional allowlist for team coordination tools on this turn.
@@ -73,7 +70,6 @@ impl Default for AgentCtx {
             agent_role: AgentRole::Solo,
             team_dir: None,
             task_reminder: None,
-            mcp_server_url: None,
             team_tool_url: None,
             allowed_team_tools: vec![],
             allowed_schedule_tools: vec![],

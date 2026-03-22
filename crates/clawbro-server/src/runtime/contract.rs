@@ -144,8 +144,6 @@ pub struct RuntimeSessionSpec {
     pub tool_surface: ToolSurfaceSpec,
     #[serde(default)]
     pub approval_mode: ApprovalMode,
-    /// ACP-family MCP bridge endpoint (typically SSE).
-    pub tool_bridge_url: Option<String>,
     /// User-configured external MCP servers for backend families that support them.
     #[serde(default)]
     pub external_mcp_servers: Vec<ExternalMcpServerSpec>,
@@ -175,7 +173,6 @@ impl RuntimeSessionSpec {
             prompt_text: self.prompt_text.clone(),
             tool_surface: self.tool_surface.clone(),
             approval_mode: self.approval_mode,
-            tool_bridge_url: self.tool_bridge_url.clone(),
             external_mcp_servers: self.external_mcp_servers.clone(),
             provider_profile: self.provider_profile.clone(),
             context: self.context.clone(),
@@ -417,12 +414,10 @@ mod tests {
                 allowed_team_tools: vec![],
                 schedule_tools: true,
                 allowed_schedule_tools: vec![],
-                local_skills: true,
                 external_mcp: false,
                 backend_native_tools: true,
             },
             approval_mode: Default::default(),
-            tool_bridge_url: Some("http://127.0.0.1:9999/sse".into()),
             external_mcp_servers: vec![
                 ExternalMcpServerSpec {
                     name: "filesystem".into(),
@@ -447,10 +442,6 @@ mod tests {
         assert_eq!(spec.workspace_dir, Some(PathBuf::from("/tmp/workspace")));
         assert_eq!(spec.prompt_text, "ship it");
         assert!(spec.tool_surface.team_tools);
-        assert_eq!(
-            spec.tool_bridge_url.as_deref(),
-            Some("http://127.0.0.1:9999/sse")
-        );
         assert_eq!(spec.external_mcp_servers.len(), 2);
         assert_eq!(
             spec.team_tool_url.as_deref(),
@@ -469,7 +460,6 @@ mod tests {
             prompt_text: "legacy raw prompt".into(),
             tool_surface: ToolSurfaceSpec::default(),
             approval_mode: Default::default(),
-            tool_bridge_url: None,
             external_mcp_servers: vec![],
             team_tool_url: None,
             provider_profile: None,
@@ -507,7 +497,6 @@ mod tests {
             prompt_text: "legacy raw prompt".into(),
             tool_surface: ToolSurfaceSpec::default(),
             approval_mode: Default::default(),
-            tool_bridge_url: None,
             external_mcp_servers: vec![],
             team_tool_url: None,
             provider_profile: None,
@@ -693,7 +682,6 @@ mod tests {
             prompt_text: "hello".into(),
             tool_surface: ToolSurfaceSpec::default(),
             approval_mode: Default::default(),
-            tool_bridge_url: Some("http://127.0.0.1:3000/sse".into()),
             external_mcp_servers: vec![
                 ExternalMcpServerSpec {
                     name: "filesystem".into(),
@@ -761,7 +749,6 @@ mod tests {
             prompt_text: String::new(),
             tool_surface: ToolSurfaceSpec::default(),
             approval_mode: Default::default(),
-            tool_bridge_url: None,
             external_mcp_servers: vec![],
             team_tool_url: None,
             provider_profile: None,
@@ -798,7 +785,6 @@ mod tests {
             prompt_text: String::new(),
             tool_surface: ToolSurfaceSpec::default(),
             approval_mode: Default::default(),
-            tool_bridge_url: None,
             external_mcp_servers: vec![],
             team_tool_url: None,
             provider_profile: None,

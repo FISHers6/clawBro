@@ -188,7 +188,6 @@ mod tests {
                     prompt_text: "hello".into(),
                     tool_surface: ToolSurfaceSpec::default(),
                     approval_mode: Default::default(),
-                    tool_bridge_url: None,
                     external_mcp_servers: vec![],
                     team_tool_url: None,
                     provider_profile: None,

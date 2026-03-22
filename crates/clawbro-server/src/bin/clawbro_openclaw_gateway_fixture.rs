@@ -216,34 +216,65 @@ async fn handle_request(
             )
             .await?;
 
-            if let Some(helper_results) = run_leader_helpers(message).await? {
-                for (idx, helper_result) in helper_results.iter().enumerate() {
+            if session_key.starts_with("specialist:") {
+                if let Some(helper_results) = run_specialist_helper(message, session_key).await? {
+                    emit_helper_results(socket, session_key, run_id, &helper_results).await?;
+                    let task_id = extract_task_id(message).unwrap_or_else(|| "T001".to_string());
                     send_frame(
                         socket,
                         GatewayFrame::Event {
-                            event: "agent".into(),
+                            event: "chat".into(),
                             payload: Some(json!({
                                 "sessionKey": session_key,
                                 "runId": run_id,
-                                "stream": "tool",
-                                "data": {
-                                    "phase": "result",
-                                    "name": "exec",
-                                    "toolCallId": format!("tool-{}", idx + 1),
-                                    "result": {
-                                        "content": [{
-                                            "type": "text",
-                                            "text": helper_result
-                                        }]
-                                    }
+                                "state": "final",
+                                "message": {
+                                    "content": [{
+                                        "type": "text",
+                                        "text": format!("openclaw-worker:submitted:{task_id}")
+                                    }]
                                 }
                             })),
-                            seq: Some((idx + 1) as u64),
+                            seq: Some((helper_results.len() as u64) + 1),
                             state_version: None,
                         },
                     )
                     .await?;
+                } else if let Some(helper_results) =
+                    run_leader_helpers(message, session_key).await?
+                {
+                    emit_helper_results(socket, session_key, run_id, &helper_results).await?;
+                    let task_id = extract_task_id(message).unwrap_or_else(|| "T001".to_string());
+                    let final_text = if message.contains("已提交待验收") {
+                        format!("openclaw-leader:accepted:{task_id}")
+                    } else {
+                        format!("openclaw-leader:planned:{task_id}")
+                    };
+                    send_frame(
+                        socket,
+                        GatewayFrame::Event {
+                            event: "chat".into(),
+                            payload: Some(json!({
+                                "sessionKey": session_key,
+                                "runId": run_id,
+                                "state": "final",
+                                "message": {
+                                    "content": [{
+                                        "type": "text",
+                                        "text": final_text
+                                    }]
+                                }
+                            })),
+                            seq: Some((helper_results.len() as u64) + 1),
+                            state_version: None,
+                        },
+                    )
+                    .await?;
+                } else {
+                    send_default_final(socket, session_key, run_id).await?;
                 }
+            } else if let Some(helper_results) = run_leader_helpers(message, session_key).await? {
+                emit_helper_results(socket, session_key, run_id, &helper_results).await?;
                 let task_id = extract_task_id(message).unwrap_or_else(|| "T001".to_string());
                 let final_text = if message.contains("已提交待验收") {
                     format!("openclaw-leader:accepted:{task_id}")
@@ -270,34 +301,9 @@ async fn handle_request(
                     },
                 )
                 .await?;
-            } else if let Some(helper_results) = run_specialist_helper(message).await? {
-                for (idx, helper_result) in helper_results.iter().enumerate() {
-                    send_frame(
-                        socket,
-                        GatewayFrame::Event {
-                            event: "agent".into(),
-                            payload: Some(json!({
-                                "sessionKey": session_key,
-                                "runId": run_id,
-                                "stream": "tool",
-                                "data": {
-                                    "phase": "result",
-                                    "name": "exec",
-                                    "toolCallId": format!("tool-{}", idx + 1),
-                                    "result": {
-                                        "content": [{
-                                            "type": "text",
-                                            "text": helper_result
-                                        }]
-                                    }
-                                }
-                            })),
-                            seq: Some((idx + 1) as u64),
-                            state_version: None,
-                        },
-                    )
-                    .await?;
-                }
+            } else if let Some(helper_results) = run_specialist_helper(message, session_key).await?
+            {
+                emit_helper_results(socket, session_key, run_id, &helper_results).await?;
                 let task_id = extract_task_id(message).unwrap_or_else(|| "T001".to_string());
                 send_frame(
                     socket,
@@ -320,26 +326,7 @@ async fn handle_request(
                 )
                 .await?;
             } else {
-                send_frame(
-                    socket,
-                    GatewayFrame::Event {
-                        event: "chat".into(),
-                        payload: Some(json!({
-                            "sessionKey": session_key,
-                            "runId": run_id,
-                            "state": "final",
-                            "message": {
-                                "content": [{
-                                    "type": "text",
-                                    "text": "openclaw:fixture"
-                                }]
-                            }
-                        })),
-                        seq: Some(1),
-                        state_version: None,
-                    },
-                )
-                .await?;
+                send_default_final(socket, session_key, run_id).await?;
             }
         }
         other => {
@@ -356,11 +343,71 @@ async fn send_frame(socket: &mut WebSocket, frame: GatewayFrame) -> Result<()> {
     Ok(())
 }
 
-async fn run_specialist_helper(prompt: &str) -> Result<Option<Vec<String>>> {
+async fn emit_helper_results(
+    socket: &mut WebSocket,
+    session_key: &str,
+    run_id: &str,
+    helper_results: &[String],
+) -> Result<()> {
+    for (idx, helper_result) in helper_results.iter().enumerate() {
+        send_frame(
+            socket,
+            GatewayFrame::Event {
+                event: "agent".into(),
+                payload: Some(json!({
+                    "sessionKey": session_key,
+                    "runId": run_id,
+                    "stream": "tool",
+                    "data": {
+                        "phase": "result",
+                        "name": "exec",
+                        "toolCallId": format!("tool-{}", idx + 1),
+                        "result": {
+                            "content": [{
+                                "type": "text",
+                                "text": helper_result
+                            }]
+                        }
+                    }
+                })),
+                seq: Some((idx + 1) as u64),
+                state_version: None,
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn send_default_final(socket: &mut WebSocket, session_key: &str, run_id: &str) -> Result<()> {
+    send_frame(
+        socket,
+        GatewayFrame::Event {
+            event: "chat".into(),
+            payload: Some(json!({
+                "sessionKey": session_key,
+                "runId": run_id,
+                "state": "final",
+                "message": {
+                    "content": [{
+                        "type": "text",
+                        "text": "openclaw:fixture"
+                    }]
+                }
+            })),
+            seq: Some(1),
+            state_version: None,
+        },
+    )
+    .await
+}
+
+async fn run_specialist_helper(prompt: &str, session_key: &str) -> Result<Option<Vec<String>>> {
     let Some(submit_template) = extract_backticked_command(prompt, "submit-task-result") else {
         return Ok(None);
     };
     let task_id = extract_task_id(prompt).unwrap_or_else(|| "T001".to_string());
+    let helper_url = extract_helper_url(prompt);
     let mut results = Vec::new();
 
     if let Some(help_template) = extract_backticked_command(prompt, "request-help") {
@@ -370,34 +417,41 @@ async fn run_specialist_helper(prompt: &str) -> Result<Option<Vec<String>>> {
                 "<message>",
                 &shell_quote("openclaw worker needs a quick hint"),
             );
-        results.push(run_helper_command(&help).await?);
+        results.push(run_helper_command(&help, session_key, helper_url.as_deref()).await?);
     }
 
     if let Some(checkpoint_template) = extract_backticked_command(prompt, "checkpoint-task") {
         let checkpoint = checkpoint_template
             .replace("<task-id>", &shell_quote(&task_id))
             .replace("<note>", &shell_quote("openclaw worker checkpoint"));
-        results.push(run_helper_command(&checkpoint).await?);
+        results.push(run_helper_command(&checkpoint, session_key, helper_url.as_deref()).await?);
     }
 
     let command = submit_template
         .replace("<task-id>", &shell_quote(&task_id))
-        .replace("<summary>", &shell_quote("openclaw worker fixture result"));
-    results.push(run_helper_command(&command).await?);
+        .replace("<summary>", &shell_quote("openclaw worker fixture result"))
+        .replace(
+            "<result-markdown>",
+            &shell_quote(
+                "# OpenClaw Worker Result\n\nImplemented the fixture task and prepared the final deliverable body for lead review.",
+            ),
+        );
+    results.push(run_helper_command(&command, session_key, helper_url.as_deref()).await?);
     Ok(Some(results))
 }
 
-async fn run_leader_helpers(prompt: &str) -> Result<Option<Vec<String>>> {
+async fn run_leader_helpers(prompt: &str, session_key: &str) -> Result<Option<Vec<String>>> {
     let Some(create_template) = extract_backticked_command(prompt, "create-task") else {
         return Ok(None);
     };
     let task_id = extract_task_id(prompt).unwrap_or_else(|| "T001".to_string());
+    let helper_url = extract_helper_url(prompt);
     let mut results = Vec::new();
 
     if prompt.contains("已提交待验收") {
         if let Some(accept_template) = extract_backticked_command(prompt, "accept-task") {
             let command = accept_template.replace("<task-id>", &shell_quote(&task_id));
-            results.push(run_helper_command(&command).await?);
+            results.push(run_helper_command(&command, session_key, helper_url.as_deref()).await?);
         }
         return Ok(Some(results));
     }
@@ -406,26 +460,36 @@ async fn run_leader_helpers(prompt: &str) -> Result<Option<Vec<String>>> {
         .replace("<task-id>", &shell_quote(&task_id))
         .replace("<title>", &shell_quote("openclaw leader fixture task"))
         .replace("<agent>", &shell_quote("worker"));
-    results.push(run_helper_command(&create).await?);
+    results.push(run_helper_command(&create, session_key, helper_url.as_deref()).await?);
 
     if let Some(assign_template) = extract_backticked_command(prompt, "assign-task") {
         let assign = assign_template
             .replace("<task-id>", &shell_quote(&task_id))
             .replace("<agent>", &shell_quote("worker"));
-        results.push(run_helper_command(&assign).await?);
+        results.push(run_helper_command(&assign, session_key, helper_url.as_deref()).await?);
     }
 
     if let Some(start_template) = extract_backticked_command(prompt, "start-execution") {
-        results.push(run_helper_command(&start_template).await?);
+        results
+            .push(run_helper_command(&start_template, session_key, helper_url.as_deref()).await?);
     }
 
     Ok(Some(results))
 }
 
-async fn run_helper_command(command: &str) -> Result<String> {
-    let output = Command::new("sh")
-        .arg("-lc")
+async fn run_helper_command(
+    command: &str,
+    session_key: &str,
+    helper_url: Option<&str>,
+) -> Result<String> {
+    let mut cmd = Command::new("sh");
+    cmd.arg("-lc")
         .arg(command)
+        .env("CLAWBRO_SESSION_REF", session_key);
+    if let Some(url) = helper_url {
+        cmd.env("CLAWBRO_TEAM_TOOL_URL", url);
+    }
+    let output = cmd
         .output()
         .await
         .with_context(|| format!("failed to execute helper command: {command}"))?;
@@ -440,7 +504,38 @@ async fn run_helper_command(command: &str) -> Result<String> {
     Ok(String::from_utf8(output.stdout)?.trim().to_string())
 }
 
+fn extract_helper_url(prompt: &str) -> Option<String> {
+    for line in prompt.lines() {
+        let Some(start) = line.find('`') else {
+            continue;
+        };
+        let Some(end) = line[start + 1..].find('`') else {
+            continue;
+        };
+        let command = &line[start + 1..start + 1 + end];
+        let Some(url_start) = command.find("--url ") else {
+            continue;
+        };
+        let rest = &command[url_start + "--url ".len()..];
+        if let Some(value) = rest.strip_prefix('\'') {
+            if let Some(end_quote) = value.find('\'') {
+                return Some(value[..end_quote].to_string());
+            }
+        }
+        if let Some(value) = rest.strip_prefix('"') {
+            if let Some(end_quote) = value.find('"') {
+                return Some(value[..end_quote].to_string());
+            }
+        }
+        if let Some(token) = rest.split_whitespace().next() {
+            return Some(token.to_string());
+        }
+    }
+    None
+}
+
 fn extract_backticked_command(prompt: &str, needle: &str) -> Option<String> {
+    let mut fallback = None;
     for line in prompt.lines() {
         let Some(start) = line.find('`') else {
             continue;
@@ -450,10 +545,15 @@ fn extract_backticked_command(prompt: &str, needle: &str) -> Option<String> {
         };
         let command = &line[start + 1..start + 1 + end];
         if command.contains(needle) {
-            return Some(command.to_string());
+            if command.contains("--session-channel") && command.contains("--session-scope") {
+                return Some(command.to_string());
+            }
+            if fallback.is_none() {
+                fallback = Some(command.to_string());
+            }
         }
     }
-    None
+    fallback
 }
 
 fn extract_task_id(text: &str) -> Option<String> {

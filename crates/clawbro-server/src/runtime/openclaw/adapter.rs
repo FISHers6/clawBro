@@ -482,7 +482,7 @@ fn augment_prompt_for_openclaw(
                 helper_prefix(helper)
             ),
             format!(
-                "`{} submit-task-result --task-id <task-id> --summary <summary>`",
+                "`{} submit-task-result --task-id <task-id> --summary <summary> --result-markdown <result-markdown>`",
                 helper_prefix(helper)
             ),
             format!(
@@ -548,11 +548,12 @@ fn augment_prompt_for_openclaw(
         return crate::runtime::contract::render_runtime_prompt(session);
     }
 
+    let runtime_prompt = crate::runtime::contract::render_runtime_prompt(session);
     format!(
-        "{}\n\n<clawbro_host_contract>\nUse the following helper commands instead of inventing your own protocol.\n{}\n{}\nIf a task is complete, submit results instead of only saying it in plain text.\n</clawbro_host_contract>",
-        crate::runtime::contract::render_runtime_prompt(session),
+        "<clawbro_host_contract>\nUse only the exact helper commands below for this OpenClaw turn.\nIgnore any generic bare `clawbro team-helper ...` examples elsewhere in the prompt that rely on env-injected session refs.\nThese OpenClaw helper commands already include the required `--session-channel` / `--session-scope` binding for the active session.\n{}\n{}\nIf a task is complete, submit results instead of only saying it in plain text.\n</clawbro_host_contract>\n\n{}",
         role_notes,
-        schedule_notes
+        schedule_notes,
+        runtime_prompt,
     )
 }
 
@@ -672,7 +673,6 @@ mod tests {
                     prompt_text: "hello".into(),
                     tool_surface: ToolSurfaceSpec::default(),
                     approval_mode: Default::default(),
-                    tool_bridge_url: None,
                     external_mcp_servers: vec![],
                     team_tool_url: None,
                     provider_profile: None,
@@ -799,12 +799,10 @@ mod tests {
                 allowed_team_tools: vec![],
                 schedule_tools: false,
                 allowed_schedule_tools: vec![],
-                local_skills: false,
                 external_mcp: false,
                 backend_native_tools: true,
             },
             approval_mode: Default::default(),
-            tool_bridge_url: None,
             external_mcp_servers: vec![],
             team_tool_url: helper.team_tool_url.clone(),
             provider_profile: None,
@@ -839,12 +837,10 @@ mod tests {
                 allowed_team_tools: vec![],
                 schedule_tools: false,
                 allowed_schedule_tools: vec![],
-                local_skills: false,
                 external_mcp: false,
                 backend_native_tools: true,
             },
             approval_mode: Default::default(),
-            tool_bridge_url: None,
             external_mcp_servers: vec![],
             team_tool_url: helper.team_tool_url.clone(),
             provider_profile: None,
@@ -891,12 +887,10 @@ mod tests {
                 allowed_team_tools: vec![],
                 schedule_tools: false,
                 allowed_schedule_tools: vec![],
-                local_skills: false,
                 external_mcp: false,
                 backend_native_tools: true,
             },
             approval_mode: Default::default(),
-            tool_bridge_url: None,
             external_mcp_servers: vec![],
             team_tool_url: helper.team_tool_url.clone(),
             provider_profile: None,

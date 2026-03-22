@@ -87,6 +87,88 @@ pub async fn run() -> Result<()> {
     // 4. Channel configuration
     println!("\n[4] Channel configuration");
     if let Some(cfg) = &parsed_cfg {
+        match cfg.channels.lark.as_ref().filter(|section| section.enabled) {
+            Some(lark) => {
+                println!("  {} lark enabled", style("✓").green());
+                if lark.instances.is_empty() {
+                    let has_env_app_id = std::env::var("LARK_APP_ID")
+                        .ok()
+                        .is_some_and(|value| !value.trim().is_empty());
+                    let has_env_app_secret = std::env::var("LARK_APP_SECRET")
+                        .ok()
+                        .is_some_and(|value| !value.trim().is_empty());
+                    if has_env_app_id && has_env_app_secret {
+                        println!(
+                            "  {} lark uses environment fallback instance `{}`",
+                            style("✓").green(),
+                            lark.default_instance_id()
+                        );
+                    } else {
+                        println!(
+                            "  {} lark enabled but no [[channels.lark.instances]] and no LARK_APP_ID/LARK_APP_SECRET fallback",
+                            style("✗").red()
+                        );
+                        issues += 1;
+                    }
+                } else {
+                    let requested_default = lark.default_instance_id();
+                    let has_requested_default = lark
+                        .instances
+                        .iter()
+                        .any(|instance| instance.id == requested_default);
+                    if lark.instances.len() > 1 && !has_requested_default {
+                        println!(
+                            "  {} lark default_instance `{}` not found in configured instances",
+                            style("✗").red(),
+                            requested_default
+                        );
+                        issues += 1;
+                    } else {
+                        println!(
+                            "  {} lark default_instance = {}",
+                            style("✓").green(),
+                            requested_default
+                        );
+                    }
+
+                    for instance in &lark.instances {
+                        if instance.app_id.trim().is_empty()
+                            || instance.app_secret.trim().is_empty()
+                        {
+                            println!(
+                                "  {} lark instance `{}` is missing app_id/app_secret",
+                                style("✗").red(),
+                                instance.id
+                            );
+                            issues += 1;
+                            continue;
+                        }
+
+                        match instance.bot_name.as_deref().map(str::trim) {
+                            Some(bot_name) if !bot_name.is_empty() => {
+                                println!(
+                                    "  {} lark instance `{}` bot = {}",
+                                    style("✓").green(),
+                                    instance.id,
+                                    bot_name
+                                );
+                            }
+                            _ => {
+                                println!(
+                                    "  {} lark instance `{}` has no bot_name (mention detection falls back to platform mentions only)",
+                                    style("–").yellow(),
+                                    instance.id
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            None => {
+                println!("  {} lark not enabled", style("–").yellow());
+            }
+        }
+
         match cfg
             .channels
             .dingtalk_webhook

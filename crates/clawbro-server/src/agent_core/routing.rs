@@ -1,5 +1,6 @@
-use crate::agent_core::bindings::{resolve_binding, BindingRule};
-use crate::agent_core::control::role_resolver::is_front_bot_turn;
+use crate::agent_core::bindings::{
+    resolve_binding, resolve_channel_instance_binding_for_target, BindingRule,
+};
 use crate::agent_core::control::session_router::get_orchestrator_for_session as route_orchestrator_for_session;
 use crate::agent_core::control::turn_intent::build_turn_intent;
 use crate::agent_core::roster::{AgentEntry, AgentRoster};
@@ -55,7 +56,7 @@ pub(crate) fn resolve_turn_routing(
     let session_team_orch = session_team_orch.or(auto_promote_orch);
     let early_is_lead = !early_is_specialist
         && session_team_orch.is_some()
-        && is_front_bot_turn(inbound, &session_team_orch, roster);
+        && matches!(inbound.source, MsgSource::Human | MsgSource::TeamNotify);
     let specialist_binding_match = if early_is_specialist {
         resolve_binding_match(roster, inbound, session_key, bindings)
     } else {
@@ -70,20 +71,27 @@ pub(crate) fn resolve_turn_routing(
         } else {
             None
         };
+        let lead_fallback_match = if early_is_lead {
+            session_team_orch
+                .as_ref()
+                .and_then(|o| o.lead_agent_name.get())
+                .and_then(|name| resolve_roster_match_by_name(roster, name))
+        } else {
+            None
+        };
         inbound
             .target_agent
             .as_deref()
-            .and_then(|mention| resolve_roster_match_by_mention(roster, mention))
-            .or_else(|| {
+            .and_then(|mention| {
                 if early_is_lead {
-                    session_team_orch
-                        .as_ref()
-                        .and_then(|o| o.lead_agent_name.get())
-                        .and_then(|name| resolve_roster_match_by_name(roster, name))
-                } else {
                     None
+                } else {
+                    resolve_roster_match_by_mention(roster, mention).or_else(|| {
+                        resolve_platform_target_roster_match(roster, session_key, bindings, mention)
+                    })
                 }
             })
+            .or_else(|| lead_fallback_match)
             .or(deterministic_binding_match)
             .or_else(|| {
                 if inbound.target_agent.is_none() && session_backend_id.is_none() {
@@ -197,6 +205,16 @@ pub(crate) fn resolve_roster_match_by_mention(
     roster
         .and_then(|r| r.find_by_mention(mention))
         .map(roster_match_from_entry)
+}
+
+fn resolve_platform_target_roster_match(
+    roster: Option<&AgentRoster>,
+    session_key: &SessionKey,
+    bindings: &[BindingRule],
+    target_agent: &str,
+) -> Option<RosterMatchData> {
+    let binding = resolve_channel_instance_binding_for_target(session_key, target_agent, bindings)?;
+    resolve_roster_match_by_name(roster, binding.agent_name())
 }
 
 fn roster_match_from_entry(entry: &AgentEntry) -> RosterMatchData {
@@ -537,6 +555,314 @@ mod tests {
             .task_reminder
             .as_deref()
             .is_some_and(|text| text.contains("create_task()")));
+    }
+
+    #[test]
+    fn delegation_request_to_specialist_mention_still_routes_to_lead_team_path() {
+        let roster = AgentRoster::new(vec![
+            AgentEntry {
+                name: "claude".into(),
+                mentions: vec!["@claude".into()],
+                backend_id: "claude-main".into(),
+                persona_dir: None,
+                workspace_dir: None,
+                extra_skills_dirs: vec![],
+            },
+            AgentEntry {
+                name: "claw".into(),
+                mentions: vec!["@claw".into()],
+                backend_id: "codex-main".into(),
+                persona_dir: None,
+                workspace_dir: None,
+                extra_skills_dirs: vec![],
+            },
+        ]);
+        let orch = make_orchestrator();
+        let orchestrators = DashMap::new();
+        orchestrators.insert(
+            stable_team_id_for_session_key(&SessionKey::new("lark", "group:route")),
+            orch,
+        );
+
+        let inbound = InboundMsg {
+            id: "route-team-delegation-specialist".into(),
+            session_key: SessionKey::new("lark", "group:route"),
+            content: MsgContent::text("让其他人帮我写一个简单的网页 猫咪成长日记 开始吧"),
+            sender: "user".into(),
+            channel: "lark".into(),
+            timestamp: chrono::Utc::now(),
+            thread_ts: None,
+            target_agent: Some("@claw".into()),
+            source: MsgSource::Human,
+        };
+
+        let decision = resolve_turn_routing(
+            &inbound,
+            Some(&roster),
+            &[],
+            &orchestrators,
+            &DashSet::new(),
+            None,
+            None,
+        );
+
+        assert!(decision.is_lead);
+        assert_eq!(decision.agent_role, AgentRole::Lead);
+        assert_eq!(decision.intent.mode, TurnMode::Team);
+        assert_eq!(
+            decision.intent.target_backend.as_deref(),
+            Some("claude-main")
+        );
+        assert_eq!(decision.sender_name.as_deref(), Some("@claude"));
+        assert!(decision
+            .task_reminder
+            .as_deref()
+            .is_some_and(|text| text.contains("create_task()")));
+    }
+
+    #[test]
+    fn platform_instance_target_routes_via_channel_instance_binding() {
+        let roster = AgentRoster::new(vec![
+            AgentEntry {
+                name: "claude".into(),
+                mentions: vec!["@claude".into()],
+                backend_id: "claude-main".into(),
+                persona_dir: None,
+                workspace_dir: None,
+                extra_skills_dirs: vec![],
+            },
+            AgentEntry {
+                name: "claw".into(),
+                mentions: vec!["@claw".into()],
+                backend_id: "codex-main".into(),
+                persona_dir: None,
+                workspace_dir: None,
+                extra_skills_dirs: vec![],
+            },
+        ]);
+
+        let inbound = InboundMsg {
+            id: "route-platform-alpha".into(),
+            session_key: SessionKey::with_instance("lark", "alpha", "group:route"),
+            content: MsgContent::text("帮我看一下"),
+            sender: "user".into(),
+            channel: "lark".into(),
+            timestamp: chrono::Utc::now(),
+            thread_ts: None,
+            target_agent: Some("@alpha".into()),
+            source: MsgSource::Human,
+        };
+
+        let decision = resolve_turn_routing(
+            &inbound,
+            Some(&roster),
+            &[BindingRule::ChannelInstance {
+                channel: "lark".into(),
+                channel_instance: "alpha".into(),
+                agent_name: "claw".into(),
+            }],
+            &DashMap::new(),
+            &DashSet::new(),
+            Some("claude-main".into()),
+            None,
+        );
+
+        assert!(!decision.is_lead);
+        assert_eq!(decision.agent_role, AgentRole::Solo);
+        assert_eq!(
+            decision.intent.target_backend.as_deref(),
+            Some("codex-main")
+        );
+        assert_eq!(decision.sender_name.as_deref(), Some("@claw"));
+    }
+
+    #[test]
+    fn platform_instance_target_for_front_bot_routes_to_lead_team_path() {
+        let roster = AgentRoster::new(vec![
+            AgentEntry {
+                name: "claude".into(),
+                mentions: vec!["@claude".into()],
+                backend_id: "claude-main".into(),
+                persona_dir: None,
+                workspace_dir: None,
+                extra_skills_dirs: vec![],
+            },
+            AgentEntry {
+                name: "claw".into(),
+                mentions: vec!["@claw".into()],
+                backend_id: "codex-main".into(),
+                persona_dir: None,
+                workspace_dir: None,
+                extra_skills_dirs: vec![],
+            },
+        ]);
+        let orch = make_orchestrator();
+        let orchestrators = DashMap::new();
+        orchestrators.insert(
+            stable_team_id_for_session_key(&SessionKey::new("lark", "group:route")),
+            orch,
+        );
+
+        let inbound = InboundMsg {
+            id: "route-platform-beta-team".into(),
+            session_key: SessionKey::with_instance("lark", "beta", "group:route"),
+            content: MsgContent::text("请你帮我推进这个任务"),
+            sender: "user".into(),
+            channel: "lark".into(),
+            timestamp: chrono::Utc::now(),
+            thread_ts: None,
+            target_agent: Some("@beta".into()),
+            source: MsgSource::Human,
+        };
+
+        let decision = resolve_turn_routing(
+            &inbound,
+            Some(&roster),
+            &[BindingRule::ChannelInstance {
+                channel: "lark".into(),
+                channel_instance: "beta".into(),
+                agent_name: "claude".into(),
+            }],
+            &orchestrators,
+            &DashSet::new(),
+            None,
+            None,
+        );
+
+        assert!(decision.is_lead);
+        assert_eq!(decision.agent_role, AgentRole::Lead);
+        assert_eq!(decision.intent.mode, TurnMode::Team);
+        assert_eq!(
+            decision.intent.target_backend.as_deref(),
+            Some("claude-main")
+        );
+        assert_eq!(decision.sender_name.as_deref(), Some("@claude"));
+    }
+
+    #[test]
+    fn delegation_request_with_platform_instance_target_still_routes_to_lead() {
+        let roster = AgentRoster::new(vec![
+            AgentEntry {
+                name: "claude".into(),
+                mentions: vec!["@claude".into()],
+                backend_id: "claude-main".into(),
+                persona_dir: None,
+                workspace_dir: None,
+                extra_skills_dirs: vec![],
+            },
+            AgentEntry {
+                name: "claw".into(),
+                mentions: vec!["@claw".into()],
+                backend_id: "codex-main".into(),
+                persona_dir: None,
+                workspace_dir: None,
+                extra_skills_dirs: vec![],
+            },
+        ]);
+        let orch = make_orchestrator();
+        let orchestrators = DashMap::new();
+        orchestrators.insert(
+            stable_team_id_for_session_key(&SessionKey::new("lark", "group:route")),
+            orch,
+        );
+
+        let inbound = InboundMsg {
+            id: "route-platform-alpha-delegation".into(),
+            session_key: SessionKey::with_instance("lark", "alpha", "group:route"),
+            content: MsgContent::text(
+                "将分配任务给其他bot来做：读取一下 ~/.clawBro/ 有什么内容 新任务要分配",
+            ),
+            sender: "user".into(),
+            channel: "lark".into(),
+            timestamp: chrono::Utc::now(),
+            thread_ts: None,
+            target_agent: Some("@alpha".into()),
+            source: MsgSource::Human,
+        };
+
+        let decision = resolve_turn_routing(
+            &inbound,
+            Some(&roster),
+            &[BindingRule::ChannelInstance {
+                channel: "lark".into(),
+                channel_instance: "alpha".into(),
+                agent_name: "claw".into(),
+            }],
+            &orchestrators,
+            &DashSet::new(),
+            None,
+            None,
+        );
+
+        assert!(decision.is_lead);
+        assert_eq!(decision.agent_role, AgentRole::Lead);
+        assert_eq!(decision.intent.mode, TurnMode::Team);
+        assert_eq!(
+            decision.intent.target_backend.as_deref(),
+            Some("claude-main")
+        );
+        assert_eq!(decision.sender_name.as_deref(), Some("@claude"));
+    }
+
+    #[test]
+    fn direct_assign_sentence_to_platform_instance_routes_to_lead() {
+        let roster = AgentRoster::new(vec![
+            AgentEntry {
+                name: "claude".into(),
+                mentions: vec!["@claude".into()],
+                backend_id: "claude-main".into(),
+                persona_dir: None,
+                workspace_dir: None,
+                extra_skills_dirs: vec![],
+            },
+            AgentEntry {
+                name: "claw".into(),
+                mentions: vec!["@claw".into()],
+                backend_id: "codex-main".into(),
+                persona_dir: None,
+                workspace_dir: None,
+                extra_skills_dirs: vec![],
+            },
+        ]);
+        let orch = make_orchestrator();
+        let orchestrators = DashMap::new();
+        orchestrators.insert(
+            stable_team_id_for_session_key(&SessionKey::new("lark", "group:route")),
+            orch,
+        );
+
+        let inbound = InboundMsg {
+            id: "route-platform-alpha-assign".into(),
+            session_key: SessionKey::with_instance("lark", "alpha", "group:route"),
+            content: MsgContent::text("让codex-beta去执行"),
+            sender: "user".into(),
+            channel: "lark".into(),
+            timestamp: chrono::Utc::now(),
+            thread_ts: None,
+            target_agent: Some("@alpha".into()),
+            source: MsgSource::Human,
+        };
+
+        let decision = resolve_turn_routing(
+            &inbound,
+            Some(&roster),
+            &[BindingRule::ChannelInstance {
+                channel: "lark".into(),
+                channel_instance: "alpha".into(),
+                agent_name: "claw".into(),
+            }],
+            &orchestrators,
+            &DashSet::new(),
+            None,
+            None,
+        );
+
+        assert!(decision.is_lead);
+        assert_eq!(decision.agent_role, AgentRole::Lead);
+        assert_eq!(
+            decision.intent.target_backend.as_deref(),
+            Some("claude-main")
+        );
     }
 
     #[test]

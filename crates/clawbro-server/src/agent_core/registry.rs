@@ -26,12 +26,14 @@ use crate::agent_core::turn_context::{TurnDeliverySource, TurnExecutionContext};
 use crate::agent_core::ApprovalResolver;
 use crate::channels_internal::mention_trigger::MentionTrigger;
 use crate::protocol::{
-    normalize_conversation_identity, parse_session_key_text, AgentEvent, InboundMsg, SessionKey,
+    normalize_runtime_session_identity, parse_session_key_text, AgentEvent, DashboardEvent,
+    InboundMsg, SessionKey,
 };
 use crate::runtime::contract::{ResumeRecoveryAction, TeamCallback, TurnResult};
 use crate::runtime::{RuntimeEvent, TeamToolCall, TeamToolResponse};
 use crate::session::{
-    ResumableBackendSession, ResumeDropReason, SessionManager, StoredMessage, ToolCallRecord,
+    ResumableBackendSession, ResumeDropReason, SessionManager, StoredMessage, StoredSessionEvent,
+    ToolCallRecord,
 };
 use anyhow::Result;
 use dashmap::DashMap;
@@ -46,7 +48,7 @@ pub struct Session {
 }
 
 fn normalized_session_key(session_key: &SessionKey) -> SessionKey {
-    normalize_conversation_identity(session_key)
+    normalize_runtime_session_identity(session_key)
 }
 
 fn collect_tool_call_records(events: &[RuntimeEvent]) -> Vec<ToolCallRecord> {
@@ -346,6 +348,7 @@ pub struct SessionRegistry {
     /// WS subscriptions: session_key → list of WS client senders
     pub ws_subs: Arc<DashMap<SessionKey, Vec<tokio::sync::mpsc::UnboundedSender<AgentEvent>>>>,
     global_tx: broadcast::Sender<AgentEvent>,
+    dashboard_tx: broadcast::Sender<DashboardEvent>,
     /// Gateway-level skills injection (prefix for all agents)
     system_injection: String,
     /// User-configured agent roster (None = single-engine mode, no @mention routing)
@@ -434,6 +437,7 @@ impl SessionRegistry {
         runtime_dispatch: Arc<dyn RuntimeDispatch>,
     ) -> (Arc<Self>, broadcast::Receiver<AgentEvent>) {
         let (global_tx, global_rx) = broadcast::channel(1024);
+        let (dashboard_tx, _dashboard_rx) = broadcast::channel(1024);
         let registry = Arc::new(Self {
             sessions: DashMap::new(),
             default_backend_id,
@@ -442,6 +446,7 @@ impl SessionRegistry {
             dedup: DedupStore::new(),
             ws_subs: Arc::new(DashMap::new()),
             global_tx,
+            dashboard_tx,
             system_injection,
             roster,
             memory_system,
@@ -514,6 +519,10 @@ impl SessionRegistry {
     /// Register a TeamOrchestrator for a given team_id.
     /// Supports multiple concurrent Team groups (one orchestrator per group).
     pub fn register_team_orchestrator(&self, team_id: String, orch: Arc<TeamOrchestrator>) {
+        let dashboard_tx = self.dashboard_tx.clone();
+        orch.set_dashboard_emit(Arc::new(move |event| {
+            let _ = dashboard_tx.send(event);
+        }));
         self.team_orchestrators.insert(team_id, orch);
     }
 
@@ -552,17 +561,17 @@ impl SessionRegistry {
 
     /// Returns true when the Lead's direct text reply should be suppressed by `spawn_im_turn`.
     ///
-    /// Suppression rule:
-    /// - The session IS the active Team Lead for some orchestrator, AND
-    /// - The team is currently in `Running` state.
+    /// Suppress the normal stream path for any Team Lead turn.
     ///
-    /// `Planning`, `AwaitingConfirm`, and `Done` are still normal conversational states:
-    /// the Lead may answer directly, and any pre-tool text must remain visible as separate
-    /// IM messages. Only active task execution is silent, where user-visible updates are
-    /// expected to come from `post_update` milestones instead of the normal stream path.
+    /// Team Lead turns may be post-validated and rewritten after `handle()` finishes
+    /// (for example when no canonical team tool side effect happened). If we let the
+    /// runtime stream directly to IM during Planning/AwaitingConfirm, incorrect free-form
+    /// model text can leak before the registry replaces it with the canonical warning.
     ///
-    /// This flag must be captured **before** calling `handle()` so that the state snapshot
-    /// is consistent with the turn being dispatched (fixes TOCTOU).
+    /// Therefore every Lead turn uses a silent stream path and emits at most one final
+    /// direct reply after post-turn validation completes. When the team is actually
+    /// Running, that final direct reply remains suppressed and user-visible updates must
+    /// come from `post_update` milestones instead.
     pub fn should_suppress_lead_final_reply(&self, session_key: &SessionKey) -> bool {
         let Some(orch) = self.get_orchestrator_for_session(session_key) else {
             tracing::info!(
@@ -581,10 +590,7 @@ impl SessionRegistry {
             return false;
         }
         let state = orch.team_state();
-        let suppress = matches!(
-            state,
-            crate::agent_core::team::orchestrator::TeamState::Running
-        );
+        let suppress = true;
         tracing::info!(
             channel = %session_key.channel,
             scope = %session_key.scope,
@@ -692,8 +698,20 @@ impl SessionRegistry {
         self.global_tx.clone()
     }
 
+    pub fn dashboard_sender(&self) -> broadcast::Sender<DashboardEvent> {
+        self.dashboard_tx.clone()
+    }
+
+    pub fn emit_dashboard_event(&self, event: DashboardEvent) {
+        let _ = self.dashboard_tx.send(event);
+    }
+
     pub fn set_team_tool_url(&self, url: String) {
         let _ = self.team_tool_url.set(url);
+    }
+
+    pub fn has_team_tool_url(&self) -> bool {
+        self.team_tool_url.get().is_some()
     }
 
     pub fn set_approval_resolver(&self, resolver: Arc<dyn ApprovalResolver>) {
@@ -742,7 +760,11 @@ impl SessionRegistry {
         let mut summaries: Vec<_> = self
             .team_orchestrators
             .iter()
-            .map(|entry| entry.value().status_snapshot())
+            .map(|entry| {
+                let mut summary = entry.value().status_snapshot();
+                summary.tool_surface_ready = self.has_team_tool_url();
+                summary
+            })
             .collect();
         summaries.sort_by(|a, b| a.team_id.cmp(&b.team_id));
         summaries
@@ -854,7 +876,7 @@ impl SessionRegistry {
         Ok(())
     }
 
-    fn lead_human_team_delegation_requires_side_effect(
+    fn lead_human_team_turn_requires_side_effect(
         inbound: &InboundMsg,
         is_lead: bool,
         team_orchestrator_present: bool,
@@ -865,10 +887,7 @@ impl SessionRegistry {
         {
             return false;
         }
-        inbound
-            .content
-            .as_text()
-            .is_some_and(crate::agent_core::mode_selector::is_team_delegation_request)
+        true
     }
 
     fn turn_has_team_coordination_side_effect(turn: &TurnResult) -> bool {
@@ -898,7 +917,12 @@ impl SessionRegistry {
     }
 
     fn build_missing_team_coordination_side_effect_reply() -> String {
-        "我这轮没有完成实际任务创建或分配，因此不会宣称任务已开始执行。请重试，或明确指定要委派的 bot 和目标。".to_string()
+        "当前处于 team 协作模式。这一轮没有产生任何 canonical team 工具副作用，所以不会宣称任务已开始执行。请先通过 create_task / assign_task / start_execution / get_task_status / post_update 等团队工具推进状态。".to_string()
+    }
+
+    pub(crate) fn is_canonical_team_guard_reply(text: &str) -> bool {
+        text == Self::build_missing_team_coordination_side_effect_reply()
+            || text == Self::build_missing_team_execution_start_reply()
     }
 
     fn turn_started_team_execution(turn: &TurnResult) -> bool {
@@ -1282,6 +1306,7 @@ impl SessionRegistry {
         let normalized_sk_for_fwd = normalized_session_key.clone();
         let sender_for_fwd = sender_name.clone();
         let prefix_for_fwd = persona_prefix.clone();
+        let session_storage_for_fwd = self.session_manager.storage();
         {
             let mut fwd_rx = session_tx.subscribe();
             tokio::spawn(async move {
@@ -1302,6 +1327,22 @@ impl SessionRegistry {
                         },
                         other => other,
                     };
+                    if let Err(err) = session_storage_for_fwd
+                        .append_event(
+                            session_id,
+                            &StoredSessionEvent {
+                                timestamp: chrono::Utc::now(),
+                                event: event.clone(),
+                            },
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            error = %err,
+                            session_id = %session_id,
+                            "failed to append session event"
+                        );
+                    }
                     let _ = global_tx.send(event.clone());
                     ws_subs_clone.alter(&normalized_sk_for_fwd, |_, mut vec| {
                         vec.retain(|tx| tx.send(event.clone()).is_ok());
@@ -1391,7 +1432,7 @@ impl SessionRegistry {
             }
         }
         let mut turn = turn_result?;
-        let delegation_requested = Self::lead_human_team_delegation_requires_side_effect(
+        let coordination_required = Self::lead_human_team_turn_requires_side_effect(
             &inbound,
             is_lead,
             session_team_orch.is_some(),
@@ -1401,22 +1442,22 @@ impl SessionRegistry {
             session_team_orch.as_ref(),
             coordination_revision_before,
         );
-        let missing_coordination = delegation_requested && !coordination_happened;
+        let missing_coordination = coordination_required && !coordination_happened;
         if missing_coordination {
             tracing::warn!(
                 session = ?session_key,
                 user_input = %user_text_for_log,
-                "lead delegation turn produced no concrete team side effects; replacing assistant reply"
+                "lead team turn produced no concrete team side effects; replacing assistant reply"
             );
             turn.full_text = Self::build_missing_team_coordination_side_effect_reply();
         } else {
             self.apply_runtime_events(&session_key, &turn).await?;
-            let auto_started = if delegation_requested {
+            let auto_started = if coordination_required {
                 Self::ensure_frontstage_team_execution_started(session_team_orch.as_ref()).await?
             } else {
                 false
             };
-            if delegation_requested
+            if coordination_required
                 && !Self::team_execution_is_actually_running(
                     &turn,
                     session_team_orch.as_ref(),
@@ -3160,20 +3201,20 @@ mod tests {
     }
 
     #[test]
-    fn suppress_lead_final_reply_only_while_team_is_running() {
+    fn suppress_lead_final_reply_for_any_lead_team_turn() {
         let (registry, orch) = make_registry_with_team_orchestrator();
         let lead_key = SessionKey::new("lark", "group:team");
 
         assert!(
-            !registry.should_suppress_lead_final_reply(&lead_key),
-            "Planning state must not suppress normal lead replies"
+            registry.should_suppress_lead_final_reply(&lead_key),
+            "Planning state must suppress the live stream so post-validation can rewrite safely"
         );
 
         *orch.team_state_inner.lock().unwrap() =
             crate::agent_core::team::orchestrator::TeamState::AwaitingConfirm;
         assert!(
-            !registry.should_suppress_lead_final_reply(&lead_key),
-            "AwaitingConfirm state must not suppress confirmation replies"
+            registry.should_suppress_lead_final_reply(&lead_key),
+            "AwaitingConfirm state must also suppress the live stream"
         );
 
         *orch.team_state_inner.lock().unwrap() =
@@ -3186,8 +3227,8 @@ mod tests {
         *orch.team_state_inner.lock().unwrap() =
             crate::agent_core::team::orchestrator::TeamState::Done;
         assert!(
-            !registry.should_suppress_lead_final_reply(&lead_key),
-            "Done state must not suppress direct lead replies"
+            registry.should_suppress_lead_final_reply(&lead_key),
+            "Done state must still suppress the live stream until post-turn final delivery"
         );
     }
 
@@ -3211,7 +3252,10 @@ mod tests {
 
         let reply = registry.handle(inbound).await.unwrap();
 
-        assert_eq!(reply.as_deref(), Some("fake-dispatch: 给我再新建一轮任务"));
+        assert_eq!(
+            reply.as_deref(),
+            Some("当前处于 team 协作模式。这一轮没有产生任何 canonical team 工具副作用，所以不会宣称任务已开始执行。请先通过 create_task / assign_task / start_execution / get_task_status / post_update 等团队工具推进状态。")
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             orch.team_state(),
@@ -3227,7 +3271,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lead_delegation_turn_without_team_side_effect_is_rewritten() {
+    async fn lead_team_turn_without_team_side_effect_is_rewritten() {
         let (registry, _orch, calls) = make_registry_with_runtime_dispatch_and_team_orchestrator();
 
         let inbound = InboundMsg {
@@ -3247,7 +3291,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             reply.as_deref(),
-            Some("我这轮没有完成实际任务创建或分配，因此不会宣称任务已开始执行。请重试，或明确指定要委派的 bot 和目标。")
+            Some("当前处于 team 协作模式。这一轮没有产生任何 canonical team 工具副作用，所以不会宣称任务已开始执行。请先通过 create_task / assign_task / start_execution / get_task_status / post_update 等团队工具推进状态。")
         );
     }
 
@@ -3280,7 +3324,6 @@ mod tests {
             dispatch_fn,
             std::time::Duration::from_secs(60),
         );
-        orch.set_test_mcp_start_result(Ok(32125));
         orch.set_lead_session_key(lead_key.clone());
         orch.set_scope(lead_key.clone());
 
@@ -3327,88 +3370,12 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn lead_delegation_turn_that_creates_tasks_but_cannot_start_execution_is_rewritten() {
-        use crate::agent_core::team::{
-            heartbeat::DispatchFn,
-            orchestrator::TeamOrchestrator,
-            registry::TaskRegistry,
-            session::{stable_team_id_for_session_key, TeamSession},
-        };
-        use tempfile::tempdir;
-
-        let dir = std::env::temp_dir().join(format!(
-            "test-registry-team-turn-activation-fail-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let storage = SessionStorage::new(dir);
-        let session_manager = Arc::new(SessionManager::new(storage));
-
-        let tmp = tempdir().unwrap();
-        let task_registry = Arc::new(TaskRegistry::new_in_memory().unwrap());
-        let lead_key = SessionKey::new("lark", "group:team");
-        let team_id = stable_team_id_for_session_key(&lead_key);
-        let session = Arc::new(TeamSession::from_dir(&team_id, tmp.keep()));
-        let dispatch_fn: DispatchFn = Arc::new(|_, _| Box::pin(async { Ok(()) }));
-        let orch = TeamOrchestrator::new(
-            task_registry,
-            session,
-            dispatch_fn,
-            std::time::Duration::from_secs(60),
-        );
-        orch.set_test_mcp_start_result(Err("synthetic mcp failure".to_string()));
-        orch.set_lead_session_key(lead_key.clone());
-        orch.set_scope(lead_key.clone());
-
-        let calls = Arc::new(AtomicUsize::new(0));
-        let (registry, _rx) = SessionRegistry::with_runtime_dispatch(
-            Some("native-main".to_string()),
-            session_manager,
-            String::new(),
-            None,
-            None,
-            None,
-            None,
-            vec![],
-            Arc::new(TeamSideEffectRuntimeDispatch {
-                calls: Arc::clone(&calls),
-                team_orchestrator: Arc::clone(&orch),
-            }),
-        );
-        registry.register_team_orchestrator(team_id, Arc::clone(&orch));
-
-        let inbound = InboundMsg {
-            id: "team-delegation-activation-fail".to_string(),
-            session_key: lead_key,
-            content: MsgContent::text("让其他bot做个任务：讲解一下clawbro"),
-            sender: "user".to_string(),
-            channel: "lark".to_string(),
-            timestamp: chrono::Utc::now(),
-            thread_ts: None,
-            target_agent: None,
-            source: crate::protocol::MsgSource::Human,
-        };
-
-        let reply = registry.handle(inbound).await.unwrap();
-
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            reply.as_deref(),
-            Some("我这轮虽然创建了任务，但还没有把团队执行真正启动，因此不会宣称 specialist 已开始处理。请重试，或要求我立即启动执行。")
-        );
-        assert!(orch.registry.get_task("T999").unwrap().is_some());
-        assert!(matches!(
-            orch.team_state(),
-            crate::agent_core::team::orchestrator::TeamState::Planning
-        ));
-    }
-
     #[test]
-    fn lead_human_team_delegation_guard_only_applies_to_explicit_requests() {
+    fn lead_human_team_turn_guard_applies_to_team_lead_human_turns() {
         let inbound = InboundMsg {
             id: "guard-1".into(),
             session_key: SessionKey::new("lark", "group:team"),
-            content: MsgContent::text("让其他bot做个任务：讲解一下clawbro"),
+            content: MsgContent::text("直接讲解一下clawbro"),
             sender: "user".into(),
             channel: "lark".into(),
             timestamp: chrono::Utc::now(),
@@ -3416,17 +3383,25 @@ mod tests {
             target_agent: None,
             source: crate::protocol::MsgSource::Human,
         };
-        assert!(
-            SessionRegistry::lead_human_team_delegation_requires_side_effect(&inbound, true, true)
-        );
+        assert!(SessionRegistry::lead_human_team_turn_requires_side_effect(
+            &inbound, true, true
+        ));
 
-        let plain = InboundMsg {
-            content: MsgContent::text("直接讲解一下clawbro"),
+        let non_lead = InboundMsg {
+            content: MsgContent::text("普通消息"),
             ..inbound.clone()
         };
-        assert!(
-            !SessionRegistry::lead_human_team_delegation_requires_side_effect(&plain, true, true)
-        );
+        assert!(!SessionRegistry::lead_human_team_turn_requires_side_effect(
+            &non_lead, false, true
+        ));
+
+        let non_team = InboundMsg {
+            content: MsgContent::text("普通消息"),
+            ..inbound
+        };
+        assert!(!SessionRegistry::lead_human_team_turn_requires_side_effect(
+            &non_team, true, false
+        ));
     }
 
     #[test]

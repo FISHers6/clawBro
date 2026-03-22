@@ -82,6 +82,7 @@ reqwest.workspace = true
 dashmap.workspace = true
 prost.workspace = true
 agent-client-protocol = { version = "0.10.2", features = ["unstable_session_usage"] }
+clawbro-channels = { path = "../clawbro-channels", version = "0.1.0" }
 clap.workspace          = true
 clap_complete.workspace = true
 dialoguer.workspace     = true
@@ -100,6 +101,7 @@ glob = "0.3"
 walkdir = "2.5"
 regex = "1"
 base64 = "0.22"
+rand = "0.8"
 hmac = "0.12"
 sha2 = "0.10"
 urlencoding = "2.1"

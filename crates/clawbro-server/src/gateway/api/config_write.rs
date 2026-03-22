@@ -1,11 +1,7 @@
 use crate::config::GatewayConfig;
 use crate::gateway::api::types::ApiErrorBody;
 use crate::state::AppState;
-use axum::{
-    extract::State,
-    http::StatusCode,
-    Json,
-};
+use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize)]

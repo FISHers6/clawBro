@@ -10,7 +10,7 @@ use crate::agent_core::{SessionRegistry, TurnExecutionContext};
 use crate::channel_registry::ChannelRegistry;
 use crate::config::{GatewayConfig, InteractionMode};
 use crate::delivery_resolver::resolve_delivery;
-use crate::protocol::{InboundMsg, MsgContent, MsgSource, OutboundMsg, SessionKey};
+use crate::protocol::{DashboardEvent, InboundMsg, MsgContent, MsgSource, OutboundMsg, SessionKey};
 use anyhow::Result;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -84,26 +84,12 @@ pub async fn wire_team_runtime(
 
     for team_scope in &team_scopes {
         tracing::info!(scope = %team_scope.scope, name = ?team_scope.name, "wire_team_runtime: wiring team scope");
-        let channel_name: String = if let Some(ref ch) = team_scope.mode.channel {
-            ch.clone()
-        } else if cfg
-            .channels
-            .dingtalk
-            .as_ref()
-            .map(|c| c.enabled)
-            .unwrap_or(false)
-        {
-            "dingtalk".to_string()
-        } else if cfg
-            .channels
-            .lark
-            .as_ref()
-            .map(|c| c.enabled)
-            .unwrap_or(false)
-        {
-            "lark".to_string()
-        } else {
-            "ws".to_string()
+        let Some(channel_name) = team_scope.mode.channel.clone() else {
+            tracing::error!(
+                scope = %team_scope.scope,
+                "team scope is missing mode.channel; skipping team runtime wiring for this scope"
+            );
+            continue;
         };
         let lead_channel_instance =
             default_channel_instance_for_scope(cfg, &channel_name, &team_scope.scope);
@@ -129,6 +115,7 @@ pub async fn wire_team_runtime(
             }
         };
         let registry_for_dispatch = Arc::clone(&registry);
+        let registry_for_milestone = Arc::clone(&registry);
         let task_reg_for_dispatch = Arc::clone(&task_registry);
         let team_session_for_dispatch = Arc::clone(&session);
         let dispatch_requester_key = lead_key.clone();
@@ -289,6 +276,7 @@ pub async fn wire_team_runtime(
                 let dedupe_key_for_record = milestone_dedupe_key(&event);
                 let cfg = Arc::clone(&cfg_for_milestone);
                 let team_orch_cell = Arc::clone(&team_orch_for_milestone_in_closure);
+                let registry_for_send = Arc::clone(&registry_for_milestone);
                 tokio::spawn(async move {
                     let stored_source = team_orch_cell
                         .get()
@@ -337,7 +325,7 @@ pub async fn wire_team_runtime(
                         Ok(()) => (ChannelSendStatus::Sent, None),
                         Err(err) => (ChannelSendStatus::SendFailed, Some(err.to_string())),
                     };
-                    if let Err(err) = session_for_record.record_channel_send(
+                    match session_for_record.record_channel_send(
                         &outbound.session_key.channel,
                         sender_channel_instance.as_deref(),
                         outbound.session_key.channel_instance.as_deref(),
@@ -354,11 +342,19 @@ pub async fn wire_team_runtime(
                         status,
                         error.as_deref(),
                     ) {
-                        tracing::warn!(
-                            team_id = %session_for_record.team_id,
-                            error = %err,
-                            "Failed to append milestone channel send ledger entry"
-                        );
+                        Ok(record) => registry_for_send.emit_dashboard_event(
+                            DashboardEvent::TeamChannelSend {
+                                team_id: session_for_record.team_id.clone(),
+                                record,
+                            },
+                        ),
+                        Err(err) => {
+                            tracing::warn!(
+                                team_id = %session_for_record.team_id,
+                                error = %err,
+                                "Failed to append milestone channel send ledger entry"
+                            );
+                        }
                     }
                 });
             },
@@ -390,16 +386,6 @@ pub async fn wire_team_runtime(
                 team_id
             )
         })?;
-
-        team_orch.start_mcp_server().await.map_err(|e| {
-            anyhow::anyhow!(
-                "failed to start SharedTeamMcpServer for scope '{}' (team '{}'): {e:#}",
-                team_scope.scope,
-                team_id
-            )
-        })?;
-        tracing::info!(scope = %team_scope.scope, team_id = %team_id, "SharedTeamMcpServer started");
-
         registry.register_team_orchestrator(team_id.clone(), team_orch);
         review_retry_orchestrators.push(
             registry

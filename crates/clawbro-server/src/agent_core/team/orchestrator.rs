@@ -9,12 +9,11 @@
 //!   Heartbeat  = 定期调度（派发 Ready 任务、重置超时任务）
 //!   Orchestrator = 事件响应（处理完成通知、检查里程碑、写文件）
 //!
-//! 注意：[DONE:]/[BLOCKED:] 文本标记已移除。当前 ACP-family 完成通知通过
-//! `SharedTeamToolServer` 的 `complete_task` / `block_task` 工具实现；
-//! canonical multi-backend semantics 将在 clawbro-runtime::tool_bridge 中升级为
-//! submit/accept/reopen 流程。
+//! 注意：[DONE:]/[BLOCKED:] 文本标记已移除。当前 team 完成通知统一走 canonical
+//! team contract；agent-facing 协作语义固定为
+//! submit/accept/reopen/checkpoint/help。
 
-use crate::protocol::SessionKey;
+use crate::protocol::{DashboardEvent, SessionKey};
 use anyhow::Result;
 use chrono::Utc;
 use serde::Serialize;
@@ -93,7 +92,6 @@ pub struct TeamRuntimeSummary {
     pub latest_channel_send: Option<crate::agent_core::team::session::ChannelSendRecord>,
     pub specialists: Vec<String>,
     pub tool_surface_ready: bool,
-    pub mcp_port: Option<u16>,
     pub task_counts: TeamTaskCounts,
     pub artifact_health: TeamArtifactHealthSummary,
     pub routing_stats: TeamRoutingStats,
@@ -128,6 +126,7 @@ pub struct PlannedTask {
 /// 生产端：将 event 渲染为字符串后推送到 IM channel。
 /// 测试端：收集事件到 Vec 供断言，不涉及任何字符串操作。
 pub type MilestoneFn = Arc<dyn Fn(crate::protocol::SessionKey, TeamMilestoneEvent) + Send + Sync>;
+pub type DashboardEmitFn = Arc<dyn Fn(DashboardEvent) + Send + Sync>;
 
 pub struct TeamOrchestrator {
     pub registry: Arc<TaskRegistry>,
@@ -142,11 +141,7 @@ pub struct TeamOrchestrator {
     /// Production: renders event → IM channel string.
     /// Tests: collects events into Vec for typed assertions.
     milestone_fn: std::sync::OnceLock<MilestoneFn>,
-    /// Unified MCP server handle (Lead + Specialist tools on one port, spawned at startup).
-    /// Uses tokio::sync::Mutex because stop() is async.
-    mcp_server_handle: tokio::sync::Mutex<Option<super::shared_mcp_server::SharedMcpServerHandle>>,
-    /// Bound port of the unified MCP server (set once after spawn, used by all agents).
-    pub mcp_server_port: std::sync::OnceLock<u16>,
+    dashboard_emit: std::sync::OnceLock<DashboardEmitFn>,
     /// 当前 Team 执行状态（Planning / AwaitingConfirm / Running / Done）
     pub team_state_inner: std::sync::Mutex<TeamState>,
     /// Lead Agent 的最近一次真实 ingress session key 诊断快照。
@@ -167,8 +162,6 @@ pub struct TeamOrchestrator {
     done_final_posted: std::sync::Mutex<bool>,
     active_lead_review: std::sync::Mutex<Option<ActiveLeadReviewContext>>,
     coordination_revision: AtomicU64,
-    #[cfg(test)]
-    test_mcp_start_result: std::sync::Mutex<Option<std::result::Result<u16, String>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -212,8 +205,7 @@ impl TeamOrchestrator {
             max_parallel: std::sync::Mutex::new(3),
             scope: std::sync::OnceLock::new(),
             milestone_fn: std::sync::OnceLock::new(),
-            mcp_server_handle: tokio::sync::Mutex::new(None),
-            mcp_server_port: std::sync::OnceLock::new(),
+            dashboard_emit: std::sync::OnceLock::new(),
             team_state_inner: std::sync::Mutex::new(TeamState::Planning),
             lead_session_key: std::sync::Mutex::new(None),
             lead_delivery_source: std::sync::Mutex::new(None),
@@ -227,8 +219,6 @@ impl TeamOrchestrator {
             done_final_posted: std::sync::Mutex::new(false),
             active_lead_review: std::sync::Mutex::new(None),
             coordination_revision: AtomicU64::new(0),
-            #[cfg(test)]
-            test_mcp_start_result: std::sync::Mutex::new(None),
         })
     }
 
@@ -324,6 +314,25 @@ impl TeamOrchestrator {
         let _ = self.milestone_fn.set(f);
     }
 
+    pub fn set_dashboard_emit(&self, f: DashboardEmitFn) {
+        let _ = self.dashboard_emit.set(f);
+    }
+
+    pub(crate) fn emit_dashboard_event(&self, event: DashboardEvent) {
+        if let Some(emit) = self.dashboard_emit.get() {
+            emit(event);
+        }
+    }
+
+    pub(crate) fn emit_task_updated(&self, task_id: &str) {
+        if let Ok(Some(task)) = self.registry.get_task(task_id) {
+            self.emit_dashboard_event(DashboardEvent::TaskUpdated {
+                team_id: self.session.team_id.clone(),
+                task,
+            });
+        }
+    }
+
     // ── Team 状态 ──────────────────────────────────────────────────────────────
 
     /// 获取当前 TeamState（克隆副本）
@@ -393,11 +402,6 @@ impl TeamOrchestrator {
         *self.max_parallel.lock().unwrap() = max_parallel.max(1);
     }
 
-    #[cfg(test)]
-    pub fn set_test_mcp_start_result(&self, result: std::result::Result<u16, String>) {
-        *self.test_mcp_start_result.lock().unwrap() = Some(result);
-    }
-
     /// 向 IM 频道发布 Lead 的任意文字更新（post_update 工具调用时使用）
     pub fn post_message(&self, message: &str) -> bool {
         if !self.reserve_done_cycle_post_update() {
@@ -452,14 +456,19 @@ impl TeamOrchestrator {
             text,
             task_id,
         ) {
-            Ok(event_id) => self
-                .pending_lead_fragments
-                .lock()
-                .unwrap()
-                .push(PendingLeadFragment {
-                    event_id,
-                    text: text.to_string(),
-                }),
+            Ok(record) => {
+                self.emit_dashboard_event(DashboardEvent::TeamLeaderUpdate {
+                    team_id: self.session.team_id.clone(),
+                    record: record.clone(),
+                });
+                self.pending_lead_fragments
+                    .lock()
+                    .unwrap()
+                    .push(PendingLeadFragment {
+                        event_id: record.event_id,
+                        text: text.to_string(),
+                    });
+            }
             Err(err) => {
                 tracing::warn!(
                     team_id = %self.session.team_id,
@@ -573,8 +582,7 @@ impl TeamOrchestrator {
                 .get()
                 .cloned()
                 .unwrap_or_default(),
-            tool_surface_ready: self.mcp_server_port.get().is_some(),
-            mcp_port: self.mcp_server_port.get().copied(),
+            tool_surface_ready: true,
             task_counts: counts,
             artifact_health,
             routing_stats,
@@ -626,7 +634,7 @@ impl TeamOrchestrator {
         stats
     }
 
-    // ── 增量任务注册（供 LeadMcpServer.create_task 调用）────────────────────
+    // ── 增量任务注册（供 Lead create_task canonical action 调用）────────────────────
 
     /// 在 Planning 阶段注册单个任务。只能在 state == Planning 或 AwaitingConfirm 时调用。
     pub fn register_task(&self, task: super::registry::CreateTask) -> Result<String> {
@@ -643,6 +651,7 @@ impl TeamOrchestrator {
         }
         self.sync_task_artifacts(&id)?;
         self.record_coordination_side_effect();
+        self.emit_task_updated(&id);
         Ok(format!("Task {} registered.", id))
     }
 
@@ -652,48 +661,9 @@ impl TeamOrchestrator {
         self.registry.next_task_id()
     }
 
-    // ── 激活执行（供 LeadMcpServer.start_execution 调用）──────────────────
-
-    /// Eagerly start the unified SharedTeamMcpServer so both Lead and Specialist
-    /// agents receive `mcp_server_url` from the very first turn.
-    ///
-    /// Called from `main.rs` immediately after creating the orchestrator, before any
-    /// agent turn runs.  `activate()` (called later by the Lead via `start_execution`)
-    /// skips the MCP spawn if the port is already set.
-    pub async fn start_mcp_server(self: &Arc<Self>) -> Result<()> {
-        if self.mcp_server_port.get().is_some() {
-            return Ok(()); // already started
-        }
-        #[cfg(test)]
-        if let Some(result) = self.test_mcp_start_result.lock().unwrap().take() {
-            match result {
-                Ok(port) => {
-                    let _ = self.mcp_server_port.set(port);
-                    tracing::info!(
-                        team_id = %self.session.team_id,
-                        mcp_port = ?self.mcp_server_port.get(),
-                        "SharedTeamMcpServer test port injected"
-                    );
-                    return Ok(());
-                }
-                Err(message) => anyhow::bail!(message),
-            }
-        }
-        let mcp_srv = super::shared_mcp_server::SharedTeamToolServer::new(Arc::clone(self));
-        let mcp_handle = mcp_srv.spawn().await?;
-        let _ = self.mcp_server_port.set(mcp_handle.port);
-        *self.mcp_server_handle.lock().await = Some(mcp_handle);
-        tracing::info!(
-            team_id = %self.session.team_id,
-            mcp_port = ?self.mcp_server_port.get(),
-            "SharedTeamMcpServer started eagerly"
-        );
-        Ok(())
-    }
-
     /// 启动 Heartbeat，设置 state → Running。
-    /// MCP server is started eagerly via `start_mcp_server()`; this method only starts
-    /// the heartbeat dispatch loop and writes team manifest files.
+    /// Team mode uses canonical skills + TEAM/AGENTS prompt context; this method
+    /// starts the heartbeat dispatch loop and writes team manifest files.
     pub async fn activate(self: &Arc<Self>) -> Result<String> {
         // Guard: already running?
         let already_activated = {
@@ -702,11 +672,6 @@ impl TeamOrchestrator {
         };
         if already_activated {
             anyhow::bail!("TeamOrchestrator::activate() called twice");
-        }
-
-        // Team execution must not transition to Running until the tool surface is reachable.
-        if self.mcp_server_port.get().is_none() {
-            self.start_mcp_server().await?;
         }
 
         self.bootstrap_workspace_artifacts()?;
@@ -736,11 +701,7 @@ impl TeamOrchestrator {
         *self.team_state_inner.lock().unwrap() = TeamState::Running;
         self.record_coordination_side_effect();
 
-        tracing::info!(
-            team_id = %self.session.team_id,
-            mcp_port = ?self.mcp_server_port.get(),
-            "Team activated"
-        );
+        tracing::info!(team_id = %self.session.team_id, "Team activated");
         Ok("Team execution started.".to_string())
     }
 
@@ -748,7 +709,7 @@ impl TeamOrchestrator {
 
     /// 应用 TeamPlan：写 TEAM.md / TASKS.md，注册任务，启动 Heartbeat
     pub async fn start(self: &Arc<Self>, plan: &TeamPlan) -> Result<()> {
-        // Guard against double-start (use state, not mcp_server_port — port is now always set eagerly)
+        // Guard against double-start (use state only)
         let already_started = {
             let state = self.team_state_inner.lock().unwrap();
             *state == TeamState::Running || *state == TeamState::Done
@@ -789,6 +750,7 @@ impl TeamOrchestrator {
                 success_criteria: task.success_criteria.clone(),
             })?;
             self.sync_task_artifacts(&task.id)?;
+            self.emit_task_updated(&task.id);
         }
 
         // 3. Activate (syncs TASKS.md, starts Heartbeat + MCP)
@@ -868,7 +830,7 @@ impl TeamOrchestrator {
         Ok(body.to_string())
     }
 
-    /// 处理 Specialist 完成通知（由 MCP complete_task 工具触发）
+    /// 处理 Specialist 完成通知（内部完成路径）
     ///
     /// 1. 更新 SQLite（mark_done）
     /// 2. 写事件日志
@@ -884,6 +846,7 @@ impl TeamOrchestrator {
     ) -> Result<()> {
         // 1. 更新状态（校验认领者身份）
         self.registry.mark_done(task_id, agent, note)?;
+        self.emit_task_updated(task_id);
         self.record_specialist_action(task_id, agent, SpecialistActionKind::Done);
         self.sync_task_artifacts(task_id)?;
         let result_artifact_path = format!("tasks/{task_id}/result.md");
@@ -997,6 +960,7 @@ impl TeamOrchestrator {
     ) -> Result<()> {
         let result_body = self.validate_submitted_result_body(task_id, summary, result_markdown)?;
         self.registry.submit_task_result(task_id, agent, summary)?;
+        self.emit_task_updated(task_id);
         self.record_specialist_action(task_id, agent, SpecialistActionKind::Submitted);
         self.sync_task_artifacts(task_id)?;
         let result_artifact_path = format!("tasks/{task_id}/result.md");
@@ -1052,6 +1016,7 @@ impl TeamOrchestrator {
             })
             .unwrap_or_else(|| ("unknown".to_string(), task_id.to_string()));
         self.registry.accept_task(task_id, by)?;
+        self.emit_task_updated(task_id);
         self.sync_task_artifacts(task_id)?;
         let _ = self.session.append_task_progress(
             task_id,
@@ -1118,6 +1083,7 @@ impl TeamOrchestrator {
     /// Lead 重新打开已提交/已验收任务，退回 pending 并通知团队。
     pub fn reopen_submitted_task(&self, task_id: &str, reason: &str, by: &str) -> Result<()> {
         self.registry.reopen_task(task_id, reason)?;
+        self.emit_task_updated(task_id);
         self.sync_task_artifacts(task_id)?;
         self.session.write_task_review_feedback(
             task_id,
@@ -1217,17 +1183,21 @@ impl TeamOrchestrator {
         let _guard = self.pending_store_lock.lock().unwrap();
 
         let Some(tx) = self.team_notify_tx.get().cloned() else {
-            if let Err(err) = self.session.append_pending_completion(
-                &envelope
-                    .clone()
-                    .with_delivery_status(RoutingDeliveryStatus::PersistedPending),
-            ) {
+            let persisted = envelope
+                .clone()
+                .with_delivery_status(RoutingDeliveryStatus::PersistedPending);
+            if let Err(err) = self.session.append_pending_completion(&persisted) {
                 tracing::error!(
                     team_id = %self.session.team_id,
                     task_id = %envelope.event.task_id,
                     error = %err,
                     "Failed to persist pending team routing event (no tx)"
                 );
+            } else {
+                self.emit_dashboard_event(DashboardEvent::TeamPendingCompletion {
+                    team_id: self.session.team_id.clone(),
+                    record: PendingRoutingRecord::from_envelope(persisted),
+                });
             }
             return;
         };
@@ -1255,6 +1225,11 @@ impl TeamOrchestrator {
                     error = %persist_err,
                     "Failed to persist pending team routing event"
                 );
+            } else {
+                self.emit_dashboard_event(DashboardEvent::TeamPendingCompletion {
+                    team_id: self.session.team_id.clone(),
+                    record: PendingRoutingRecord::from_envelope(pending_on_error),
+                });
             }
         }
     }
@@ -1308,6 +1283,7 @@ impl TeamOrchestrator {
         .to_string();
         let _ = self.session.append_event(&event);
         self.registry.reset_claim(task_id)?;
+        self.emit_task_updated(task_id);
         self.sync_task_artifacts(task_id)?;
         let _ = self.session.append_task_progress(
             task_id,
@@ -1486,8 +1462,6 @@ impl TeamOrchestrator {
         if let Some(handle) = self.heartbeat_handle.lock().unwrap().take() {
             handle.abort();
         }
-        // Keep the shared MCP server alive across /clear so the next lead turn
-        // does not inherit a stale cached port with no listener behind it.
         // Clear tasks.db
         self.registry.clear_all_tasks()?;
         // Clear all jsonl files
@@ -1525,11 +1499,6 @@ impl TeamOrchestrator {
         // Stop heartbeat
         if let Some(handle) = self.heartbeat_handle.lock().unwrap().take() {
             handle.abort();
-        }
-        // Stop unified MCP server
-        if let Some(handle) = self.mcp_server_handle.lock().await.take() {
-            handle.stop().await;
-            tracing::info!(team_id = %self.session.team_id, "SharedTeamMcpServer stopped");
         }
         // Archive directory
         self.session.archive()?;
@@ -1653,6 +1622,11 @@ impl TeamOrchestrator {
                 error = %err,
                 "Failed to persist pending team routing event"
             );
+        } else {
+            self.emit_dashboard_event(DashboardEvent::TeamPendingCompletion {
+                team_id: self.session.team_id.clone(),
+                record: PendingRoutingRecord::from_envelope(envelope),
+            });
         }
     }
 
@@ -1665,6 +1639,11 @@ impl TeamOrchestrator {
                 error = %err,
                 "Failed to persist pending team routing record"
             );
+        } else {
+            self.emit_dashboard_event(DashboardEvent::TeamPendingCompletion {
+                team_id: self.session.team_id.clone(),
+                record,
+            });
         }
     }
 
@@ -1692,6 +1671,11 @@ impl TeamOrchestrator {
                 error = %err,
                 "Failed to append routing outcome"
             );
+        } else {
+            self.emit_dashboard_event(DashboardEvent::TeamRoutingEvent {
+                team_id: self.session.team_id.clone(),
+                event: delivered.clone(),
+            });
         }
     }
 }
@@ -1775,7 +1759,8 @@ This team exists to coordinate user-visible work through one lead and zero or mo
 - `tasks/<task-id>/progress.md`: append-only progress and escalation trail\n\
 - `tasks/<task-id>/result.md`: final specialist result plus lead acceptance notes\n\n\
 ## Coordination Precedence\n\n\
-If the user is asking to delegate, split work, assign another bot, coordinate specialists, or manage team execution, the lead must enter team coordination first.\
+In this workspace, every front-stage human message is owned by the lead first.\
+\nThe lead must decide coordination state through canonical team tools before falling back to generic repo workflow chatter.\
 \nGeneric repo workflow skills are for performing work inside a task, not for replacing task creation or assignment.\n\n\
 ## Speaking Rules\n\n\
 - Only the lead speaks to the user-facing channel.\n\
@@ -1814,18 +1799,20 @@ Read `TEAM.md`, `TASKS.md`, and task-local artifacts before acting.\n\n\
 - `{lead_name}` is the front-stage lead for this team cycle.\n\
 - Available specialists:\n{specialists_list}\n\n\
 ## Lead Turn Rules\n\n\
-Use team coordination first when the user intent is any of:\n\
-- delegate work to another bot or specialist\n\
-- split a request into sub-tasks\n\
-- track specialist progress or review specialist results\n\
-- ask for team execution, handoff, assignment, or re-assignment\n\n\
-For those requests, do not begin with generic repo workflow chatter like \"check skills\", \"brainstorm first\", or \"write a plan first\".\
-\nFirst decide the task graph and use the team coordination surface:\n\
-- `create_task(...)`\n\
-- `assign_task(...)`\n\
-- `start_execution()`\n\
-- `get_task_status()`\n\
-- `post_update(...)`\n\n\
+Every front-stage human message in this team workspace is a lead turn.\
+\nDo not hand front-stage human requests directly to a specialist lane.\
+\nDo not begin with generic repo workflow chatter like \"check skills\", \"brainstorm first\", or \"write a plan first\" when the real next step is team coordination.\
+\nFirst decide the coordination state and use the team coordination surface through `clawbro team-helper`:\n\
+- `clawbro team-helper create-task --title \"...\" [--assignee claw]`\n\
+- `clawbro team-helper assign-task --task-id T001 --assignee claw`\n\
+- `clawbro team-helper start-execution`\n\
+- `clawbro team-helper get-task-status`\n\
+- `clawbro team-helper post-update --message \"...\"`\n\
+- `clawbro team-helper request-confirmation --plan-summary \"...\"`\n\
+- `clawbro team-helper accept-task --task-id T001`\n\
+- `clawbro team-helper reopen-task --task-id T001 --reason \"...\"`\n\n\
+The runtime injects `CLAWBRO_TEAM_TOOL_URL` and `CLAWBRO_SESSION_REF`, so `clawbro team-helper` already knows the current team session.\n\
+Do not search for tokens, internal endpoints, or hidden team commands.\n\n\
 Generic repo workflow skills remain available, but they are for doing work inside a task or for explicit design/implementation requests from the user.\n\n\
 ## Scheduler Rule\n\n\
 - The built-in `scheduler` skill is available by default in this workspace.\n\
@@ -1833,9 +1820,15 @@ Generic repo workflow skills remain available, but they are for doing work insid
 - In those cases, create or update a schedule through `clawbro schedule ...`; do not merely promise to remember later.\n\
 - Do not use scheduler as a substitute for team task creation or specialist assignment.\n\n\
 ## Specialist Turn Rules\n\n\
+- Specialists do not own front-stage human conversation in this team workspace.\n\
 - Treat the assigned task and `tasks/<task-id>/...` artifacts as the working surface.\n\
 - Update `plan.md` before substantive execution if it still contains only the default scaffold.\n\
-- Use canonical team coordination actions for checkpoints, help requests, submission, completion, blocking, and reopen handling.\n\
+- Use canonical team coordination actions through `clawbro team-helper` for checkpoints, help requests, submission, completion, blocking, and reopen handling.\n\
+- Typical specialist commands:\n\
+  - `clawbro team-helper checkpoint-task --task-id T001 --note \"...\"`\n\
+  - `clawbro team-helper request-help --task-id T001 --message \"...\"`\n\
+  - `clawbro team-helper block-task --task-id T001 --reason \"...\"`\n\
+  - `clawbro team-helper submit-task-result --task-id T001 --summary \"...\" --result-markdown \"...\"`\n\
 - Do not rely on plain natural-language replies as the only record of progress.\n\n\
 ## Artifact Discipline\n\n\
 Each task directory should remain readable without replaying the whole transcript:\n\
@@ -1857,41 +1850,7 @@ mod tests {
     use super::*;
     use crate::agent_core::team::registry::CreateTask;
     use tempfile::tempdir;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::time::{timeout, Duration};
-
-    async fn post_initialize_to_mcp(port: u16) -> String {
-        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .expect("connect to shared team MCP server");
-        let body = r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test-client","version":"0.0.0"}}}"#;
-        let request = format!(
-            concat!(
-                "POST /mcp HTTP/1.1\r\n",
-                "Host: 127.0.0.1:{port}\r\n",
-                "Accept: application/json, text/event-stream\r\n",
-                "Content-Type: application/json\r\n",
-                "Content-Length: {content_length}\r\n",
-                "Connection: close\r\n",
-                "\r\n",
-                "{body}"
-            ),
-            port = port,
-            content_length = body.len(),
-            body = body,
-        );
-        stream
-            .write_all(request.as_bytes())
-            .await
-            .expect("write initialize request");
-
-        let mut response = Vec::new();
-        timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
-            .await
-            .expect("read initialize response timed out")
-            .expect("read initialize response");
-        String::from_utf8(response).expect("initialize response is utf-8")
-    }
 
     fn make_orchestrator() -> (Arc<TeamOrchestrator>, tempfile::TempDir) {
         let tmp = tempdir().unwrap();
@@ -2011,9 +1970,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_activate_starts_mcp_and_sets_running() {
+    async fn test_activate_sets_running() {
         let (orch, _tmp) = make_orchestrator();
-        orch.set_test_mcp_start_result(Ok(32123));
         orch.register_task(CreateTask {
             id: "T001".into(),
             title: "test".into(),
@@ -2022,50 +1980,17 @@ mod tests {
         .unwrap();
         orch.activate().await.unwrap();
         assert!(matches!(orch.team_state(), TeamState::Running));
-        assert_eq!(orch.mcp_server_port.get().copied(), Some(32123));
     }
 
     #[tokio::test]
-    async fn test_activate_fails_when_mcp_start_fails() {
+    async fn test_clear_workspace_does_not_depend_on_team_mcp_server() {
         let (orch, _tmp) = make_orchestrator();
-        orch.set_test_mcp_start_result(Err("synthetic mcp failure".to_string()));
-        orch.register_task(CreateTask {
-            id: "TFAIL".into(),
-            title: "test".into(),
-            ..Default::default()
-        })
-        .unwrap();
-
-        let err = orch.activate().await.unwrap_err().to_string();
-        assert!(err.contains("synthetic mcp failure"));
-        assert!(matches!(orch.team_state(), TeamState::Planning));
-        assert!(orch.mcp_server_port.get().is_none());
-    }
-
-    #[tokio::test]
-    async fn test_clear_workspace_keeps_shared_mcp_server_reachable() {
-        let (orch, _tmp) = make_orchestrator();
-        orch.start_mcp_server().await.unwrap();
-        let port = orch
-            .mcp_server_port
-            .get()
-            .copied()
-            .expect("shared MCP server port");
-
         orch.clear_workspace().await.unwrap();
-
-        let response = post_initialize_to_mcp(port).await;
-        assert!(
-            response.starts_with("HTTP/1.1 200 OK"),
-            "unexpected initialize status: {response}"
-        );
-        assert!(
-            response
-                .to_ascii_lowercase()
-                .contains("content-type: text/event-stream"),
-            "missing SSE content type after /clear: {response}"
-        );
         assert!(matches!(orch.team_state(), TeamState::Planning));
+        assert!(
+            orch.session.dir.exists(),
+            "team workspace should still exist"
+        );
     }
 
     #[test]
@@ -2725,7 +2650,6 @@ mod tests {
     #[tokio::test]
     async fn test_start_registers_tasks_and_writes_team_md() {
         let (orch, tmp) = make_orchestrator();
-        orch.set_test_mcp_start_result(Ok(32124));
 
         let plan = TeamPlan {
             team_id: "test-team".into(),
@@ -2750,7 +2674,8 @@ mod tests {
 
         let agents_md = orch.session.read_agents_md();
         assert!(agents_md.contains("Lead Turn Rules"));
-        assert!(agents_md.contains("delegate work to another bot"));
+        assert!(agents_md
+            .contains("Every front-stage human message in this team workspace is a lead turn"));
         assert!(agents_md.contains("Generic repo workflow skills remain available"));
 
         let task = orch.registry.get_task("T001").unwrap().unwrap();

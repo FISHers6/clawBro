@@ -467,12 +467,10 @@ mod tests {
                 allowed_team_tools: vec![],
                 schedule_tools: false,
                 allowed_schedule_tools: vec![],
-                local_skills: false,
                 external_mcp: true,
                 backend_native_tools: true,
             },
             approval_mode: ApprovalMode::AutoAllow,
-            tool_bridge_url: None,
             context: RuntimeContext::default(),
             external_mcp_servers: vec![ExternalMcpServerSpec {
                 name: "test-external".to_string(),

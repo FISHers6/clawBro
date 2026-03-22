@@ -2,45 +2,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::runtime::contract::RuntimeRole;
 
-pub use crate::protocol::{
-    ScheduleTool, TeamTool, TeamToolCall, TeamToolRequest, TeamToolResponse,
+pub use crate::protocol::ScheduleTool;
+pub use crate::team_contract::{
+    visible_team_tools_for_role, TeamTool, TeamToolCall, TeamToolRequest, TeamToolResponse,
+    TeamToolVisibility,
 };
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TeamToolVisibility {
-    pub role: RuntimeRole,
-    pub visible: Vec<TeamTool>,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScheduleToolVisibility {
     pub role: RuntimeRole,
     pub visible: Vec<ScheduleTool>,
-}
-
-pub fn visible_team_tools_for_role(role: RuntimeRole) -> TeamToolVisibility {
-    let visible = match role {
-        RuntimeRole::Solo => vec![],
-        RuntimeRole::Leader => vec![
-            TeamTool::CreateTask,
-            TeamTool::StartExecution,
-            TeamTool::RequestConfirmation,
-            TeamTool::PostUpdate,
-            TeamTool::GetTaskStatus,
-            TeamTool::AssignTask,
-            TeamTool::AcceptTask,
-            TeamTool::ReopenTask,
-        ],
-        RuntimeRole::Specialist => vec![
-            TeamTool::CheckpointTask,
-            TeamTool::SubmitTaskResult,
-            TeamTool::CompleteTask,
-            TeamTool::BlockTask,
-            TeamTool::RequestHelp,
-        ],
-    };
-
-    TeamToolVisibility { role, visible }
 }
 
 pub fn visible_schedule_tools_for_role(role: RuntimeRole) -> ScheduleToolVisibility {

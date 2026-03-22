@@ -22,9 +22,7 @@ pub struct SessionLocator {
 impl SessionLocator {
     fn to_session_key(&self) -> SessionKey {
         match &self.channel_instance {
-            Some(instance) => {
-                SessionKey::with_instance(&self.channel, instance, &self.scope)
-            }
+            Some(instance) => SessionKey::with_instance(&self.channel, instance, &self.scope),
             None => SessionKey::new(&self.channel, &self.scope),
         }
     }
@@ -77,17 +75,14 @@ pub async fn delete_session_history(
         ));
     }
 
-    manager
-        .reset_conversation(session_id)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiErrorBody {
-                    error: e.to_string(),
-                }),
-            )
-        })?;
+    manager.reset_conversation(session_id).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiErrorBody {
+                error: e.to_string(),
+            }),
+        )
+    })?;
 
     Ok(Json(SessionDeleteResponse {
         ok: true,
