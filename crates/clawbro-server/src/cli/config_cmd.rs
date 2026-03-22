@@ -1,4 +1,8 @@
-use crate::cli::args::{ConfigArgs, ConfigCommands};
+use crate::cli::{
+    args::{ConfigArgs, ConfigCommands},
+    config_agent_cmd, config_backend, config_binding, config_channel, config_delivery,
+    config_provider, config_team_scope_cmd, config_validate, config_wizard,
+};
 use anyhow::{Context, Result};
 use console::style;
 
@@ -7,14 +11,20 @@ pub async fn run(args: ConfigArgs) -> Result<()> {
         ConfigCommands::Show => cmd_show(),
         ConfigCommands::Validate => cmd_validate(),
         ConfigCommands::Edit => cmd_edit(),
+        ConfigCommands::Wizard => config_wizard::run().await,
+        ConfigCommands::Channel(args) => config_channel::run(args).await,
+        ConfigCommands::Provider(args) => config_provider::run(args).await,
+        ConfigCommands::Backend(args) => config_backend::run(args).await,
+        ConfigCommands::Agent(args) => config_agent_cmd::run(args).await,
+        ConfigCommands::Binding(args) => config_binding::run(args).await,
+        ConfigCommands::DeliverySender(args) => config_delivery::run_sender(args).await,
+        ConfigCommands::DeliveryTarget(args) => config_delivery::run_target(args).await,
+        ConfigCommands::TeamScope(args) => config_team_scope_cmd::run(args).await,
     }
 }
 
 fn config_path() -> std::path::PathBuf {
-    dirs::home_dir()
-        .unwrap_or_default()
-        .join(".clawbro")
-        .join("config.toml")
+    crate::config::config_file_path()
 }
 
 fn cmd_show() -> Result<()> {
@@ -56,14 +66,30 @@ fn cmd_validate() -> Result<()> {
     if !path.exists() {
         anyhow::bail!("config.toml not found: {}", path.display());
     }
-    let content = std::fs::read_to_string(&path)?;
-    let _: toml::Value = toml::from_str(&content).context("TOML syntax error")?;
-    let cfg = crate::config::GatewayConfig::load().context("config load failed")?;
-    cfg.validate_runtime_topology()
-        .context("topology validation failed")?;
+    let report = config_validate::validate_config_path(&path)
+        .with_context(|| format!("validate {}", path.display()))?;
+    for issue in &report.issues {
+        match issue.severity {
+            config_validate::ValidationSeverity::Error => {
+                println!("{} [{}] {}", style("✗").red(), issue.code, issue.message);
+            }
+            config_validate::ValidationSeverity::Warning => {
+                println!("{} [{}] {}", style("!").yellow(), issue.code, issue.message);
+            }
+        }
+    }
+    if report.has_errors() {
+        anyhow::bail!(
+            "config validation failed with {} error(s) and {} warning(s)",
+            report.error_count(),
+            report.warning_count()
+        );
+    }
     println!(
-        "{} Config syntax and topology are valid",
-        style("✓").green()
+        "{} Config is valid ({} warning{})",
+        style("✓").green(),
+        report.warning_count(),
+        if report.warning_count() == 1 { "" } else { "s" }
     );
     Ok(())
 }

@@ -43,8 +43,14 @@ pub struct Messages {
     pub enter_ws_token_hint: &'static str,
     pub select_channel: &'static str,
     pub channel_none: &'static str,
+    pub channel_wechat: &'static str,
     pub channel_lark: &'static str,
     pub channel_dingtalk: &'static str,
+    pub select_wechat_presentation: &'static str,
+    pub wechat_presentation_final: &'static str,
+    pub wechat_presentation_progress: &'static str,
+    pub confirm_wechat_login_now: &'static str,
+    pub wechat_team_scope_dm_only: &'static str,
     pub enter_lark_app_id: &'static str,
     pub enter_lark_app_secret: &'static str,
     pub enter_lark_bot_name: &'static str,
@@ -63,6 +69,8 @@ pub struct Messages {
     pub written_env: &'static str,
     pub backed_up: &'static str,
     pub done: &'static str,
+    pub continue_advanced_config: &'static str,
+    pub launching_config_wizard: &'static str,
     pub next_steps: &'static str,
 }
 
@@ -101,8 +109,15 @@ static ZH: Messages = Messages {
     enter_ws_token_hint: "建议生产环境设置 Token 保护 /ws 端点",
     select_channel: "接入 IM Channel（可选）",
     channel_none: "暂不接入，只用 WebSocket",
+    channel_wechat: "企业微信 / WeChat",
     channel_lark: "飞书 / Feishu / Lark",
     channel_dingtalk: "钉钉 / DingTalk",
+    select_wechat_presentation: "选择 WeChat 结果展示模式",
+    wechat_presentation_final: "Final Only — 只发最终结果",
+    wechat_presentation_progress: "Progress Compact — 发送精简进度",
+    confirm_wechat_login_now: "现在执行 WeChat 扫码登录？",
+    wechat_team_scope_dm_only:
+        "WeChat Team 当前只支持单聊 user:* scope，已自动切换为 Direct Message Team。",
     enter_lark_app_id: "飞书 App ID（格式: cli_xxxx）",
     enter_lark_app_secret: "飞书 App Secret",
     enter_lark_bot_name: "Bot 名称（群消息 @mention 识别，可留空）",
@@ -121,6 +136,8 @@ static ZH: Messages = Messages {
     written_env: "✓ API Key 已写入 ~/.clawbro/.env",
     backed_up: "✓ 旧配置已备份",
     done: "🎉 初始化完成！",
+    continue_advanced_config: "现在继续进入高级配置中心吗？",
+    launching_config_wizard: "进入配置中心…",
     next_steps: "启动 Gateway：\n  source ~/.clawbro/.env && clawbro serve\n\n其他命令：\n  clawbro doctor      — 诊断问题\n  clawbro status      — 查看配置\n  clawbro auth list   — 查看 API Key\n  clawbro setup       — 重新配置",
 };
 
@@ -148,8 +165,15 @@ static EN: Messages = Messages {
     enter_ws_token_hint: "Recommended to set a token in production",
     select_channel: "Connect an IM Channel (optional)",
     channel_none: "Skip — WebSocket only",
+    channel_wechat: "WeChat",
     channel_lark: "Feishu / Lark",
     channel_dingtalk: "DingTalk",
+    select_wechat_presentation: "Choose WeChat presentation mode",
+    wechat_presentation_final: "Final Only — send only the final result",
+    wechat_presentation_progress: "Progress Compact — send concise progress updates",
+    confirm_wechat_login_now: "Run WeChat QR login now?",
+    wechat_team_scope_dm_only:
+        "WeChat Team currently supports DM user scopes only; switched to Direct Message Team.",
     enter_lark_app_id: "Lark App ID (format: cli_xxxx)",
     enter_lark_app_secret: "Lark App Secret",
     enter_lark_bot_name: "Bot name (for @mention in groups, optional)",
@@ -168,6 +192,8 @@ static EN: Messages = Messages {
     written_env: "✓ API Key written to ~/.clawbro/.env",
     backed_up: "✓ Old config backed up",
     done: "Setup complete!",
+    continue_advanced_config: "Continue into the advanced configuration center now?",
+    launching_config_wizard: "Opening config wizard...",
     next_steps: "Start Gateway:\n  source ~/.clawbro/.env && clawbro serve\n\nOther commands:\n  clawbro doctor      — diagnose issues\n  clawbro status      — show config\n  clawbro auth list   — view API keys\n  clawbro setup       — reconfigure",
 };
 
@@ -195,8 +221,15 @@ static JA: Messages = Messages {
     enter_ws_token_hint: "本番環境では設定を推奨",
     select_channel: "IMチャンネル接続（任意）",
     channel_none: "スキップ — WebSocketのみ",
+    channel_wechat: "WeChat",
     channel_lark: "Feishu / Lark",
     channel_dingtalk: "DingTalk",
+    select_wechat_presentation: "WeChat の表示モードを選択",
+    wechat_presentation_final: "Final Only — 最終結果のみ送信",
+    wechat_presentation_progress: "Progress Compact — 簡潔な進捗も送信",
+    confirm_wechat_login_now: "今すぐ WeChat QR ログインを実行しますか？",
+    wechat_team_scope_dm_only:
+        "WeChat Team は現在 DM の user:* scope のみ対応です。Direct Message Team に切り替えました。",
     enter_lark_app_id: "Lark App ID（形式: cli_xxxx）",
     enter_lark_app_secret: "Lark App Secret",
     enter_lark_bot_name: "Bot名（@mention識別用、任意）",
@@ -215,6 +248,8 @@ static JA: Messages = Messages {
     written_env: "✓ APIキーを ~/.clawbro/.env に書き込みました",
     backed_up: "✓ 旧設定をバックアップしました",
     done: "セットアップ完了！",
+    continue_advanced_config: "このまま高度な設定センターに進みますか？",
+    launching_config_wizard: "設定センターを開いています…",
     next_steps: "起動：\n  source ~/.clawbro/.env && clawbro serve\n\nその他：\n  clawbro doctor      — 問題診断\n  clawbro status      — 設定確認",
 };
 
@@ -242,8 +277,15 @@ static KO: Messages = Messages {
     enter_ws_token_hint: "프로덕션 환경에서는 설정 권장",
     select_channel: "IM 채널 연결（선택사항）",
     channel_none: "건너뛰기 — WebSocket만",
+    channel_wechat: "WeChat",
     channel_lark: "Feishu / Lark",
     channel_dingtalk: "DingTalk",
+    select_wechat_presentation: "WeChat 표시 모드 선택",
+    wechat_presentation_final: "Final Only — 최종 결과만 전송",
+    wechat_presentation_progress: "Progress Compact — 간단한 진행 상황도 전송",
+    confirm_wechat_login_now: "지금 WeChat QR 로그인을 실행할까요?",
+    wechat_team_scope_dm_only:
+        "WeChat Team 은 현재 DM user:* scope 만 지원합니다. Direct Message Team 으로 전환했습니다.",
     enter_lark_app_id: "Lark App ID（형식: cli_xxxx）",
     enter_lark_app_secret: "Lark App Secret",
     enter_lark_bot_name: "봇 이름（선택사항）",
@@ -262,6 +304,8 @@ static KO: Messages = Messages {
     written_env: "✓ API 키가 ~/.clawbro/.env에 저장되었습니다",
     backed_up: "✓ 이전 설정이 백업되었습니다",
     done: "설정 완료！",
+    continue_advanced_config: "지금 고급 설정 센터로 계속 진행할까요?",
+    launching_config_wizard: "설정 마법사를 여는 중...",
     next_steps: "시작：\n  source ~/.clawbro/.env && clawbro serve\n\n기타：\n  clawbro doctor      — 문제 진단\n  clawbro status      — 설정 확인",
 };
 

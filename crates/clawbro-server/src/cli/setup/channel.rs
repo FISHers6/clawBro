@@ -1,12 +1,20 @@
 use crate::cli::i18n::{Language, Messages};
+use crate::config::ProgressPresentationMode;
 use anyhow::Result;
-use dialoguer::{theme::ColorfulTheme, Input, Password, Select};
+use dialoguer::{theme::ColorfulTheme, Confirm, Input, Password, Select};
 
 #[derive(Debug, Clone)]
 pub enum ChannelConfig {
     None,
+    WeChat(WeChatCfg),
     Lark(LarkCfg),
     DingTalk(DingTalkCfg),
+}
+
+#[derive(Debug, Clone)]
+pub struct WeChatCfg {
+    pub presentation: ProgressPresentationMode,
+    pub login_now: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -37,20 +45,71 @@ pub enum DingTalkReceiveMode {
 pub fn collect(lang: Language) -> Result<ChannelConfig> {
     let m = Messages::for_lang(lang);
     let theme = ColorfulTheme::default();
-    let items = [m.channel_none, m.channel_lark, m.channel_dingtalk];
+    let items = [
+        m.channel_none,
+        m.channel_wechat,
+        m.channel_lark,
+        m.channel_dingtalk,
+    ];
     let idx = Select::with_theme(&theme)
         .with_prompt(m.select_channel)
         .items(&items)
         .default(0)
         .interact()?;
     match idx {
-        1 => collect_lark(m, &theme),
-        2 => collect_dingtalk(m, &theme),
+        1 => collect_wechat_with(m, &theme),
+        2 => collect_lark_with(m, &theme),
+        3 => collect_dingtalk_with(m, &theme),
         _ => Ok(ChannelConfig::None),
     }
 }
 
-fn collect_lark(m: &Messages, theme: &ColorfulTheme) -> Result<ChannelConfig> {
+pub fn collect_wechat(lang: Language) -> Result<ChannelConfig> {
+    let m = Messages::for_lang(lang);
+    let theme = ColorfulTheme::default();
+    collect_wechat_with(m, &theme)
+}
+
+pub fn collect_lark(lang: Language) -> Result<ChannelConfig> {
+    let m = Messages::for_lang(lang);
+    let theme = ColorfulTheme::default();
+    collect_lark_with(m, &theme)
+}
+
+pub fn collect_dingtalk(lang: Language) -> Result<ChannelConfig> {
+    let m = Messages::for_lang(lang);
+    let theme = ColorfulTheme::default();
+    collect_dingtalk_with(m, &theme)
+}
+
+pub fn default_wechat() -> ChannelConfig {
+    ChannelConfig::WeChat(WeChatCfg {
+        presentation: ProgressPresentationMode::FinalOnly,
+        login_now: false,
+    })
+}
+
+fn collect_wechat_with(m: &Messages, theme: &ColorfulTheme) -> Result<ChannelConfig> {
+    let presentation_idx = Select::with_theme(theme)
+        .with_prompt(m.select_wechat_presentation)
+        .items(&[m.wechat_presentation_final, m.wechat_presentation_progress])
+        .default(0)
+        .interact()?;
+    let presentation = match presentation_idx {
+        1 => ProgressPresentationMode::ProgressCompact,
+        _ => ProgressPresentationMode::FinalOnly,
+    };
+    let login_now = Confirm::with_theme(theme)
+        .with_prompt(m.confirm_wechat_login_now)
+        .default(true)
+        .interact()?;
+    Ok(ChannelConfig::WeChat(WeChatCfg {
+        presentation,
+        login_now,
+    }))
+}
+
+fn collect_lark_with(m: &Messages, theme: &ColorfulTheme) -> Result<ChannelConfig> {
     let app_id: String = Input::with_theme(theme)
         .with_prompt(m.enter_lark_app_id)
         .interact_text()?;
@@ -73,7 +132,7 @@ fn collect_lark(m: &Messages, theme: &ColorfulTheme) -> Result<ChannelConfig> {
     }))
 }
 
-fn collect_dingtalk(m: &Messages, theme: &ColorfulTheme) -> Result<ChannelConfig> {
+fn collect_dingtalk_with(m: &Messages, theme: &ColorfulTheme) -> Result<ChannelConfig> {
     let mode_idx = Select::with_theme(theme)
         .with_prompt(m.select_dingtalk_mode)
         .items(&[m.dingtalk_mode_stream, m.dingtalk_mode_webhook])
@@ -171,5 +230,15 @@ mod tests {
             webhook_path: None,
         };
         assert!(cfg.agent_id.is_none());
+    }
+
+    #[test]
+    fn wechat_cfg_fields() {
+        let cfg = WeChatCfg {
+            presentation: ProgressPresentationMode::ProgressCompact,
+            login_now: true,
+        };
+        assert_eq!(cfg.presentation, ProgressPresentationMode::ProgressCompact);
+        assert!(cfg.login_now);
     }
 }

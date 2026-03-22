@@ -1,11 +1,14 @@
 pub mod auth_cfg;
 pub mod channel;
 pub mod mode;
+pub mod preset;
 pub mod provider;
 pub mod writer;
 
 use crate::cli::{
     args::SetupArgs,
+    config_validate::{validate_config_path, ValidationSeverity},
+    config_wizard,
     i18n::{Language, Messages},
 };
 use crate::{config::GatewayConfig, skills_internal::reconcile_default_skills};
@@ -53,21 +56,27 @@ pub async fn run(args: SetupArgs) -> Result<()> {
         }
     }
 
-    // Step 3: Provider + API key
+    // Step 3: Topology preset
+    let preset = preset::select(&args)?;
+    if !matches!(preset, preset::SetupPreset::Custom) {
+        println!("Using preset: {}", preset.label());
+    }
+
+    // Step 4: Provider + API key
     let provider_cfg = provider::collect(&args, lang)?;
 
-    // Step 4: Mode + port + workspace
-    let mut mode_cfg = mode::collect(&args, lang)?;
+    // Step 5: Mode + channel topology
+    let (mut mode_cfg, channel_cfg) = preset::collect_topology(preset, &args, lang)?;
 
-    // Step 5: Auth (ws_token)
+    // Step 6: Auth (ws_token)
     let auth_cfg = auth_cfg::collect(&args, lang)?;
 
-    // Step 6: Channel (optional)
-    let channel_cfg = if args.non_interactive {
-        channel::ChannelConfig::None
-    } else {
-        channel::collect(lang)?
-    };
+    if let channel::ChannelConfig::WeChat(wechat) = &channel_cfg {
+        if wechat.login_now {
+            let path = clawbro_channels::wechat_login().await?;
+            println!("✓ WeChat credentials saved to {}", path.display());
+        }
+    }
 
     // Step 7: Team scope details (requires knowing the channel)
     mode::collect_team_scope_details(&args, &mut mode_cfg, &channel_cfg, lang)?;
@@ -97,6 +106,14 @@ pub async fn run(args: SetupArgs) -> Result<()> {
         println!("{}", style(m.written_env).green());
     }
 
+    let validation = validate_config_path(&config_path)?;
+    for issue in validation.issues {
+        match issue.severity {
+            ValidationSeverity::Error => eprintln!("warning: {}", issue.message),
+            ValidationSeverity::Warning => eprintln!("warning: {}", issue.message),
+        }
+    }
+
     let cfg = GatewayConfig::load()?;
     let report = reconcile_default_skills(&cfg)?;
     for warning in report.warnings() {
@@ -105,6 +122,15 @@ pub async fn run(args: SetupArgs) -> Result<()> {
 
     // Step 10: Done
     println!("\n{}", style(m.done).bold().green());
+    if !args.non_interactive
+        && Confirm::with_theme(&theme)
+            .with_prompt(m.continue_advanced_config)
+            .default(false)
+            .interact()?
+    {
+        println!("{}", style(m.launching_config_wizard).cyan());
+        config_wizard::run().await?;
+    }
     println!("\n{}", m.next_steps);
     Ok(())
 }

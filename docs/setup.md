@@ -142,11 +142,13 @@ clawbro setup
 向导会依次引导你：
 
 - 选择语言
+- 选择初始化预设
 - 选择 provider
 - 输入 API key
 - 选择模式
 - 可选输入 WebSocket token
-- 可选接入 Lark / DingTalk
+- 可选接入 WeChat / Lark / DingTalk
+- 初始化完成后可直接继续进入 `clawbro config wizard`
 
 ### Non-interactive
 
@@ -155,6 +157,7 @@ clawbro setup
 ```bash
 clawbro setup \
   --lang en \
+  --preset wechat-solo \
   --provider anthropic \
   --api-key sk-ant-xxx \
   --mode solo \
@@ -164,6 +167,25 @@ clawbro setup \
 ---
 
 ## 6. Setup Modes
+
+### Presets
+
+`setup` 现在支持常见拓扑预设：
+
+| 预设 | 说明 |
+| --- | --- |
+| `custom` | 手动选择模式和 channel |
+| `wechat-solo` | WeChat 单聊 + solo |
+| `wechat-dm-team` | WeChat 单聊 + Team DM |
+| `lark-group-team` | Lark 群组 + Team |
+
+示例：
+
+```bash
+clawbro setup --preset wechat-solo
+clawbro setup --preset wechat-dm-team
+clawbro setup --preset lark-group-team
+```
 
 ### Solo
 
@@ -284,6 +306,7 @@ Direct Message:
 - 无 channel: `user:default`
 - Lark: `user:ou_your_user_id`
 - DingTalk: `user:ding_your_user_id`
+- WeChat: `user:o9cqxxxx@im.wechat`
 
 Group:
 
@@ -319,9 +342,78 @@ clawbro auth list
 clawbro auth check anthropic
 ```
 
+也可以直接通过配置中心补 provider / backend / agent：
+
+```bash
+clawbro config provider add-anthropic-compatible \
+  --id deepseek-anthropic \
+  --base-url https://api.deepseek.com/anthropic \
+  --auth-env DEEPSEEK_API_KEY \
+  --default-model deepseek-chat
+
+clawbro config backend add \
+  --id claude-main \
+  --family acp \
+  --acp-backend claude \
+  --provider deepseek-anthropic
+
+clawbro config agent add --name claude --backend claude-main
+```
+
 ---
 
-## 7. Lark / DingTalk
+## 8. Config Wizard and Scriptable Config
+
+初始化后，推荐继续通过共享配置中心维护配置，而不是手写 `config.toml`：
+
+```bash
+clawbro config wizard
+```
+
+它现在可以统一管理：
+
+- channels
+- providers
+- backends
+- agents
+- routing bindings
+- delivery sender / target overrides
+- team scopes
+- validate / diff / apply
+
+如果你更偏好脚本化，也可以直接使用：
+
+```bash
+clawbro config channel --help
+clawbro config binding --help
+clawbro config team-scope --help
+clawbro config delivery-sender --help
+clawbro config delivery-target --help
+```
+
+### WeChat CLI surface
+
+WeChat 现在是一等 channel，支持：
+
+```bash
+clawbro config channel enable wechat
+clawbro config channel login wechat
+clawbro config channel set-presentation wechat --presentation final-only
+clawbro config channel setup-solo wechat --agent claw
+clawbro config channel setup-team wechat \
+  --scope user:o9cqxxxx@im.wechat \
+  --front-bot claude \
+  --specialist claw
+```
+
+注意：
+
+- WeChat 当前仍是 1:1 runtime，所以 `setup-team` 只支持 `user:*` DM scope
+- `clawbro wechat-login` 仍可用，但现在和 `config channel login wechat` 走同一条登录实现
+
+---
+
+## 9. Lark / DingTalk
 
 setup 支持在向导里直接录入 channel 配置。
 

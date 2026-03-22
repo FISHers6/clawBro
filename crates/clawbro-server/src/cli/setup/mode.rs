@@ -205,17 +205,110 @@ pub fn collect(args: &SetupArgs, lang: Language) -> Result<ModeConfig> {
     })
 }
 
+pub fn collect_with_defaults(
+    args: &SetupArgs,
+    lang: Language,
+    mode: Mode,
+    team_target: Option<TeamTarget>,
+    default_front_bot: Option<&str>,
+    default_specialists: &[&str],
+) -> Result<ModeConfig> {
+    let m = Messages::for_lang(lang);
+    let theme = ColorfulTheme::default();
+
+    let front_bot = if matches!(mode, Mode::Team) {
+        if let Some(name) = &args.front_bot {
+            Some(name.trim().to_string())
+        } else if args.non_interactive {
+            Some(default_front_bot.unwrap_or("lead").to_string())
+        } else {
+            let entered: String = Input::with_theme(&theme)
+                .with_prompt(m.enter_front_bot_name)
+                .default(default_front_bot.unwrap_or("lead").into())
+                .interact_text()?;
+            let normalized = entered.trim();
+            Some(if normalized.is_empty() {
+                default_front_bot.unwrap_or("lead").to_string()
+            } else {
+                normalized.to_string()
+            })
+        }
+    } else {
+        None
+    };
+
+    let specialists = if matches!(mode, Mode::Team) {
+        if !args.specialist.is_empty() {
+            collect_specialists(args, m, &theme, front_bot.as_deref().unwrap_or("lead"))?
+        } else if args.non_interactive {
+            default_specialists
+                .iter()
+                .map(|value| value.to_string())
+                .collect()
+        } else {
+            let mut collected =
+                collect_specialists(args, m, &theme, front_bot.as_deref().unwrap_or("lead"))?;
+            if collected == vec!["specialist".to_string()] && !default_specialists.is_empty() {
+                collected = default_specialists
+                    .iter()
+                    .map(|value| value.to_string())
+                    .collect();
+            }
+            collected
+        }
+    } else {
+        Vec::new()
+    };
+
+    let port: u16 = if args.non_interactive {
+        8080
+    } else {
+        let port_str: String = Input::with_theme(&theme)
+            .with_prompt(m.enter_port)
+            .default("8080".into())
+            .interact_text()?;
+        port_str.trim().parse().unwrap_or(8080)
+    };
+
+    let workspace = if args.non_interactive {
+        None
+    } else {
+        let ws_str: String = Input::with_theme(&theme)
+            .with_prompt(m.enter_workspace)
+            .allow_empty(true)
+            .interact_text()?;
+        if ws_str.trim().is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(ws_str.trim()))
+        }
+    };
+
+    Ok(ModeConfig {
+        mode,
+        team_target,
+        front_bot,
+        specialists,
+        team_scope: None,
+        team_name: None,
+        port,
+        workspace,
+    })
+}
+
 fn team_scope_defaults(
     target: TeamTarget,
     channel: &ChannelConfig,
 ) -> (&'static str, &'static str) {
     match target {
         TeamTarget::DirectMessage => match channel {
+            ChannelConfig::WeChat(_) => ("user:o9cqxxxx@im.wechat", "wechat-dm-team"),
             ChannelConfig::Lark(_) => ("user:ou_your_user_id", "my-team"),
             ChannelConfig::DingTalk(_) => ("user:ding_your_user_id", "my-team"),
             ChannelConfig::None => ("user:default", "my-team"),
         },
         TeamTarget::Group => match channel {
+            ChannelConfig::WeChat(_) => ("user:o9cqxxxx@im.wechat", "wechat-dm-team"),
             ChannelConfig::Lark(_) => ("group:lark:chat-123", "group-team"),
             ChannelConfig::DingTalk(_) => ("group:dingtalk:conversation-123", "group-team"),
             ChannelConfig::None => ("group:default", "group-team"),
@@ -231,6 +324,14 @@ pub fn collect_team_scope_details(
 ) -> Result<()> {
     if !matches!(mode.mode, Mode::Team) {
         return Ok(());
+    }
+
+    let m = Messages::for_lang(lang);
+    if matches!(mode.team_target, Some(TeamTarget::Group))
+        && matches!(channel, ChannelConfig::WeChat(_))
+    {
+        println!("{}", m.wechat_team_scope_dm_only);
+        mode.team_target = Some(TeamTarget::DirectMessage);
     }
 
     let target = mode.team_target.unwrap_or(TeamTarget::DirectMessage);
@@ -256,7 +357,6 @@ pub fn collect_team_scope_details(
         return Ok(());
     }
 
-    let m = Messages::for_lang(lang);
     let theme = ColorfulTheme::default();
 
     let scope_input: String = Input::with_theme(&theme)

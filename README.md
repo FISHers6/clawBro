@@ -1,8 +1,8 @@
 <div align="center">
   <img src="./assets/logo.png" alt="clawBro Logo" width="200">
-  <h1>🦀 clawBro: Let Coding CLI Agents Work Like OpenClaw in Chat and collaborating as a team at all times</h1>
+  <h1>🦀 clawBro: Let CLI Coding Agents Work Like OpenClaw in Chat and Team Mode</h1>
   <p>
-    <strong>Built around OpenClaw ideas, clawBro helps Claude Code, Codex, Qwen, Qoder, Gemini, and other coding agent CLIs work together and connect to Lark, DingTalk, and team workflows.</strong>
+    <strong>Built around OpenClaw ideas, clawBro helps Claude Code, Codex, Qwen, Qoder, Gemini, and other CLI Coding Agents work together across WeChat, Lark, DingTalk, and long-running team workflows.</strong>
   </p>
   <p>
     <a href="./README_ZH.md"><strong>中文</strong></a> ·
@@ -15,7 +15,7 @@
     <a href="#-use-cases">Use Cases</a> ·
     <a href="#-quick-start">Quick Start</a> ·
     <a href="#-team-modes">Team Modes</a> ·
-    <a href="#-coding-agent-integration">Coding Agent Integration</a> ·
+    <a href="#-cli-coding-agent-integration">CLI Coding Agent Integration</a> ·
     <a href="./docs/setup.md">Setup Guide</a>
   </p>
   <p>
@@ -23,24 +23,26 @@
     <img src="https://img.shields.io/badge/rust-1.90%2B-orange" alt="Rust">
     <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
     <img src="https://img.shields.io/badge/agents-Claude%20%7C%20Codex%20%7C%20Qwen%20%7C%20Qoder%20%7C%20Gemini-111827" alt="Agents">
-    <img src="https://img.shields.io/badge/channels-Lark%20%7C%20DingTalk-4EA1FF" alt="Channels">
+    <img src="https://img.shields.io/badge/channels-WeChat%20%7C%20Lark%20%7C%20DingTalk-4EA1FF" alt="Channels">
     <img src="https://img.shields.io/badge/runtime-Native%20%7C%20CLI%20Bridge%20%7C%20OpenClaw-8B5CF6" alt="Runtime">
     <img src="https://img.shields.io/badge/modes-Solo%20%7C%20Multi%20%7C%20Team-111827" alt="Modes">
   </p>
 </div>
 
-`clawBro` is a Rust-based system for making coding agent CLIs work together across local workflows, chat apps, and long-running team collaboration.
+`clawBro` is a Rust-based system for making CLI Coding Agents work together across local workflows, chat apps, and long-running team collaboration.
 
-It stays close to the OpenClaw spirit, but pushes toward practical teamwork: Claude Code, Codex, Qwen, Qoder, Gemini, and related coding agents can be organized into solo, role-based, and lead-plus-specialist workflows, then connected to Lark, DingTalk, and WebSocket entrypoints.
+It stays close to the OpenClaw spirit, but pushes toward practical teamwork: Claude Code, Codex, Qwen, Qoder, Gemini, and related coding agents can be organized into solo, role-based, and lead-plus-specialist workflows, then connected to WeChat, Lark, DingTalk, and WebSocket entrypoints.
+
+It also supports the official WeChat lobster path: a WeChat front bot can lead shrimp soldiers and crab generals in Team mode, keep the user-facing conversation stable, and delegate work to specialists behind the scenes.
 
 ## 📢 Project Status
 
-- **[03-19]** One `clawbro` surface now brings together multiple AI coding CLIs instead of forcing one tool per workflow.
-- **[03-19]** Team orchestration supports lead-driven workflows, specialist agents, milestone delivery, and named roles like `planner`, `coder`, `reviewer`, and `researcher`.
-- **[03-19]** Group and direct-message usage now fit the same routing model, with Lark, DingTalk Stream Mode, DingTalk custom robot webhook, and WebSocket entrypoints.
-- **[03-19]** Multi-IM connectivity is now practical for always-on chat workflows: one runtime can stay online across Lark, DingTalk, and team conversations at the same time.
-- **[03-19]** Operational controls include approvals, allowlists, memory-aware sessions, `/health`, `/status`, `/doctor`, and diagnostics surfaces.
 - **[03-20]** Durable scheduling is now built in: one-shot reminders, exact-time jobs, interval polling, cron schedules, chat-created reminders, and current-session cleanup all share the same runtime scheduler.
+- **[03-19]** One `clawbro` surface now brings together multiple AI CLI Coding Agents instead of forcing one tool per workflow.
+- **[03-19]** Team orchestration supports lead-driven workflows, specialist agents, milestone delivery, and named roles like `planner`, `coder`, `reviewer`, and `researcher`.
+- **[03-19]** Group and direct-message usage now fit the same routing model, with WeChat DM, Lark, DingTalk Stream Mode, DingTalk custom robot webhook, and WebSocket entrypoints.
+- **[03-19]** Multi-IM connectivity is now practical for always-on chat workflows: one runtime can stay online across WeChat, Lark, DingTalk, and team conversations at the same time.
+- **[03-19]** Operational controls include approvals, allowlists, memory-aware sessions, `/health`, `/status`, `/doctor`, and diagnostics surfaces.
 
 > `clawBro` is built for engineering, research, and workflow experimentation. It is meant for real agent collaboration, not just another chat wrapper.
 
@@ -48,7 +50,7 @@ It stays close to the OpenClaw spirit, but pushes toward practical teamwork: Cla
 
 🏛️ **Unified Control Plane**: One `clawbro` entrypoint for setup, routing, session management, diagnostics, and runtime dispatch.
 
-🤖 **Unified Coding Agents**: Bring Claude, Codex, Qwen, Qoder, Gemini, and other coding CLIs into one product surface instead of juggling separate entrypoints.
+🤖 **Unified CLI Coding Agents**: Bring Claude, Codex, Qwen, Qoder, Gemini, and other coding CLIs into one product surface instead of juggling separate entrypoints.
 
 👥 **Team Orchestration**: Support `solo`, `multi`, and `team` interaction models with lead + specialists, scope-aware routing, and milestone-style collaboration.
 
@@ -92,7 +94,7 @@ User / Group / WebSocket / Scheduled Jobs
 - [Quick Start](#-quick-start)
 - [Scheduled Tasks](#-scheduled-tasks)
 - [Team Modes](#-team-modes)
-- [Coding Agent Integration](#-coding-agent-integration)
+- [CLI Coding Agent Integration](#-cli-coding-agent-integration)
 - [Chat Channels](#-chat-channels)
 - [Configuration & Operations](#️-configuration--operations)
 - [Project Structure](#️-project-structure)
@@ -220,69 +222,39 @@ cargo build -p clawbro --bin clawbro
 ## 🚀 Quick Start
 
 > [!TIP]
-> The recommended first path is `WebSocket + ClawBro Native`.
-> Add agent rosters, bindings, channels, and Team scopes after the base path is working.
+> Start with one of these classic cases. For deeper topology design, use `clawbro config wizard` or read [Setup Guide](./docs/setup.md).
 
-**1. Install**
+**Case 1: minimal local start**
 
 ```bash
 cargo install clawbro
-```
-
-Or choose one of these:
-
-```bash
-# GitHub Release: unpack and run directly
-./clawbro --version
-
-# npm: download the matching binary during install
-npm install -g clawbro
-clawbro --version
-```
-
-**2. Initialize**
-
-```bash
 clawbro setup
-```
-
-This creates the default runtime layout under `~/.clawbro/`, including:
-
-- `config.toml`
-- `.env`
-- `sessions/`
-- `shared/`
-- `skills/`
-- `personas/`
-
-**3. Validate your config**
-
-```bash
 clawbro config validate
-```
-
-**4. Start the gateway**
-
-```bash
 source ~/.clawbro/.env
 clawbro serve
 ```
 
-**5. Example: non-interactive Team setup**
+**Case 2: official WeChat lobster, solo mode**
 
 ```bash
-clawbro setup \
-  --lang en \
-  --provider anthropic \
-  --api-key sk-ant-xxx \
-  --mode team \
-  --team-target group \
-  --front-bot planner \
-  --specialist coder \
-  --specialist reviewer \
-  --team-scope group:lark:chat-123 \
-  --team-name ops-room \
-  --non-interactive
+clawbro setup --preset wechat-solo
+clawbro config channel login wechat
+clawbro config channel setup-solo wechat --agent claw
+clawbro config validate
+clawbro serve
+```
+
+**Case 3: WeChat DM Team, front bot leads shrimp soldiers and crab generals**
+
+```bash
+clawbro setup --preset wechat-dm-team
+clawbro config channel login wechat
+clawbro config channel setup-team wechat \
+  --scope user:o9cqxxxx@im.wechat \
+  --front-bot claude \
+  --specialist claw
+clawbro config validate
+clawbro serve
 ```
 
 ## ⏰ Scheduled Tasks
@@ -389,14 +361,14 @@ ClawBro supports multiple interaction styles from the same control plane.
 
 </details>
 
-## 🔌 Coding Agent Integration
+## 🔌 CLI Coding Agent Integration
 
 ClawBro separates the business control plane from the execution plane so you can bring multiple coding agents into the same system without turning the README into a protocol manual.
 
 | Integration path | Current role | Notes |
 | --- | --- | --- |
 | **ClawBro Native** | Default native execution path | Uses the internal runtime bridge and supports canonical Team Tool RPC. |
-| **Coding CLI bridge** | Compatibility layer for external coding CLIs | Unifies multiple AI coding agents behind one control plane. Internally this is where ACP-style compatibility helps, but users mainly feel a single product surface. |
+| **Coding CLI bridge** | Compatibility layer for external coding CLIs | Unifies multiple AI CLI Coding Agents behind one control plane. Internally this is where ACP-style compatibility helps, but users mainly feel a single product surface. |
 | **OpenClaw Gateway** | Remote runtime integration | Active backend family for OpenClaw WS-based execution with explicit helper constraints in Team mode. |
 
 Current documented agent examples include:
@@ -419,16 +391,17 @@ ClawBro connects agent workflows to chat delivery surfaces while keeping transcr
 
 | Channel | Current status | Notes |
 | --- | --- | --- |
+| **WeChat (official lobster)** | Structured | Supports official WeChat login, WeChat solo routing, and WeChat DM Team mode where the front bot leads specialist agents. |
 | **Lark / Feishu** | Complete | Supports `final_only` and `progress_compact` presentation modes. |
 | **DingTalk** | Structured | Supports both app/stream mode and custom robot group webhook mode. |
 | **WebSocket** | Structured | Recommended first setup path before adding IM integrations. |
 
 Typical deployment path:
 
-1. Start with WebSocket and one native backend.
+1. Start with WebSocket or official WeChat lobster and one primary backend.
 2. Add `agent_roster`, bindings, and named roles.
 3. Add Team scope and routing.
-4. Connect Lark or DingTalk.
+4. Connect Lark or DingTalk if you need more channels.
 
 For DingTalk, there are now two distinct integration styles:
 
@@ -452,12 +425,15 @@ Common commands:
 | Command | Purpose |
 | --- | --- |
 | `clawbro setup` | First-time initialization |
+| `clawbro config wizard` | Continue configuring providers, backends, channels, routing, and Team scopes |
+| `clawbro config validate` | Validate topology and config references |
+| `clawbro config channel login wechat` | Log in to the official WeChat lobster channel |
+| `clawbro config channel setup-solo wechat --agent claw` | Turn WeChat into a solo front door |
+| `clawbro config channel setup-team wechat --scope user:o9cqxxxx@im.wechat --front-bot claude --specialist claw` | Turn a WeChat DM scope into a Team lead workspace |
 | `clawbro serve` | Start the gateway |
 | `clawbro status` | Show the active config summary |
 | `clawbro doctor` | Diagnose environment and runtime issues |
-| `clawbro config validate` | Validate topology and config references |
 | `clawbro auth list` | List configured auth material |
-| `clawbro completions zsh` | Generate shell completions |
 
 Default runtime layout:
 

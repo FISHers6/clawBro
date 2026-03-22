@@ -242,6 +242,9 @@ pub struct SetupArgs {
     /// 界面语言（跳过语言选择步骤）
     #[arg(long, value_enum)]
     pub lang: Option<LangArg>,
+    /// 首次初始化拓扑预设
+    #[arg(long, value_enum)]
+    pub preset: Option<SetupPresetArg>,
     /// AI Provider
     #[arg(long, value_enum)]
     pub provider: Option<ProviderArg>,
@@ -283,6 +286,14 @@ pub struct SetupArgs {
     pub non_interactive: bool,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum SetupPresetArg {
+    Custom,
+    WechatSolo,
+    WechatDmTeam,
+    LarkGroupTeam,
+}
+
 #[derive(clap::Args, Debug)]
 pub struct AuthArgs {
     #[command(subcommand)]
@@ -313,6 +324,387 @@ pub struct ConfigArgs {
     pub command: ConfigCommands,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum ConfigChannelArg {
+    Wechat,
+    Lark,
+    Dingtalk,
+    DingtalkWebhook,
+}
+
+impl ConfigChannelArg {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Wechat => "wechat",
+            Self::Lark => "lark",
+            Self::Dingtalk => "dingtalk",
+            Self::DingtalkWebhook => "dingtalk_webhook",
+        }
+    }
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ConfigChannelArgs {
+    #[command(subcommand)]
+    pub command: ConfigChannelCommands,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum ConfigPresentationArg {
+    FinalOnly,
+    ProgressCompact,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConfigChannelCommands {
+    /// 查看 channel 当前配置摘要
+    Show { channel: ConfigChannelArg },
+    /// 启用 channel
+    Enable { channel: ConfigChannelArg },
+    /// 禁用 channel
+    Disable { channel: ConfigChannelArg },
+    /// 执行 channel 登录流程（当前仅 WeChat）
+    Login { channel: ConfigChannelArg },
+    /// 设置 channel 的前台展示模式
+    SetPresentation(ConfigChannelPresentationArgs),
+    /// 一键把 channel 配成 solo 路由
+    SetupSolo(ConfigChannelSetupSoloArgs),
+    /// 一键把 channel 配成 team scope
+    SetupTeam(ConfigChannelSetupTeamArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ConfigChannelPresentationArgs {
+    #[arg(value_enum)]
+    pub channel: ConfigChannelArg,
+    #[arg(long, value_enum)]
+    pub presentation: ConfigPresentationArg,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ConfigChannelSetupSoloArgs {
+    #[arg(value_enum)]
+    pub channel: ConfigChannelArg,
+    #[arg(long)]
+    pub agent: String,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ConfigChannelSetupTeamArgs {
+    #[arg(value_enum)]
+    pub channel: ConfigChannelArg,
+    #[arg(long)]
+    pub scope: String,
+    #[arg(long)]
+    pub name: Option<String>,
+    #[arg(long = "front-bot")]
+    pub front_bot: String,
+    #[arg(long = "specialist")]
+    pub specialists: Vec<String>,
+    #[arg(long = "max-parallel", default_value_t = 1)]
+    pub max_parallel: usize,
+    #[arg(long = "public-updates", default_value = "minimal")]
+    pub public_updates: String,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ConfigProviderArgs {
+    #[command(subcommand)]
+    pub command: ConfigProviderCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConfigProviderCommands {
+    List,
+    Show { id: String },
+    Remove { id: String },
+    AddOfficialSession { id: String },
+    AddAnthropicCompatible(ConfigProviderAnthropicAddArgs),
+    AddOpenaiCompatible(ConfigProviderOpenaiAddArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ConfigProviderAnthropicAddArgs {
+    #[arg(long)]
+    pub id: String,
+    #[arg(long = "base-url")]
+    pub base_url: String,
+    #[arg(long = "auth-env")]
+    pub auth_env: String,
+    #[arg(long = "default-model")]
+    pub default_model: String,
+    #[arg(long = "small-fast-model")]
+    pub small_fast_model: Option<String>,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ConfigProviderOpenaiAddArgs {
+    #[arg(long)]
+    pub id: String,
+    #[arg(long = "base-url")]
+    pub base_url: String,
+    #[arg(long = "auth-env")]
+    pub auth_env: String,
+    #[arg(long = "default-model")]
+    pub default_model: String,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ConfigBackendArgs {
+    #[command(subcommand)]
+    pub command: ConfigBackendCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConfigBackendCommands {
+    List,
+    Show { id: String },
+    Remove { id: String },
+    Add(ConfigBackendAddArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ConfigBackendAddArgs {
+    #[arg(long)]
+    pub id: String,
+    #[arg(long)]
+    pub family: String,
+    #[arg(long = "acp-backend")]
+    pub acp_backend: Option<String>,
+    #[arg(long = "provider")]
+    pub provider: Option<String>,
+    #[arg(long = "launch", default_value = "bundled")]
+    pub launch: String,
+    #[arg(long)]
+    pub command: Option<String>,
+    #[arg(long = "arg")]
+    pub args: Vec<String>,
+    #[arg(long = "env")]
+    pub env: Vec<String>,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ConfigAgentArgs {
+    #[command(subcommand)]
+    pub command: ConfigAgentCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConfigAgentCommands {
+    List,
+    Show { name: String },
+    Remove { name: String },
+    Add(ConfigAgentAddArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ConfigAgentAddArgs {
+    #[arg(long)]
+    pub name: String,
+    #[arg(long = "mention")]
+    pub mentions: Vec<String>,
+    #[arg(long = "backend")]
+    pub backend: String,
+    #[arg(long = "persona-dir")]
+    pub persona_dir: Option<PathBuf>,
+    #[arg(long = "workspace-dir")]
+    pub workspace_dir: Option<PathBuf>,
+    #[arg(long = "extra-skills-dir")]
+    pub extra_skills_dirs: Vec<PathBuf>,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ConfigTeamScopeArgs {
+    #[command(subcommand)]
+    pub command: ConfigTeamScopeCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConfigTeamScopeCommands {
+    List,
+    Show { channel: String, scope: String },
+    Remove { channel: String, scope: String },
+    Add(ConfigTeamScopeAddArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ConfigTeamScopeAddArgs {
+    #[arg(long)]
+    pub channel: String,
+    #[arg(long)]
+    pub scope: String,
+    #[arg(long)]
+    pub name: Option<String>,
+    #[arg(long = "front-bot")]
+    pub front_bot: String,
+    #[arg(long = "specialist")]
+    pub specialists: Vec<String>,
+    #[arg(long = "max-parallel", default_value_t = 1)]
+    pub max_parallel: usize,
+    #[arg(long = "public-updates", default_value = "minimal")]
+    pub public_updates: String,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum ConfigBindingPeerKindArg {
+    User,
+    Group,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ConfigBindingArgs {
+    #[command(subcommand)]
+    pub command: ConfigBindingCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConfigBindingCommands {
+    List,
+    Show { id: String },
+    Remove { id: String },
+    AddThread(ConfigBindingAddThreadArgs),
+    AddScope(ConfigBindingAddScopeArgs),
+    AddPeer(ConfigBindingAddPeerArgs),
+    AddTeam(ConfigBindingAddTeamArgs),
+    AddChannelInstance(ConfigBindingAddChannelInstanceArgs),
+    AddChannel(ConfigBindingAddChannelArgs),
+    AddDefault(ConfigBindingAddDefaultArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ConfigBindingAddThreadArgs {
+    #[arg(long)]
+    pub agent: String,
+    #[arg(long)]
+    pub scope: String,
+    #[arg(long = "thread-id")]
+    pub thread_id: String,
+    #[arg(long)]
+    pub channel: Option<String>,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ConfigBindingAddScopeArgs {
+    #[arg(long)]
+    pub agent: String,
+    #[arg(long)]
+    pub scope: String,
+    #[arg(long)]
+    pub channel: Option<String>,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ConfigBindingAddPeerArgs {
+    #[arg(long)]
+    pub agent: String,
+    #[arg(long = "peer-kind", value_enum)]
+    pub peer_kind: ConfigBindingPeerKindArg,
+    #[arg(long = "peer-id")]
+    pub peer_id: String,
+    #[arg(long)]
+    pub channel: Option<String>,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ConfigBindingAddTeamArgs {
+    #[arg(long)]
+    pub agent: String,
+    #[arg(long = "team-id")]
+    pub team_id: String,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ConfigBindingAddChannelInstanceArgs {
+    #[arg(long)]
+    pub agent: String,
+    #[arg(long)]
+    pub channel: String,
+    #[arg(long = "channel-instance")]
+    pub channel_instance: String,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ConfigBindingAddChannelArgs {
+    #[arg(long)]
+    pub agent: String,
+    #[arg(long)]
+    pub channel: String,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ConfigBindingAddDefaultArgs {
+    #[arg(long)]
+    pub agent: String,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum ConfigDeliveryPurposeArg {
+    LeadFinal,
+    LeadMessage,
+    Milestone,
+    Approval,
+    BotMention,
+    Cron,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ConfigDeliverySenderArgs {
+    #[command(subcommand)]
+    pub command: ConfigDeliverySenderCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConfigDeliverySenderCommands {
+    List,
+    Show { id: String },
+    Remove { id: String },
+    Add(ConfigDeliverySenderAddArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ConfigDeliverySenderAddArgs {
+    #[arg(long, value_enum)]
+    pub purpose: ConfigDeliveryPurposeArg,
+    #[arg(long)]
+    pub agent: Option<String>,
+    #[arg(long)]
+    pub channel: Option<String>,
+    #[arg(long = "channel-instance")]
+    pub channel_instance: String,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ConfigDeliveryTargetArgs {
+    #[command(subcommand)]
+    pub command: ConfigDeliveryTargetCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConfigDeliveryTargetCommands {
+    List,
+    Show { id: String },
+    Remove { id: String },
+    Add(ConfigDeliveryTargetAddArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ConfigDeliveryTargetAddArgs {
+    #[arg(long, value_enum)]
+    pub purpose: ConfigDeliveryPurposeArg,
+    #[arg(long)]
+    pub agent: Option<String>,
+    #[arg(long)]
+    pub channel: Option<String>,
+    #[arg(long = "channel-instance")]
+    pub channel_instance: Option<String>,
+    #[arg(long)]
+    pub scope: String,
+    #[arg(long = "reply-to")]
+    pub reply_to: Option<String>,
+    #[arg(long = "thread-ts")]
+    pub thread_ts: Option<String>,
+}
+
 #[derive(Subcommand, Debug)]
 pub enum ConfigCommands {
     /// 打印当前配置（secrets 脱敏）
@@ -321,6 +713,24 @@ pub enum ConfigCommands {
     Validate,
     /// 用 $EDITOR 打开 config.toml
     Edit,
+    /// 交互式配置中心
+    Wizard,
+    /// 管理 channel 配置
+    Channel(ConfigChannelArgs),
+    /// 管理 provider_profile 配置
+    Provider(ConfigProviderArgs),
+    /// 管理 backend 配置
+    Backend(ConfigBackendArgs),
+    /// 管理 agent_roster 配置
+    Agent(ConfigAgentArgs),
+    /// 管理 routing binding 配置
+    Binding(ConfigBindingArgs),
+    /// 管理 delivery sender 绑定
+    DeliverySender(ConfigDeliverySenderArgs),
+    /// 管理 delivery target override
+    DeliveryTarget(ConfigDeliveryTargetArgs),
+    /// 管理 team_scope 配置
+    TeamScope(ConfigTeamScopeArgs),
 }
 
 #[derive(clap::Args, Debug, Default)]

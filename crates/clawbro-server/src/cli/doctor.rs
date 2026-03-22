@@ -1,4 +1,6 @@
-use crate::config::GatewayConfig;
+use crate::cli::config_store::load_graph;
+use crate::cli::config_validate::{validate_graph, ValidationSeverity};
+use crate::config::config_file_path;
 use crate::scheduler_runtime::resolve_scheduler_db_path;
 use anyhow::Result;
 use console::style;
@@ -8,7 +10,6 @@ pub async fn run() -> Result<()> {
     println!("{}", "─".repeat(40));
     let mut issues = 0usize;
 
-    // 1. Binaries
     println!("\n[1] Binaries");
     for bin in ["clawbro"] {
         match which::which(bin) {
@@ -24,208 +25,111 @@ pub async fn run() -> Result<()> {
         }
     }
 
-    // 2. Config
     println!("\n[2] Config file");
-    let cfg_path = dirs::home_dir()
-        .unwrap_or_default()
-        .join(".clawbro")
-        .join("config.toml");
-    let mut parsed_cfg: Option<GatewayConfig> = None;
-    if cfg_path.exists() {
-        let content = std::fs::read_to_string(&cfg_path).unwrap_or_default();
-        match toml::from_str::<toml::Value>(&content) {
-            Ok(_) => {
-                println!(
-                    "  {} ~/.clawbro/config.toml (valid TOML)",
-                    style("✓").green()
-                );
-                match toml::from_str::<GatewayConfig>(&content) {
-                    Ok(cfg) => parsed_cfg = Some(cfg),
-                    Err(e) => {
-                        println!("  {} config.toml schema error: {e}", style("✗").red());
-                        issues += 1;
-                    }
-                }
-            }
-            Err(e) => {
-                println!("  {} config.toml syntax error: {e}", style("✗").red());
-                issues += 1;
-            }
-        }
-    } else {
+    let cfg_path = config_file_path();
+    if !cfg_path.exists() {
         println!(
             "  {} config.toml missing — run: clawbro setup",
             style("✗").red()
         );
         issues += 1;
+    } else {
+        println!("  {} {}", style("✓").green(), cfg_path.display());
     }
 
-    // 3. API Keys
-    println!("\n[3] API Keys");
+    if !cfg_path.exists() {
+        println!(
+            "\n{} Found {} issue(s)",
+            style("Doctor complete.").bold(),
+            issues
+        );
+        return Ok(());
+    }
+
+    let graph = load_graph()?;
+    let cfg = graph.to_gateway_config();
+    let report = validate_graph(&graph);
+
+    println!("\n[3] API / credentials");
     let env_path = dirs::home_dir()
         .unwrap_or_default()
         .join(".clawbro")
         .join(".env");
-    if env_path.exists() {
-        println!("  {} ~/.clawbro/.env exists", style("✓").green());
-    } else {
-        println!("  {} ~/.clawbro/.env missing", style("–").yellow());
-    }
-    for var in ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"] {
-        match std::env::var(var) {
-            Ok(v) if !v.is_empty() => {
-                println!("  {} {} set (current shell)", style("✓").green(), var)
-            }
-            _ => println!(
-                "  {} {} not set (run: source ~/.clawbro/.env)",
-                style("–").yellow(),
-                var
-            ),
-        }
-    }
-
-    // 4. Channel configuration
-    println!("\n[4] Channel configuration");
-    if let Some(cfg) = &parsed_cfg {
-        match cfg.channels.lark.as_ref().filter(|section| section.enabled) {
-            Some(lark) => {
-                println!("  {} lark enabled", style("✓").green());
-                if lark.instances.is_empty() {
-                    let has_env_app_id = std::env::var("LARK_APP_ID")
-                        .ok()
-                        .is_some_and(|value| !value.trim().is_empty());
-                    let has_env_app_secret = std::env::var("LARK_APP_SECRET")
-                        .ok()
-                        .is_some_and(|value| !value.trim().is_empty());
-                    if has_env_app_id && has_env_app_secret {
-                        println!(
-                            "  {} lark uses environment fallback instance `{}`",
-                            style("✓").green(),
-                            lark.default_instance_id()
-                        );
-                    } else {
-                        println!(
-                            "  {} lark enabled but no [[channels.lark.instances]] and no LARK_APP_ID/LARK_APP_SECRET fallback",
-                            style("✗").red()
-                        );
-                        issues += 1;
-                    }
-                } else {
-                    let requested_default = lark.default_instance_id();
-                    let has_requested_default = lark
-                        .instances
-                        .iter()
-                        .any(|instance| instance.id == requested_default);
-                    if lark.instances.len() > 1 && !has_requested_default {
-                        println!(
-                            "  {} lark default_instance `{}` not found in configured instances",
-                            style("✗").red(),
-                            requested_default
-                        );
-                        issues += 1;
-                    } else {
-                        println!(
-                            "  {} lark default_instance = {}",
-                            style("✓").green(),
-                            requested_default
-                        );
-                    }
-
-                    for instance in &lark.instances {
-                        if instance.app_id.trim().is_empty()
-                            || instance.app_secret.trim().is_empty()
-                        {
-                            println!(
-                                "  {} lark instance `{}` is missing app_id/app_secret",
-                                style("✗").red(),
-                                instance.id
-                            );
-                            issues += 1;
-                            continue;
-                        }
-
-                        match instance.bot_name.as_deref().map(str::trim) {
-                            Some(bot_name) if !bot_name.is_empty() => {
-                                println!(
-                                    "  {} lark instance `{}` bot = {}",
-                                    style("✓").green(),
-                                    instance.id,
-                                    bot_name
-                                );
-                            }
-                            _ => {
-                                println!(
-                                    "  {} lark instance `{}` has no bot_name (mention detection falls back to platform mentions only)",
-                                    style("–").yellow(),
-                                    instance.id
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-            None => {
-                println!("  {} lark not enabled", style("–").yellow());
-            }
-        }
-
-        match cfg
-            .channels
-            .dingtalk_webhook
-            .as_ref()
-            .filter(|section| section.enabled)
-        {
-            Some(webhook) => {
-                if webhook.secret_key.trim().is_empty() {
-                    println!("  {} dingtalk_webhook.secret_key missing", style("✗").red());
-                    issues += 1;
-                } else {
-                    println!(
-                        "  {} dingtalk_webhook.secret_key configured",
-                        style("✓").green()
-                    );
-                }
-                if webhook.webhook_path.trim().is_empty() {
-                    println!(
-                        "  {} dingtalk_webhook.webhook_path missing",
-                        style("✗").red()
-                    );
-                    issues += 1;
-                } else {
-                    println!(
-                        "  {} dingtalk_webhook.webhook_path = {}",
-                        style("✓").green(),
-                        webhook.webhook_path
-                    );
-                }
-                if webhook
-                    .access_token
-                    .as_deref()
-                    .is_some_and(|value| !value.trim().is_empty())
-                {
-                    println!(
-                        "  {} dingtalk_webhook.access_token configured (fallback enabled)",
-                        style("✓").green()
-                    );
-                } else {
-                    println!(
-                        "  {} dingtalk_webhook.access_token missing (no robot/send fallback)",
-                        style("–").yellow()
-                    );
-                }
-            }
-            None => {
-                println!("  {} dingtalk_webhook not enabled", style("–").yellow());
-            }
-        }
-    } else {
-        println!(
-            "  {} channel checks skipped (config invalid)",
+    println!(
+        "  {} ~/.clawbro/.env {}",
+        if env_path.exists() {
+            style("✓").green()
+        } else {
             style("–").yellow()
-        );
-    }
+        },
+        if env_path.exists() {
+            "exists"
+        } else {
+            "missing"
+        }
+    );
+    let wechat_path = crate::channels_internal::wechat::WeChatConfig::credentials_path();
+    println!(
+        "  {} WeChat credentials {}",
+        if wechat_path.exists() {
+            style("✓").green()
+        } else {
+            style("–").yellow()
+        },
+        wechat_path.display()
+    );
 
-    // 5. Runtime directories
+    println!("\n[4] Channels");
+    println!(
+        "  {} WeChat {}",
+        if graph
+            .channels
+            .wechat
+            .as_ref()
+            .is_some_and(|cfg| cfg.enabled)
+        {
+            style("✓").green()
+        } else {
+            style("–").yellow()
+        },
+        if let Some(wechat) = graph.channels.wechat.as_ref() {
+            format!("enabled (presentation={:?})", wechat.presentation)
+        } else {
+            "not enabled".to_string()
+        }
+    );
+    println!(
+        "  {} Lark {}",
+        if graph.channels.lark.as_ref().is_some_and(|cfg| cfg.enabled) {
+            style("✓").green()
+        } else {
+            style("–").yellow()
+        },
+        if let Some(lark) = graph.channels.lark.as_ref() {
+            format!("enabled (instances={})", lark.instances.len())
+        } else {
+            "not enabled".to_string()
+        }
+    );
+    println!(
+        "  {} DingTalk {}",
+        if graph
+            .channels
+            .dingtalk
+            .as_ref()
+            .is_some_and(|cfg| cfg.enabled)
+        {
+            style("✓").green()
+        } else {
+            style("–").yellow()
+        },
+        if graph.channels.dingtalk.is_some() {
+            "enabled".to_string()
+        } else {
+            "not enabled".to_string()
+        }
+    );
+
     println!("\n[5] Runtime directories");
     for sub in ["sessions", "shared", "skills"] {
         let p = dirs::home_dir()
@@ -235,79 +139,49 @@ pub async fn run() -> Result<()> {
         if p.exists() {
             println!("  {} ~/.clawbro/{}", style("✓").green(), sub);
         } else {
-            println!(
-                "  {} ~/.clawbro/{} missing (mkdir -p ~/.clawbro/{})",
-                style("✗").red(),
-                sub,
-                sub
-            );
+            println!("  {} ~/.clawbro/{} missing", style("✗").red(), sub);
             issues += 1;
         }
     }
 
-    // 6. Gateway process
-    println!("\n[6] Gateway process");
-    let port_file = dirs::home_dir()
-        .unwrap_or_default()
-        .join(".clawbro")
-        .join("gateway.port");
-    if port_file.exists() {
-        let port = std::fs::read_to_string(&port_file).unwrap_or_default();
-        println!("  {} Running (port: {})", style("✓").green(), port.trim());
-    } else {
-        println!(
-            "  {} Not running (gateway.port missing)",
-            style("–").yellow()
-        );
-    }
-
-    // 7. Scheduler
-    println!("\n[7] Scheduler");
-    if let Some(cfg) = &parsed_cfg {
-        let db_path = resolve_scheduler_db_path(cfg);
-        println!(
-            "  {} scheduler {}",
-            if cfg.scheduler.enabled {
-                style("✓").green()
-            } else {
-                style("–").yellow()
-            },
-            if cfg.scheduler.enabled {
-                format!(
-                    "enabled (poll={}s, max_concurrent={})",
-                    cfg.scheduler.poll_secs, cfg.scheduler.max_concurrent
-                )
-            } else {
-                "disabled".to_string()
-            }
-        );
-        if db_path.exists() {
-            println!("  {} db path {}", style("✓").green(), db_path.display());
+    println!("\n[6] Scheduler");
+    let scheduler_db = resolve_scheduler_db_path(&cfg);
+    println!(
+        "  {} scheduler db {}",
+        if scheduler_db.exists() {
+            style("✓").green()
         } else {
-            println!(
-                "  {} db path {} (not created yet)",
-                style("–").yellow(),
-                db_path.display()
-            );
-        }
-    } else {
-        println!(
-            "  {} scheduler checks skipped (config invalid)",
             style("–").yellow()
-        );
+        },
+        scheduler_db.display()
+    );
+
+    println!("\n[7] Validation");
+    if report.issues.is_empty() {
+        println!("  {} no validation issues", style("✓").green());
+    } else {
+        for issue in &report.issues {
+            match issue.severity {
+                ValidationSeverity::Error => {
+                    println!("  {} [{}] {}", style("✗").red(), issue.code, issue.message);
+                    issues += 1;
+                }
+                ValidationSeverity::Warning => {
+                    println!(
+                        "  {} [{}] {}",
+                        style("!").yellow(),
+                        issue.code,
+                        issue.message
+                    );
+                }
+            }
+        }
     }
 
-    // Summary
-    println!("\n{}", "─".repeat(40));
-    if issues == 0 {
-        println!("{}", style("✓ All checks passed").bold().green());
-    } else {
-        println!(
-            "{}",
-            style(format!("{} issue(s) found — see above", issues))
-                .bold()
-                .yellow()
-        );
-    }
+    println!(
+        "\n{} Found {} issue(s)",
+        style("Doctor complete.").bold(),
+        issues
+    );
     Ok(())
 }

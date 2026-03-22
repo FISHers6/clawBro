@@ -1,8 +1,21 @@
 use super::{
     auth_cfg::AuthConfig,
-    channel::{ChannelConfig, DingTalkReceiveMode},
+    channel::{ChannelConfig, DingTalkCfg, DingTalkReceiveMode, LarkCfg, WeChatCfg},
     mode::{Mode, ModeConfig, TeamTarget},
-    provider::ProviderConfig,
+    provider::{ProviderConfig, ProviderKind},
+};
+use crate::agent_core::roster::AgentEntry;
+use crate::cli::config_apply::{
+    apply_graph_to_path, default_config_path, default_env_path, render_graph_to_toml,
+};
+use crate::cli::config_keys::TeamScopeKey;
+use crate::cli::config_model::ConfigGraph;
+use crate::cli::config_validate::validate_graph_static;
+use crate::config::{
+    BackendCatalogEntry, BackendFamilyConfig, BackendLaunchConfig, DingTalkSection,
+    DingTalkWebhookSection, GroupConfig, GroupModeConfig, GroupTeamConfig, InteractionMode,
+    LarkInstanceConfig, LarkSection, ProgressPresentationMode, ProviderProfileConfig,
+    ProviderProfileProtocolConfig, TeamScopeConfig, WeChatSection,
 };
 use anyhow::{Context, Result};
 use std::path::PathBuf;
@@ -14,262 +27,242 @@ pub struct WriteInputs<'a> {
     pub channel: &'a ChannelConfig,
 }
 
-fn configured_team_channel(channel: &ChannelConfig) -> Option<&'static str> {
+fn configured_team_channel(channel: &ChannelConfig) -> &'static str {
     match channel {
-        ChannelConfig::Lark(_) => Some("lark"),
+        ChannelConfig::WeChat(_) => "wechat",
+        ChannelConfig::Lark(_) => "lark",
         ChannelConfig::DingTalk(d) => match d.receive_mode {
-            DingTalkReceiveMode::Stream => Some("dingtalk"),
-            DingTalkReceiveMode::Webhook => Some("dingtalk_webhook"),
+            DingTalkReceiveMode::Stream => "dingtalk",
+            DingTalkReceiveMode::Webhook => "dingtalk_webhook",
         },
-        ChannelConfig::None => None,
+        ChannelConfig::None => "ws",
     }
 }
 
-pub fn build_config_toml(input: &WriteInputs) -> String {
-    let home = dirs::home_dir().unwrap_or_default();
-    let qdir = home.join(".clawbro");
-    let front_bot = input.mode.front_bot.as_deref().unwrap_or("lead");
-    let team_scope = input.mode.team_scope.as_deref();
-    let team_name = input.mode.team_name.as_deref();
-    let specialists = if input.mode.specialists.is_empty() {
-        vec!["specialist".to_string()]
-    } else {
-        input.mode.specialists.clone()
+fn provider_profile_auth_env(provider: &ProviderConfig) -> String {
+    match provider.kind {
+        ProviderKind::Anthropic => provider.kind.env_var().to_string(),
+        _ => {
+            let env = provider.kind.env_var().trim();
+            if env.is_empty() {
+                "OPENAI_API_KEY".to_string()
+            } else {
+                env.to_string()
+            }
+        }
+    }
+}
+
+fn build_provider_profile(provider: &ProviderConfig) -> ProviderProfileConfig {
+    let protocol = match provider.kind {
+        ProviderKind::Anthropic => ProviderProfileProtocolConfig::AnthropicCompatible {
+            base_url: provider.base_url.clone(),
+            auth_token_env: provider_profile_auth_env(provider),
+            default_model: provider.model.clone(),
+            small_fast_model: None,
+        },
+        _ => ProviderProfileProtocolConfig::OpenaiCompatible {
+            base_url: provider.base_url.clone(),
+            auth_token_env: provider_profile_auth_env(provider),
+            default_model: provider.model.clone(),
+        },
     };
-    let mut s = String::new();
 
-    // [gateway]
-    s.push_str("[gateway]\n");
-    s.push_str("host = \"127.0.0.1\"\n");
-    s.push_str(&format!("port = {}\n", input.mode.port));
-    let require_mention = !matches!(input.mode.mode, Mode::Solo);
-    s.push_str(&format!(
-        "require_mention_in_groups = {}\n",
-        require_mention
-    ));
-    if let Some(ws) = &input.mode.workspace {
-        s.push_str(&format!(
-            "default_workspace = {:?}\n",
-            ws.to_string_lossy().as_ref()
-        ));
+    ProviderProfileConfig {
+        id: provider.profile_id.clone(),
+        protocol,
     }
-    s.push('\n');
+}
 
-    // [auth]
-    if let Some(tok) = &input.auth.ws_token {
-        s.push_str("[auth]\n");
-        s.push_str(&format!("ws_token = {:?}\n", tok));
-        s.push('\n');
+fn build_default_backend(provider: &ProviderConfig) -> BackendCatalogEntry {
+    BackendCatalogEntry {
+        id: "native-main".to_string(),
+        family: BackendFamilyConfig::ClawBroNative,
+        adapter_key: None,
+        acp_backend: None,
+        acp_auth_method: None,
+        codex: None,
+        provider_profile: Some(provider.profile_id.clone()),
+        approval: Default::default(),
+        external_mcp_servers: vec![],
+        launch: BackendLaunchConfig::BundledCommand,
     }
+}
 
-    // [[provider_profile]]
-    s.push_str("[[provider_profile]]\n");
-    s.push_str(&format!("id = {:?}\n", input.provider.profile_id));
-    s.push_str(&format!(
-        "protocol = {:?}\n",
-        input.provider.kind.protocol_tag()
-    ));
-    s.push_str(&format!("base_url = {:?}\n", input.provider.base_url));
-    if !input.provider.kind.env_var().is_empty() {
-        s.push_str(&format!(
-            "auth_token_env = {:?}\n",
-            input.provider.kind.env_var()
-        ));
+fn make_agent_entry(name: String) -> AgentEntry {
+    AgentEntry {
+        mentions: vec![format!("@{name}")],
+        name,
+        backend_id: "native-main".to_string(),
+        persona_dir: None,
+        workspace_dir: None,
+        extra_skills_dirs: vec![],
     }
-    s.push_str(&format!("default_model = {:?}\n", input.provider.model));
-    s.push('\n');
+}
 
-    // [[backend]]
-    s.push_str("[[backend]]\n");
-    s.push_str("id = \"native-main\"\n");
-    s.push_str("family = \"claw_bro_native\"\n");
-    s.push_str(&format!(
-        "provider_profile = {:?}\n",
-        input.provider.profile_id
-    ));
-    s.push('\n');
-    s.push_str("[backend.launch]\n");
-    s.push_str("type = \"bundled_command\"\n");
-    s.push('\n');
-
-    // [agent], team skeleton, or multi-agent comments
-    match input.mode.mode {
-        Mode::Solo => {
-            s.push_str("[agent]\n");
-            s.push_str("backend_id = \"native-main\"\n");
-            s.push('\n');
+fn insert_channel_config(graph: &mut ConfigGraph, channel: &ChannelConfig) {
+    match channel {
+        ChannelConfig::WeChat(WeChatCfg { presentation, .. }) => {
+            graph.channels.wechat = Some(WeChatSection {
+                enabled: true,
+                presentation: *presentation,
+            });
         }
-        Mode::Multi => {
-            s.push_str("# Add [[agent_roster]] entries below to configure multiple agents\n");
-            s.push_str("# Example:\n");
-            s.push_str("# [[agent_roster]]\n");
-            s.push_str("# name = \"claude\"\n");
-            s.push_str("# mentions = [\"@claude\"]\n");
-            s.push_str("# backend_id = \"native-main\"\n");
-            s.push('\n');
+        ChannelConfig::Lark(LarkCfg {
+            app_id,
+            app_secret,
+            bot_name,
+        }) => {
+            graph.channels.lark = Some(LarkSection {
+                enabled: true,
+                presentation: ProgressPresentationMode::default(),
+                trigger_policy: None,
+                default_instance: Some("default".to_string()),
+                instances: vec![LarkInstanceConfig {
+                    id: "default".to_string(),
+                    app_id: app_id.clone(),
+                    app_secret: app_secret.clone(),
+                    bot_name: bot_name.clone(),
+                }],
+            });
         }
-        Mode::Team => {
-            let team_channel = configured_team_channel(input.channel);
-            s.push_str("[[agent_roster]]\n");
-            s.push_str(&format!("name = {:?}\n", front_bot));
-            s.push_str(&format!("mentions = [{:?}]\n", format!("@{front_bot}")));
-            s.push_str("backend_id = \"native-main\"\n\n");
-
-            for specialist in &specialists {
-                s.push_str("[[agent_roster]]\n");
-                s.push_str(&format!("name = {:?}\n", specialist));
-                s.push_str(&format!("mentions = [{:?}]\n", format!("@{specialist}")));
-                s.push_str("backend_id = \"native-main\"\n\n");
-            }
-
-            let specialist_roster = specialists
-                .iter()
-                .map(|specialist| format!("{specialist:?}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-
-            match input.mode.team_target.unwrap_or(TeamTarget::DirectMessage) {
-                TeamTarget::DirectMessage => {
-                    s.push_str("[[team_scope]]\n");
-                    s.push_str(&format!(
-                        "scope = {:?}\n",
-                        team_scope.unwrap_or("user:default")
-                    ));
-                    s.push_str(&format!("name = {:?}\n\n", team_name.unwrap_or("my-team")));
-                    s.push_str("[team_scope.mode]\n");
-                    s.push_str("interaction = \"team\"\n");
-                    s.push_str(&format!("front_bot = {:?}\n", front_bot));
-                    if let Some(channel) = team_channel {
-                        s.push_str(&format!("channel = {:?}\n", channel));
-                    }
-                    s.push('\n');
-                    s.push_str("[team_scope.team]\n");
-                    s.push_str(&format!("roster = [{}]\n", specialist_roster));
-                    s.push_str("max_parallel = 1\n");
-                    s.push('\n');
-                }
-                TeamTarget::Group => {
-                    s.push_str("[[group]]\n");
-                    let default_scope = match team_channel {
-                        Some("lark") => "group:lark:default",
-                        Some("dingtalk") => "group:dingtalk:default",
-                        _ => "group:default",
-                    };
-                    s.push_str(&format!(
-                        "scope = {:?}\n",
-                        team_scope.unwrap_or(default_scope)
-                    ));
-                    if let Some(name) = team_name {
-                        s.push_str(&format!("name = {:?}\n", name));
-                    }
-                    s.push('\n');
-                    s.push_str("[group.mode]\n");
-                    s.push_str("interaction = \"team\"\n");
-                    s.push_str(&format!("front_bot = {:?}\n", front_bot));
-                    if let Some(channel) = team_channel {
-                        s.push_str(&format!("channel = {:?}\n", channel));
-                    }
-                    s.push('\n');
-                    s.push_str("[group.team]\n");
-                    s.push_str(&format!("roster = [{}]\n", specialist_roster));
-                    s.push_str("max_parallel = 1\n");
-                    s.push('\n');
-                }
-            }
-        }
-    }
-
-    // [session]
-    s.push_str("[session]\n");
-    s.push_str(&format!(
-        "dir = {:?}\n",
-        qdir.join("sessions").to_string_lossy().as_ref()
-    ));
-    s.push('\n');
-
-    // [memory]
-    s.push_str("[memory]\n");
-    s.push_str(&format!(
-        "shared_dir = {:?}\n",
-        qdir.join("shared").to_string_lossy().as_ref()
-    ));
-    s.push_str("distill_every_n = 20\n");
-    s.push_str("distiller_binary = \"clawbro\"\n");
-    s.push('\n');
-
-    // [skills]
-    s.push_str("# Built-in core skills such as `scheduler` are injected automatically.\n");
-    s.push_str("# Use this directory only for extra user/project skills.\n");
-    s.push_str("[skills]\n");
-    s.push_str(&format!(
-        "dir = {:?}\n",
-        qdir.join("skills").to_string_lossy().as_ref()
-    ));
-    s.push('\n');
-
-    // [scheduler]
-    s.push_str("[scheduler]\n");
-    s.push_str("enabled = true\n");
-    s.push_str("poll_secs = 15\n");
-    s.push_str("max_concurrent = 4\n");
-    s.push_str("max_fetch_per_tick = 64\n");
-    s.push_str("default_timezone = \"UTC\"\n");
-    s.push('\n');
-
-    // channels
-    match input.channel {
-        ChannelConfig::Lark(l) => {
-            s.push_str("[channels.lark]\n");
-            s.push_str("enabled = true\n");
-            s.push('\n');
-            s.push_str("[[channels.lark.instances]]\n");
-            s.push_str("id = \"default\"\n");
-            s.push_str(&format!("app_id = {:?}\n", l.app_id));
-            s.push_str(&format!("app_secret = {:?}\n", l.app_secret));
-            if let Some(bn) = &l.bot_name {
-                s.push_str(&format!("bot_name = {:?}\n", bn));
-            }
-            s.push('\n');
-        }
-        ChannelConfig::DingTalk(d) => match d.receive_mode {
+        ChannelConfig::DingTalk(DingTalkCfg { receive_mode, .. }) => match receive_mode {
             DingTalkReceiveMode::Stream => {
-                s.push_str("[channels.dingtalk]\n");
-                s.push_str("enabled = true\n");
-                if let Some(aid) = d.agent_id {
-                    s.push_str(&format!("agent_id = {}\n", aid));
-                }
-                if let Some(bn) = &d.bot_name {
-                    s.push_str(&format!("bot_name = {:?}\n", bn));
-                }
-                s.push('\n');
+                graph.channels.dingtalk = Some(DingTalkSection {
+                    enabled: true,
+                    presentation: ProgressPresentationMode::default(),
+                });
             }
             DingTalkReceiveMode::Webhook => {
-                s.push_str("[channels.dingtalk_webhook]\n");
-                s.push_str("enabled = true\n");
-                s.push_str(&format!(
-                    "secret_key = {:?}\n",
-                    d.webhook_secret_key.as_deref().unwrap_or_default()
-                ));
-                s.push_str(&format!(
-                    "webhook_path = {:?}\n",
-                    d.webhook_path
-                        .as_deref()
+                graph.channels.dingtalk_webhook = Some(DingTalkWebhookSection {
+                    enabled: true,
+                    secret_key: channel.webhook_secret_key().unwrap_or_default().to_string(),
+                    webhook_path: channel
+                        .webhook_path()
                         .unwrap_or("/channels/dingtalk/webhook")
-                ));
-                if let Some(access_token) = d
-                    .webhook_access_token
-                    .as_deref()
-                    .filter(|value| !value.trim().is_empty())
-                {
-                    s.push_str(&format!("access_token = {:?}\n", access_token));
-                }
-                s.push('\n');
+                        .to_string(),
+                    access_token: channel.webhook_access_token().map(str::to_string),
+                    presentation: ProgressPresentationMode::default(),
+                });
             }
         },
         ChannelConfig::None => {}
     }
+}
 
-    s
+pub fn build_config_graph(input: &WriteInputs) -> ConfigGraph {
+    let mut graph = ConfigGraph::default();
+    graph.gateway.port = input.mode.port;
+    graph.gateway.require_mention_in_groups = !matches!(input.mode.mode, Mode::Solo);
+    graph.gateway.default_workspace = input.mode.workspace.clone();
+    graph.auth.ws_token = input.auth.ws_token.clone();
+
+    let provider = build_provider_profile(input.provider);
+    graph.providers.insert(provider.id.clone(), provider);
+
+    let backend = build_default_backend(input.provider);
+    graph.backends.insert(backend.id.clone(), backend);
+
+    insert_channel_config(&mut graph, input.channel);
+
+    match input.mode.mode {
+        Mode::Solo => {
+            graph.agent.backend_id = "native-main".to_string();
+        }
+        Mode::Multi => {
+            // Keep setup output valid while still allowing the user to extend into a roster later.
+            graph.agent.backend_id = "native-main".to_string();
+        }
+        Mode::Team => {
+            let front_bot = input
+                .mode
+                .front_bot
+                .as_deref()
+                .unwrap_or("lead")
+                .to_string();
+            let specialists = if input.mode.specialists.is_empty() {
+                vec!["specialist".to_string()]
+            } else {
+                input.mode.specialists.clone()
+            };
+            graph
+                .agents
+                .insert(front_bot.clone(), make_agent_entry(front_bot.clone()));
+            for specialist in &specialists {
+                graph
+                    .agents
+                    .insert(specialist.clone(), make_agent_entry(specialist.clone()));
+            }
+
+            let mode = GroupModeConfig {
+                interaction: InteractionMode::Team,
+                auto_promote: false,
+                front_bot: Some(front_bot),
+                channel: Some(configured_team_channel(input.channel).to_string()),
+            };
+            let team = GroupTeamConfig {
+                roster: specialists,
+                ..Default::default()
+            };
+
+            match input.mode.team_target.unwrap_or(TeamTarget::DirectMessage) {
+                TeamTarget::DirectMessage => {
+                    let scope = input
+                        .mode
+                        .team_scope
+                        .clone()
+                        .unwrap_or_else(|| "user:default".to_string());
+                    let key = TeamScopeKey::new(configured_team_channel(input.channel), &scope);
+                    graph.team_scopes.insert(
+                        key,
+                        TeamScopeConfig {
+                            scope,
+                            name: input.mode.team_name.clone(),
+                            mode,
+                            team,
+                        },
+                    );
+                }
+                TeamTarget::Group => {
+                    let scope = input
+                        .mode
+                        .team_scope
+                        .clone()
+                        .unwrap_or_else(|| "group:default".to_string());
+                    graph.groups.insert(
+                        scope.clone(),
+                        GroupConfig {
+                            scope,
+                            name: input.mode.team_name.clone(),
+                            mode,
+                            team,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    graph
+}
+
+pub fn build_config_toml(input: &WriteInputs) -> Result<String> {
+    render_graph_to_toml(&build_config_graph(input))
+}
+
+pub fn write_config(input: &WriteInputs) -> Result<Option<PathBuf>> {
+    let graph = build_config_graph(input);
+    let report = validate_graph_static(&graph);
+    if report.has_errors() {
+        let summary = report
+            .issues
+            .iter()
+            .map(|issue| issue.message.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        anyhow::bail!(summary);
+    }
+    apply_graph_to_path(&graph, &config_path())
 }
 
 pub fn build_env_content(provider: &ProviderConfig, channel: &ChannelConfig) -> String {
@@ -279,6 +272,7 @@ pub fn build_env_content(provider: &ProviderConfig, channel: &ChannelConfig) -> 
         lines.push(format!("export {}={}", env_var, provider.api_key));
     }
     match channel {
+        ChannelConfig::WeChat(_) => {}
         ChannelConfig::Lark(l) => {
             lines.push(format!("export LARK_APP_ID={}", l.app_id));
             lines.push(format!("export LARK_APP_SECRET={}", l.app_secret));
@@ -304,23 +298,6 @@ pub fn build_env_content(provider: &ProviderConfig, channel: &ChannelConfig) -> 
     }
 }
 
-pub fn write_config(input: &WriteInputs) -> Result<Option<PathBuf>> {
-    let path = config_path();
-    if let Some(p) = path.parent() {
-        std::fs::create_dir_all(p)?;
-    }
-    let backup = if path.exists() {
-        let ts = chrono::Utc::now().format("%Y%m%d%H%M%S");
-        let bak = path.with_extension(format!("toml.bak.{ts}"));
-        std::fs::copy(&path, &bak).context("backup failed")?;
-        Some(bak)
-    } else {
-        None
-    };
-    std::fs::write(&path, build_config_toml(input)).context("write config.toml")?;
-    Ok(backup)
-}
-
 pub fn write_env(provider: &ProviderConfig, channel: &ChannelConfig) -> Result<()> {
     let content = build_env_content(provider, channel);
     if content.is_empty() {
@@ -335,28 +312,47 @@ pub fn write_env(provider: &ProviderConfig, channel: &ChannelConfig) -> Result<(
 }
 
 pub fn config_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_default()
-        .join(".clawbro")
-        .join("config.toml")
+    default_config_path()
 }
 
 pub fn env_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_default()
-        .join(".clawbro")
-        .join(".env")
+    default_env_path()
+}
+
+trait DingTalkCfgExt {
+    fn webhook_secret_key(&self) -> Option<&str>;
+    fn webhook_access_token(&self) -> Option<&str>;
+    fn webhook_path(&self) -> Option<&str>;
+}
+
+impl DingTalkCfgExt for ChannelConfig {
+    fn webhook_secret_key(&self) -> Option<&str> {
+        match self {
+            ChannelConfig::DingTalk(cfg) => cfg.webhook_secret_key.as_deref(),
+            _ => None,
+        }
+    }
+
+    fn webhook_access_token(&self) -> Option<&str> {
+        match self {
+            ChannelConfig::DingTalk(cfg) => cfg.webhook_access_token.as_deref(),
+            _ => None,
+        }
+    }
+
+    fn webhook_path(&self) -> Option<&str> {
+        match self {
+            ChannelConfig::DingTalk(cfg) => cfg.webhook_path.as_deref(),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::setup::{
-        auth_cfg::AuthConfig,
-        channel::{ChannelConfig, DingTalkCfg, DingTalkReceiveMode, LarkCfg},
-        mode::{Mode, ModeConfig},
-        provider::{ProviderConfig, ProviderKind},
-    };
+    use crate::cli::config_validate::validate_graph_static;
+    use crate::cli::setup::{auth_cfg::AuthConfig, mode::ModeConfig};
 
     fn anthropic() -> ProviderConfig {
         ProviderConfig {
@@ -367,6 +363,7 @@ mod tests {
             profile_id: "anthropic-main".into(),
         }
     }
+
     fn solo() -> ModeConfig {
         ModeConfig {
             mode: Mode::Solo,
@@ -379,285 +376,71 @@ mod tests {
             workspace: None,
         }
     }
+
     fn no_auth() -> AuthConfig {
         AuthConfig { ws_token: None }
     }
 
+    fn render(input: &WriteInputs) -> String {
+        build_config_toml(input).unwrap()
+    }
+
     #[test]
-    fn toml_has_gateway() {
-        let t = build_config_toml(&WriteInputs {
+    fn solo_setup_graph_is_valid() {
+        let graph = build_config_graph(&WriteInputs {
             provider: &anthropic(),
             mode: &solo(),
             auth: &no_auth(),
             channel: &ChannelConfig::None,
         });
-        assert!(t.contains("[gateway]"), "missing [gateway]: {t}");
-        assert!(t.contains("port = 8080"), "missing port: {t}");
+        let report = validate_graph_static(&graph);
+        assert!(!report.has_errors(), "{report:#?}");
+        assert_eq!(graph.agent.backend_id, "native-main");
     }
 
     #[test]
-    fn toml_has_provider_profile() {
-        let t = build_config_toml(&WriteInputs {
+    fn team_dm_setup_graph_is_valid_and_uses_exact_scope() {
+        let graph = build_config_graph(&WriteInputs {
             provider: &anthropic(),
-            mode: &solo(),
+            mode: &ModeConfig {
+                mode: Mode::Team,
+                team_target: Some(TeamTarget::DirectMessage),
+                front_bot: Some("planner".into()),
+                specialists: vec!["coder".into(), "reviewer".into()],
+                team_scope: Some("user:ou_demo".into()),
+                team_name: Some("my-team".into()),
+                port: 8080,
+                workspace: None,
+            },
             auth: &no_auth(),
-            channel: &ChannelConfig::None,
+            channel: &ChannelConfig::WeChat(WeChatCfg {
+                presentation: ProgressPresentationMode::ProgressCompact,
+                login_now: false,
+            }),
         });
-        assert!(
-            t.contains("[[provider_profile]]"),
-            "missing [[provider_profile]]: {t}"
-        );
-        assert!(t.contains("anthropic_compatible"), "missing protocol: {t}");
-        assert!(t.contains("anthropic-main"), "missing profile id: {t}");
+        let report = validate_graph_static(&graph);
+        assert!(!report.has_errors(), "{report:#?}");
+        assert!(graph.agents.contains_key("planner"));
+        assert!(graph.agents.contains_key("coder"));
+        assert!(graph
+            .team_scopes
+            .contains_key(&TeamScopeKey::new("wechat", "user:ou_demo")));
     }
 
     #[test]
-    fn toml_auth_token_written() {
-        let auth = AuthConfig {
-            ws_token: Some("my-secret".into()),
-        };
-        let t = build_config_toml(&WriteInputs {
+    fn team_group_setup_graph_is_valid_and_uses_group_scope() {
+        let graph = build_config_graph(&WriteInputs {
             provider: &anthropic(),
-            mode: &solo(),
-            auth: &auth,
-            channel: &ChannelConfig::None,
-        });
-        assert!(t.contains("[auth]"), "missing [auth]: {t}");
-        assert!(t.contains("my-secret"), "missing token: {t}");
-    }
-
-    #[test]
-    fn toml_no_auth_section_when_no_token() {
-        let t = build_config_toml(&WriteInputs {
-            provider: &anthropic(),
-            mode: &solo(),
-            auth: &no_auth(),
-            channel: &ChannelConfig::None,
-        });
-        assert!(!t.contains("[auth]"), "should not have [auth]: {t}");
-    }
-
-    #[test]
-    fn toml_lark_channel() {
-        let lark = ChannelConfig::Lark(LarkCfg {
-            app_id: "cli_abc".into(),
-            app_secret: "sec".into(),
-            bot_name: Some("AI".into()),
-        });
-        let t = build_config_toml(&WriteInputs {
-            provider: &anthropic(),
-            mode: &solo(),
-            auth: &no_auth(),
-            channel: &lark,
-        });
-        assert!(t.contains("[channels.lark]"), "missing lark: {t}");
-        assert!(t.contains("cli_abc"), "missing app_id: {t}");
-    }
-
-    #[test]
-    fn toml_dingtalk_agent_id() {
-        let dt = ChannelConfig::DingTalk(DingTalkCfg {
-            receive_mode: DingTalkReceiveMode::Stream,
-            client_id: Some("dingxxxx".into()),
-            client_secret: Some("sec".into()),
-            agent_id: Some(12345),
-            bot_name: None,
-            webhook_secret_key: None,
-            webhook_access_token: None,
-            webhook_path: None,
-        });
-        let t = build_config_toml(&WriteInputs {
-            provider: &anthropic(),
-            mode: &solo(),
-            auth: &no_auth(),
-            channel: &dt,
-        });
-        assert!(t.contains("[channels.dingtalk]"), "missing dingtalk: {t}");
-        assert!(t.contains("agent_id = 12345"), "missing agent_id: {t}");
-    }
-
-    #[test]
-    fn toml_dingtalk_webhook_channel() {
-        let dt = ChannelConfig::DingTalk(DingTalkCfg {
-            receive_mode: DingTalkReceiveMode::Webhook,
-            client_id: None,
-            client_secret: None,
-            agent_id: None,
-            bot_name: None,
-            webhook_secret_key: Some("SEC-test".into()),
-            webhook_access_token: Some("dt-token".into()),
-            webhook_path: Some("/dingtalk-channel/message".into()),
-        });
-        let t = build_config_toml(&WriteInputs {
-            provider: &anthropic(),
-            mode: &solo(),
-            auth: &no_auth(),
-            channel: &dt,
-        });
-        assert!(
-            t.contains("[channels.dingtalk_webhook]"),
-            "missing webhook: {t}"
-        );
-        assert!(
-            t.contains("secret_key = \"SEC-test\""),
-            "missing secret_key: {t}"
-        );
-        assert!(
-            t.contains("webhook_path = \"/dingtalk-channel/message\""),
-            "missing webhook_path: {t}"
-        );
-        assert!(
-            t.contains("access_token = \"dt-token\""),
-            "missing access_token: {t}"
-        );
-    }
-
-    #[test]
-    fn env_anthropic_key() {
-        let e = build_env_content(&anthropic(), &ChannelConfig::None);
-        assert!(
-            e.contains("ANTHROPIC_API_KEY=sk-ant-test"),
-            "missing key: {e}"
-        );
-    }
-
-    #[test]
-    fn env_lark_credentials() {
-        let lark = ChannelConfig::Lark(LarkCfg {
-            app_id: "cli_abc".into(),
-            app_secret: "sec".into(),
-            bot_name: None,
-        });
-        let e = build_env_content(&anthropic(), &lark);
-        assert!(e.contains("LARK_APP_ID=cli_abc"), "missing lark id: {e}");
-        assert!(e.contains("LARK_APP_SECRET=sec"), "missing secret: {e}");
-        assert!(
-            !e.contains("LARK_VERIFICATION_TOKEN"),
-            "should not write verification token: {e}"
-        );
-    }
-
-    #[test]
-    fn env_dingtalk_webhook_writes_no_stream_credentials() {
-        let dt = ChannelConfig::DingTalk(DingTalkCfg {
-            receive_mode: DingTalkReceiveMode::Webhook,
-            client_id: None,
-            client_secret: None,
-            agent_id: None,
-            bot_name: None,
-            webhook_secret_key: Some("SEC-test".into()),
-            webhook_access_token: Some("dt-token".into()),
-            webhook_path: None,
-        });
-        let e = build_env_content(&anthropic(), &dt);
-        assert!(
-            !e.contains("DINGTALK_APP_KEY"),
-            "webhook should not write stream env: {e}"
-        );
-        assert!(
-            !e.contains("DINGTALK_APP_SECRET"),
-            "webhook should not write stream secret env: {e}"
-        );
-    }
-
-    #[test]
-    fn env_ollama_no_export() {
-        let ollama = ProviderConfig {
-            kind: ProviderKind::Ollama,
-            api_key: String::new(),
-            base_url: "http://localhost:11434".into(),
-            model: "llama3".into(),
-            profile_id: "ollama-main".into(),
-        };
-        let e = build_env_content(&ollama, &ChannelConfig::None);
-        assert!(e.is_empty(), "ollama should produce empty env: {:?}", e);
-    }
-
-    #[test]
-    fn multi_mode_has_no_agent_section() {
-        let multi_mode = ModeConfig {
-            mode: Mode::Multi,
-            team_target: None,
-            front_bot: None,
-            specialists: Vec::new(),
-            team_scope: None,
-            team_name: None,
-            port: 8080,
-            workspace: None,
-        };
-        let t = build_config_toml(&WriteInputs {
-            provider: &anthropic(),
-            mode: &multi_mode,
-            auth: &no_auth(),
-            channel: &ChannelConfig::None,
-        });
-        assert!(
-            !t.contains("\n[agent]\n"),
-            "multi mode should not have [agent] section: {t}"
-        );
-        assert!(
-            t.contains("agent_roster"),
-            "should have roster comment: {t}"
-        );
-    }
-
-    #[test]
-    fn team_dm_mode_writes_valid_team_scope_skeleton() {
-        let team_mode = ModeConfig {
-            mode: Mode::Team,
-            team_target: Some(TeamTarget::DirectMessage),
-            front_bot: Some("planner".into()),
-            specialists: vec!["coder".into(), "reviewer".into()],
-            team_scope: Some("user:ou_demo".into()),
-            team_name: Some("my-team".into()),
-            port: 8080,
-            workspace: None,
-        };
-        let t = build_config_toml(&WriteInputs {
-            provider: &anthropic(),
-            mode: &team_mode,
-            auth: &no_auth(),
-            channel: &ChannelConfig::None,
-        });
-        assert!(t.contains("[[agent_roster]]"), "missing roster: {t}");
-        assert!(t.contains("name = \"planner\""), "missing lead: {t}");
-        assert!(t.contains("name = \"coder\""), "missing coder: {t}");
-        assert!(t.contains("name = \"reviewer\""), "missing reviewer: {t}");
-        assert!(t.contains("[[team_scope]]"), "missing team_scope: {t}");
-        assert!(
-            t.contains("scope = \"user:ou_demo\""),
-            "missing team scope: {t}"
-        );
-        assert!(t.contains("name = \"my-team\""), "missing team name: {t}");
-        assert!(
-            t.contains("interaction = \"team\""),
-            "missing team interaction: {t}"
-        );
-        assert!(
-            t.contains("front_bot = \"planner\""),
-            "missing front bot: {t}"
-        );
-        assert!(
-            t.contains("roster = [\"coder\", \"reviewer\"]"),
-            "missing specialist roster: {t}"
-        );
-    }
-
-    #[test]
-    fn team_group_mode_writes_valid_group_skeleton() {
-        let team_mode = ModeConfig {
-            mode: Mode::Team,
-            team_target: Some(TeamTarget::Group),
-            front_bot: Some("captain".into()),
-            specialists: vec!["analyst".into()],
-            team_scope: Some("group:lark:chat-123".into()),
-            team_name: Some("research-room".into()),
-            port: 8080,
-            workspace: None,
-        };
-        let t = build_config_toml(&WriteInputs {
-            provider: &anthropic(),
-            mode: &team_mode,
+            mode: &ModeConfig {
+                mode: Mode::Team,
+                team_target: Some(TeamTarget::Group),
+                front_bot: Some("captain".into()),
+                specialists: vec!["analyst".into()],
+                team_scope: Some("group:lark:chat-123".into()),
+                team_name: Some("research-room".into()),
+                port: 8080,
+                workspace: None,
+            },
             auth: &no_auth(),
             channel: &ChannelConfig::Lark(LarkCfg {
                 app_id: "cli_abc".into(),
@@ -665,47 +448,54 @@ mod tests {
                 bot_name: Some("AI".into()),
             }),
         });
-        assert!(t.contains("[[group]]"), "missing group: {t}");
-        assert!(
-            t.contains("scope = \"group:lark:chat-123\""),
-            "missing group scope: {t}"
-        );
-        assert!(
-            t.contains("name = \"research-room\""),
-            "missing group name: {t}"
-        );
-        assert!(t.contains("[group.mode]"), "missing group.mode: {t}");
-        assert!(
-            t.contains("interaction = \"team\""),
-            "missing group interaction: {t}"
-        );
-        assert!(
-            t.contains("front_bot = \"captain\""),
-            "missing front bot: {t}"
-        );
-        assert!(t.contains("channel = \"lark\""), "missing channel: {t}");
-        assert!(t.contains("[group.team]"), "missing group.team: {t}");
-        assert!(
-            t.contains("roster = [\"analyst\"]"),
-            "missing analyst roster: {t}"
+        let report = validate_graph_static(&graph);
+        assert!(!report.has_errors(), "{report:#?}");
+        assert_eq!(
+            graph
+                .groups
+                .get("group:lark:chat-123")
+                .and_then(|group| group.mode.channel.as_deref()),
+            Some("lark")
         );
     }
 
     #[test]
-    fn team_group_mode_writes_dingtalk_webhook_channel_name() {
-        let team_mode = ModeConfig {
-            mode: Mode::Team,
-            team_target: Some(TeamTarget::Group),
-            front_bot: Some("captain".into()),
-            specialists: vec!["analyst".into()],
-            team_scope: Some("group:dingtalk:conversation-123".into()),
-            team_name: Some("ops-room".into()),
-            port: 8080,
-            workspace: None,
-        };
-        let t = build_config_toml(&WriteInputs {
+    fn rendered_toml_contains_enabled_wechat_channel() {
+        let text = render(&WriteInputs {
             provider: &anthropic(),
-            mode: &team_mode,
+            mode: &solo(),
+            auth: &no_auth(),
+            channel: &ChannelConfig::WeChat(WeChatCfg {
+                presentation: ProgressPresentationMode::ProgressCompact,
+                login_now: false,
+            }),
+        });
+        assert!(text.contains("[channels.wechat]"));
+        assert!(text.contains("presentation = \"progress_compact\""));
+    }
+
+    #[test]
+    fn rendered_toml_contains_lark_instance() {
+        let text = render(&WriteInputs {
+            provider: &anthropic(),
+            mode: &solo(),
+            auth: &no_auth(),
+            channel: &ChannelConfig::Lark(LarkCfg {
+                app_id: "cli_abc".into(),
+                app_secret: "sec".into(),
+                bot_name: Some("AI".into()),
+            }),
+        });
+        assert!(text.contains("[channels.lark]"));
+        assert!(text.contains("id = \"default\""));
+        assert!(text.contains("app_id = \"cli_abc\""));
+    }
+
+    #[test]
+    fn rendered_toml_contains_dingtalk_webhook_channel() {
+        let text = render(&WriteInputs {
+            provider: &anthropic(),
+            mode: &solo(),
             auth: &no_auth(),
             channel: &ChannelConfig::DingTalk(DingTalkCfg {
                 receive_mode: DingTalkReceiveMode::Webhook,
@@ -715,50 +505,62 @@ mod tests {
                 bot_name: None,
                 webhook_secret_key: Some("SEC-test".into()),
                 webhook_access_token: Some("dt-token".into()),
-                webhook_path: Some("/channels/dingtalk/webhook".into()),
+                webhook_path: Some("/dingtalk-channel/message".into()),
             }),
         });
-        assert!(t.contains("[[group]]"), "missing group: {t}");
-        assert!(
-            t.contains("scope = \"group:dingtalk:conversation-123\""),
-            "missing group scope: {t}"
-        );
-        assert!(
-            t.contains("channel = \"dingtalk_webhook\""),
-            "missing dingtalk_webhook channel name: {t}"
-        );
+        assert!(text.contains("[channels.dingtalk_webhook]"));
+        assert!(text.contains("secret_key = \"SEC-test\""));
+        assert!(text.contains("webhook_path = \"/dingtalk-channel/message\""));
+        assert!(text.contains("access_token = \"dt-token\""));
     }
 
     #[test]
-    fn toml_has_scheduler_section_for_new_users() {
-        let t = build_config_toml(&WriteInputs {
+    fn multi_mode_keeps_valid_default_backend() {
+        let graph = build_config_graph(&WriteInputs {
             provider: &anthropic(),
-            mode: &solo(),
+            mode: &ModeConfig {
+                mode: Mode::Multi,
+                team_target: None,
+                front_bot: None,
+                specialists: vec![],
+                team_scope: None,
+                team_name: None,
+                port: 8080,
+                workspace: None,
+            },
             auth: &no_auth(),
             channel: &ChannelConfig::None,
         });
-        assert!(t.contains("[scheduler]"), "missing [scheduler]: {t}");
-        assert!(
-            t.contains("enabled = true"),
-            "missing scheduler enabled: {t}"
-        );
-        assert!(
-            t.contains("default_timezone = \"UTC\""),
-            "missing scheduler timezone default: {t}"
-        );
+        let report = validate_graph_static(&graph);
+        assert!(!report.has_errors(), "{report:#?}");
+        assert_eq!(graph.agent.backend_id, "native-main");
+        assert!(graph.agents.is_empty());
     }
 
     #[test]
-    fn toml_skills_section_explains_builtin_scheduler_skill() {
-        let t = build_config_toml(&WriteInputs {
-            provider: &anthropic(),
-            mode: &solo(),
-            auth: &no_auth(),
-            channel: &ChannelConfig::None,
-        });
-        assert!(
-            t.contains("Built-in core skills such as `scheduler` are injected automatically."),
-            "missing builtin scheduler skill guidance: {t}"
+    fn env_content_writes_expected_exports() {
+        let text = build_env_content(
+            &anthropic(),
+            &ChannelConfig::Lark(LarkCfg {
+                app_id: "cli_abc".into(),
+                app_secret: "sec".into(),
+                bot_name: None,
+            }),
         );
+        assert!(text.contains("ANTHROPIC_API_KEY=sk-ant-test"));
+        assert!(text.contains("LARK_APP_ID=cli_abc"));
+        assert!(text.contains("LARK_APP_SECRET=sec"));
+    }
+
+    #[test]
+    fn ollama_env_content_stays_empty() {
+        let ollama = ProviderConfig {
+            kind: ProviderKind::Ollama,
+            api_key: String::new(),
+            base_url: "http://localhost:11434".into(),
+            model: "llama3".into(),
+            profile_id: "ollama-main".into(),
+        };
+        assert!(build_env_content(&ollama, &ChannelConfig::None).is_empty());
     }
 }

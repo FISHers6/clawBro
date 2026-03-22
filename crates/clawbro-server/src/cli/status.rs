@@ -1,13 +1,13 @@
-use crate::config::GatewayConfig;
+use crate::cli::config_store::load_graph;
+use crate::cli::config_validate::validate_graph;
+use crate::config::config_file_path;
+use crate::config::BindingConfig;
 use crate::scheduler_runtime::resolve_scheduler_db_path;
 use anyhow::Result;
 use console::style;
 
 pub async fn run() -> Result<()> {
-    let cfg_path = dirs::home_dir()
-        .unwrap_or_default()
-        .join(".clawbro")
-        .join("config.toml");
+    let cfg_path = config_file_path();
 
     println!("{}", style("ClawBro — Status").bold().cyan());
     println!("{}", "─".repeat(40));
@@ -20,16 +20,11 @@ pub async fn run() -> Result<()> {
         return Ok(());
     }
 
-    let content = std::fs::read_to_string(&cfg_path)?;
-    let val: toml::Value =
-        toml::from_str(&content).unwrap_or(toml::Value::Table(toml::map::Map::new()));
-    let parsed_cfg = GatewayConfig::from_toml_str(&content).ok();
+    let graph = load_graph()?;
+    let cfg = graph.to_gateway_config();
+    let report = validate_graph(&graph);
 
-    let port = val
-        .get("gateway")
-        .and_then(|g| g.get("port"))
-        .and_then(|p| p.as_integer())
-        .unwrap_or(0);
+    let port = cfg.gateway.port;
     println!(
         "  Port         {}",
         if port == 0 {
@@ -39,93 +34,151 @@ pub async fn run() -> Result<()> {
         }
     );
 
-    let roster_n = val
-        .get("agent_roster")
-        .and_then(|r| r.as_array())
-        .map(|a| a.len())
-        .unwrap_or(0);
     println!(
         "  Mode         {}",
-        if roster_n > 0 {
-            format!("Multi-agent ({} agents)", roster_n)
+        if graph.team_scopes.is_empty() {
+            if graph.agents.is_empty() {
+                "Solo".to_string()
+            } else {
+                format!("Multi-agent ({} agents)", graph.agents.len())
+            }
         } else {
-            "Solo".into()
+            format!(
+                "Team ({} scopes, {} agents)",
+                graph.team_scopes.len(),
+                graph.agents.len()
+            )
         }
     );
 
-    let backends: Vec<&str> = val
-        .get("backend")
-        .and_then(|b| b.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|b| b.get("id").and_then(|id| id.as_str()))
-                .collect()
-        })
-        .unwrap_or_default();
     println!(
         "  Backends     {}",
-        if backends.is_empty() {
+        if graph.backends.is_empty() {
             "(none configured)".into()
         } else {
-            backends.join(", ")
+            graph
+                .backends
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
         }
     );
-
-    let profiles: Vec<&str> = val
-        .get("provider_profile")
-        .and_then(|p| p.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|p| p.get("id").and_then(|id| id.as_str()))
-                .collect()
-        })
-        .unwrap_or_default();
     println!(
         "  Providers    {}",
-        if profiles.is_empty() {
+        if graph.providers.is_empty() {
             "(none configured)".into()
         } else {
-            profiles.join(", ")
+            graph
+                .providers
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
         }
     );
 
-    let lark = val.get("channels").and_then(|c| c.get("lark")).is_some();
-    let dt = val
-        .get("channels")
-        .and_then(|c| c.get("dingtalk"))
-        .is_some();
-    let ch_str = match (lark, dt) {
-        (true, true) => "Lark + DingTalk",
-        (true, false) => "Lark",
-        (false, true) => "DingTalk",
-        _ => "WebSocket only",
-    };
-    println!("  Channel      {}", ch_str);
-
-    let has_ws_token = val
-        .get("auth")
-        .and_then(|a| a.get("ws_token"))
-        .and_then(|t| t.as_str())
-        .map(|s| !s.is_empty())
-        .unwrap_or(false);
+    let channels = [
+        (
+            "WeChat",
+            graph
+                .channels
+                .wechat
+                .as_ref()
+                .is_some_and(|cfg| cfg.enabled),
+        ),
+        (
+            "Lark",
+            graph.channels.lark.as_ref().is_some_and(|cfg| cfg.enabled),
+        ),
+        (
+            "DingTalk",
+            graph
+                .channels
+                .dingtalk
+                .as_ref()
+                .is_some_and(|cfg| cfg.enabled),
+        ),
+        (
+            "DingTalkWebhook",
+            graph
+                .channels
+                .dingtalk_webhook
+                .as_ref()
+                .is_some_and(|cfg| cfg.enabled),
+        ),
+    ];
+    let enabled_channels = channels
+        .iter()
+        .filter_map(|(name, enabled)| enabled.then_some(*name))
+        .collect::<Vec<_>>();
     println!(
-        "  WS Auth      {}",
-        if has_ws_token {
-            style("enabled (token set)").green().to_string()
+        "  Channels     {}",
+        if enabled_channels.is_empty() {
+            "WebSocket only".to_string()
         } else {
-            "open mode (no token)".into()
+            enabled_channels.join(" + ")
         }
     );
 
-    let has_key = std::env::var("ANTHROPIC_API_KEY")
-        .or_else(|_| std::env::var("OPENAI_API_KEY"))
-        .is_ok();
     println!(
-        "  API Key      {}",
-        if has_key {
+        "  WeChat       {}",
+        match graph.channels.wechat.as_ref() {
+            Some(section) => format!("enabled (presentation={:?})", section.presentation),
+            None => "not configured".to_string(),
+        }
+    );
+
+    println!(
+        "  Routing      {}",
+        if graph.bindings.is_empty() {
+            "none".to_string()
+        } else {
+            format!(
+                "{} bindings ({})",
+                graph.bindings.len(),
+                binding_summary(&graph)
+            )
+        }
+    );
+
+    println!(
+        "  Teams        {}",
+        if graph.team_scopes.is_empty() {
+            "none".to_string()
+        } else {
+            team_scope_summary(&graph)
+        }
+    );
+
+    println!(
+        "  Delivery     sender={} target={}",
+        graph.delivery_sender_bindings.len(),
+        graph.delivery_target_overrides.len()
+    );
+
+    let has_api_env = cfg
+        .provider_profiles
+        .iter()
+        .any(|profile| match &profile.protocol {
+            crate::config::ProviderProfileProtocolConfig::OfficialSession => false,
+            crate::config::ProviderProfileProtocolConfig::AnthropicCompatible {
+                auth_token_env,
+                ..
+            }
+            | crate::config::ProviderProfileProtocolConfig::OpenaiCompatible {
+                auth_token_env,
+                ..
+            } => std::env::var(auth_token_env)
+                .ok()
+                .is_some_and(|value| !value.trim().is_empty()),
+        });
+    println!(
+        "  API Env      {}",
+        if has_api_env {
             style("set").green().to_string()
         } else {
-            style("not set (source ~/.clawbro/.env)")
+            style("not set / source ~/.clawbro/.env")
                 .yellow()
                 .to_string()
         }
@@ -144,32 +197,107 @@ pub async fn run() -> Result<()> {
         }
     );
 
-    if let Some(cfg) = parsed_cfg.as_ref() {
-        let scheduler_db = resolve_scheduler_db_path(cfg);
-        println!(
-            "  Scheduler    {}",
-            if cfg.scheduler.enabled {
-                format!(
-                    "enabled (poll={}s, db={})",
-                    cfg.scheduler.poll_secs,
-                    scheduler_db.display()
-                )
-            } else {
-                format!("disabled (db={})", scheduler_db.display())
-            }
-        );
-        println!(
-            "  Scheduler DB {}",
-            if scheduler_db.exists() {
-                style("present").green().to_string()
-            } else {
-                style("missing").yellow().to_string()
-            }
-        );
-    } else {
-        println!("  Scheduler    config invalid");
-    }
+    let scheduler_db = resolve_scheduler_db_path(&cfg);
+    println!(
+        "  Scheduler    {}",
+        if cfg.scheduler.enabled {
+            format!(
+                "enabled (poll={}s, db={})",
+                cfg.scheduler.poll_secs,
+                scheduler_db.display()
+            )
+        } else {
+            format!("disabled (db={})", scheduler_db.display())
+        }
+    );
+
+    println!(
+        "  Validation   {}",
+        if report.has_errors() {
+            style(format!(
+                "{} error(s), {} warning(s)",
+                report.error_count(),
+                report.warning_count()
+            ))
+            .red()
+            .to_string()
+        } else {
+            style(format!("ok ({} warning(s))", report.warning_count()))
+                .green()
+                .to_string()
+        }
+    );
 
     println!("\nConfig: {}", cfg_path.display());
     Ok(())
+}
+
+fn binding_summary(graph: &crate::cli::config_model::ConfigGraph) -> String {
+    let mut samples = graph
+        .bindings
+        .values()
+        .take(3)
+        .map(|binding| match binding {
+            BindingConfig::Channel { agent, channel } => format!("channel:{channel}->{agent}"),
+            BindingConfig::Scope {
+                agent,
+                scope,
+                channel,
+            } => format!(
+                "scope:{}:{}->{}",
+                channel.as_deref().unwrap_or("*"),
+                scope,
+                agent
+            ),
+            BindingConfig::Default { agent } => format!("default->{agent}"),
+            BindingConfig::ChannelInstance {
+                agent,
+                channel,
+                channel_instance,
+            } => format!("instance:{channel}/{channel_instance}->{agent}"),
+            BindingConfig::Peer {
+                agent,
+                peer_id,
+                channel,
+                ..
+            } => format!(
+                "peer:{}:{}->{}",
+                channel.as_deref().unwrap_or("*"),
+                peer_id,
+                agent
+            ),
+            BindingConfig::Team { agent, team_id } => format!("team:{team_id}->{agent}"),
+            BindingConfig::Thread {
+                agent,
+                scope,
+                thread_id,
+                ..
+            } => format!("thread:{scope}/{thread_id}->{agent}"),
+        })
+        .collect::<Vec<_>>();
+    if graph.bindings.len() > samples.len() {
+        samples.push(format!("+{}", graph.bindings.len() - samples.len()));
+    }
+    samples.join(", ")
+}
+
+fn team_scope_summary(graph: &crate::cli::config_model::ConfigGraph) -> String {
+    let mut scopes = graph
+        .team_scopes
+        .values()
+        .take(2)
+        .map(|team_scope| {
+            format!(
+                "{}:{} (lead={}, specialists={})",
+                team_scope.mode.channel.as_deref().unwrap_or("*"),
+                team_scope.scope,
+                team_scope.mode.front_bot.as_deref().unwrap_or("?"),
+                team_scope.team.roster.len()
+            )
+        })
+        .collect::<Vec<_>>();
+    if graph.team_scopes.len() > scopes.len() {
+        scopes.push(format!("+{}", graph.team_scopes.len() - scopes.len()));
+    }
+    scopes.join(", ")
 }
