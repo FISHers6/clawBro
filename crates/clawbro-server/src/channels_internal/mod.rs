@@ -10,12 +10,14 @@ pub mod lark;
 mod mention_parsing;
 pub mod mention_trigger;
 pub mod traits;
+pub mod ws_virtual;
 
 pub use allowlist::AllowlistChecker;
 pub use dingtalk::{DingTalkChannel, DingTalkConfig};
 pub use dingtalk_webhook::DingTalkWebhookChannel;
 pub use lark::{LarkChannel, LarkTriggerMode, LarkTriggerPolicy};
 pub use traits::{BoxChannel, Channel};
+pub use ws_virtual::WsVirtualChannel;
 
 /// Maximum number of retries for transient send errors (not counting the first attempt).
 pub(crate) const SEND_MAX_RETRIES: u32 = 3;
