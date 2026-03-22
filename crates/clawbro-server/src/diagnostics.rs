@@ -5,9 +5,10 @@ use crate::agent_core::team::session::{ChannelSendRecord, LeaderUpdateRecord};
 use crate::runtime::{
     provider_profiles::ConfiguredProviderProtocol, AcpBackend, BackendFamily, CapabilityProfile,
 };
-use crate::{config, state::AppState};
+use crate::{config, protocol::DashboardEvent, state::AppState};
 use serde::Serialize;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -104,7 +105,6 @@ pub struct TeamDiagnostic {
     pub latest_leader_update: Option<LeaderUpdateRecord>,
     pub latest_channel_send: Option<ChannelSendRecord>,
     pub tool_surface_ready: bool,
-    pub mcp_port: Option<u16>,
     pub task_counts: TeamTaskCounts,
     pub artifact_health: TeamArtifactHealthSummary,
     pub routing_stats: TeamRoutingStats,
@@ -168,6 +168,43 @@ pub struct DoctorReport {
     pub ok: bool,
     pub state: DiagnosticsStatus,
     pub findings: Vec<DiagnosticFinding>,
+}
+
+pub fn spawn_dashboard_diagnostics_poller(state: AppState) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        let dashboard_tx = state.registry.dashboard_sender();
+        let mut backend_snapshots: BTreeMap<String, String> = BTreeMap::new();
+        let mut channel_snapshots: BTreeMap<String, String> = BTreeMap::new();
+
+        loop {
+            interval.tick().await;
+
+            for backend in collect_backend_diagnostics(&state).await {
+                let Ok(snapshot) = serde_json::to_string(&backend) else {
+                    continue;
+                };
+                let key = backend.backend_id.clone();
+                let changed = backend_snapshots.get(&key) != Some(&snapshot);
+                if changed {
+                    backend_snapshots.insert(key, snapshot);
+                    let _ = dashboard_tx.send(DashboardEvent::BackendUpdated { backend });
+                }
+            }
+
+            for channel in collect_channel_diagnostics(&state) {
+                let Ok(snapshot) = serde_json::to_string(&channel) else {
+                    continue;
+                };
+                let key = channel.channel.clone();
+                let changed = channel_snapshots.get(&key) != Some(&snapshot);
+                if changed {
+                    channel_snapshots.insert(key, snapshot);
+                    let _ = dashboard_tx.send(DashboardEvent::ChannelUpdated { channel });
+                }
+            }
+        }
+    });
 }
 
 pub async fn collect_backend_diagnostics(state: &AppState) -> Vec<BackendDiagnostic> {
@@ -452,7 +489,6 @@ fn team_diagnostic_from_summary(summary: TeamRuntimeSummary) -> TeamDiagnostic {
         latest_leader_update: summary.latest_leader_update,
         latest_channel_send: summary.latest_channel_send,
         tool_surface_ready: summary.tool_surface_ready,
-        mcp_port: summary.mcp_port,
         task_counts: summary.task_counts,
         artifact_health: summary.artifact_health,
         routing_stats: summary.routing_stats,
@@ -832,6 +868,7 @@ mod tests {
             runtime_token: Arc::new("diagnostics-token".to_string()),
             approvals: ApprovalBroker::default(),
             scheduler_service: crate::scheduler_runtime::build_test_scheduler_service(),
+            config_path: Arc::new(crate::config::config_file_path()),
         }
     }
 
@@ -948,7 +985,6 @@ mod tests {
             dispatch_fn,
             std::time::Duration::from_secs(60),
         );
-        let _ = orch.mcp_server_port.set(32123);
         *orch.team_state_inner.lock().unwrap() = TeamState::Running;
         state
             .registry

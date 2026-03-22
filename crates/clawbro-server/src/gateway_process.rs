@@ -4,6 +4,7 @@ use crate::agent_core::{
 use crate::channel_registry::ChannelRegistry;
 use crate::config;
 use crate::delivery_resolver::resolve_delivery;
+use crate::diagnostics::spawn_dashboard_diagnostics_poller;
 use crate::gateway;
 use crate::im_sink::spawn_im_turn;
 use crate::runtime::{
@@ -133,7 +134,12 @@ pub async fn run() -> Result<()> {
     );
     // 使用 registry 内部的 global_tx，确保事件正确广播
     let event_tx = registry.global_sender();
+    let dashboard_tx = registry.dashboard_sender();
     registry.set_approval_resolver(Arc::new(BrokerApprovalResolver::new(approvals.clone())));
+    approvals.set_dashboard_sender(dashboard_tx.clone());
+    registry
+        .session_manager_ref()
+        .set_dashboard_sender(dashboard_tx.clone());
 
     let cfg_arc = Arc::new(cfg.clone());
 
@@ -372,8 +378,10 @@ pub async fn run() -> Result<()> {
 
     let (scheduler_service, scheduler_db) =
         scheduler_runtime::build_scheduler_service(cfg_arc.as_ref()).await?;
+    scheduler_service.set_dashboard_sender(dashboard_tx);
 
     let cron_channel_map = Arc::new(cron_channel_map);
+    let config_path = Arc::new(crate::config::config_file_path());
     let state = AppState {
         registry: registry.clone(),
         runtime_registry: Arc::clone(&runtime_registry),
@@ -384,7 +392,9 @@ pub async fn run() -> Result<()> {
         runtime_token: Arc::new(uuid::Uuid::new_v4().to_string()),
         approvals,
         scheduler_service: scheduler_service.clone(),
+        config_path,
     };
+    spawn_dashboard_diagnostics_poller(state.clone());
 
     // Approval notify loop: surface runtime approval requests back into the originating IM
     // session so operators can resolve them with `/approve <id> <decision>`.

@@ -1,8 +1,8 @@
-use crate::runtime::{TeamToolRequest, TeamToolResponse};
+use crate::runtime::TeamToolRequest;
 use crate::state::AppState;
+use crate::team_contract::projection::http_rpc::invoke_team_http_request;
 use axum::{
     extract::{Query, State},
-    http::StatusCode,
     response::IntoResponse,
     Json,
 };
@@ -18,39 +18,14 @@ pub async fn invoke_team_tool(
     State(state): State<AppState>,
     Json(req): Json<TeamToolRequest>,
 ) -> impl IntoResponse {
-    if query.token != *state.runtime_token {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(TeamToolResponse {
-                ok: false,
-                message: "invalid runtime token".to_string(),
-                payload: None,
-            }),
-        );
-    }
-
-    match state
-        .registry
-        .invoke_team_tool(&req.session_key, req.call)
-        .await
-    {
-        Ok(resp) => (StatusCode::OK, Json(resp)),
-        Err(err) => (
-            StatusCode::BAD_REQUEST,
-            Json(TeamToolResponse {
-                ok: false,
-                message: err.to_string(),
-                payload: None,
-            }),
-        ),
-    }
+    let (status, response) = invoke_team_http_request(&state, &query.token, req).await;
+    (status, Json(response))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::agent_core::SessionRegistry;
-    use crate::runtime::{TeamToolCall, TeamToolRequest};
+    use crate::runtime::{TeamToolCall, TeamToolRequest, TeamToolResponse};
     use crate::session::{SessionManager, SessionStorage};
     use crate::skills_internal::SkillLoader;
     use crate::{config::GatewayConfig, gateway, state::AppState};
@@ -115,6 +90,7 @@ mod tests {
             runtime_token: Arc::new("test-token".to_string()),
             approvals: crate::runtime::ApprovalBroker::default(),
             scheduler_service: crate::scheduler_runtime::build_test_scheduler_service(),
+            config_path: Arc::new(crate::config::config_file_path()),
         };
         let addr = gateway::server::start(state, "127.0.0.1", 0).await.unwrap();
 

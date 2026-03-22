@@ -10,6 +10,7 @@ use crate::runtime::{
 };
 use crate::scheduler::SchedulerService;
 use async_trait::async_trait;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
@@ -24,6 +25,7 @@ pub struct AppState {
     pub runtime_token: Arc<String>,
     pub approvals: ApprovalBroker,
     pub scheduler_service: Arc<SchedulerService>,
+    pub config_path: Arc<PathBuf>,
 }
 
 #[derive(Clone)]

@@ -22,6 +22,7 @@ pub mod session;
 pub mod skills_internal;
 pub mod state;
 pub mod team_runtime;
+pub mod team_contract;
 
 pub use gateway_process::run as run_gateway_process;
 
@@ -29,6 +30,7 @@ pub use config::GatewayConfig;
 pub use state::{AppState, BrokerApprovalResolver};
 
 use crate::agent_core::{ConductorRuntimeDispatch, SessionRegistry};
+use crate::diagnostics::spawn_dashboard_diagnostics_poller;
 use crate::runtime::{
     acp::AcpBackendAdapter, ApprovalBroker, BackendFamily, BackendRegistry, BackendSpec,
     ClawBroNativeBackendAdapter, LaunchSpec, OpenClawBackendAdapter,
@@ -141,7 +143,12 @@ pub async fn build_test_state_with_config(cfg: GatewayConfig) -> Result<AppState
         runtime_dispatch,
     );
     let event_tx = registry.global_sender();
+    let dashboard_tx = registry.dashboard_sender();
     registry.set_approval_resolver(Arc::new(BrokerApprovalResolver::new(approvals.clone())));
+    approvals.set_dashboard_sender(dashboard_tx.clone());
+    registry
+        .session_manager_ref()
+        .set_dashboard_sender(dashboard_tx.clone());
 
     let mut channel_registry = channel_registry::ChannelRegistry::new();
     let dingtalk_webhook_channel = cfg
@@ -163,6 +170,7 @@ pub async fn build_test_state_with_config(cfg: GatewayConfig) -> Result<AppState
         });
     let channel_registry = Arc::new(channel_registry);
     let scheduler_service = crate::scheduler_runtime::build_test_scheduler_service();
+    scheduler_service.set_dashboard_sender(dashboard_tx);
     let state = AppState {
         registry,
         runtime_registry,
@@ -173,6 +181,7 @@ pub async fn build_test_state_with_config(cfg: GatewayConfig) -> Result<AppState
         runtime_token: Arc::new(uuid::Uuid::new_v4().to_string()),
         approvals,
         scheduler_service,
+        config_path: Arc::new(crate::config::config_file_path()),
     };
 
     team_runtime::wire_team_runtime(
@@ -182,6 +191,7 @@ pub async fn build_test_state_with_config(cfg: GatewayConfig) -> Result<AppState
         Duration::from_millis(50),
     )
     .await?;
+    spawn_dashboard_diagnostics_poller(state.clone());
 
     Ok(state)
 }

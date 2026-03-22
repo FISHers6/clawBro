@@ -280,12 +280,6 @@ impl GatewayConfig {
                         backend.id
                     );
                 }
-                if name == "team-tools" {
-                    anyhow::bail!(
-                        "backend `{}` uses reserved external MCP server name `team-tools`",
-                        backend.id
-                    );
-                }
                 if !seen_mcp_names.insert(name.to_string()) {
                     anyhow::bail!(
                         "backend `{}` contains duplicate external MCP server name `{}`",
@@ -392,6 +386,14 @@ impl GatewayConfig {
             );
         }
         for group in &self.groups {
+            if matches!(group.mode.interaction, InteractionMode::Team)
+                && group.mode.channel.as_deref().is_none_or(str::is_empty)
+            {
+                anyhow::bail!(
+                    "group `{}` sets mode.interaction = \"team\" but is missing group.mode.channel; team scopes must declare their channel explicitly",
+                    group.scope
+                );
+            }
             if let Some(front_bot) = group.mode.front_bot.as_deref() {
                 if !roster_names.contains(front_bot) {
                     anyhow::bail!(
@@ -427,6 +429,12 @@ impl GatewayConfig {
             if !matches!(team_scope.mode.interaction, InteractionMode::Team) {
                 anyhow::bail!(
                     "team_scope `{}` must set mode.interaction = \"team\"",
+                    team_scope.scope
+                );
+            }
+            if team_scope.mode.channel.as_deref().is_none_or(str::is_empty) {
+                anyhow::bail!(
+                    "team_scope `{}` is missing team_scope.mode.channel; team scopes must declare their channel explicitly",
                     team_scope.scope
                 );
             }
@@ -1219,17 +1227,22 @@ impl BindingConfig {
     }
 }
 
+/// 解析配置文件路径（env CLAWBRO_CONFIG 或 ~/.clawbro/config.toml）
+pub fn config_file_path() -> std::path::PathBuf {
+    std::env::var("CLAWBRO_CONFIG")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            dirs::home_dir()
+                .unwrap_or_default()
+                .join(".clawbro")
+                .join("config.toml")
+        })
+}
+
 impl GatewayConfig {
     /// 从 ~/.clawbro/config.toml 加载，不存在则用默认值
     pub fn load() -> Result<Self> {
-        let path = std::env::var("CLAWBRO_CONFIG")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| {
-                dirs::home_dir()
-                    .unwrap_or_default()
-                    .join(".clawbro")
-                    .join("config.toml")
-            });
+        let path = config_file_path();
 
         if !path.exists() {
             let mut cfg = Self::default();
@@ -1572,6 +1585,7 @@ scope = "group:lark:abc"
 [group.mode]
 interaction = "team"
 front_bot = "claude"
+channel = "lark"
 
 [group.team]
 roster = ["codex"]
@@ -1607,6 +1621,7 @@ scope = "group:lark:abc"
 [group.mode]
 interaction = "team"
 front_bot = "claude"
+channel = "lark"
 "#,
         )
         .unwrap();
@@ -1640,6 +1655,7 @@ scope = "group:lark:abc"
 [group.mode]
 interaction = "team"
 front_bot = "claude"
+channel = "lark"
 
 [group.team]
 roster = ["codex"]
@@ -2044,8 +2060,8 @@ name = "私聊工作台"
 
 [team_scope.mode]
 interaction = "team"
-front_bot = "claude"
 channel = "lark"
+front_bot = "claude"
 
 [team_scope.team]
 roster = ["codex", "researcher"]
@@ -2097,6 +2113,7 @@ scope = "user:ou_abc"
 
 [team_scope.mode]
 interaction = "team"
+channel = "lark"
 front_bot = "claude"
 
 [team_scope.team]
@@ -2106,6 +2123,72 @@ roster = ["codex"]
         .unwrap();
 
         cfg.validate_runtime_topology().unwrap();
+    }
+
+    #[test]
+    fn test_validate_runtime_topology_rejects_team_group_without_channel() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+[[backend]]
+id = "native-main"
+family = "quick_ai_native"
+
+[backend.launch]
+type = "bundled_command"
+
+[agent]
+backend_id = "native-main"
+
+[[agent_roster]]
+name = "claude"
+mentions = ["@claude"]
+backend_id = "native-main"
+
+[[group]]
+scope = "group:lark:abc"
+
+[group.mode]
+interaction = "team"
+front_bot = "claude"
+"#,
+        )
+        .unwrap();
+
+        let err = cfg.validate_runtime_topology().unwrap_err();
+        assert!(err.to_string().contains("missing group.mode.channel"));
+    }
+
+    #[test]
+    fn test_validate_runtime_topology_rejects_team_scope_without_channel() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+[[backend]]
+id = "native-main"
+family = "quick_ai_native"
+
+[backend.launch]
+type = "bundled_command"
+
+[agent]
+backend_id = "native-main"
+
+[[agent_roster]]
+name = "claude"
+mentions = ["@claude"]
+backend_id = "native-main"
+
+[[team_scope]]
+scope = "user:ou_123"
+
+[team_scope.mode]
+interaction = "team"
+front_bot = "claude"
+"#,
+        )
+        .unwrap();
+
+        let err = cfg.validate_runtime_topology().unwrap_err();
+        assert!(err.to_string().contains("missing team_scope.mode.channel"));
     }
 
     #[test]
@@ -2167,6 +2250,7 @@ scope = "user:ou_abc"
 
 [team_scope.mode]
 interaction = "team"
+channel = "lark"
 auto_promote = true
 front_bot = "claude"
 "#,
@@ -2208,6 +2292,7 @@ scope = "user:ou_dup"
 
 [team_scope.mode]
 interaction = "team"
+channel = "lark"
 front_bot = "claude"
 
 [[team_scope]]
@@ -2215,6 +2300,7 @@ scope = "user:ou_dup"
 
 [team_scope.mode]
 interaction = "team"
+channel = "lark"
 front_bot = "claude"
 "#,
         )
@@ -2223,7 +2309,7 @@ front_bot = "claude"
         let err = cfg.validate_runtime_topology().unwrap_err();
         assert!(err
             .to_string()
-            .contains("duplicate team_scope `user:ou_dup` for channel `*`"));
+            .contains("duplicate team_scope `user:ou_dup` for channel `lark`"));
     }
 
     #[test]
@@ -2536,33 +2622,6 @@ backend_id = "native-main"
         assert!(err
             .to_string()
             .contains("contains duplicate external MCP server name `filesystem`"));
-    }
-
-    #[test]
-    fn test_validate_runtime_topology_rejects_reserved_external_mcp_name() {
-        let cfg: GatewayConfig = toml::from_str(
-            r#"
-[[backend]]
-id = "native-main"
-family = "quick_ai_native"
-
-[backend.launch]
-type = "bundled_command"
-
-[[backend.external_mcp_servers]]
-name = "team-tools"
-url = "http://127.0.0.1:3001/sse"
-
-[agent]
-backend_id = "native-main"
-"#,
-        )
-        .unwrap();
-
-        let err = cfg.validate_runtime_topology().unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("uses reserved external MCP server name `team-tools`"));
     }
 
     #[test]
