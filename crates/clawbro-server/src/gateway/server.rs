@@ -13,7 +13,7 @@ use axum::{
     body::Bytes,
     extract::State,
     http::{HeaderMap, StatusCode},
-    routing::{get, post, put},
+    routing::{delete, get, patch, post, put},
     Json, Router,
 };
 use std::net::SocketAddr;
@@ -26,7 +26,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/status", get(status))
         .route("/doctor", get(doctor))
         .route("/api/agents", get(api::agents::list_agents))
+        .route("/api/agents", post(api::agents_write::create_agent))
         .route("/api/agents/{agent_id}", get(api::agents::get_agent))
+        .route("/api/agents/{name}", patch(api::agents_write::patch_agent))
+        .route("/api/agents/{name}", delete(api::agents_write::delete_agent))
         .route("/api/approvals", get(api::approvals::list_approvals))
         .route("/api/approvals/{approval_id}", get(api::approvals::get_approval))
         .route("/api/approvals/{approval_id}/approve", post(api::approvals::approve_approval))

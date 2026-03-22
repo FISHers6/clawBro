@@ -1,6 +1,7 @@
 pub mod approvals;
 pub mod chat;
 pub mod agents;
+pub mod agents_write;
 pub mod backends;
 pub mod channels;
 pub mod config;
