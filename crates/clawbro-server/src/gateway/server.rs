@@ -56,6 +56,7 @@ pub fn build_router(state: AppState) -> Router {
             post(api::scheduler::run_job_now),
         )
         .route("/api/sessions", get(api::sessions::list_sessions))
+        .route("/api/sessions", delete(api::sessions_write::delete_session_history))
         .route("/api/sessions/detail", get(api::sessions::get_session))
         .route("/api/sessions/messages", get(api::sessions::get_session_messages))
         .route("/api/sessions/events", get(api::sessions::get_session_events))

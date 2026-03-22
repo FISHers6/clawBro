@@ -8,6 +8,7 @@ pub mod config;
 pub mod config_write;
 pub mod scheduler;
 pub mod sessions;
+pub mod sessions_write;
 pub mod skills;
 pub mod tasks;
 pub mod teams;
