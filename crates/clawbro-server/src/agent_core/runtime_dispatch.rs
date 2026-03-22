@@ -16,7 +16,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::{timeout, Duration};
 
-const RUNTIME_FORWARDER_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+const RUNTIME_FORWARDER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 pub struct RuntimeDispatchRequest {
@@ -313,12 +313,22 @@ async fn run_dispatch_job(
             );
         }
         Err(_) => {
-            tracing::warn!(
-                session_id = %session_id,
-                timeout_ms = RUNTIME_FORWARDER_DRAIN_TIMEOUT.as_millis(),
-                runtime_complete_seen = runtime_complete_seen.load(Ordering::SeqCst),
-                "Runtime event forwarder drain timed out; continuing turn finalization"
-            );
+            let saw_turn_complete = runtime_complete_seen.load(Ordering::SeqCst);
+            if saw_turn_complete {
+                tracing::debug!(
+                    session_id = %session_id,
+                    timeout_ms = RUNTIME_FORWARDER_DRAIN_TIMEOUT.as_millis(),
+                    runtime_complete_seen = saw_turn_complete,
+                    "Runtime event forwarder drain timed out after TurnComplete; continuing turn finalization"
+                );
+            } else {
+                tracing::warn!(
+                    session_id = %session_id,
+                    timeout_ms = RUNTIME_FORWARDER_DRAIN_TIMEOUT.as_millis(),
+                    runtime_complete_seen = saw_turn_complete,
+                    "Runtime event forwarder drain timed out before TurnComplete; continuing turn finalization"
+                );
+            }
         }
     }
     if !runtime_complete_seen.load(Ordering::SeqCst) && !turn.full_text.is_empty() {
@@ -814,7 +824,7 @@ mod tests {
         let (tx, mut rx) = broadcast::channel(8);
 
         let result = tokio::time::timeout(
-            Duration::from_secs(2),
+            RUNTIME_FORWARDER_DRAIN_TIMEOUT + Duration::from_secs(1),
             dispatcher.dispatch(RuntimeDispatchRequest {
                 intent: TurnIntent {
                     session_key: crate::protocol::SessionKey::new("ws", "user"),

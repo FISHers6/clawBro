@@ -887,7 +887,41 @@ impl SessionRegistry {
         {
             return false;
         }
-        true
+        Self::lead_human_team_turn_requests_coordination(inbound)
+    }
+
+    fn lead_human_team_turn_requests_coordination(inbound: &InboundMsg) -> bool {
+        let Some(text) = inbound.content.as_text() else {
+            return false;
+        };
+        if crate::agent_core::mode_selector::is_team_trigger(text) {
+            return true;
+        }
+
+        let lower = text.to_lowercase();
+        [
+            "让其他bot",
+            "让其他 bot",
+            "让其他agent",
+            "让其他 agent",
+            "让另一个bot",
+            "让另一个 bot",
+            "让别的bot",
+            "让别的 bot",
+            "交给其他bot",
+            "交给其他 bot",
+            "分配给其他bot",
+            "分配给其他 bot",
+            "创建任务",
+            "新建任务",
+            "新建一轮任务",
+            "开始执行",
+            "启动执行",
+            "assign to",
+            "delegate to",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle))
     }
 
     fn turn_has_team_coordination_side_effect(turn: &TurnResult) -> bool {
@@ -3371,11 +3405,11 @@ mod tests {
     }
 
     #[test]
-    fn lead_human_team_turn_guard_applies_to_team_lead_human_turns() {
-        let inbound = InboundMsg {
+    fn lead_human_team_turn_guard_only_applies_to_coordination_requests() {
+        let delegation = InboundMsg {
             id: "guard-1".into(),
             session_key: SessionKey::new("lark", "group:team"),
-            content: MsgContent::text("直接讲解一下clawbro"),
+            content: MsgContent::text("让其他bot做个任务：讲解一下clawbro"),
             sender: "user".into(),
             channel: "lark".into(),
             timestamp: chrono::Utc::now(),
@@ -3384,12 +3418,30 @@ mod tests {
             source: crate::protocol::MsgSource::Human,
         };
         assert!(SessionRegistry::lead_human_team_turn_requires_side_effect(
-            &inbound, true, true
+            &delegation,
+            true,
+            true
+        ));
+
+        let qa = InboundMsg {
+            content: MsgContent::text("直接讲解一下 clawbro 支持哪些模式"),
+            ..delegation.clone()
+        };
+        assert!(!SessionRegistry::lead_human_team_turn_requires_side_effect(
+            &qa, true, true
+        ));
+
+        let greeting = InboundMsg {
+            content: MsgContent::text("你好"),
+            ..delegation.clone()
+        };
+        assert!(!SessionRegistry::lead_human_team_turn_requires_side_effect(
+            &greeting, true, true
         ));
 
         let non_lead = InboundMsg {
             content: MsgContent::text("普通消息"),
-            ..inbound.clone()
+            ..delegation.clone()
         };
         assert!(!SessionRegistry::lead_human_team_turn_requires_side_effect(
             &non_lead, false, true
@@ -3397,7 +3449,7 @@ mod tests {
 
         let non_team = InboundMsg {
             content: MsgContent::text("普通消息"),
-            ..inbound
+            ..delegation
         };
         assert!(!SessionRegistry::lead_human_team_turn_requires_side_effect(
             &non_team, true, false
