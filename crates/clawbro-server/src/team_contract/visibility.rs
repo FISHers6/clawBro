@@ -13,7 +13,10 @@ pub struct TeamToolVisibility {
 
 pub fn visible_team_tools_for_role(role: RuntimeRole) -> TeamToolVisibility {
     let visible = match role {
-        RuntimeRole::Solo => vec![],
+        RuntimeRole::Solo => vec![
+            TeamTool::ListAgents,
+            TeamTool::SendMessage,
+        ],
         RuntimeRole::Leader => vec![
             TeamTool::CreateTask,
             TeamTool::StartExecution,
@@ -23,12 +26,16 @@ pub fn visible_team_tools_for_role(role: RuntimeRole) -> TeamToolVisibility {
             TeamTool::AssignTask,
             TeamTool::AcceptTask,
             TeamTool::ReopenTask,
+            TeamTool::ListAgents,
+            TeamTool::SendMessage,
         ],
         RuntimeRole::Specialist => vec![
             TeamTool::CheckpointTask,
             TeamTool::SubmitTaskResult,
             TeamTool::BlockTask,
             TeamTool::RequestHelp,
+            TeamTool::ListAgents,
+            TeamTool::SendMessage,
         ],
     };
 
@@ -63,6 +70,27 @@ mod tests {
         assert!(visible.contains(&TeamTool::CheckpointTask));
         assert!(visible.contains(&TeamTool::SubmitTaskResult));
         assert!(visible.contains(&TeamTool::RequestHelp));
+    }
+
+    #[test]
+    fn solo_visibility_contains_social_tools() {
+        let visible = visible_team_tools_for_role(RuntimeRole::Solo).visible;
+        assert!(visible.contains(&TeamTool::ListAgents));
+        assert!(visible.contains(&TeamTool::SendMessage));
+    }
+
+    #[test]
+    fn leader_visibility_contains_social_tools() {
+        let visible = visible_team_tools_for_role(RuntimeRole::Leader).visible;
+        assert!(visible.contains(&TeamTool::ListAgents));
+        assert!(visible.contains(&TeamTool::SendMessage));
+    }
+
+    #[test]
+    fn specialist_visibility_contains_social_tools() {
+        let visible = visible_team_tools_for_role(RuntimeRole::Specialist).visible;
+        assert!(visible.contains(&TeamTool::ListAgents));
+        assert!(visible.contains(&TeamTool::SendMessage));
     }
 
     #[test]
