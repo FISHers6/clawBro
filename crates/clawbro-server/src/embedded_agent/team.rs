@@ -87,13 +87,21 @@ impl RuntimeToolAugmentor for ClawBroTeamToolAugmentor {
         tracker: Option<ToolProgressTracker>,
         approval_mode: ApprovalMode,
     ) -> ConfiguredAgentBuilder<M> {
-        if !session.tool_surface.team_tools {
-            return builder;
-        }
         let Some(endpoint) = self.endpoint.clone() else {
             return builder;
         };
         let client = TeamToolClient::new(endpoint, session.session_ref.clone());
+
+        // Solo agents bypass the team_tools gate — they still get social tools
+        // (list_agents + send_message) as long as an endpoint is configured.
+        // tool_surface.team_tools is false for Solo by default (bridge.rs:466).
+        if !session.tool_surface.team_tools {
+            if session.role == ExecutionRole::Solo {
+                return inject_social_tools_only(builder, &client, tracker, approval_mode);
+            }
+            return builder;
+        }
+
         match tracker {
             Some(tracker) => register_team_tools_with_progress(
                 builder,
@@ -183,6 +191,14 @@ struct BlockTaskArgs {
 struct RequestHelpArgs {
     task_id: String,
     message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SendMessageArgs {
+    target: String,
+    message: String,
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 macro_rules! define_team_tool {
@@ -428,6 +444,45 @@ define_team_tool!(
     }
 );
 
+define_team_tool!(
+    ListAgentsTool,
+    "list_agents",
+    serde_json::Value,
+    "All roles. List all agents available in the team roster. Returns their names, mentions, and backend IDs. Use before send_message to verify the target agent name.",
+    json!({"type": "object", "properties": {}}),
+    |_args: serde_json::Value| TeamToolCall::ListAgents
+);
+
+define_team_tool!(
+    SendMessageTool,
+    "send_message",
+    SendMessageArgs,
+    "All roles. Send a message to another agent by name (e.g. 'coder') or to 'user' (the human operator). Use list_agents first to find valid agent names. V1: agent responses are delivered via WebSocket only.",
+    json!({
+        "type": "object",
+        "properties": {
+            "target": {
+                "type": "string",
+                "description": "Agent name from the roster (e.g. 'coder', 'reviewer') or 'user' to reach the human operator."
+            },
+            "message": {
+                "type": "string",
+                "description": "Message body to send."
+            },
+            "scope": {
+                "type": "string",
+                "description": "Optional session scope override. Leave empty to use the current session scope."
+            }
+        },
+        "required": ["target", "message"]
+    }),
+    |args: SendMessageArgs| TeamToolCall::SendMessage {
+        target: args.target,
+        message: args.message,
+        scope: args.scope,
+    }
+);
+
 fn register_team_tools<M: CompletionModel>(
     builder: ConfiguredAgentBuilder<M>,
     role: ExecutionRole,
@@ -466,7 +521,11 @@ fn register_team_tools_with_progress<M: CompletionModel>(
                 builder = add_specialist_team_tool(builder, tool, &client, &tracker, approval_mode);
             }
         }
-        ExecutionRole::Solo => {}
+        ExecutionRole::Solo => {
+            for tool in visible_tools {
+                builder = add_social_team_tool(builder, tool, &client, &tracker, approval_mode);
+            }
+        }
     }
 
     builder
@@ -532,6 +591,16 @@ fn add_leader_team_tool<M: CompletionModel>(
             Some(tracker.clone()),
             approval_mode,
         )),
+        TeamTool::ListAgents => builder.tool(EventedTool::new(
+            ListAgentsTool::new(client.clone()),
+            Some(tracker.clone()),
+            approval_mode,
+        )),
+        TeamTool::SendMessage => builder.tool(EventedTool::new(
+            SendMessageTool::new(client.clone()),
+            Some(tracker.clone()),
+            approval_mode,
+        )),
         _ => builder,
     }
 }
@@ -571,6 +640,59 @@ fn add_specialist_team_tool<M: CompletionModel>(
         )),
         TeamTool::RequestHelp => builder.tool(EventedTool::new(
             RequestHelpTool::new(client.clone()),
+            Some(tracker.clone()),
+            approval_mode,
+        )),
+        TeamTool::ListAgents => builder.tool(EventedTool::new(
+            ListAgentsTool::new(client.clone()),
+            Some(tracker.clone()),
+            approval_mode,
+        )),
+        TeamTool::SendMessage => builder.tool(EventedTool::new(
+            SendMessageTool::new(client.clone()),
+            Some(tracker.clone()),
+            approval_mode,
+        )),
+        _ => builder,
+    }
+}
+
+fn inject_social_tools_only<M: CompletionModel>(
+    mut builder: ConfiguredAgentBuilder<M>,
+    client: &TeamToolClient,
+    tracker: Option<ToolProgressTracker>,
+    approval_mode: ApprovalMode,
+) -> ConfiguredAgentBuilder<M> {
+    let tracker =
+        tracker.unwrap_or_else(|| ToolProgressTracker::new(std::sync::Arc::new(|_| {})));
+    builder = builder.tool(EventedTool::new(
+        ListAgentsTool::new(client.clone()),
+        Some(tracker.clone()),
+        approval_mode,
+    ));
+    builder = builder.tool(EventedTool::new(
+        SendMessageTool::new(client.clone()),
+        Some(tracker),
+        approval_mode,
+    ));
+    builder
+}
+
+fn add_social_team_tool<M: CompletionModel>(
+    builder: ConfiguredAgentBuilder<M>,
+    tool: TeamTool,
+    client: &TeamToolClient,
+    tracker: &ToolProgressTracker,
+    approval_mode: ApprovalMode,
+) -> ConfiguredAgentBuilder<M> {
+    match tool {
+        TeamTool::ListAgents => builder.tool(EventedTool::new(
+            ListAgentsTool::new(client.clone()),
+            Some(tracker.clone()),
+            approval_mode,
+        )),
+        TeamTool::SendMessage => builder.tool(EventedTool::new(
+            SendMessageTool::new(client.clone()),
             Some(tracker.clone()),
             approval_mode,
         )),
