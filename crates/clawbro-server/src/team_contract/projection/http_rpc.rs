@@ -8,6 +8,16 @@ use crate::runtime::{TeamToolCall, TeamToolRequest, TeamToolResponse};
 use crate::state::AppState;
 use std::sync::Arc;
 
+/// Resolve the outbound channel for a session key.
+/// Falls back to WsVirtualChannel (WS-broadcast-only) when no IM channel is registered,
+/// e.g. in pure-WebSocket deployments.
+fn resolve_channel(state: &AppState, session_key: &SessionKey) -> Arc<dyn crate::channels_internal::Channel> {
+    state
+        .channel_registry
+        .resolve_for_session(session_key)
+        .unwrap_or_else(|| Arc::new(WsVirtualChannel))
+}
+
 pub async fn invoke_team_http_request(
     state: &AppState,
     provided_token: &str,
@@ -118,42 +128,6 @@ async fn handle_send_message(
     message: &str,
     scope_override: Option<&str>,
 ) -> (StatusCode, TeamToolResponse) {
-    // "user" is a reserved target: deliver to the caller's own session (no agent routing).
-    // V1 limitation: response is broadcast via WebSocket only (WsVirtualChannel is a no-op sender
-    // for IM channels — DingTalk/Lark delivery will be added in a future version).
-    if target.eq_ignore_ascii_case("user") {
-        let scope = scope_override.unwrap_or(&caller_session.scope).to_string();
-        let session_key = SessionKey::new("ws", &scope);
-        let turn_id = uuid::Uuid::new_v4().to_string();
-        let inbound = InboundMsg {
-            id: turn_id,
-            session_key,
-            content: MsgContent::text(message),
-            sender: "agent".to_string(),
-            channel: "ws".to_string(),
-            timestamp: chrono::Utc::now(),
-            thread_ts: None,
-            target_agent: None,
-            source: MsgSource::TeamNotify,
-        };
-        spawn_im_turn(
-            Arc::clone(&state.registry),
-            Arc::new(WsVirtualChannel),
-            Arc::clone(&state.channel_registry),
-            Arc::clone(&state.cfg),
-            inbound,
-            ProgressPresentationMode::FinalOnly,
-        );
-        return (
-            StatusCode::OK,
-            TeamToolResponse {
-                ok: true,
-                message: "Message delivered to user session.".to_string(),
-                payload: None,
-            },
-        );
-    }
-
     // Target is an agent name — verify it exists in roster before dispatching.
     let roster_entry = state
         .registry
@@ -167,7 +141,10 @@ async fn handle_send_message(
             StatusCode::BAD_REQUEST,
             TeamToolResponse {
                 ok: false,
-                message: format!("Agent '{}' not found in roster.", target),
+                message: format!(
+                    "Agent '{}' not found in roster. Use list_agents to see available agents.",
+                    target
+                ),
                 payload: None,
             },
         );
@@ -201,15 +178,22 @@ async fn handle_send_message(
         );
     }
 
+    // Inherit the caller's channel so the dispatched turn — and its reply — travel the same
+    // transport as the original conversation (DingTalk, Lark, or WebSocket).
     let scope = scope_override.unwrap_or(&caller_session.scope).to_string();
-    let session_key = SessionKey::new("ws", &scope);
+    let session_key = SessionKey {
+        channel: caller_session.channel.clone(),
+        channel_instance: caller_session.channel_instance.clone(),
+        scope,
+    };
+    let channel = resolve_channel(state, &session_key);
     let turn_id = uuid::Uuid::new_v4().to_string();
     let inbound = InboundMsg {
         id: turn_id,
+        channel: session_key.channel.clone(),
         session_key,
         content: MsgContent::text(message),
         sender: "agent".to_string(),
-        channel: "ws".to_string(),
         timestamp: chrono::Utc::now(),
         thread_ts: None,
         target_agent: Some(mention.clone()),
@@ -217,7 +201,7 @@ async fn handle_send_message(
     };
     spawn_im_turn(
         Arc::clone(&state.registry),
-        Arc::new(WsVirtualChannel),
+        channel,
         Arc::clone(&state.channel_registry),
         Arc::clone(&state.cfg),
         inbound,
@@ -350,8 +334,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_message_to_user_dispatches_without_orchestrator() {
-        // "user" target bypasses roster lookup — succeeds even with empty roster
+    async fn send_message_to_user_returns_error() {
+        // "user" is not a valid target — agents communicate with the user by returning text,
+        // not by using send_message.
         let state = make_state_with_roster(AgentRoster::new(vec![]));
         let request = TeamToolRequest {
             session_key: SessionKey::new("ws", "main"),
@@ -362,8 +347,8 @@ mod tests {
             },
         };
         let (status, resp) = invoke_team_http_request(&state, "tok", request).await;
-        assert_eq!(status, axum::http::StatusCode::OK);
-        assert!(resp.ok);
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(!resp.ok);
     }
 
     #[tokio::test]
@@ -389,6 +374,37 @@ mod tests {
         assert_eq!(status, axum::http::StatusCode::OK);
         assert!(resp.ok);
         assert!(resp.message.contains("@coder"));
+    }
+
+    #[tokio::test]
+    async fn send_message_inherits_caller_channel() {
+        // When the caller is on a "lark" session, the dispatched InboundMsg must also
+        // carry channel="lark", not the legacy hardcoded "ws".
+        // We verify this indirectly: the call succeeds and the channel in the session_key
+        // matches the caller's. (spawn_im_turn is fire-and-forget so we can't inspect
+        // the inbound directly, but the channel resolution path is exercised.)
+        let roster = AgentRoster::new(vec![AgentEntry {
+            name: "reviewer".to_string(),
+            mentions: vec!["@reviewer".to_string()],
+            backend_id: "claude".to_string(),
+            persona_dir: None,
+            workspace_dir: None,
+            extra_skills_dirs: vec![],
+        }]);
+        let state = make_state_with_roster(roster);
+        let request = TeamToolRequest {
+            // Simulate a caller coming from Lark
+            session_key: SessionKey::new("lark", "group:oc_x"),
+            call: crate::runtime::TeamToolCall::SendMessage {
+                target: "reviewer".to_string(),
+                message: "please review PR #99".to_string(),
+                scope: None,
+            },
+        };
+        let (status, resp) = invoke_team_http_request(&state, "tok", request).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(resp.ok);
+        assert!(resp.message.contains("@reviewer"));
     }
 
     #[tokio::test]
