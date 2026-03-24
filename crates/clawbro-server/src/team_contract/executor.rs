@@ -251,6 +251,11 @@ pub async fn execute_team_contract_call(
                 payload: None,
             }
         }
+        TeamToolCall::ListAgents | TeamToolCall::SendMessage { .. } => {
+            anyhow::bail!(
+                "ListAgents and SendMessage are handled at HTTP layer and must not reach executor"
+            )
+        }
     };
 
     Ok(response)
@@ -325,6 +330,38 @@ mod tests {
 
         assert!(err.contains("CreateTask"));
         assert!(err.contains("Specialist"));
+    }
+
+    #[tokio::test]
+    async fn executor_rejects_list_agents_as_not_handled_here() {
+        let orch = make_orchestrator();
+        let result = execute_team_contract_call(
+            Arc::clone(&orch),
+            RuntimeRole::Leader,
+            TeamToolCall::ListAgents,
+        )
+        .await;
+        // Returns Err either because:
+        // - ensure_team_call_allowed rejects it (before Task 2 adds it to visibility), OR
+        // - the executor defensive arm fires (after Task 2)
+        // Either way, it must never succeed.
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn executor_rejects_send_message_as_not_handled_here() {
+        let orch = make_orchestrator();
+        let result = execute_team_contract_call(
+            Arc::clone(&orch),
+            RuntimeRole::Leader,
+            TeamToolCall::SendMessage {
+                target: "coder".to_string(),
+                message: "hello".to_string(),
+                scope: None,
+            },
+        )
+        .await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]

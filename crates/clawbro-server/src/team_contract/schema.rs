@@ -16,6 +16,8 @@ pub enum TeamTool {
     ReopenTask,
     BlockTask,
     RequestHelp,
+    ListAgents,
+    SendMessage,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,6 +72,16 @@ pub enum TeamToolCall {
         message: String,
         agent: Option<String>,
     },
+    ListAgents,
+    SendMessage {
+        /// Agent name (from roster) or "user" to reach the human operator.
+        target: String,
+        /// Message body to deliver.
+        message: String,
+        /// Optional scope override. If omitted, uses the caller's own session scope.
+        #[serde(default)]
+        scope: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,6 +112,8 @@ pub fn tool_for_call(call: &TeamToolCall) -> TeamTool {
         TeamToolCall::ReopenTask { .. } => TeamTool::ReopenTask,
         TeamToolCall::BlockTask { .. } => TeamTool::BlockTask,
         TeamToolCall::RequestHelp { .. } => TeamTool::RequestHelp,
+        TeamToolCall::ListAgents => TeamTool::ListAgents,
+        TeamToolCall::SendMessage { .. } => TeamTool::SendMessage,
     }
 }
 
@@ -146,6 +160,33 @@ mod tests {
             result_markdown: Some("final".into()),
             agent: None,
         }));
+    }
+
+    #[test]
+    fn list_agents_tool_maps_to_correct_variant() {
+        let call = TeamToolCall::ListAgents;
+        assert_eq!(tool_for_call(&call), TeamTool::ListAgents);
+    }
+
+    #[test]
+    fn send_message_tool_maps_to_correct_variant() {
+        let call = TeamToolCall::SendMessage {
+            target: "codex".to_string(),
+            message: "please review".to_string(),
+            scope: None,
+        };
+        assert_eq!(tool_for_call(&call), TeamTool::SendMessage);
+    }
+
+    #[test]
+    fn send_message_scope_defaults_to_none_when_absent_from_json() {
+        // Validates #[serde(default)] on scope field
+        let json = r#"{"SendMessage":{"target":"coder","message":"hello"}}"#;
+        let call: TeamToolCall = serde_json::from_str(json).unwrap();
+        match call {
+            TeamToolCall::SendMessage { scope, .. } => assert!(scope.is_none()),
+            _ => panic!("wrong variant"),
+        }
     }
 
     #[test]
