@@ -178,6 +178,7 @@ fn acp_backend_policy_matches_identity_for_all_known_backends() {
         AcpBackend::Opencode,
         AcpBackend::Qoder,
         AcpBackend::Vibe,
+        AcpBackend::Gemini,
         AcpBackend::Custom,
     ] {
         let policy = AcpBackendPolicy::for_backend(Some(backend));

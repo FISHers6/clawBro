@@ -74,6 +74,7 @@ impl AcpSupportCategory {
             | Some(AcpBackend::Opencode)
             | Some(AcpBackend::Qoder)
             | Some(AcpBackend::Vibe)
+            | Some(AcpBackend::Gemini)
             | Some(AcpBackend::Custom) => Some(Self::GenericAcpCli),
         }
     }

@@ -2719,6 +2719,26 @@ backend_id = "native-main"
     fn acp_backend_rejects_unknown_value() {
         let toml = r#"
 [[backend]]
+id = "bogus-main"
+family = "acp"
+acp_backend = "bogus-agent-xyz"
+
+[backend.launch]
+type = "external_command"
+command = "bogus-agent-xyz"
+args = ["--acp"]
+        "#;
+        let result: Result<GatewayConfig, _> = toml::from_str(toml);
+        assert!(
+            result.is_err(),
+            "unknown acp_backend value should be rejected at parse time"
+        );
+    }
+
+    #[test]
+    fn acp_backend_accepts_gemini() {
+        let toml = r#"
+[[backend]]
 id = "gemini-main"
 family = "acp"
 acp_backend = "gemini"
@@ -2727,11 +2747,15 @@ acp_backend = "gemini"
 type = "external_command"
 command = "gemini"
 args = ["--acp"]
+
+[agent]
+backend_id = "gemini-main"
         "#;
-        let result: Result<GatewayConfig, _> = toml::from_str(toml);
-        assert!(
-            result.is_err(),
-            "unknown acp_backend value should be rejected at parse time"
+        let cfg: GatewayConfig = toml::from_str(toml).unwrap();
+        assert_eq!(
+            cfg.backends[0].acp_backend,
+            Some(AcpBackendConfig::Gemini),
+            "gemini should be a valid acp_backend value"
         );
     }
 }

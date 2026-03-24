@@ -46,6 +46,16 @@ OpenClaw의 방향을 이어가되, 실전 협업에 더 초점을 맞춥니다.
 
 > `clawBro` 는 엔지니어링 협업, 리서치 워크플로, 그룹 채팅 AI 도우미, 멀티 Agent 실험에 적합합니다.
 
+## 📸 데모
+
+<table align="center">
+  <tr align="center">
+    <td><img src="./assets/demo-multi-bot-mention.png" width="260"><br><sub><b>그룹 채팅에서 여러 Bot 동시 멘션</b></sub></td>
+    <td><img src="./assets/demo-scheduled-tasks.png" width="260"><br><sub><b>채팅으로 정기 작업 알림 생성</b></sub></td>
+    <td><img src="./assets/demo-wechat-team.png" width="260"><br><sub><b>WeChat에서의 팀 모드 협업</b></sub></td>
+  </tr>
+</table>
+
 ## clawBro의 핵심 특징
 
 🤖 **통합 CLI Coding Agent**: Claude Code, Codex, Qwen, Qoder, Gemini 등을 같은 시스템 안에서 함께 사용할 수 있습니다.

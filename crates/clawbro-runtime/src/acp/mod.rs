@@ -20,6 +20,7 @@ pub enum AcpBackend {
     Opencode,
     Qoder,
     Vibe,
+    Gemini,
     Custom,
 }
 

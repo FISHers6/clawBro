@@ -126,19 +126,14 @@ Can be launched with a direct command + args. Expected to speak ACP over stdio.
 | iFlow | `iflow` | `iflow --acp` | `Experimental` |
 | Goose | `goose` | `goose acp` | `Experimental` |
 | Kimi | `kimi` | `kimi --acp` | `Experimental` |
-| OpenCode | `opencode` | `opencode --acp` | `Experimental` |
-| Qoder | `qoder` | `qoder --acp` | `Experimental` |
+| OpenCode | `opencode` | `opencode acp` | `Experimental` |
+| Qoder | `qoder` | `qodercli --acp` | `Experimental` |
+| Gemini CLI | `gemini` | `gemini --acp` | `Experimental` |
 | Vibe | `vibe` | `vibe --acp` | `Experimental` |
 | Custom | `custom` | user-defined | `Experimental` |
 | (unspecified) | _(omitted)_ | user-defined | `Experimental` |
 
 `acp_backend` is optional. When omitted, the generic ACP CLI path is used.
-
-#### Category C: Declared but Not Yet Enabled
-
-| Backend | Status | Notes |
-| --- | --- | --- |
-| Gemini CLI | `Declared` | No validated ACP path in ClawBro; not in the `acp_backend` enum |
 
 **Support level semantics:**
 

@@ -46,6 +46,16 @@ It also supports the official WeChat lobster path: a WeChat front bot can lead s
 
 > `clawBro` is built for engineering, research, and workflow experimentation. It is meant for real agent collaboration, not just another chat wrapper.
 
+## 📸 Demo
+
+<table align="center">
+  <tr align="center">
+    <td><img src="./assets/demo-multi-bot-mention.png" width="260"><br><sub><b>Mention multiple bots at once in group chat</b></sub></td>
+    <td><img src="./assets/demo-scheduled-tasks.png" width="260"><br><sub><b>Scheduled task reminders via chat</b></sub></td>
+    <td><img src="./assets/demo-wechat-team.png" width="260"><br><sub><b>Team mode collaboration in WeChat</b></sub></td>
+  </tr>
+</table>
+
 ## Key Features of clawBro:
 
 🏛️ **Unified Control Plane**: One `clawbro` entrypoint for setup, routing, session management, diagnostics, and runtime dispatch.

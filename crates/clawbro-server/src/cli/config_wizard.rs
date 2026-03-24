@@ -315,13 +315,36 @@ fn backends_menu(draft: &mut ConfigDraft, theme: &ColorfulTheme) -> Result<()> {
                 let acp_backend = if matches!(family, BackendFamilyConfig::Acp) {
                     match Select::with_theme(theme)
                         .with_prompt("ACP backend")
-                        .items(&["none", "claude", "codex", "custom"])
+                        .items(&[
+                            "none (generic ACP CLI)",
+                            "claude",
+                            "codex",
+                            "codebuddy",
+                            "qwen",
+                            "iflow",
+                            "goose",
+                            "kimi",
+                            "opencode",
+                            "qoder",
+                            "vibe",
+                            "gemini",
+                            "custom",
+                        ])
                         .default(0)
                         .interact()?
                     {
                         1 => Some(AcpBackendConfig::Claude),
                         2 => Some(AcpBackendConfig::Codex),
-                        3 => Some(AcpBackendConfig::Custom),
+                        3 => Some(AcpBackendConfig::Codebuddy),
+                        4 => Some(AcpBackendConfig::Qwen),
+                        5 => Some(AcpBackendConfig::Iflow),
+                        6 => Some(AcpBackendConfig::Goose),
+                        7 => Some(AcpBackendConfig::Kimi),
+                        8 => Some(AcpBackendConfig::Opencode),
+                        9 => Some(AcpBackendConfig::Qoder),
+                        10 => Some(AcpBackendConfig::Vibe),
+                        11 => Some(AcpBackendConfig::Gemini),
+                        12 => Some(AcpBackendConfig::Custom),
                         _ => None,
                     }
                 } else {

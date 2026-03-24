@@ -100,6 +100,7 @@ fn parse_acp_backend(value: &str) -> Result<AcpBackendConfig> {
         "opencode" => Ok(AcpBackendConfig::Opencode),
         "qoder" => Ok(AcpBackendConfig::Qoder),
         "vibe" => Ok(AcpBackendConfig::Vibe),
+        "gemini" => Ok(AcpBackendConfig::Gemini),
         "custom" => Ok(AcpBackendConfig::Custom),
         _ => anyhow::bail!("unsupported acp backend `{value}`"),
     }

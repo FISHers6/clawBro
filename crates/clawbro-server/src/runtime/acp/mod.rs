@@ -20,6 +20,7 @@ pub enum AcpBackend {
     Opencode,
     Qoder,
     Vibe,
+    Gemini,
     Custom,
 }
 
@@ -67,6 +68,27 @@ pub fn supports_native_local_skills(backend: Option<AcpBackend>) -> bool {
                 | AcpBackend::Opencode
                 | AcpBackend::Qoder
                 | AcpBackend::Vibe
+                | AcpBackend::Gemini
         )
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn supports_native_local_skills_gemini_returns_true() {
+        assert!(supports_native_local_skills(Some(AcpBackend::Gemini)));
+    }
+
+    #[test]
+    fn supports_native_local_skills_custom_returns_false() {
+        assert!(!supports_native_local_skills(Some(AcpBackend::Custom)));
+    }
+
+    #[test]
+    fn supports_native_local_skills_none_returns_false() {
+        assert!(!supports_native_local_skills(None));
+    }
 }

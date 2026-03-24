@@ -462,6 +462,7 @@ fn acp_backend_mirror_root(
         Some(AcpBackend::Opencode) => Some(xdg_config_home.join("opencode").join("skills")),
         Some(AcpBackend::Qoder) => Some(home_dir.join(".qoder").join("skills")),
         Some(AcpBackend::Vibe) => Some(home_dir.join(".vibe").join("skills")),
+        Some(AcpBackend::Gemini) => Some(home_dir.join(".gemini").join("skills")),
         Some(AcpBackend::Custom) | None => None,
     }
 }

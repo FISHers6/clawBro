@@ -122,7 +122,8 @@ The `acp` family supports an optional `acp_backend` field that identifies the sp
 **Constraints:**
 - `acp_backend` is only valid when `family = "acp"`. Other families reject it at config validation.
 - `config.toml` does **not** support `${ENV_VAR}` interpolation inside TOML values. All values must be literal strings.
-- Gemini is not a validated `acp_backend` in this version.
+
+**Supported backends include:** `claude`, `codex`, `codebuddy`, `qwen`, `iflow`, `goose`, `kimi`, `opencode` (`opencode acp`), `qoder` (`qodercli --acp`), `vibe`, `gemini` (`gemini --acp`), `custom`. All have been validated via ACP probe (`protocolVersion: 1`).
 
 ### Claude via claude-agent-acp (bridge-backed)
 
@@ -215,6 +216,61 @@ type = "external_command"
 command = "goose"
 args = ["acp"]
 ```
+
+### OpenCode via ACP subcommand path
+
+`opencode` uses a subcommand (`opencode acp`), not a flag. The args must be `["acp"]`.
+
+```toml
+[[backend]]
+id = "opencode-main"
+family = "acp"
+acp_backend = "opencode"
+
+[backend.launch]
+type = "external_command"
+command = "opencode"
+args = ["acp"]
+```
+
+Install: `npm install -g opencode-ai`
+
+### Qoder via generic ACP CLI
+
+The npm package `@qoder-ai/qodercli` installs the binary as `qodercli`, not `qoder`.
+
+```toml
+[[backend]]
+id = "qoder-main"
+family = "acp"
+acp_backend = "qoder"
+
+[backend.launch]
+type = "external_command"
+command = "qodercli"
+args = ["--acp"]
+```
+
+Install: `npm install -g @qoder-ai/qodercli`
+
+### Gemini CLI via generic ACP CLI
+
+```toml
+[[backend]]
+id = "gemini-main"
+family = "acp"
+acp_backend = "gemini"
+
+[backend.launch]
+type = "external_command"
+command = "gemini"
+args = ["--acp"]
+
+[backend.launch.env]
+GEMINI_API_KEY = "your-gemini-api-key"
+```
+
+Install: `npm install -g @google/gemini-cli`
 
 ### Generic or custom ACP backend (no explicit identity)
 

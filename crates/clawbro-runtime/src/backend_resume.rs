@@ -158,6 +158,7 @@ fn acp_backend_name(backend: crate::acp::AcpBackend) -> &'static str {
         crate::acp::AcpBackend::Opencode => "opencode",
         crate::acp::AcpBackend::Qoder => "qoder",
         crate::acp::AcpBackend::Vibe => "vibe",
+        crate::acp::AcpBackend::Gemini => "gemini",
         crate::acp::AcpBackend::Custom => "custom",
     }
 }

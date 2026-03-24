@@ -46,6 +46,16 @@
 
 > `clawBro` 适合工程协作、研究工作流、群聊 AI 助手和多 Agent 实验，而不是单纯做一个最轻量的对话 CLI。
 
+## 📸 效果演示
+
+<table align="center">
+  <tr align="center">
+    <td><img src="./assets/demo-multi-bot-mention.png" width="260"><br><sub><b>群聊中同时 @ 多个 Bot</b></sub></td>
+    <td><img src="./assets/demo-scheduled-tasks.png" width="260"><br><sub><b>通过聊天创建定时任务</b></sub></td>
+    <td><img src="./assets/demo-wechat-team.png" width="260"><br><sub><b>微信中使用 Team 模式协作</b></sub></td>
+  </tr>
+</table>
+
 ## clawBro 的核心特点
 
 🏛️ **统一入口**：一个 `clawbro` 命令，负责初始化、路由、会话、诊断和运行。
