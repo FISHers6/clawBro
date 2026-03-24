@@ -155,14 +155,14 @@ async fn handle_send_message(
     }
 
     // Target is an agent name — verify it exists in roster before dispatching.
-    let agent_exists = state
+    let roster_entry = state
         .registry
         .roster
         .as_ref()
         .and_then(|r| r.find_by_name(target))
-        .is_some();
+        .map(|e| (e.name.clone(), e.mentions.clone()));
 
-    if !agent_exists {
+    let Some((agent_name, agent_mentions)) = roster_entry else {
         return (
             StatusCode::BAD_REQUEST,
             TeamToolResponse {
@@ -171,14 +171,39 @@ async fn handle_send_message(
                 payload: None,
             },
         );
+    };
+
+    // Use the stored mention string — routing.rs resolves target_agent via find_by_mention(),
+    // so the mention must match what's in the roster, not a synthesized "@{name}".
+    let mention = agent_mentions
+        .first()
+        .cloned()
+        .unwrap_or_else(|| format!("@{}", agent_name));
+
+    // Self-send guard: prevent agent from dispatching a turn to itself.
+    // For specialist sessions, scope encodes the agent name as the last colon-separated token.
+    // For Solo sessions, full detection requires registry introspection (V1 limitation: not detected).
+    let caller_scope_tokens: Vec<&str> = caller_session.scope.split(':').collect();
+    let caller_encoded_agent = caller_scope_tokens.last().copied().unwrap_or("");
+    if !caller_encoded_agent.is_empty()
+        && agent_name.to_lowercase() == caller_encoded_agent.to_lowercase()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            TeamToolResponse {
+                ok: false,
+                message: format!(
+                    "Cannot send message to '{}': self-send detected. An agent cannot dispatch a turn to itself.",
+                    agent_name
+                ),
+                payload: None,
+            },
+        );
     }
 
     let scope = scope_override.unwrap_or(&caller_session.scope).to_string();
     let session_key = SessionKey::new("ws", &scope);
     let turn_id = uuid::Uuid::new_v4().to_string();
-    // IMPORTANT: target_agent must be @mention format — routing.rs uses find_by_mention(),
-    // not find_by_name(). Agent names from roster must be prefixed with "@".
-    let mention = format!("@{}", target);
     let inbound = InboundMsg {
         id: turn_id,
         session_key,
@@ -187,8 +212,8 @@ async fn handle_send_message(
         channel: "ws".to_string(),
         timestamp: chrono::Utc::now(),
         thread_ts: None,
-        target_agent: Some(mention),
-        source: MsgSource::TeamNotify,
+        target_agent: Some(mention.clone()),
+        source: MsgSource::BotMention,
     };
     spawn_im_turn(
         Arc::clone(&state.registry),
@@ -203,7 +228,7 @@ async fn handle_send_message(
         StatusCode::OK,
         TeamToolResponse {
             ok: true,
-            message: format!("Message dispatched to agent '@{}'.", target),
+            message: format!("Message dispatched to agent '{}'.", mention),
             payload: None,
         },
     )
