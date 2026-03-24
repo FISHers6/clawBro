@@ -197,10 +197,8 @@ pub fn render_history_lines(
     let mut assistant_seen = 0usize;
 
     for msg in history_messages {
-        if msg.content.trim().is_empty() {
-            if !msg.role.eq_ignore_ascii_case("assistant") {
-                continue;
-            }
+        if msg.content.trim().is_empty() && !msg.role.eq_ignore_ascii_case("assistant") {
+            continue;
         }
         let content = match msg.sender.as_deref() {
             Some(sender) if !sender.is_empty() => format!("[{sender}]: {}", msg.content),

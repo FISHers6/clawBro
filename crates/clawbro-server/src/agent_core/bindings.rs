@@ -117,9 +117,7 @@ pub fn resolve_channel_instance_binding_for_target<'a>(
     target_agent: &str,
     bindings: &'a [BindingRule],
 ) -> Option<&'a BindingRule> {
-    let Some(channel_instance) = session_key.channel_instance.as_deref() else {
-        return None;
-    };
+    let channel_instance = session_key.channel_instance.as_deref()?;
     let target_instance = target_agent.trim().trim_start_matches('@');
     if target_instance != channel_instance {
         return None;

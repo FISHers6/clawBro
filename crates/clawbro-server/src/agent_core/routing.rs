@@ -91,7 +91,7 @@ pub(crate) fn resolve_turn_routing(
                     })
                 }
             })
-            .or_else(|| lead_fallback_match)
+            .or(lead_fallback_match)
             .or(deterministic_binding_match)
             .or_else(|| {
                 if inbound.target_agent.is_none() && session_backend_id.is_none() {

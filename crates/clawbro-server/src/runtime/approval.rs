@@ -253,9 +253,8 @@ mod tests {
         broker.set_dashboard_sender(tx);
 
         assert!(!broker.resolve("missing-approval", ApprovalDecision::Deny));
-        assert!(matches!(
-            tokio::time::timeout(Duration::from_millis(25), rx.recv()).await,
-            Err(_)
-        ));
+        assert!(tokio::time::timeout(Duration::from_millis(25), rx.recv())
+            .await
+            .is_err());
     }
 }

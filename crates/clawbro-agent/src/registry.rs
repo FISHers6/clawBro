@@ -1301,6 +1301,7 @@ mod tests {
         )
     }
 
+    #[allow(clippy::type_complexity)]
     struct FakeRuntimeDispatch {
         calls: Arc<AtomicUsize>,
         last_backend: Arc<std::sync::Mutex<Option<String>>>,

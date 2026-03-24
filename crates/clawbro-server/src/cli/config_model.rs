@@ -120,11 +120,7 @@ impl ConfigGraph {
     }
 
     pub fn to_gateway_config(&self) -> GatewayConfig {
-        let team_scopes = self
-            .team_scopes
-            .iter()
-            .map(|(_, team_scope)| team_scope.clone())
-            .collect();
+        let team_scopes = self.team_scopes.values().cloned().collect();
         GatewayConfig {
             gateway: self.gateway.clone(),
             agent: self.agent.clone(),

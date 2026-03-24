@@ -2201,7 +2201,7 @@ mod tests {
             "T004R",
             "codex",
             "ready for review",
-            Some("# Result\n\nDraft explanation body.".into()),
+            Some("# Result\n\nDraft explanation body."),
         )
         .unwrap();
 

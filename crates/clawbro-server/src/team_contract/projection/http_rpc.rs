@@ -61,7 +61,14 @@ pub async fn invoke_team_http_request(
     else {
         unreachable!()
     };
-    handle_send_message(state, &request.session_key, &target, &message, scope.as_deref()).await
+    handle_send_message(
+        state,
+        &request.session_key,
+        &target,
+        &message,
+        scope.as_deref(),
+    )
+    .await
 }
 
 fn handle_list_agents(state: &AppState) -> (StatusCode, TeamToolResponse) {
@@ -86,11 +93,12 @@ fn handle_list_agents(state: &AppState) -> (StatusCode, TeamToolResponse) {
     let message = if agents.is_empty() {
         "No agents configured in roster.".to_string()
     } else {
-        let names: Vec<&str> = agents
-            .iter()
-            .filter_map(|v| v["name"].as_str())
-            .collect();
-        format!("Roster has {} agent(s): {}.", agents.len(), names.join(", "))
+        let names: Vec<&str> = agents.iter().filter_map(|v| v["name"].as_str()).collect();
+        format!(
+            "Roster has {} agent(s): {}.",
+            agents.len(),
+            names.join(", ")
+        )
     };
 
     (
@@ -114,9 +122,7 @@ async fn handle_send_message(
     // V1 limitation: response is broadcast via WebSocket only (WsVirtualChannel is a no-op sender
     // for IM channels — DingTalk/Lark delivery will be added in a future version).
     if target.eq_ignore_ascii_case("user") {
-        let scope = scope_override
-            .unwrap_or(&caller_session.scope)
-            .to_string();
+        let scope = scope_override.unwrap_or(&caller_session.scope).to_string();
         let session_key = SessionKey::new("ws", &scope);
         let turn_id = uuid::Uuid::new_v4().to_string();
         let inbound = InboundMsg {
@@ -167,9 +173,7 @@ async fn handle_send_message(
         );
     }
 
-    let scope = scope_override
-        .unwrap_or(&caller_session.scope)
-        .to_string();
+    let scope = scope_override.unwrap_or(&caller_session.scope).to_string();
     let session_key = SessionKey::new("ws", &scope);
     let turn_id = uuid::Uuid::new_v4().to_string();
     // IMPORTANT: target_agent must be @mention format — routing.rs uses find_by_mention(),

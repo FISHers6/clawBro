@@ -14,7 +14,7 @@ impl NTurnDistillTrigger {
         Self { n }
     }
     pub fn should_fire_for(&self, turn_count: u64) -> bool {
-        turn_count > 0 && turn_count % self.n == 0
+        turn_count > 0 && turn_count.is_multiple_of(self.n)
     }
 }
 

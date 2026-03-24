@@ -838,7 +838,7 @@ mod tests {
             .unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["default_backend_id"], "native-main");
-        assert!(json["roster_agents"].as_array().unwrap().len() >= 1);
+        assert!(!json["roster_agents"].as_array().unwrap().is_empty());
         assert!(json["team_scopes"].is_array());
         assert!(json["channels"]
             .as_array()

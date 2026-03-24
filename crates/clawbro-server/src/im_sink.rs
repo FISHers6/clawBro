@@ -197,6 +197,7 @@ fn decide_final_delivery(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_team_channel_send(
     team_orchestrator: Option<&Arc<TeamOrchestrator>>,
     session_key: &SessionKey,
@@ -258,6 +259,7 @@ fn record_team_channel_send(
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn delivery_parts_or_fallback(
     resolved: Option<ResolvedDelivery>,
     fallback_channel: Arc<dyn Channel>,

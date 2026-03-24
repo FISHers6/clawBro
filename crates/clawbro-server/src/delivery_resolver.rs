@@ -27,6 +27,7 @@ impl ResolvedDelivery {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_delivery(
     cfg: &GatewayConfig,
     channels: &ChannelRegistry,

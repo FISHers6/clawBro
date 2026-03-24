@@ -663,8 +663,7 @@ fn inject_social_tools_only<M: CompletionModel>(
     tracker: Option<ToolProgressTracker>,
     approval_mode: ApprovalMode,
 ) -> ConfiguredAgentBuilder<M> {
-    let tracker =
-        tracker.unwrap_or_else(|| ToolProgressTracker::new(std::sync::Arc::new(|_| {})));
+    let tracker = tracker.unwrap_or_else(|| ToolProgressTracker::new(std::sync::Arc::new(|_| {})));
     builder = builder.tool(EventedTool::new(
         ListAgentsTool::new(client.clone()),
         Some(tracker.clone()),

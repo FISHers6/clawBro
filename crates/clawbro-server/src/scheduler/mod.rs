@@ -1,5 +1,6 @@
 pub mod models;
 pub mod schedule;
+#[allow(clippy::module_inception)]
 pub mod scheduler;
 pub mod service;
 pub mod store;

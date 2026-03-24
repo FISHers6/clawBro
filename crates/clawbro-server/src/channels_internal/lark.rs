@@ -129,6 +129,7 @@ impl LarkChannel {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_instance(
         instance_id: impl Into<String>,
         bot_name: Option<String>,

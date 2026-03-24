@@ -121,15 +121,9 @@ async fn build_team_harness(
     runtime_registry
         .register_adapter(lead_adapter_key, lead_adapter)
         .await;
-    if lead_adapter_key != specialist_adapter_key {
-        runtime_registry
-            .register_adapter(specialist_adapter_key, specialist_adapter)
-            .await;
-    } else {
-        runtime_registry
-            .register_adapter(specialist_adapter_key, specialist_adapter)
-            .await;
-    }
+    runtime_registry
+        .register_adapter(specialist_adapter_key, specialist_adapter)
+        .await;
     runtime_registry.register_backend(lead_backend).await;
     runtime_registry.register_backend(specialist_backend).await;
 

@@ -404,7 +404,6 @@ fn runtime_context_from_ctx(
         history_messages,
         transcript_semantics,
         user_input: Some(ctx.user_text.clone()),
-        ..RuntimeContext::default()
     }
 }
 
@@ -601,6 +600,7 @@ fn runtime_event_kind(event: &RuntimeEvent) -> &'static str {
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
     use crate::runtime::{
@@ -847,13 +847,12 @@ mod tests {
         let mut saw_complete = false;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
         while tokio::time::Instant::now() < deadline {
-            if let Ok(Ok(event)) = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await
+            if let Ok(Ok(AgentEvent::TurnComplete { full_text, .. })) =
+                tokio::time::timeout(Duration::from_millis(50), rx.recv()).await
             {
-                if let AgentEvent::TurnComplete { full_text, .. } = event {
-                    if full_text == "hello world" {
-                        saw_complete = true;
-                        break;
-                    }
+                if full_text == "hello world" {
+                    saw_complete = true;
+                    break;
                 }
             }
         }

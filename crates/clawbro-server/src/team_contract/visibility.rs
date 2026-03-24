@@ -13,10 +13,7 @@ pub struct TeamToolVisibility {
 
 pub fn visible_team_tools_for_role(role: RuntimeRole) -> TeamToolVisibility {
     let visible = match role {
-        RuntimeRole::Solo => vec![
-            TeamTool::ListAgents,
-            TeamTool::SendMessage,
-        ],
+        RuntimeRole::Solo => vec![TeamTool::ListAgents, TeamTool::SendMessage],
         RuntimeRole::Leader => vec![
             TeamTool::CreateTask,
             TeamTool::StartExecution,

@@ -196,7 +196,7 @@ impl SchedulerStore {
           ORDER BY name
             "#,
         )?;
-        let rows = stmt.query_map([], |row| read_job_row(row))?;
+        let rows = stmt.query_map([], read_job_row)?;
         let mut jobs = Vec::new();
         for row in rows {
             jobs.push(row?);

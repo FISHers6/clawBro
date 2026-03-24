@@ -1783,6 +1783,7 @@ mod tests {
     /// Verifies that the resume branch is only taken when all three conditions hold:
     /// AcpLoadSession strategy + load_session capability + prior session ID present.
     #[test]
+    #[allow(clippy::nonminimal_bool, clippy::overly_complex_bool_expr)]
     fn resume_branch_requires_strategy_plus_capability_plus_prior_id() {
         use crate::runtime::acp::policy::ResumeStrategy;
 

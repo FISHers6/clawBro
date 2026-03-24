@@ -472,39 +472,6 @@ fn normalize_schedule_helper_command(
     normalized
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn resolve_helper_session_key_accepts_explicit_channel_and_scope() {
-        let key = resolve_helper_session_key(Some("lark".into()), Some("group:oc_test".into()))
-            .expect("explicit session key");
-        assert_eq!(key.channel, "lark");
-        assert_eq!(key.scope, "group:oc_test");
-    }
-
-    #[test]
-    fn resolve_helper_session_key_reads_env_session_ref() {
-        unsafe {
-            std::env::set_var("CLAWBRO_SESSION_REF", "lark@alpha:group:oc_test");
-        }
-        let key = resolve_helper_session_key(None, None).expect("env session key");
-        assert_eq!(key.channel, "lark");
-        assert_eq!(key.scope, "group:oc_test");
-        assert_eq!(key.channel_instance.as_deref(), Some("alpha"));
-        unsafe {
-            std::env::remove_var("CLAWBRO_SESSION_REF");
-        }
-    }
-
-    #[test]
-    fn resolve_helper_session_key_rejects_partial_explicit_args() {
-        let err = resolve_helper_session_key(Some("lark".into()), None).unwrap_err();
-        assert!(err.to_string().contains("must be provided together"));
-    }
-}
-
 fn infer_schedule_kind_from_flags(args: &[String]) -> Option<String> {
     let mut inferred = Vec::new();
     if args.iter().any(|arg| arg == "--expr") {
@@ -748,4 +715,37 @@ async fn invoke_schedule_command(command: &[String]) -> Result<Value> {
         .and_then(Value::as_str)
         .unwrap_or("schedule command failed");
     bail!("{message}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_helper_session_key_accepts_explicit_channel_and_scope() {
+        let key = resolve_helper_session_key(Some("lark".into()), Some("group:oc_test".into()))
+            .expect("explicit session key");
+        assert_eq!(key.channel, "lark");
+        assert_eq!(key.scope, "group:oc_test");
+    }
+
+    #[test]
+    fn resolve_helper_session_key_reads_env_session_ref() {
+        unsafe {
+            std::env::set_var("CLAWBRO_SESSION_REF", "lark@alpha:group:oc_test");
+        }
+        let key = resolve_helper_session_key(None, None).expect("env session key");
+        assert_eq!(key.channel, "lark");
+        assert_eq!(key.scope, "group:oc_test");
+        assert_eq!(key.channel_instance.as_deref(), Some("alpha"));
+        unsafe {
+            std::env::remove_var("CLAWBRO_SESSION_REF");
+        }
+    }
+
+    #[test]
+    fn resolve_helper_session_key_rejects_partial_explicit_args() {
+        let err = resolve_helper_session_key(Some("lark".into()), None).unwrap_err();
+        assert!(err.to_string().contains("must be provided together"));
+    }
 }
