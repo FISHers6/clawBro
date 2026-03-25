@@ -332,10 +332,9 @@ pub(crate) fn expand_for_multi_agent(
     }
 
     let target = inbound.target_agent.as_deref();
-    let is_broadcast_target = target.is_none()
-        || target
-            .map(|t| t.eq_ignore_ascii_case("@all"))
-            .unwrap_or(false);
+    let is_broadcast_target = target
+        .map(|t| t.eq_ignore_ascii_case("@all"))
+        .unwrap_or(true); // None → no specific target → broadcast
 
     // Broadcast: Human sends with no mention or @all → expand to every roster agent.
     if is_broadcast_target && matches!(inbound.source, MsgSource::Human) {
@@ -344,11 +343,18 @@ pub(crate) fn expand_for_multi_agent(
             .iter()
             .map(|agent| {
                 let scoped_scope = agent_scoped_scope(base_scope, &agent.name);
-                let mention = agent
-                    .mentions
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| format!("@{}", agent.name));
+                let mention = if let Some(m) = agent.mentions.first() {
+                    m.clone()
+                } else {
+                    let synthetic = format!("@{}", agent.name);
+                    tracing::warn!(
+                        agent_name = %agent.name,
+                        synthetic_mention = %synthetic,
+                        "Agent has no configured mentions; using synthetic mention for broadcast dispatch. \
+                         Configure at least one mention in [[agent_roster]] to avoid this."
+                    );
+                    synthetic
+                };
                 let mut msg = inbound.clone();
                 msg.session_key.scope = scoped_scope;
                 msg.target_agent = Some(mention.clone());
@@ -382,6 +388,17 @@ pub fn spawn_im_turn(
     // Multi-agent expansion: may produce >1 message for broadcast scenarios.
     let expanded = expand_for_multi_agent(&inbound, &registry);
     if expanded.len() > 1 {
+        // Safety: each expanded message must have a specific target_agent (not @all),
+        // otherwise the recursive call would re-enter broadcast expansion indefinitely.
+        debug_assert!(
+            expanded.iter().all(|m| {
+                m.target_agent
+                    .as_deref()
+                    .map(|t| !t.eq_ignore_ascii_case("@all"))
+                    .unwrap_or(false)
+            }),
+            "expand_for_multi_agent produced a fanout message without a specific target_agent"
+        );
         for msg in expanded {
             spawn_im_turn(
                 Arc::clone(&registry),
