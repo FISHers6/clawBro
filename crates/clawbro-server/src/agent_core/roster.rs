@@ -69,11 +69,6 @@ impl AgentRoster {
             .find(|entry| entry.name.to_lowercase() == name_lower)
     }
 
-    /// Returns true if message text contains "@all" broadcast trigger.
-    pub fn is_broadcast(text: &str) -> bool {
-        text.to_lowercase().contains("@all")
-    }
-
     /// All agents in roster order.
     pub fn all_agents(&self) -> &[AgentEntry] {
         &self.agents
@@ -184,18 +179,6 @@ mod tests {
     fn test_find_by_name_no_match() {
         let roster = make_mention_roster();
         assert!(roster.find_by_name("nonexistent").is_none());
-    }
-
-    #[test]
-    fn test_is_broadcast_true() {
-        assert!(AgentRoster::is_broadcast("@all hello everyone"));
-        assert!(AgentRoster::is_broadcast("@ALL"));
-    }
-
-    #[test]
-    fn test_is_broadcast_false() {
-        assert!(!AgentRoster::is_broadcast("@mybot please help"));
-        assert!(!AgentRoster::is_broadcast("hello world"));
     }
 
     #[test]

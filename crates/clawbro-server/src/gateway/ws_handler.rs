@@ -183,6 +183,11 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                                     &mut local_subscriptions,
                                     &inbound.session_key,
                                 );
+                                // NOTE(V1-limitation): WS path calls handle_with_context directly,
+                                // bypassing expand_for_multi_agent in im_sink.rs. In multi-agent Solo
+                                // deployments, WS clients must include an explicit @mention to route
+                                // to a specific agent. @all broadcast is not supported over WebSocket.
+                                // See docs/plans/2026-03-25-multi-agent-session-isolation.md § V1 限制.
                                 let registry = state.registry.clone();
                                 tokio::spawn(async move {
                                     if let Err(e) = registry
