@@ -34,7 +34,12 @@ pub struct AgentRoster {
 
 /// Returns `"{scope}:{agent_name_lowercase}"` — used for per-agent session isolation
 /// in multi-agent Solo deployments.
+///
+/// # Panics (debug only)
+/// Panics if `scope` or `agent_name` is empty.
 pub fn agent_scoped_scope(scope: &str, agent_name: &str) -> String {
+    debug_assert!(!scope.is_empty(), "scope must not be empty");
+    debug_assert!(!agent_name.is_empty(), "agent_name must not be empty");
     format!("{}:{}", scope, agent_name.to_lowercase())
 }
 
@@ -87,8 +92,10 @@ impl AgentRoster {
     pub fn conversation_scope<'a>(&self, scope: &'a str) -> &'a str {
         for agent in &self.agents {
             let suffix = format!(":{}", agent.name.to_lowercase());
-            if scope.len() > suffix.len() && scope.ends_with(&suffix) {
-                return &scope[..scope.len() - suffix.len()];
+            if let Some(base) = scope.strip_suffix(suffix.as_str()) {
+                if !base.is_empty() {
+                    return base;
+                }
             }
         }
         scope
@@ -314,5 +321,32 @@ backend_id = "claude-main"
         let roster = make_roster();
         // "ghost" is not in roster — must not be stripped
         assert_eq!(roster.conversation_scope("group:abc:ghost"), "group:abc:ghost");
+    }
+
+    #[test]
+    fn conversation_scope_does_not_partial_strip_longer_suffix() {
+        // Agent "ex" must not strip ":codex" — suffix must match exactly as ":ex"
+        let roster = AgentRoster::new(vec![
+            AgentEntry {
+                name: "ex".to_string(),
+                mentions: vec!["@ex".to_string()],
+                backend_id: "ex".to_string(),
+                persona_dir: None,
+                workspace_dir: None,
+                extra_skills_dirs: vec![],
+            },
+            AgentEntry {
+                name: "codex".to_string(),
+                mentions: vec!["@codex".to_string()],
+                backend_id: "codex".to_string(),
+                persona_dir: None,
+                workspace_dir: None,
+                extra_skills_dirs: vec![],
+            },
+        ]);
+        // "group:abc:codex" ends with ":codex", not ":ex" — must strip to "group:abc"
+        assert_eq!(roster.conversation_scope("group:abc:codex"), "group:abc");
+        // "group:abc:ex" ends with ":ex" — must strip to "group:abc"
+        assert_eq!(roster.conversation_scope("group:abc:ex"), "group:abc");
     }
 }
