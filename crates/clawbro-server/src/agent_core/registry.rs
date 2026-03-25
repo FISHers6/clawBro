@@ -532,6 +532,12 @@ impl SessionRegistry {
             .map(|entry| entry.value().clone())
     }
 
+    /// Returns true if a TeamOrchestrator is registered for the session key's scope.
+    /// Used by multi-agent broadcast expansion to skip team-mode sessions.
+    pub fn has_active_team_for_key(&self, session_key: &SessionKey) -> bool {
+        self.get_orchestrator_for_session(session_key).is_some()
+    }
+
     #[cfg(test)]
     pub(crate) fn memory_control(&self) -> MemoryControlContext<'_> {
         MemoryControlContext { registry: self }
@@ -3769,5 +3775,12 @@ mod tests {
             result.starts_with("relay-processed:"),
             "non-Lead turn must enter relay branch"
         );
+    }
+
+    #[test]
+    fn has_active_team_returns_false_when_no_orchestrator() {
+        let (registry, _rx) = make_registry();
+        let key = SessionKey::new("lark", "group:oc_test");
+        assert!(!registry.has_active_team_for_key(&key));
     }
 }
