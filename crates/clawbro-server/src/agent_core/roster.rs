@@ -32,6 +32,12 @@ pub struct AgentRoster {
     agents: Vec<AgentEntry>,
 }
 
+/// Returns `"{scope}:{agent_name_lowercase}"` — used for per-agent session isolation
+/// in multi-agent Solo deployments.
+pub fn agent_scoped_scope(scope: &str, agent_name: &str) -> String {
+    format!("{}:{}", scope, agent_name.to_lowercase())
+}
+
 impl AgentRoster {
     pub fn new(agents: Vec<AgentEntry>) -> Self {
         Self { agents }
@@ -72,6 +78,21 @@ impl AgentRoster {
     pub fn default_agent(&self) -> Option<&AgentEntry> {
         self.agents.first()
     }
+
+    /// Strips the per-agent suffix added by `agent_scoped_scope`, restoring the
+    /// original conversation scope.
+    ///
+    /// `"group:abc:claude"` → `"group:abc"` (when "claude" is in roster)
+    /// `"group:abc"` → `"group:abc"` (no suffix, returned as-is)
+    pub fn conversation_scope<'a>(&self, scope: &'a str) -> &'a str {
+        for agent in &self.agents {
+            let suffix = format!(":{}", agent.name.to_lowercase());
+            if scope.len() > suffix.len() && scope.ends_with(&suffix) {
+                return &scope[..scope.len() - suffix.len()];
+            }
+        }
+        scope
+    }
 }
 
 impl AgentEntry {
@@ -84,7 +105,7 @@ impl AgentEntry {
 mod tests {
     use super::*;
 
-    fn make_roster() -> AgentRoster {
+    fn make_mention_roster() -> AgentRoster {
         AgentRoster::new(vec![
             AgentEntry {
                 name: "mybot".to_string(),
@@ -107,54 +128,54 @@ mod tests {
 
     #[test]
     fn test_find_by_mention_exact() {
-        let roster = make_roster();
+        let roster = make_mention_roster();
         let entry = roster.find_by_mention("@mybot").unwrap();
         assert_eq!(entry.name, "mybot");
     }
 
     #[test]
     fn test_find_by_mention_alias() {
-        let roster = make_roster();
+        let roster = make_mention_roster();
         let entry = roster.find_by_mention("@dev-assistant").unwrap();
         assert_eq!(entry.name, "mybot");
     }
 
     #[test]
     fn test_find_by_mention_case_insensitive() {
-        let roster = make_roster();
+        let roster = make_mention_roster();
         let entry = roster.find_by_mention("@MYBOT").unwrap();
         assert_eq!(entry.name, "mybot");
     }
 
     #[test]
     fn test_find_by_mention_no_match() {
-        let roster = make_roster();
+        let roster = make_mention_roster();
         assert!(roster.find_by_mention("@unknown-bot").is_none());
     }
 
     #[test]
     fn test_find_by_mention_empty_string() {
-        let roster = make_roster();
+        let roster = make_mention_roster();
         assert!(roster.find_by_mention("").is_none());
     }
 
     #[test]
     fn test_find_by_name() {
-        let roster = make_roster();
+        let roster = make_mention_roster();
         let entry = roster.find_by_name("reviewer").unwrap();
         assert_eq!(entry.name, "reviewer");
     }
 
     #[test]
     fn test_find_by_name_case_insensitive() {
-        let roster = make_roster();
+        let roster = make_mention_roster();
         let entry = roster.find_by_name("MYBOT").unwrap();
         assert_eq!(entry.name, "mybot");
     }
 
     #[test]
     fn test_find_by_name_no_match() {
-        let roster = make_roster();
+        let roster = make_mention_roster();
         assert!(roster.find_by_name("nonexistent").is_none());
     }
 
@@ -172,7 +193,7 @@ mod tests {
 
     #[test]
     fn test_default_agent_is_first() {
-        let roster = make_roster();
+        let roster = make_mention_roster();
         assert_eq!(roster.default_agent().unwrap().name, "mybot");
     }
 
@@ -245,5 +266,53 @@ backend_id = "claude-main"
         "#;
         let entry: AgentEntry = toml::from_str(toml).unwrap();
         assert!(entry.extra_skills_dirs.is_empty());
+    }
+
+    fn make_roster() -> AgentRoster {
+        AgentRoster::new(vec![
+            AgentEntry {
+                name: "claude".to_string(),
+                mentions: vec!["@claude".to_string()],
+                backend_id: "claude".to_string(),
+                persona_dir: None,
+                workspace_dir: None,
+                extra_skills_dirs: vec![],
+            },
+            AgentEntry {
+                name: "codex".to_string(),
+                mentions: vec!["@codex".to_string()],
+                backend_id: "codex".to_string(),
+                persona_dir: None,
+                workspace_dir: None,
+                extra_skills_dirs: vec![],
+            },
+        ])
+    }
+
+    #[test]
+    fn agent_scoped_scope_appends_lowercase_name() {
+        assert_eq!(agent_scoped_scope("group:abc", "Claude"), "group:abc:claude");
+        assert_eq!(agent_scoped_scope("user:123", "codex"), "user:123:codex");
+    }
+
+    #[test]
+    fn conversation_scope_strips_known_agent_suffix() {
+        let roster = make_roster();
+        assert_eq!(roster.conversation_scope("group:abc:claude"), "group:abc");
+        assert_eq!(roster.conversation_scope("group:abc:codex"), "group:abc");
+    }
+
+    #[test]
+    fn conversation_scope_passthrough_when_no_agent_suffix() {
+        let roster = make_roster();
+        assert_eq!(roster.conversation_scope("group:abc"), "group:abc");
+        assert_eq!(roster.conversation_scope("user:123"), "user:123");
+    }
+
+    #[test]
+    fn conversation_scope_does_not_strip_unknown_suffix() {
+        let roster = make_roster();
+        // "ghost" is not in roster — must not be stripped
+        assert_eq!(roster.conversation_scope("group:abc:ghost"), "group:abc:ghost");
     }
 }
