@@ -58,7 +58,14 @@
   - [GET /api/teams](#get-apiteams)
   - [GET /api/teams/{team_id}](#get-apiteamsteam_id)
   - [GET /api/teams/{team_id}/artifacts](#get-apiteamsteam_idartifacts)
+  - [GET /api/teams/{team_id}/artifacts/{artifact_name}](#get-apiteamsteam_idartifactsartifact_name)
+  - [GET /api/teams/{team_id}/tasks](#get-apiteamsteam_idtasks)
   - [GET /api/teams/{team_id}/tasks/{task_id}](#get-apiteamsteam_idtaskstask_id)
+  - [GET /api/teams/{team_id}/tasks/{task_id}/artifacts](#get-apiteamsteam_idtaskstask_idartifacts)
+  - [GET /api/teams/{team_id}/leader-updates](#get-apiteamsteam_idleader-updates)
+  - [GET /api/teams/{team_id}/channel-sends](#get-apiteamsteam_idchannel-sends)
+  - [GET /api/teams/{team_id}/routing-events](#get-apiteamsteam_idrouting-events)
+  - [GET /api/teams/{team_id}/pending-completions](#get-apiteamsteam_idpending-completions)
 - [Tasks（任务）](#tasks任务)
   - [GET /api/tasks](#get-apitasks)
   - [GET /api/tasks/{task_id}](#get-apitaskstask_id)
@@ -197,14 +204,17 @@ Authorization: Bearer <token>
 {
   "type": "ResolveApproval",
   "approval_id": "approval-uuid",
-  "decision": "approve"
+  "decision": "allow-once"
 }
 ```
 
 | `decision` 取值 | 含义 |
 |-----------------|------|
-| `"approve"` | 批准 |
+| `"allow-once"` | 本次允许（推荐默认值） |
+| `"allow-always"` | 本次及此后同类调用均允许 |
 | `"deny"` | 拒绝 |
+
+> **注意**：`"approve"` 不是合法值，服务端会静默忽略未识别的 decision 字符串（`ApprovalDecision::parse()` 返回 `None`），导致审批永远挂起。
 
 #### 6. 发送聊天消息（InboundMsg，无 type 字段）
 
@@ -224,7 +234,7 @@ Authorization: Bearer <token>
   "sender": "web",
   "channel": "ws",
   "timestamp": "2026-03-22T10:00:00Z",
-  "source": "Human"
+  "source": "human"
 }
 ```
 
@@ -239,8 +249,8 @@ Authorization: Bearer <token>
 | `channel` | `string` | ✅ | 同 `session_key.channel`，填 `"ws"` |
 | `timestamp` | `string` | ✅ | ISO 8601 UTC 时间 |
 | `thread_ts` | `string?` | ❌ | 平台线程 ID，web chat 不需要 |
-| `target_agent` | `string?` | ❌ | 指定 Agent，如 `"@claude"`；不填则用默认 Agent |
-| `source` | `string` | ❌ | 来源类型，默认 `"Human"` |
+| `target_agent` | `string?` | ❌ | 指定目标 Agent，如 `"@claude"`；不填时：多 Agent 模式（配置了 roster）下广播给所有 roster Agent，单 Agent 模式下使用默认 Agent |
+| `source` | `string` | ❌ | 来源类型，默认 `"human"`（可省略，服务端自动填充）|
 
 **MsgContent 格式：**
 
@@ -389,6 +399,54 @@ Authorization: Bearer <token>
 | `{"kind":"team","team_id":"xxx"}` | `TeamLeaderUpdate`、`TeamChannelSend`、`TeamRoutingEvent`、`TaskUpdated` |
 | `{"kind":"task","team_id":"xxx","task_id":"T001"}` | 指定任务的 Team 事件 |
 
+**DashboardEvent 所有类型的 JSON 结构（`type` 字段为 snake_case）：**
+
+```json
+// ApprovalPending — 工具调用等待审批（Approvals topic）
+{ "type": "approval_pending", "request": { "id": "approval-uuid", "prompt": "...", "command": "rm ...", "cwd": "/tmp", "host": "localhost", "agent_id": "claude", "expires_at_ms": 1742640000000 } }
+
+// ApprovalResolved — 审批已处理（Approvals topic）
+// decision 值为 Rust enum 名："AllowOnce" | "AllowAlways" | "Deny"
+{ "type": "approval_resolved", "approval_id": "approval-uuid", "decision": "AllowOnce", "resolved": true }
+
+// SessionUpdated — session 状态变化（Session topic）
+{ "type": "session_updated", "summary": { "session_id": "uuid", "session_key": {"channel":"ws","scope":"main"}, "created_at": "2026-03-25T10:00:00Z", "updated_at": "2026-03-25T10:01:00Z", "message_count": 5, "status": "idle", "backend_id": "claude" } }
+
+// BackendUpdated — backend 健康状态变化（Backends / Backend topic）
+{ "type": "backend_updated", "backend": { "backend_id": "claude", "family": "Acp", "adapter_key": "acp", "registered": true, "adapter_registered": true, "probed": true, "healthy": true, "error": null, "notes": [] } }
+
+// ChannelUpdated — channel 状态变化（Channels / Channel topic）
+{ "type": "channel_updated", "channel": { "channel": "lark", "configured": true, "enabled": true, "routing_present": true, "credential_state": "ok", "notes": [] } }
+
+// SchedulerJobUpdated — 定时任务更新（Scheduler / SchedulerJob topic）
+{ "type": "scheduler_job_updated", "job": { "id": "job-uuid", "name": "daily", "enabled": true, ... } }
+
+// SchedulerJobDeleted — 定时任务删除（Scheduler / SchedulerJob topic）
+{ "type": "scheduler_job_deleted", "job_id": "job-uuid" }
+
+// SchedulerRunUpdated — 任务运行记录更新（Scheduler / SchedulerJob topic）
+{ "type": "scheduler_run_updated", "run": { "job_id": "job-uuid", ... } }
+
+// TeamLeaderUpdate — Lead Agent 发出进度更新（Team / Task topic）
+// kind: "post_update" | "final_answer_fragment" | "system_forward"
+{ "type": "team_leader_update", "team_id": "team-uuid", "record": { "event_id": "evt-uuid", "ts": "2026-03-25T10:00:00Z", "team_id": "team-uuid", "source_agent": "claude", "kind": "post_update", "text": "任务完成 50%...", "task_id": "T001" } }
+
+// TeamChannelSend — Team 向 IM 渠道发送消息（Team / Task topic）
+// source_kind: "lead_text" | "milestone" | "progress" | "tool_placeholder" | "gateway_error"
+// status: "sent" | "send_failed"
+{ "type": "team_channel_send", "team_id": "team-uuid", "record": { "event_id": "send-uuid", "ts": "...", "channel": "lark", "target_scope": "group:oc_xxx", "team_id": "team-uuid", "source_kind": "milestone", "source_agent": "claude", "task_id": "T001", "text": "里程碑完成", "status": "sent" } }
+
+// TeamRoutingEvent — 任务完成路由事件（Team / Task topic，内部协议，可按需消费）
+{ "type": "team_routing_event", "team_id": "team-uuid", "event": { "run_id": "...", "team_id": "team-uuid", "event": { "task_id": "T001", ... } } }
+
+// TeamPendingCompletion — 待路由的任务完成记录（Team / Task topic）
+{ "type": "team_pending_completion", "team_id": "team-uuid", "record": { ... } }
+
+// TaskUpdated — 任务状态机变化（Team / Task topic）
+// status_raw 格式："pending" | "claimed:{agent}:{iso8601}" | "submitted:{agent}:{iso8601}" | "accepted:{by}:{iso8601}" | "done" | "failed:{msg}" | "retrying:{n}"
+{ "type": "task_updated", "team_id": "team-uuid", "task": { "id": "T001", "title": "实现登录", "status_raw": "claimed:claude:2026-03-25T10:00:00Z", "deps_json": "[]", "assignee_hint": "claude", "retry_count": 0, "timeout_secs": 300, "spec": "...", "success_criteria": null, "completion_note": null, "created_at": "...", "done_at": null } }
+```
+
 ---
 
 ## 聊天
@@ -416,7 +474,7 @@ Content-Type: application/json
 |------|------|------|------|
 | `message` | `string` | ✅ | 用户消息内容，不能为空 |
 | `scope` | `string?` | ❌ | Session scope，默认 `"main"`；空字符串也会退回 `"main"` |
-| `agent` | `string?` | ❌ | 指定目标 Agent，如 `"@claude"`；不填则使用默认 Agent |
+| `agent` | `string?` | ❌ | 指定目标 Agent，如 `"@claude"`；不填时：多 Agent 模式（配置了 roster）下广播给所有 roster Agent，单 Agent 模式下使用默认 Agent |
 
 **Response 200**
 
@@ -930,11 +988,17 @@ Content-Type: application/json
 | `role` | `"user"` / `"assistant"` |
 | `sender` | 发送者标识，可能为 null |
 
+**Errors**
+
+| 状态码 | 原因 |
+|--------|------|
+| `404` | Session 不存在 |
+
 ---
 
 ### GET /api/sessions/events
 
-获取 Session 的原始事件日志（JSONL 形式，每条事件含 type + payload）。
+获取 Session 的原始事件日志（每条事件含 `event_type` + `payload`）。
 
 **Query 参数** — 同 `/api/sessions/detail`
 
@@ -945,12 +1009,31 @@ Content-Type: application/json
   "items": [
     {
       "timestamp": "2026-03-22T10:00:05Z",
-      "event_type": "TurnComplete",
-      "payload": { "full_text": "...", "sender": "claude" }
+      "event_type": "turn_complete",
+      "payload": { "session_id": "uuid", "full_text": "...", "sender": "claude" }
     }
   ]
 }
 ```
+
+> **`event_type` 取值（均为 snake_case）：**
+>
+> | event_type | payload 说明 |
+> |------------|-------------|
+> | `"text_delta"` | `{ session_id, delta }` — 流式文字片段 |
+> | `"turn_complete"` | `{ session_id, full_text, sender }` — 本轮完成 |
+> | `"thinking"` | `{ session_id }` — Agent 思考中 |
+> | `"tool_call_start"` | `{ session_id, tool_name, call_id }` — 工具调用开始 |
+> | `"tool_call_result"` | `{ session_id, call_id, result }` — 工具调用结果 |
+> | `"tool_call_failed"` | `{ session_id, tool_name, call_id, error }` — 工具调用失败 |
+> | `"approval_request"` | `{ session_id, session_key, approval_id, prompt, command, cwd, host, agent_id, expires_at_ms }` |
+> | `"error"` | `{ session_id, message }` — 执行错误 |
+
+**Errors**
+
+| 状态码 | 原因 |
+|--------|------|
+| `404` | Session 不存在 |
 
 ---
 
@@ -1177,14 +1260,14 @@ Content-Type: application/json
 
 ### POST /api/approvals/{approval_id}/approve
 
-批准工具调用。Agent 将继续执行。
+批准工具调用（等同于 WS `ResolveApproval` + `decision: "allow-once"`）。Agent 将继续执行。
 
 **Response 200**
 
 ```json
 {
   "approval_id": "approval-uuid",
-  "decision": "approve",
+  "decision": "allow-once",
   "resolved": true
 }
 ```
@@ -1205,7 +1288,9 @@ Content-Type: application/json
 }
 ```
 
-> 也可通过 WebSocket `ResolveApproval` 消息完成审批，效果相同。
+> **注意：** REST 接口只提供 `allow-once`（`/approve`）和 `deny`（`/deny`）两种决策。如需 `allow-always`（永久允许该 agent 执行此类工具调用），必须通过 WebSocket 的 `ResolveApproval` 消息发送 `"decision": "allow-always"`。
+
+> 也可通过 WebSocket `ResolveApproval` 消息完成所有三种审批决策（`allow-once` / `allow-always` / `deny`），效果与 REST 相同。
 
 ---
 
@@ -1224,9 +1309,15 @@ Content-Type: application/json
       "id": "job-uuid",
       "name": "daily-report",
       "enabled": true,
-      "schedule": { "cron": "0 9 * * *" },
+      "schedule": { "kind": "cron", "expr": "0 9 * * *" },
       "timezone": "Asia/Shanghai",
-      "target": { ... },
+      "target": {
+        "kind": "agent_turn",
+        "session_key": "lark/group:abc",
+        "prompt": "生成今日汇报",
+        "agent": null,
+        "preconditions": []
+      },
       "next_run_at": "2026-03-23T09:00:00Z",
       "last_run_at": "2026-03-22T09:00:00Z",
       "last_success_at": "2026-03-22T09:01:30Z",
@@ -1240,6 +1331,29 @@ Content-Type: application/json
   ]
 }
 ```
+
+> **schedule 类型：**
+>
+> ```json
+> // Cron 表达式（5字段，标准 cron）
+> { "kind": "cron", "expr": "0 9 * * *" }
+>
+> // 固定时间点（一次性）
+> { "kind": "at", "run_at": "2026-04-01T09:00:00Z" }
+>
+> // 固定间隔
+> { "kind": "every", "interval_ms": 60000 }
+> ```
+>
+> **target 类型：**
+>
+> ```json
+> // 发起 Agent 对话（Agent 会执行 prompt）
+> { "kind": "agent_turn", "session_key": "lark/group:abc", "prompt": "生成报告", "agent": null, "preconditions": [] }
+>
+> // 仅投递消息到 IM（不触发 Agent 执行）
+> { "kind": "delivery_message", "session_key": "lark/group:abc", "message": "提醒：每日站会" }
+> ```
 
 ---
 
@@ -1336,10 +1450,31 @@ Team 模式下，一个 Lead Agent 协调多个 Specialist Agent 并行完成复
       "task_counts": {
         "total": 5,
         "pending": 1,
-        "in_progress": 2,
-        "completed": 2,
+        "claimed": 1,
+        "submitted": 0,
+        "accepted": 1,
+        "done": 2,
         "failed": 0
       },
+      "artifact_health": {
+        "root_present": true,
+        "team_md_present": true,
+        "context_md_present": true,
+        "tasks_md_present": true,
+        "task_artifacts_present": true
+      },
+      "routing_stats": {
+        "direct_delivered": 3,
+        "queued_delivered": 0,
+        "fallback_redirected": 0,
+        "pending_count": 1,
+        "missing_delivery_target": 0,
+        "delivery_dedupe_ledger_size": 3,
+        "delivery_dedupe_hits": 0,
+        "failed_terminal": 0
+      },
+      "latest_leader_update": null,
+      "latest_channel_send": null,
       "healthy": true,
       "notes": []
     }
@@ -1347,11 +1482,24 @@ Team 模式下，一个 Lead Agent 协调多个 Specialist Agent 并行完成复
 }
 ```
 
+> **task_counts 字段说明**
+>
+> | 字段 | 说明 |
+> |------|------|
+> | `pending` | 未被认领，等待分配 |
+> | `claimed` | 已被某 agent 认领，执行中 |
+> | `submitted` | Agent 已提交结果，等待 Lead 接收 |
+> | `accepted` | Lead 已接收结果，等待最终确认 |
+> | `done` | 任务完成 |
+> | `failed` | 任务失败 |
+
 ---
 
 ### GET /api/teams/{team_id}
 
-获取单个 Team 详情（含 Leader 最新更新、Channel 发送记录、路由统计等）。
+获取单个 Team 详情。与列表 item 结构相同，包含完整字段。
+
+**Response 200** — 与列表 item 结构相同（含 `task_counts`、`artifact_health`、`routing_stats`、`latest_leader_update`、`latest_channel_send` 等所有字段）
 
 **Errors**
 
@@ -1363,7 +1511,7 @@ Team 模式下，一个 Lead Agent 协调多个 Specialist Agent 并行完成复
 
 ### GET /api/teams/{team_id}/artifacts
 
-获取 Team 工作目录中的上下文文件列表（TEAM.md、AGENTS.md、TASKS.md 等）。
+获取 Team 工作目录中的上下文文件列表。固定返回 5 个 artifact（无论是否存在）：`team`(TEAM.md)、`agents`(AGENTS.md)、`tasks`(TASKS.md)、`context`(CONTEXT.md)、`heartbeat`(HEARTBEAT.md)。
 
 **Response 200**
 
@@ -1373,11 +1521,61 @@ Team 模式下，一个 Lead Agent 协调多个 Specialist Agent 并行完成复
     {
       "name": "team",
       "file_name": "TEAM.md",
-      "path": "/home/user/.clawbro/teams/team-uuid/TEAM.md",
+      "path": "./TEAM.md",
       "present": true,
       "size_bytes": 1024
+    },
+    {
+      "name": "agents",
+      "file_name": "AGENTS.md",
+      "path": "./AGENTS.md",
+      "present": true,
+      "size_bytes": 512
     }
   ]
+}
+```
+
+---
+
+### GET /api/teams/{team_id}/artifacts/{artifact_name}
+
+获取单个 Team artifact 的完整内容。`artifact_name` 为 `team` / `agents` / `tasks` / `context` / `heartbeat`。
+
+**Response 200**
+
+```json
+{
+  "team_id": "team-uuid",
+  "artifact": {
+    "name": "team",
+    "file_name": "TEAM.md",
+    "path": "./TEAM.md",
+    "present": true,
+    "size_bytes": 1024
+  },
+  "content_type": "text/markdown",
+  "content": "# Team\n\n..."
+}
+```
+
+**Errors**
+
+| 状态码 | 原因 |
+|--------|------|
+| `404` | artifact_name 不合法或文件不存在 |
+
+---
+
+### GET /api/teams/{team_id}/tasks
+
+列出指定 Team 的所有 Task。结构与全局 `GET /api/tasks` 的 item 相同，但只含该 team 的任务。
+
+**Response 200**
+
+```json
+{
+  "items": [{ "team_id": "...", "id": "T001", "status_raw": "done", ... }]
 }
 ```
 
@@ -1394,24 +1592,141 @@ Team 模式下，一个 Lead Agent 协调多个 Specialist Agent 并行完成复
   "team_id": "team-uuid",
   "id": "T001",
   "title": "实现用户认证模块",
-  "status_raw": "completed",
+  "status_raw": "done",
   "assignee_hint": "claude",
   "retry_count": 0,
   "timeout_secs": 1800,
   "spec": "实现 JWT 认证...",
   "success_criteria": "所有测试通过",
   "completion_note": "已完成，PR 已提交",
+  "artifact_meta": { "assigned_agent": "claude", "started_at": "2026-03-22T10:00:00Z", "finished_at": "2026-03-22T10:15:00Z" },
   "artifacts": [
+    { "name": "meta", "file_name": "meta.json", "path": "./tasks/T001/meta.json", "present": true, "size_bytes": 128 },
+    { "name": "spec", "file_name": "spec.md", "path": "./tasks/T001/spec.md", "present": true, "size_bytes": 512 },
+    { "name": "plan", "file_name": "plan.md", "path": "./tasks/T001/plan.md", "present": false, "size_bytes": null },
+    { "name": "progress", "file_name": "progress.md", "path": "./tasks/T001/progress.md", "present": false, "size_bytes": null },
+    { "name": "result", "file_name": "result.md", "path": "./tasks/T001/result.md", "present": true, "size_bytes": 512 },
+    { "name": "review-feedback", "file_name": "review-feedback.md", "path": "./tasks/T001/review-feedback.md", "present": false, "size_bytes": null }
+  ]
+}
+```
+
+> **Task artifact 说明（固定返回全部 6 个，`present: false` 表示文件尚未生成）：**
+>
+> | name | file | 说明 |
+> |------|------|------|
+> | `meta` | meta.json | 执行元数据（content_type: `application/json`）|
+> | `spec` | spec.md | Agent 接收到的任务详细描述 |
+> | `plan` | plan.md | Agent 的执行计划 |
+> | `progress` | progress.md | Agent 的进度更新 |
+> | `result` | result.md | **最终产出**，Lead 的主要参考依据 |
+> | `review-feedback` | review-feedback.md | Lead 对结果的审查反馈 |
+
+---
+
+### GET /api/teams/{team_id}/tasks/{task_id}/artifacts
+
+列出指定 Task 的产出文件列表（同 task 详情 `artifacts` 字段，固定 6 项）。
+
+**Response 200**
+
+```json
+{
+  "items": [
+    { "name": "meta", "file_name": "meta.json", "path": "./tasks/T001/meta.json", "present": true, "size_bytes": 128 },
+    { "name": "result", "file_name": "result.md", "path": "./tasks/T001/result.md", "present": true, "size_bytes": 512 }
+  ]
+}
+```
+
+---
+
+### GET /api/teams/{team_id}/tasks/{task_id}/artifacts/{artifact_name}
+
+获取 Task 产出文件完整内容。`artifact_name` 为 `meta` / `spec` / `plan` / `progress` / `result` / `review-feedback`。
+
+**Response 200**
+
+```json
+{
+  "team_id": "team-uuid",
+  "task_id": "T001",
+  "artifact": { "name": "result", "file_name": "result.md", "path": "./tasks/T001/result.md", "present": true, "size_bytes": 512 },
+  "content_type": "text/markdown",
+  "content": "# Result\n\n..."
+}
+```
+
+> `content_type` 为 `"application/json"`（仅 `meta` artifact），其余均为 `"text/markdown"`。
+
+**Errors**
+
+| 状态码 | 原因 |
+|--------|------|
+| `404` | team_id / task_id / artifact_name 不存在，或文件尚未生成 |
+
+---
+
+### GET /api/teams/{team_id}/leader-updates
+
+获取 Lead Agent 历次更新记录（每次 Lead 向 Team 发布进度时写入）。
+
+**Response 200**
+
+```json
+{
+  "items": [
     {
-      "name": "result",
-      "file_name": "result.md",
-      "path": "/tasks/T001/result.md",
-      "present": true,
-      "size_bytes": 512
+      "kind": "post_update",
+      "text": "T001 已完成，开始 T002",
+      "timestamp": "2026-03-22T10:00:00Z"
     }
   ]
 }
 ```
+
+> `kind` 取值：`"post_update"` | `"final_answer_fragment"` | `"system_forward"`
+
+---
+
+### GET /api/teams/{team_id}/channel-sends
+
+获取 Team 向 IM Channel 发送消息的记录（含投递状态）。
+
+**Response 200**
+
+```json
+{
+  "items": [
+    {
+      "source_kind": "lead_text",
+      "status": "sent",
+      "text": "任务进行中...",
+      "timestamp": "2026-03-22T10:01:00Z"
+    }
+  ]
+}
+```
+
+> `source_kind` 取值：`"lead_text"` | `"milestone"` | `"progress"` | `"tool_placeholder"` | `"gateway_error"`
+>
+> `status` 取值：`"sent"` | `"send_failed"`
+
+---
+
+### GET /api/teams/{team_id}/routing-events
+
+获取 Task 完成路由事件记录（Specialist 提交结果时的路由过程）。
+
+**Response 200** — `{ "items": [...] }`（包含路由时间戳、target session key、投递状态等）
+
+---
+
+### GET /api/teams/{team_id}/pending-completions
+
+获取尚未被 Lead 处理的 Task 完成通知队列。
+
+**Response 200** — `{ "items": [...] }`（每项含 run_id、task_id、提交 agent、等待时间等）
 
 ---
 
@@ -1430,7 +1745,7 @@ Team 模式下，一个 Lead Agent 协调多个 Specialist Agent 并行完成复
       "team_id": "team-uuid",
       "id": "T001",
       "title": "实现用户认证",
-      "status_raw": "completed",
+      "status_raw": "done",
       "assignee_hint": "claude",
       "retry_count": 0,
       "timeout_secs": 1800,
@@ -1442,17 +1757,30 @@ Team 模式下，一个 Lead Agent 协调多个 Specialist Agent 并行完成复
 }
 ```
 
+> **status_raw 格式说明**
+>
+> | 值 | 说明 |
+> |----|------|
+> | `"pending"` | 等待认领 |
+> | `"claimed:{agent}:{iso8601}"` | 已被 agent 认领，正在执行 |
+> | `"submitted:{agent}:{iso8601}"` | Agent 已提交结果 |
+> | `"accepted:{by}:{iso8601}"` | Lead 已接收 |
+> | `"done"` | 任务完成 |
+> | `"failed:{msg}"` | 任务失败，含失败原因 |
+> | `"retrying:{n}"` | 第 n 次重试中 |
+> | `"hold:{reason}"` | 暂挂 |
+
 ---
 
 ### GET /api/tasks/{task_id}
 
-获取全局唯一的 Task 详情（`task_id` 在所有 Team 中唯一时返回；若有歧义返回 400）。
+获取全局唯一的 Task 详情（`task_id` 在所有 Team 中唯一时返回；若跨 Team 存在同名 task_id 则返回 409）。
 
 **Errors**
 
 | 状态码 | 原因 |
 |--------|------|
-| `400` | 多个 Team 中存在相同 task_id，产生歧义 |
+| `409` | 多个 Team 中存在相同 task_id，产生歧义；错误消息提示改用 `/api/teams/{team_id}/tasks/{task_id}` |
 | `404` | Task 不存在 |
 
 ---
@@ -1523,7 +1851,15 @@ Team 模式下，一个 Lead Agent 协调多个 Specialist Agent 并行完成复
 | `POST` | `/api/scheduler/jobs/{job_id}/run-now` | 立即执行 Job |
 | `GET` | `/api/teams` | 列出 Teams |
 | `GET` | `/api/teams/{team_id}` | Team 详情 |
-| `GET` | `/api/teams/{team_id}/artifacts` | Team 上下文文件 |
+| `GET` | `/api/teams/{team_id}/artifacts` | Team 上下文文件列表 |
+| `GET` | `/api/teams/{team_id}/artifacts/{artifact_name}` | Team 上下文文件内容 |
+| `GET` | `/api/teams/{team_id}/tasks` | Team 内 Task 列表 |
 | `GET` | `/api/teams/{team_id}/tasks/{task_id}` | Team Task 详情 |
+| `GET` | `/api/teams/{team_id}/tasks/{task_id}/artifacts` | Task 产出文件列表 |
+| `GET` | `/api/teams/{team_id}/tasks/{task_id}/artifacts/{artifact_name}` | Task 产出文件内容 |
+| `GET` | `/api/teams/{team_id}/leader-updates` | Lead Agent 更新记录 |
+| `GET` | `/api/teams/{team_id}/channel-sends` | Channel 发送记录 |
+| `GET` | `/api/teams/{team_id}/routing-events` | Task 完成路由记录 |
+| `GET` | `/api/teams/{team_id}/pending-completions` | 待处理完成通知 |
 | `GET` | `/api/tasks` | 全局 Task 列表 |
 | `GET` | `/api/tasks/{task_id}` | Task 详情 |
