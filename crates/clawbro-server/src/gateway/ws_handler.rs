@@ -1,4 +1,5 @@
-use crate::agent_core::TurnExecutionContext;
+use crate::channels_internal::ws_virtual::WsVirtualChannel;
+use crate::config::ProgressPresentationMode;
 use crate::protocol::{
     normalize_runtime_session_identity, AgentEvent, InboundMsg, SessionKey, WsTopic,
 };
@@ -14,6 +15,7 @@ use axum::{
 };
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 fn extract_bearer(header: &str) -> Option<&str> {
@@ -174,29 +176,40 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                                 }
                             }
                             Ok(WsClientMsg::Message(inbound)) => {
-                                // A socket sending a turn should also receive the resulting runtime
-                                // events for that same session without requiring a separate explicit
-                                // Subscribe round-trip first.
+                                // Subscribe to the original session key (single-agent / explicit mention).
                                 ensure_subscription(
                                     &state,
                                     &private_tx,
                                     &mut local_subscriptions,
                                     &inbound.session_key,
                                 );
-                                // NOTE(V1-limitation): WS path calls handle_with_context directly,
-                                // bypassing expand_for_multi_agent in im_sink.rs. In multi-agent Solo
-                                // deployments, WS clients must include an explicit @mention to route
-                                // to a specific agent. @all broadcast is not supported over WebSocket.
-                                // See docs/plans/2026-03-25-multi-agent-session-isolation.md § V1 限制.
-                                let registry = state.registry.clone();
-                                tokio::spawn(async move {
-                                    if let Err(e) = registry
-                                        .handle_with_context(inbound, TurnExecutionContext::default())
-                                        .await
-                                    {
-                                        tracing::error!("Registry handle error: {e}");
+                                // Multi-agent broadcast: pre-expand to get agent-scoped session keys
+                                // and subscribe to each, so WS events from all agent sessions are
+                                // delivered back to this connection.
+                                let expanded = crate::im_sink::expand_for_multi_agent(
+                                    &inbound,
+                                    &state.registry,
+                                );
+                                for msg in &expanded {
+                                    if msg.session_key.scope != inbound.session_key.scope {
+                                        ensure_subscription(
+                                            &state,
+                                            &private_tx,
+                                            &mut local_subscriptions,
+                                            &msg.session_key,
+                                        );
                                     }
-                                });
+                                }
+                                // Route through spawn_im_turn — picks up expand_for_multi_agent
+                                // internally, so single-agent and @all broadcast both work uniformly.
+                                crate::im_sink::spawn_im_turn(
+                                    state.registry.clone(),
+                                    Arc::new(WsVirtualChannel),
+                                    state.channel_registry.clone(),
+                                    state.cfg.clone(),
+                                    inbound,
+                                    ProgressPresentationMode::FinalOnly,
+                                );
                             }
                             Err(e) => {
                                 tracing::warn!("WS: malformed message ({})", e);

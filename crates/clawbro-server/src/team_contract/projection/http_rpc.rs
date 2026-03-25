@@ -180,11 +180,22 @@ async fn handle_send_message(
 
     // Inherit the caller's channel so the dispatched turn — and its reply — travel the same
     // transport as the original conversation (DingTalk, Lark, or WebSocket).
-    let scope = scope_override.unwrap_or(&caller_session.scope).to_string();
+    // Strip any agent suffix from the caller scope (e.g. "group:abc:claude" → "group:abc") so
+    // expand_for_multi_agent in spawn_im_turn can re-scope to the correct target agent session.
+    let base_scope = scope_override
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            state
+                .registry
+                .roster
+                .as_ref()
+                .map(|r| r.conversation_scope(&caller_session.scope).to_string())
+                .unwrap_or_else(|| caller_session.scope.clone())
+        });
     let session_key = SessionKey {
         channel: caller_session.channel.clone(),
         channel_instance: caller_session.channel_instance.clone(),
-        scope,
+        scope: base_scope,
     };
     let channel = resolve_channel(state, &session_key);
     let turn_id = uuid::Uuid::new_v4().to_string();
@@ -405,6 +416,49 @@ mod tests {
         assert_eq!(status, axum::http::StatusCode::OK);
         assert!(resp.ok);
         assert!(resp.message.contains("@reviewer"));
+    }
+
+    #[tokio::test]
+    async fn send_message_strips_agent_suffix_from_caller_scope() {
+        // When the caller's session scope is already agent-scoped (e.g. "group:room:claude"),
+        // the dispatched message must target the conversation scope ("group:room"), not
+        // double-suffix ("group:room:claude:codex").
+        let roster = AgentRoster::new(vec![
+            AgentEntry {
+                name: "claude".to_string(),
+                mentions: vec!["@claude".to_string()],
+                backend_id: "claude".to_string(),
+                persona_dir: None,
+                workspace_dir: None,
+                extra_skills_dirs: vec![],
+            },
+            AgentEntry {
+                name: "codex".to_string(),
+                mentions: vec!["@codex".to_string()],
+                backend_id: "codex".to_string(),
+                persona_dir: None,
+                workspace_dir: None,
+                extra_skills_dirs: vec![],
+            },
+        ]);
+        let state = make_state_with_roster(roster);
+        let request = TeamToolRequest {
+            // Caller is the claude specialist — scope is already agent-scoped.
+            session_key: SessionKey {
+                channel: "lark".to_string(),
+                channel_instance: Some("main".to_string()),
+                scope: "group:room:claude".to_string(),
+            },
+            call: crate::runtime::TeamToolCall::SendMessage {
+                target: "codex".to_string(),
+                message: "please review".to_string(),
+                scope: None,
+            },
+        };
+        let (status, resp) = invoke_team_http_request(&state, "tok", request).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(resp.ok);
+        assert!(resp.message.contains("@codex"));
     }
 
     #[tokio::test]
