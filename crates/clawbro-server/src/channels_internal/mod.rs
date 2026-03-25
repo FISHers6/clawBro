@@ -7,7 +7,7 @@ pub mod dingtalk_webhook_reply;
 pub mod dingtalk_webhook_richtext;
 pub mod dingtalk_webhook_types;
 pub mod lark;
-mod mention_parsing;
+pub(crate) mod mention_parsing;
 pub mod mention_trigger;
 pub mod traits;
 pub mod wechat;

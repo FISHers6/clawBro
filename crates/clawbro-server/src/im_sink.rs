@@ -1,3 +1,4 @@
+use crate::agent_core::roster::agent_scoped_scope;
 use crate::agent_core::team::orchestrator::TeamOrchestrator;
 use crate::agent_core::team::session::{ChannelSendSourceKind, ChannelSendStatus};
 use crate::agent_core::{
@@ -5,11 +6,12 @@ use crate::agent_core::{
     TurnExecutionContext,
 };
 use crate::channel_registry::ChannelRegistry;
+use crate::channels_internal::mention_parsing::derive_fanout_message_id;
 use crate::channels_internal::Channel;
 use crate::config::{DeliveryPurposeConfig, GatewayConfig, ProgressPresentationMode};
 use crate::delivery_resolver::{resolve_delivery, ResolvedDelivery};
 use crate::progress_presentation;
-use crate::protocol::{AgentEvent, DashboardEvent, InboundMsg, OutboundMsg, SessionKey};
+use crate::protocol::{AgentEvent, DashboardEvent, InboundMsg, MsgSource, OutboundMsg, SessionKey};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -292,6 +294,83 @@ fn delivery_parts_or_fallback(
     }
 }
 
+/// Expands a single InboundMsg into one message per roster agent for multi-agent
+/// Solo deployments. Returns the original message unchanged when:
+/// - Roster has ≤ 1 agent (single-agent config)
+/// - A TeamOrchestrator is active for this scope (team mode takes over)
+///
+/// Expansion conditions (must ALL be true):
+/// - Roster has ≥ 2 agents
+/// - No active TeamOrchestrator
+/// - Human source AND (no target_agent OR target is "@all")
+///
+/// For Human messages with a specific @mention, the scope is suffixed with the
+/// agent name but no additional messages are created.
+///
+/// For non-Human sources (BotMention, Heartbeat, TeamNotify) with a specific
+/// @mention, only the scope suffix is applied (prevents broadcast loops).
+pub(crate) fn expand_for_multi_agent(
+    inbound: &InboundMsg,
+    registry: &crate::agent_core::SessionRegistry,
+) -> Vec<InboundMsg> {
+    let roster = match registry.roster.as_ref() {
+        Some(r) if r.all_agents().len() > 1 => r,
+        _ => return vec![inbound.clone()], // Single-agent or no roster: pass through
+    };
+
+    // Strip any existing agent suffix to get the conversation-level scope.
+    let base_scope = roster.conversation_scope(&inbound.session_key.scope);
+
+    // Build a normalised key at the base scope to check for a TeamOrchestrator.
+    let base_key = crate::protocol::SessionKey {
+        channel: inbound.session_key.channel.clone(),
+        scope: base_scope.to_string(),
+        channel_instance: inbound.session_key.channel_instance.clone(),
+    };
+    if registry.has_active_team_for_key(&base_key) {
+        return vec![inbound.clone()]; // Team mode: orchestrator handles dispatch
+    }
+
+    let target = inbound.target_agent.as_deref();
+    let is_broadcast_target = target.is_none()
+        || target
+            .map(|t| t.eq_ignore_ascii_case("@all"))
+            .unwrap_or(false);
+
+    // Broadcast: Human sends with no mention or @all → expand to every roster agent.
+    if is_broadcast_target && matches!(inbound.source, MsgSource::Human) {
+        return roster
+            .all_agents()
+            .iter()
+            .map(|agent| {
+                let scoped_scope = agent_scoped_scope(base_scope, &agent.name);
+                let mention = agent
+                    .mentions
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| format!("@{}", agent.name));
+                let mut msg = inbound.clone();
+                msg.session_key.scope = scoped_scope;
+                msg.target_agent = Some(mention.clone());
+                msg.id = derive_fanout_message_id(&inbound.id, Some(&mention));
+                msg
+            })
+            .collect();
+    }
+
+    // Specific mention (any source): suffix scope for session isolation.
+    if let Some(mention) = target {
+        if let Some(agent) = roster.find_by_mention(mention) {
+            let mut msg = inbound.clone();
+            msg.session_key.scope = agent_scoped_scope(base_scope, &agent.name);
+            return vec![msg];
+        }
+    }
+
+    // Fallback: unknown mention or non-Human broadcast — pass through unchanged.
+    vec![inbound.clone()]
+}
+
 pub fn spawn_im_turn(
     registry: Arc<SessionRegistry>,
     channel: Arc<dyn Channel>,
@@ -300,6 +379,24 @@ pub fn spawn_im_turn(
     inbound: InboundMsg,
     presentation: ProgressPresentationMode,
 ) {
+    // Multi-agent expansion: may produce >1 message for broadcast scenarios.
+    let expanded = expand_for_multi_agent(&inbound, &registry);
+    if expanded.len() > 1 {
+        for msg in expanded {
+            spawn_im_turn(
+                Arc::clone(&registry),
+                Arc::clone(&channel),
+                Arc::clone(&channel_registry),
+                Arc::clone(&cfg),
+                msg,
+                presentation,
+            );
+        }
+        return;
+    }
+    // Single message (possibly scope-updated): use it going forward.
+    let inbound = expanded.into_iter().next().unwrap_or(inbound);
+
     let channel_name = channel.name().to_string();
     let session_key = inbound.session_key.clone();
     let thread_ts = inbound.thread_ts.clone();
@@ -651,5 +748,160 @@ mod tests {
             decide_final_delivery(true, false, true, false),
             FinalDeliveryDecision::DirectSend
         );
+    }
+}
+
+#[cfg(test)]
+mod multi_agent_expand_tests {
+    use super::*;
+    use crate::agent_core::roster::{AgentEntry, AgentRoster};
+    use crate::agent_core::SessionRegistry;
+    use crate::config::GatewayConfig;
+    use crate::protocol::{InboundMsg, MsgContent, MsgSource, SessionKey};
+    use crate::session::{SessionManager, SessionStorage};
+    use crate::skills_internal::SkillLoader;
+    use std::sync::Arc;
+
+    fn make_two_agent_registry() -> Arc<SessionRegistry> {
+        let cfg = GatewayConfig::default();
+        let storage = SessionStorage::new(cfg.session.dir.clone());
+        let session_manager = Arc::new(SessionManager::new(storage));
+        let skill_loader = SkillLoader::new(vec![cfg.skills.dir.clone()]);
+        let skills = skill_loader.load_all();
+        let system_injection = skill_loader.build_system_injection(&skills);
+        let skill_dirs = skill_loader.search_dirs().to_vec();
+        let roster = AgentRoster::new(vec![
+            AgentEntry {
+                name: "claude".to_string(),
+                mentions: vec!["@claude".to_string()],
+                backend_id: "claude".to_string(),
+                persona_dir: None,
+                workspace_dir: None,
+                extra_skills_dirs: vec![],
+            },
+            AgentEntry {
+                name: "codex".to_string(),
+                mentions: vec!["@codex".to_string()],
+                backend_id: "codex".to_string(),
+                persona_dir: None,
+                workspace_dir: None,
+                extra_skills_dirs: vec![],
+            },
+        ]);
+        let (registry, _rx) = SessionRegistry::new(
+            None,
+            session_manager,
+            system_injection,
+            Some(roster),
+            None,
+            None,
+            None,
+            skill_dirs,
+        );
+        registry
+    }
+
+    fn make_inbound(scope: &str, target: Option<&str>, source: MsgSource) -> InboundMsg {
+        InboundMsg {
+            id: "msg-001".to_string(),
+            session_key: SessionKey::new("lark", scope),
+            content: MsgContent::text("hello"),
+            sender: "user-001".to_string(),
+            channel: "lark".to_string(),
+            timestamp: chrono::Utc::now(),
+            thread_ts: None,
+            target_agent: target.map(str::to_string),
+            source,
+        }
+    }
+
+    #[test]
+    fn no_target_human_expands_to_all_agents() {
+        let registry = make_two_agent_registry();
+        let inbound = make_inbound("group:abc", None, MsgSource::Human);
+        let msgs = expand_for_multi_agent(&inbound, &registry);
+        assert_eq!(msgs.len(), 2);
+        let scopes: Vec<&str> = msgs.iter().map(|m| m.session_key.scope.as_str()).collect();
+        assert!(scopes.contains(&"group:abc:claude"));
+        assert!(scopes.contains(&"group:abc:codex"));
+    }
+
+    #[test]
+    fn at_all_human_expands_to_all_agents() {
+        let registry = make_two_agent_registry();
+        let inbound = make_inbound("group:abc", Some("@all"), MsgSource::Human);
+        let msgs = expand_for_multi_agent(&inbound, &registry);
+        assert_eq!(msgs.len(), 2);
+    }
+
+    #[test]
+    fn specific_mention_human_scopes_single_agent() {
+        let registry = make_two_agent_registry();
+        let inbound = make_inbound("group:abc", Some("@claude"), MsgSource::Human);
+        let msgs = expand_for_multi_agent(&inbound, &registry);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].session_key.scope, "group:abc:claude");
+        assert_eq!(msgs[0].target_agent.as_deref(), Some("@claude"));
+    }
+
+    #[test]
+    fn bot_mention_source_scopes_but_does_not_broadcast() {
+        let registry = make_two_agent_registry();
+        let inbound = make_inbound("group:abc", Some("@codex"), MsgSource::BotMention);
+        let msgs = expand_for_multi_agent(&inbound, &registry);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].session_key.scope, "group:abc:codex");
+    }
+
+    #[test]
+    fn single_agent_roster_passes_through_unchanged() {
+        let cfg = GatewayConfig::default();
+        let storage = SessionStorage::new(cfg.session.dir.clone());
+        let session_manager = Arc::new(SessionManager::new(storage));
+        let skill_loader = SkillLoader::new(vec![cfg.skills.dir.clone()]);
+        let skills = skill_loader.load_all();
+        let system_injection = skill_loader.build_system_injection(&skills);
+        let skill_dirs = skill_loader.search_dirs().to_vec();
+        let roster = AgentRoster::new(vec![AgentEntry {
+            name: "claude".to_string(),
+            mentions: vec!["@claude".to_string()],
+            backend_id: "claude".to_string(),
+            persona_dir: None,
+            workspace_dir: None,
+            extra_skills_dirs: vec![],
+        }]);
+        let (registry, _rx) = SessionRegistry::new(
+            None,
+            session_manager,
+            system_injection,
+            Some(roster),
+            None,
+            None,
+            None,
+            skill_dirs,
+        );
+        let inbound = make_inbound("group:abc", None, MsgSource::Human);
+        let msgs = expand_for_multi_agent(&inbound, &registry);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].session_key.scope, "group:abc");
+    }
+
+    #[test]
+    fn already_agent_scoped_specific_mention_strips_and_rescopes() {
+        let registry = make_two_agent_registry();
+        // Caller scope is "group:abc:claude"; MentionTrigger dispatches "@codex"
+        let inbound = make_inbound("group:abc:claude", Some("@codex"), MsgSource::BotMention);
+        let msgs = expand_for_multi_agent(&inbound, &registry);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].session_key.scope, "group:abc:codex");
+    }
+
+    #[test]
+    fn fanout_messages_have_unique_ids() {
+        let registry = make_two_agent_registry();
+        let inbound = make_inbound("group:abc", None, MsgSource::Human);
+        let msgs = expand_for_multi_agent(&inbound, &registry);
+        assert_eq!(msgs.len(), 2);
+        assert_ne!(msgs[0].id, msgs[1].id);
     }
 }
