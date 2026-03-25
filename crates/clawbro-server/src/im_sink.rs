@@ -904,4 +904,59 @@ mod multi_agent_expand_tests {
         assert_eq!(msgs.len(), 2);
         assert_ne!(msgs[0].id, msgs[1].id);
     }
+
+    #[test]
+    fn team_orchestrator_active_passes_through_unchanged() {
+        // When a TeamOrchestrator is active for the base scope, expand_for_multi_agent
+        // must return the message unchanged (no broadcast expansion) — the orchestrator
+        // owns dispatch for team-mode sessions.
+        use crate::agent_core::team::{
+            heartbeat::DispatchFn,
+            orchestrator::TeamOrchestrator,
+            registry::TaskRegistry,
+            session::{stable_team_id_for_session_key, TeamSession},
+        };
+
+        let registry = make_two_agent_registry();
+        let session_key = SessionKey::new("lark", "group:abc");
+
+        // Verify the bypass is not yet active (sanity check before registration).
+        assert!(
+            !registry.has_active_team_for_key(&session_key),
+            "no orchestrator registered yet — should not be active"
+        );
+
+        // Build a minimal TeamOrchestrator (same pattern used in session_router tests).
+        let tmp = tempfile::tempdir().unwrap();
+        let task_registry = Arc::new(TaskRegistry::new_in_memory().unwrap());
+        let team_session = Arc::new(TeamSession::from_dir(
+            "team-test",
+            tmp.path().to_path_buf(),
+        ));
+        let dispatch_fn: DispatchFn = Arc::new(|_, _| Box::pin(async { Ok(()) }));
+        let orch = TeamOrchestrator::new(
+            task_registry,
+            team_session,
+            dispatch_fn,
+            std::time::Duration::from_secs(60),
+        );
+
+        // Register under the team_id derived from session_key (matches what production code
+        // does via `stable_team_id_for_session_key` in team_runtime.rs).
+        let team_id = stable_team_id_for_session_key(&session_key);
+        registry.register_team_orchestrator(team_id, Arc::clone(&orch));
+
+        // Now the bypass must be active.
+        assert!(
+            registry.has_active_team_for_key(&session_key),
+            "orchestrator registered — must be detected as active"
+        );
+
+        // expand_for_multi_agent must return exactly 1 message and leave it unchanged.
+        let inbound = make_inbound("group:abc", None, MsgSource::Human);
+        let msgs = expand_for_multi_agent(&inbound, &registry);
+        assert_eq!(msgs.len(), 1, "team mode must not broadcast");
+        assert_eq!(msgs[0].session_key.scope, "group:abc");
+        assert_eq!(msgs[0].target_agent, None);
+    }
 }
